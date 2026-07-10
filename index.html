@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="8-week CKA exam prep tracker: ~160 tiny checkpoints with under-the-hood internals notes. Progress saves in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>CKA Prep — 8-Week Internals Tracker</title>
+<style>
+:root{
+  --bg:#F5F7FB; --surface:#FFFFFF; --ink:#1C2433; --muted:#5B6577; --line:#DCE2EE;
+  --accent:#2F5FD0; --accent-soft:#E5EBFA; --done:#2E7D5B; --done-soft:#E2F0E9;
+  --weight:#A16A1B; --weight-soft:#F5EBDA; --code-bg:#EDF1F8; --shadow:0 1px 3px rgba(28,36,51,.07);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0F131B; --surface:#171D29; --ink:#E2E7F2; --muted:#94A0B8; --line:#2A3346;
+    --accent:#7C9BEF; --accent-soft:#1E2A47; --done:#5BBE94; --done-soft:#1B3229;
+    --weight:#D9A85C; --weight-soft:#3A2F1C; --code-bg:#212938; --shadow:none;
+  }
+}
+:root[data-theme="light"]{
+  --bg:#F5F7FB; --surface:#FFFFFF; --ink:#1C2433; --muted:#5B6577; --line:#DCE2EE;
+  --accent:#2F5FD0; --accent-soft:#E5EBFA; --done:#2E7D5B; --done-soft:#E2F0E9;
+  --weight:#A16A1B; --weight-soft:#F5EBDA; --code-bg:#EDF1F8; --shadow:0 1px 3px rgba(28,36,51,.07);
+}
+:root[data-theme="dark"]{
+  --bg:#0F131B; --surface:#171D29; --ink:#E2E7F2; --muted:#94A0B8; --line:#2A3346;
+  --accent:#7C9BEF; --accent-soft:#1E2A47; --done:#5BBE94; --done-soft:#1B3229;
+  --weight:#D9A85C; --weight-soft:#3A2F1C; --code-bg:#212938; --shadow:none;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){ html{scroll-behavior:auto} *{transition:none!important} }
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:16px/1.6 "Segoe UI",-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+}
+.mono, h1,h2,h3, .cp-id, code, .nav a, .badge, .count, .days-num, .pct{
+  font-family:ui-monospace,"JetBrains Mono","Cascadia Code","SF Mono",Menlo,Consolas,monospace;
+}
+code{background:var(--code-bg); border-radius:4px; padding:.08em .35em; font-size:.86em}
+.wrap{display:flex; max-width:1180px; margin:0 auto; gap:40px; padding:0 20px}
+/* ---------- sidebar ---------- */
+.side{
+  width:264px; flex:0 0 264px; position:sticky; top:0; align-self:flex-start;
+  max-height:100vh; overflow-y:auto; padding:28px 4px 28px 0;
+}
+.brand-row{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px}
+.brand{font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); font-weight:700}
+.theme-btn{font:600 11px ui-monospace,Menlo,Consolas,monospace; color:var(--muted); background:var(--surface);
+  border:1px solid var(--line); border-radius:6px; padding:4px 8px; cursor:pointer}
+.theme-btn:hover{color:var(--ink); border-color:var(--muted)}
+.panel{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:16px; box-shadow:var(--shadow); margin-bottom:14px}
+.days-num{font-size:34px; font-weight:700; line-height:1.1}
+.days-lbl{font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.1em}
+.exam-date{margin-top:10px; font-size:12px; color:var(--muted); display:flex; align-items:center; gap:8px}
+.exam-date input{font:inherit; color:var(--ink); background:var(--code-bg); border:1px solid var(--line); border-radius:5px; padding:2px 6px}
+.ring-row{display:flex; align-items:center; gap:14px}
+.ring{width:64px; height:64px; border-radius:50%; flex:0 0 64px; display:grid; place-items:center;
+  background:conic-gradient(var(--done) calc(var(--p,0)*1%), var(--line) 0)}
+.ring::after{content:""; position:absolute}
+.ring .pct{width:48px; height:48px; border-radius:50%; background:var(--surface); display:grid; place-items:center; font-size:12px; font-weight:700}
+.ring-meta{font-size:12px; color:var(--muted)}
+.ring-meta strong{color:var(--ink); font-size:14px; display:block}
+.nav{list-style:none; margin:0; padding:0}
+.nav li{margin:2px 0}
+.nav a{
+  display:flex; justify-content:space-between; align-items:baseline; gap:8px;
+  text-decoration:none; color:var(--ink); font-size:12.5px; padding:7px 10px; border-radius:7px;
+}
+.nav a:hover{background:var(--accent-soft)}
+.nav .count{color:var(--muted); font-size:11px; white-space:nowrap}
+.nav a.done-week{color:var(--done)} .nav a.done-week .count{color:var(--done)}
+.reset{margin-top:10px; width:100%; font:600 11.5px ui-monospace,Menlo,Consolas,monospace; letter-spacing:.05em;
+  color:var(--muted); background:none; border:1px dashed var(--line); border-radius:7px; padding:7px; cursor:pointer}
+.reset:hover{color:var(--ink); border-color:var(--muted)}
+/* ---------- main ---------- */
+main{flex:1; min-width:0; max-width:770px; padding:34px 0 90px}
+header.hero{margin-bottom:30px}
+h1{font-size:29px; line-height:1.25; margin:0 0 10px; text-wrap:balance; letter-spacing:-.02em}
+.hero p{color:var(--muted); max-width:62ch; margin:.4em 0}
+.weights{display:flex; flex-wrap:wrap; gap:8px; margin-top:16px}
+.weights span{font-size:11.5px; font-weight:600; padding:4px 10px; border-radius:99px;
+  background:var(--surface); border:1px solid var(--line); color:var(--muted); font-family:ui-monospace,Menlo,Consolas,monospace}
+.weights b{color:var(--weight); font-weight:700; margin-left:4px}
+section.wk{margin:44px 0; scroll-margin-top:20px}
+.wk-head{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; border-bottom:2px solid var(--line); padding-bottom:10px; margin-bottom:6px}
+.wk-head h2{font-size:19px; margin:0; letter-spacing:-.01em}
+.badge{font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+  background:var(--weight-soft); color:var(--weight); border-radius:5px; padding:3px 8px}
+.badge.dom{background:var(--accent-soft); color:var(--accent)}
+.wk-goal{color:var(--muted); font-size:14.5px; margin:8px 0 18px; max-width:66ch}
+.grp{margin:22px 0}
+.grp h3{font-size:13px; letter-spacing:.1em; text-transform:uppercase; color:var(--accent); margin:0 0 8px}
+ul.cps{list-style:none; margin:0; padding:0; background:var(--surface); border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow); overflow:hidden}
+li.cp{border-top:1px solid var(--line); padding:11px 14px}
+li.cp:first-child{border-top:0}
+.cp label{display:flex; gap:11px; align-items:flex-start; cursor:pointer}
+.cp input{position:absolute; opacity:0; width:1px; height:1px}
+.box{flex:0 0 19px; width:19px; height:19px; margin-top:3px; border:2px solid var(--muted); border-radius:5px; position:relative; transition:background .12s,border-color .12s}
+.cp input:focus-visible + .box{outline:2px solid var(--accent); outline-offset:2px}
+.cp input:checked + .box{background:var(--done); border-color:var(--done)}
+.cp input:checked + .box::after{content:""; position:absolute; left:4.5px; top:1px; width:5px; height:9px;
+  border:solid #fff; border-width:0 2.5px 2.5px 0; transform:rotate(43deg)}
+.txt{font-size:14.5px}
+.cp.is-done .txt{color:var(--muted); text-decoration:line-through; text-decoration-color:var(--line); text-decoration-thickness:1.5px}
+.cp-id{font-size:10.5px; color:var(--muted); margin-right:7px; user-select:none}
+.cp details{margin:7px 0 2px 30px}
+.cp summary{cursor:pointer; font-size:11.5px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; color:var(--accent); list-style:none; display:inline-block}
+.cp summary::before{content:"▸ "}
+.cp details[open] summary::before{content:"▾ "}
+.cp details p{font-size:13.5px; color:var(--muted); margin:6px 0 4px; max-width:64ch}
+.cp details p strong{color:var(--ink)}
+.note{background:var(--accent-soft); border-radius:10px; padding:13px 16px; font-size:13.5px; color:var(--ink); margin:14px 0}
+.note b{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); display:block; margin-bottom:3px}
+footer{color:var(--muted); font-size:12.5px; border-top:1px solid var(--line); padding-top:18px; margin-top:60px}
+@media (max-width: 900px){
+  .wrap{flex-direction:column; gap:0}
+  .side{position:static; width:auto; flex:auto; max-height:none; padding:20px 0 0}
+  .nav{display:none}
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="panel">
+    <div class="days-num" id="days">—</div>
+    <div class="days-lbl">days until exam</div>
+    <div class="exam-date"><label for="examdate">Exam:</label><input type="date" id="examdate" value="2026-09-10"></div>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>checkpoints done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <button class="reset" id="reset">reset all progress</button>
+</aside>
+
+<main>
+<header class="hero">
+  <h1>CKA in 8 weeks, from the internals up</h1>
+  <p>A checkpoint-driven plan for the Certified Kubernetes Administrator exam. Every topic pairs the hands-on task the exam tests with an <em>Under the hood</em> note explaining what the machinery is actually doing — because knowing <em>why</em> is what makes troubleshooting (30% of your score) fast.</p>
+  <p>Checkboxes save automatically in this browser. Aim to clear one group per study day; the weeks are sequenced so each layer builds on the one below it.</p>
+  <div class="weights">
+    <span>Troubleshooting<b>30%</b></span>
+    <span>Cluster Architecture &amp; Install<b>25%</b></span>
+    <span>Services &amp; Networking<b>20%</b></span>
+    <span>Workloads &amp; Scheduling<b>15%</b></span>
+    <span>Storage<b>10%</b></span>
+  </div>
+</header>
+
+<!-- ================= WEEK 0 ================= -->
+<section class="wk" id="w0" data-title="W0 · Setup">
+<div class="wk-head"><h2>Week 0 — Set up your lab &amp; logistics</h2><span class="badge dom">2–3 days</span></div>
+<p class="wk-goal">Before Day 1 of studying: book the exam, build a real kubeadm cluster (the exam runs on kubeadm clusters on Ubuntu), and tune your shell so speed habits form from the start.</p>
+
+<div class="grp"><h3>Logistics</h3>
+<ul class="cps">
+<li class="cp" data-id="w0-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.1</span>Buy the CKA from the Linux Foundation and schedule it ~8 weeks out (you can reschedule). Note: it includes <strong>two killer.sh sessions</strong> and <strong>one free retake</strong>.</span></label></li>
+<li class="cp" data-id="w0-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.2</span>Download the current CKA curriculum PDF from the CNCF curriculum repo and skim every bullet — the 2025 revision added Gateway API, Helm, Kustomize, CRDs/operators, and CNI understanding.</span></label></li>
+<li class="cp" data-id="w0-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.3</span>Run the PSI online-proctoring system check on the machine you'll test on (webcam, mic, bandwidth, single monitor works best).</span></label></li>
+<li class="cp" data-id="w0-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.4</span>Memorize what documentation is allowed in the exam: <code>kubernetes.io/docs</code>, <code>kubernetes.io/blog</code>, and <code>helm.sh/docs</code> — opened in the exam environment's own Firefox only.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Lab environment</h3>
+<ul class="cps">
+<li class="cp" data-id="w0-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.5</span>Create 3 Ubuntu VMs (2 vCPU / 4 GB each) — local (Multipass/Vagrant/KVM) or cloud — for one control plane + two workers.</span></label>
+<details><summary>Under the hood</summary><p>You want a cluster you can <strong>break</strong>. Managed clusters (EKS/GKE) and minikube hide the control plane from you; the exam expects you to SSH into nodes, read <code>journalctl</code>, and edit static pod manifests — only a kubeadm cluster gives you that.</p></details></li>
+<li class="cp" data-id="w0-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.6</span>Install containerd + kubeadm/kubelet/kubectl on all nodes following the official "Installing kubeadm" doc — do it manually once, no scripts.</span></label>
+<details><summary>Under the hood</summary><p>The manual steps teach you the node prerequisites the exam probes: swap off (kubelet refuses to start with swap by default), kernel modules <code>overlay</code> and <code>br_netfilter</code>, sysctls <code>net.ipv4.ip_forward=1</code>, and matching <strong>cgroup drivers</strong> — kubelet and containerd must both use <code>systemd</code> cgroups or pods will mysteriously fail.</p></details></li>
+<li class="cp" data-id="w0-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.7</span><code>kubeadm init</code> the control plane, install a CNI (Calico or Flannel), join both workers. Keep this cluster for the whole 8 weeks.</span></label></li>
+<li class="cp" data-id="w0-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.8</span>Snapshot the VMs (or script a rebuild) so you can break things fearlessly and restore in minutes.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Shell &amp; editor speed setup</h3>
+<ul class="cps">
+<li class="cp" data-id="w0-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.9</span>Set up and start using: <code>alias k=kubectl</code>, shell completion (<code>source &lt;(kubectl completion bash)</code> + <code>complete -o default -F __start_kubectl k</code>), <code>export do="--dry-run=client -o yaml"</code>, <code>export now="--force --grace-period 0"</code>.</span></label></li>
+<li class="cp" data-id="w0-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.10</span>Add to <code>~/.vimrc</code>: <code>set ts=2 sw=2 et</code> (YAML dies on tabs). Practice vim basics: visual-block indent (<code>V</code> + <code>&gt;</code>), <code>dd</code>/<code>yy</code>/<code>p</code>, <code>/search</code>, <code>u</code>.</span></label></li>
+<li class="cp" data-id="w0-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.11</span>Learn <code>kubectl explain</code> deeply: <code>k explain pod.spec.containers --recursive</code> — often faster than the docs for field names.</span></label></li>
+<li class="cp" data-id="w0-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">0.12</span>Write a one-page baseline self-assessment: rate yourself 1–5 on each of the five domains. Revisit it at week 7 to target revision.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 1 ================= -->
+<section class="wk" id="w1" data-title="W1 · Control plane internals">
+<div class="wk-head"><h2>Week 1 — How the control plane actually works</h2><span class="badge">feeds the 25% + 30% domains</span></div>
+<p class="wk-goal">Everything else in the exam sits on top of five binaries and a database. Learn each component's real job and its failure signature. This week is reading + tracing on your live cluster, not memorizing.</p>
+
+<div class="grp"><h3>The big picture</h3>
+<ul class="cps">
+<li class="cp" data-id="w1-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.1</span>Draw the full architecture from memory: apiserver, etcd, scheduler, controller-manager, kubelet, kube-proxy, container runtime — with arrows showing who talks to whom.</span></label>
+<details><summary>Under the hood</summary><p>The key insight: <strong>everything talks only to the apiserver</strong>, and only the apiserver talks to etcd. Scheduler and controllers don't command kubelets — they write desired state to the API, and kubelets <em>watch</em> and converge. Kubernetes is a set of independent control loops around a shared database, not a pipeline.</p></details></li>
+<li class="cp" data-id="w1-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.2</span>On your control plane node, identify how each component runs: <code>ls /etc/kubernetes/manifests</code> (static pods) vs <code>systemctl status kubelet</code> (the only systemd service).</span></label>
+<details><summary>Under the hood</summary><p>Chicken-and-egg: the control plane runs as pods, but pods need a control plane. Solution: <strong>static pods</strong> — kubelet watches <code>/etc/kubernetes/manifests</code> and runs whatever YAML appears there, no apiserver needed. It then reports read-only <em>mirror pods</em> to the API (named <code>kube-apiserver-&lt;node&gt;</code>), which you can see but not delete via kubectl.</p></details></li>
+<li class="cp" data-id="w1-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.3</span>Trace one <code>kubectl create deployment</code> end-to-end on paper: which components act, in what order, until a container runs.</span></label>
+<details><summary>Under the hood</summary><p>kubectl POSTs the Deployment → apiserver persists it → <strong>deployment controller</strong> creates a ReplicaSet → <strong>replicaset controller</strong> creates Pods with empty <code>nodeName</code> → <strong>scheduler</strong> watches for unscheduled pods, picks a node, writes a Binding → the <strong>kubelet</strong> on that node sees the pod in its watch, calls CRI to pull the image and start containers → kubelet posts status back. Five independent loops, no direct calls between them.</p></details></li>
+</ul></div>
+
+<div class="grp"><h3>kube-apiserver</h3>
+<ul class="cps">
+<li class="cp" data-id="w1-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.4</span>Learn the request pipeline in order: authentication → authorization → admission (mutating → validating) → persistence to etcd.</span></label>
+<details><summary>Under the hood</summary><p>Every request passes: <strong>authn</strong> (who are you? — client cert, bearer/ServiceAccount token, OIDC; first module to succeed wins), <strong>authz</strong> (may you? — Node, RBAC, webhook authorizers; first to <em>allow</em> wins, deny-by-default), <strong>mutating admission</strong> (webhooks can edit the object — this is how sidecar injectors work), schema validation, <strong>validating admission</strong>, then serialization to etcd. Memorize this order — it explains a whole class of "permission denied vs rejected" confusions.</p></details></li>
+<li class="cp" data-id="w1-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.5</span>Read your live <code>/etc/kubernetes/manifests/kube-apiserver.yaml</code> and explain 10 flags to yourself (<code>--etcd-servers</code>, <code>--client-ca-file</code>, <code>--service-cluster-ip-range</code>, <code>--authorization-mode</code>, …).</span></label></li>
+<li class="cp" data-id="w1-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.6</span>Understand watches: run <code>kubectl get pods -w -v6</code> and observe the HTTP request it actually makes.</span></label>
+<details><summary>Under the hood</summary><p>A watch is a long-lived HTTP GET with <code>?watch=true&amp;resourceVersion=N</code>, streaming change events since revision N. The apiserver maintains a <strong>watch cache</strong> per resource fed by one etcd watch, so thousands of kubelet watches don't hammer etcd. <code>resourceVersion</code> is literally etcd's MVCC revision — it's why optimistic concurrency ("the object has been modified") works.</p></details></li>
+<li class="cp" data-id="w1-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.7</span>Talk to the API without kubectl once: <code>kubectl proxy</code> then <code>curl localhost:8001/api/v1/namespaces/default/pods</code> — see that kubectl is just a REST client.</span></label></li>
+<li class="cp" data-id="w1-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.8</span>Know API groups &amp; versions: what lives in core <code>v1</code> vs <code>apps/v1</code> vs <code>batch/v1</code> vs <code>networking.k8s.io/v1</code>; use <code>kubectl api-resources</code> to explore.</span></label>
+<details><summary>Under the hood</summary><p>Objects are stored in etcd under <code>/registry/&lt;resource&gt;/&lt;namespace&gt;/&lt;name&gt;</code> in one canonical storage version; the apiserver <em>converts</em> between served versions on the fly. That's why <code>apiVersion</code> typos are a classic planted exam bug — the API literally has no such endpoint.</p></details></li>
+</ul></div>
+
+<div class="grp"><h3>etcd</h3>
+<ul class="cps">
+<li class="cp" data-id="w1-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.9</span>Learn Raft at the "explain to a colleague" level: leader election, log replication, quorum commit.</span></label>
+<details><summary>Under the hood</summary><p>All writes go to the elected <strong>leader</strong>, which appends to its write-ahead log and replicates to followers; a write commits once a <strong>quorum</strong> (majority) has persisted it. That's why member counts are odd: 3 members tolerate 1 failure, 5 tolerate 2 — and why a 2-member cluster is <em>worse</em> than 1 (quorum of 2 means either failure halts writes). Losing quorum makes the cluster read-only: the apiserver still answers cached reads but every write hangs.</p></details></li>
+<li class="cp" data-id="w1-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.10</span>Understand etcd's MVCC model: revisions, compaction, defragmentation.</span></label>
+<details><summary>Under the hood</summary><p>etcd never updates in place — every change creates a new <strong>revision</strong> of the key in a bbolt B+tree, and watches are "replay all events since revision N". Old revisions accumulate until <strong>compaction</strong> discards them; compaction frees logical space but only <strong>defrag</strong> returns it to the OS. The <code>resourceVersion</code> you see on every Kubernetes object is this revision counter.</p></details></li>
+<li class="cp" data-id="w1-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.11</span>Read the etcd static pod manifest and locate the four values you'll always need for <code>etcdctl</code>: endpoint, <code>--cacert</code>, <code>--cert</code>, <code>--key</code>.</span></label></li>
+<li class="cp" data-id="w1-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.12</span>Browse raw data once: <code>etcdctl get /registry/pods --prefix --keys-only | head</code> — see where objects really live.</span></label></li>
+<li class="cp" data-id="w1-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.13</span>Check cluster health the way the exam expects: <code>etcdctl endpoint health</code> and <code>etcdctl member list -w table</code>.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Scheduler &amp; controller-manager</h3>
+<ul class="cps">
+<li class="cp" data-id="w1-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.14</span>Learn the scheduler's two-phase cycle: scheduling cycle (Filter → Score) and binding cycle.</span></label>
+<details><summary>Under the hood</summary><p>The scheduler watches for pods with empty <code>spec.nodeName</code>. The <strong>scheduling cycle</strong> runs plugins at fixed extension points: PreFilter → <strong>Filter</strong> (drop nodes failing resources, taints, affinity, ports, volume topology) → PostFilter (this is where <strong>preemption</strong> lives) → <strong>Score</strong> (rank survivors: least-allocated, spreading, image locality) → pick the winner. The async <strong>binding cycle</strong> then writes a Binding subresource, which sets <code>nodeName</code>. The scheduler never talks to nodes.</p></details></li>
+<li class="cp" data-id="w1-15"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.15</span>Prove it to yourself: create a pod with a <code>nodeName</code> already set and confirm the scheduler is bypassed entirely (works even with the scheduler stopped).</span></label></li>
+<li class="cp" data-id="w1-16"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.16</span>Understand the controller pattern: informer → work queue → reconcile loop; "observed state vs desired state".</span></label>
+<details><summary>Under the hood</summary><p>Every controller is the same shape: an <strong>informer</strong> (a watch + in-memory cache, seeded by an initial LIST) delivers events into a <strong>work queue</strong>; workers pop keys and run <em>reconcile</em>: read desired state, read actual state, do one small step to converge, requeue on error with backoff. This is level-triggered, not edge-triggered — controllers recover from missed events by periodic resync. It's also exactly how operators/CRD controllers work, which the curriculum now expects you to understand.</p></details></li>
+<li class="cp" data-id="w1-17"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.17</span>Follow an ownership chain live: <code>kubectl get rs &lt;rs&gt; -o yaml</code> and find <code>ownerReferences</code>; delete a Deployment and explain who deletes the RS and pods.</span></label>
+<details><summary>Under the hood</summary><p>Nothing "cascades" imperatively. Deleting a Deployment leaves orphan-looking ReplicaSets whose <code>ownerReferences</code> now point to a missing object — the <strong>garbage collector controller</strong> notices and deletes them, then the same happens to pods. <code>kubectl delete --cascade=orphan</code> strips this behavior; it's how you can replace a Deployment without killing pods.</p></details></li>
+<li class="cp" data-id="w1-18"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.18</span>Know leader election: why running two controller-manager replicas doesn't double the controllers (check the Lease objects in <code>kube-system</code>).</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>kubelet &amp; the container runtime</h3>
+<ul class="cps">
+<li class="cp" data-id="w1-19"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.19</span>Learn the kubelet's syncLoop: its three pod sources (apiserver watch, static manifest dir, HTTP) and how PLEG feeds container state changes back in.</span></label>
+<details><summary>Under the hood</summary><p>The kubelet merges pod specs from all sources into one desired set, then per-pod workers converge reality: create sandbox, pull images, start containers, run probes. The <strong>PLEG</strong> (Pod Lifecycle Event Generator) detects container state changes from the runtime and triggers re-syncs — "PLEG is not healthy" in kubelet logs means the runtime is too slow/hung, a real troubleshooting signature.</p></details></li>
+<li class="cp" data-id="w1-20"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.20</span>Understand CRI: kubelet → gRPC (<code>RuntimeService</code>/<code>ImageService</code>) → containerd → shim → runc. Find the socket path in your kubelet config.</span></label>
+<details><summary>Under the hood</summary><p>containerd spawns a tiny <strong>shim</strong> process per pod which calls <strong>runc</strong>; runc builds the namespaces + cgroups per the OCI spec, starts PID 1, and <em>exits</em> — the shim stays to hold stdio and the exit code, so containerd can restart without killing your containers. <code>crictl</code> speaks CRI directly to the runtime, which is why it works when the apiserver is down — your most important debugging tool for control plane failures.</p></details></li>
+<li class="cp" data-id="w1-21"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.21</span>Meet the pause container: <code>crictl ps</code> vs <code>crictl pods</code>; explain what the sandbox container actually does.</span></label>
+<details><summary>Under the hood</summary><p>Every pod starts with an invisible <strong>pause</strong> container whose only job is to sleep and <em>own the pod's network namespace</em>. App containers join its namespaces — that's the entire mechanism behind "containers in a pod share an IP and localhost". If an app container crashes and restarts, the IP survives because pause never died.</p></details></li>
+<li class="cp" data-id="w1-22"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.22</span>Understand node heartbeats: NodeStatus updates + Lease objects in <code>kube-node-lease</code>; what happens timing-wise when a node dies.</span></label>
+<details><summary>Under the hood</summary><p>Kubelet renews a <strong>Lease</strong> every 10s (cheap) and NodeStatus every 5m (or on change). If leases stop, the node controller marks the node <code>NotReady/Unknown</code> after ~40s, then adds the <code>node.kubernetes.io/unreachable:NoExecute</code> taint; pods have a default toleration of <strong>300s</strong>, after which they're evicted. This 5-minute delay before pods reschedule is a classic "why isn't my pod moving?" exam moment.</p></details></li>
+<li class="cp" data-id="w1-23"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.23</span>Explore <code>/var/lib/kubelet/</code> on a node: find <code>config.yaml</code> (the kubelet config file), <code>pods/</code> (volumes live here), and know the second config source: <code>/var/lib/kubelet/kubeadm-flags.env</code>.</span></label></li>
+<li class="cp" data-id="w1-24"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">1.24</span>Weekend drill: stop the scheduler, create a deployment, watch pods stay Pending, then start it and watch them schedule. Repeat with controller-manager. Narrate what's happening.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 2 ================= -->
+<section class="wk" id="w2" data-title="W2 · kubeadm, PKI, lifecycle">
+<div class="wk-head"><h2>Week 2 — Installation, PKI &amp; cluster lifecycle</h2><span class="badge">Cluster Architecture · 25%</span></div>
+<p class="wk-goal">kubeadm init/join/upgrade, the certificate machinery underneath it, and etcd backup/restore. These are guaranteed high-value exam tasks — practice each until it's muscle memory.</p>
+
+<div class="grp"><h3>kubeadm init, dissected</h3>
+<ul class="cps">
+<li class="cp" data-id="w2-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.1</span>List the kubeadm init phases from memory: preflight → certs → kubeconfig → kubelet-start → control-plane → etcd → upload-config → mark-control-plane → bootstrap-token → addons (CoreDNS, kube-proxy).</span></label>
+<details><summary>Under the hood</summary><p>Each phase is independently runnable: <code>kubeadm init phase certs apiserver</code> regenerates just one cert. <em>control-plane</em> and <em>etcd</em> phases simply write static pod YAML into <code>/etc/kubernetes/manifests</code> — kubeadm doesn't start anything itself; the already-running kubelet notices the files and starts the pods. <em>upload-config</em> stores the config as the <code>kubeadm-config</code> ConfigMap in kube-system, which later <code>kubeadm upgrade</code> and <code>join</code> read.</p></details></li>
+<li class="cp" data-id="w2-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.2</span>Tear down a worker (<code>kubeadm reset</code>) and rebuild the cluster from scratch once, watching the phase output line by line.</span></label></li>
+<li class="cp" data-id="w2-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.3</span>Know the four kubeconfigs kubeadm writes in <code>/etc/kubernetes/</code>: <code>admin.conf</code>, <code>super-admin.conf</code>, <code>controller-manager.conf</code>, <code>scheduler.conf</code>, <code>kubelet.conf</code> — and which identity each carries.</span></label>
+<details><summary>Under the hood</summary><p>Each is a client certificate identity: admin.conf is CN <code>kubernetes-admin</code> in group <code>kubeadm:cluster-admins</code>; controller-manager and scheduler have their own users bound to exactly the RBAC they need. This is the pattern for <em>all</em> cert-based auth in Kubernetes: <strong>CN = username, O = group</strong>. There is no "user" object in the API at all.</p></details></li>
+<li class="cp" data-id="w2-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.4</span>Understand why the control-plane node has a <code>node-role.kubernetes.io/control-plane:NoSchedule</code> taint, and practice removing/re-adding it.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>PKI — the certificate web</h3>
+<ul class="cps">
+<li class="cp" data-id="w2-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.5</span>Map <code>/etc/kubernetes/pki</code>: the cluster CA, apiserver serving cert, apiserver-kubelet-client, front-proxy pair, etcd CA + certs, and the <code>sa.key/sa.pub</code> pair.</span></label>
+<details><summary>Under the hood</summary><p>Three separate trust domains: the <strong>cluster CA</strong> signs the apiserver's serving cert and all client certs; the <strong>etcd CA</strong> is independent (apiserver holds an etcd-client cert signed by it); the <strong>front-proxy CA</strong> secures the aggregation layer (how metrics-server plugs in). <code>sa.key</code> is not TLS at all — it's the RSA key that <em>signs ServiceAccount JWTs</em>; <code>sa.pub</code> verifies them.</p></details></li>
+<li class="cp" data-id="w2-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.6</span>Inspect a cert by hand: <code>openssl x509 -in /etc/kubernetes/pki/apiserver.crt -text -noout</code> — find the Subject, Issuer, SANs, and expiry.</span></label>
+<details><summary>Under the hood</summary><p>The apiserver cert's <strong>SANs</strong> must include every name clients use: <code>kubernetes.default.svc</code>, the service ClusterIP (first IP of the service range), the node IP, and any LB name. "x509: certificate is valid for X, not Y" errors in kubelet or kubectl logs mean a SAN mismatch — a classic planted fault.</p></details></li>
+<li class="cp" data-id="w2-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.7</span>Run <code>kubeadm certs check-expiration</code>, then <code>kubeadm certs renew all</code> and restart the control-plane static pods. Know that client certs last 1 year, CAs 10 years.</span></label></li>
+<li class="cp" data-id="w2-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.8</span>Find where the kubelet's own client cert lives (<code>/var/lib/kubelet/pki/kubelet-client-current.pem</code>) and check whether rotation is enabled in the kubelet config.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Joining nodes &amp; TLS bootstrap</h3>
+<ul class="cps">
+<li class="cp" data-id="w2-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.9</span>Generate a fresh join command (<code>kubeadm token create --print-join-command</code>) and join a node with it. Know tokens expire after 24h by default.</span></label></li>
+<li class="cp" data-id="w2-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.10</span>Understand the TLS bootstrap flow the join command triggers: token auth → CSR → auto-approval → kubelet client cert.</span></label>
+<details><summary>Under the hood</summary><p>The bootstrap token (format <code>id.secret</code>, stored as a Secret in kube-system) lets the new kubelet authenticate as the <code>system:bootstrappers</code> group — which has exactly one RBAC power: <em>create CertificateSigningRequests</em>. The kubelet submits a CSR; the csrapproving controller auto-approves node client certs; the kubelet downloads its signed cert and writes <code>kubelet.conf</code>. The <code>--discovery-token-ca-cert-hash</code> pins the CA's public key hash so the node can't be tricked into joining a rogue cluster.</p></details></li>
+<li class="cp" data-id="w2-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.11</span>Know the HA topologies: stacked etcd (etcd on each control-plane node) vs external etcd; why stacked needs 3 CP nodes and what the load balancer in front of apiservers is for.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Cluster upgrades</h3>
+<ul class="cps">
+<li class="cp" data-id="w2-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.12</span>Memorize the version skew rules: upgrade one minor at a time; kubelet may be up to 3 minors <em>behind</em> the apiserver, never ahead; kubeadm/kubectl within 1 minor.</span></label></li>
+<li class="cp" data-id="w2-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.13</span>Upgrade your control plane for real: apt-install new kubeadm → <code>kubeadm upgrade plan</code> → <code>kubeadm upgrade apply v1.xx.y</code> → drain → upgrade kubelet+kubectl → restart kubelet → uncordon.</span></label>
+<details><summary>Under the hood</summary><p><code>upgrade apply</code> is mostly a manifest rewrite: it pulls new images, then replaces each static pod manifest in <code>/etc/kubernetes/manifests</code> one at a time, waiting for the new pod to go healthy before the next (with automatic rollback on failure). The kubelet binary itself is <em>never</em> touched by kubeadm — that's your job via the package manager, which is why the exam task has those separate apt steps.</p></details></li>
+<li class="cp" data-id="w2-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.14</span>Upgrade a worker: drain from the CP node, then on the worker: new kubeadm → <code>kubeadm upgrade node</code> → new kubelet → restart → uncordon. Time yourself; target under 10 minutes.</span></label></li>
+<li class="cp" data-id="w2-15"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.15</span>Understand what <code>drain</code> really does (evictions respecting PodDisruptionBudgets + cordon) and when you need <code>--ignore-daemonsets</code> and <code>--delete-emptydir-data</code>.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>etcd backup &amp; restore — drill until reflexive</h3>
+<ul class="cps">
+<li class="cp" data-id="w2-16"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.16</span>Take a snapshot: <code>etcdctl snapshot save /backup/snap.db</code> with <code>--endpoints --cacert --cert --key</code> pulled from the etcd manifest. Verify with <code>etcdutl snapshot status</code>.</span></label></li>
+<li class="cp" data-id="w2-17"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.17</span>Restore for real: <code>etcdutl snapshot restore snap.db --data-dir /var/lib/etcd-restore</code>, then edit the etcd static pod's hostPath volume to the new dir. Confirm deleted objects came back.</span></label>
+<details><summary>Under the hood</summary><p>A snapshot is a point-in-time copy of the bbolt keyspace. <strong>Restore never touches the running etcd</strong> — it materializes a brand-new data directory (with a fresh member identity) on disk; the cluster only changes when you repoint the etcd pod's volume and the kubelet restarts it. Afterwards, controllers reconcile the world back to the snapshot's state — pods created after the snapshot get deleted because their records no longer exist.</p></details></li>
+<li class="cp" data-id="w2-18"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">2.18</span>Do the full backup→delete-stuff→restore cycle twice more on different days, from memory, under 10 minutes.</span></label></li>
+</ul></div>
+
+<div class="note"><b>Weekend checkpoint</b>You can now rebuild, upgrade, back up, and restore a cluster without notes. If any of these still needs the docs open, repeat it before moving on — weeks 6–8 assume this fluency.</div>
+</section>
+
+<!-- ================= WEEK 3 ================= -->
+<section class="wk" id="w3" data-title="W3 · Workloads & scheduling">
+<div class="wk-head"><h2>Week 3 — Workloads, scheduling &amp; app config</h2><span class="badge">Workloads &amp; Scheduling · 15%</span></div>
+<p class="wk-goal">Pod lifecycle mechanics, how Deployments really roll, how the scheduler decides, and how resources map to cgroups. Plus Helm and Kustomize, which the revised exam tests directly.</p>
+
+<div class="grp"><h3>Pod lifecycle internals</h3>
+<ul class="cps">
+<li class="cp" data-id="w3-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.1</span>Distinguish pod <em>phases</em> (Pending/Running/Succeeded/Failed) from container <em>states</em> (Waiting/Running/Terminated) and <em>conditions</em> (PodScheduled, Ready…). Find each in <code>kubectl get pod -o yaml</code> status.</span></label></li>
+<li class="cp" data-id="w3-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.2</span>Build a pod with two init containers and confirm they run <em>serially, to completion, in order</em> before the app container starts.</span></label></li>
+<li class="cp" data-id="w3-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.3</span>Learn native sidecars: an init container with <code>restartPolicy: Always</code>. Build one (e.g. a log tailer) and observe it outlive init and stop <em>after</em> the main container.</span></label>
+<details><summary>Under the hood</summary><p>Before 1.28, sidecars were plain extra containers with painful ordering (app could start before its proxy, Jobs never terminated because the sidecar kept running). The native mechanism reuses init ordering for startup but keeps the container running, and terminates it after app containers on shutdown — solving both problems with one field.</p></details></li>
+<li class="cp" data-id="w3-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.4</span>Master the three probes and their different consequences: liveness (kill &amp; restart), readiness (remove from Service endpoints), startup (suspends the other two until first success).</span></label>
+<details><summary>Under the hood</summary><p>Probes are executed <em>by the kubelet on the node</em> — httpGet comes from the node's kubelet, exec runs inside the container via CRI. A failing <strong>readiness</strong> probe doesn't restart anything; it flips the pod's Ready condition, and the EndpointSlice controller drops its IP from Services — the pod quietly stops receiving traffic. Confusing liveness with readiness is the most common self-inflicted outage: an overloaded pod that fails liveness gets restarted, making the overload worse.</p></details></li>
+<li class="cp" data-id="w3-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.5</span>Understand graceful termination: SIGTERM → <code>terminationGracePeriodSeconds</code> (default 30) → SIGKILL, plus where preStop hooks fit.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Deployments &amp; rollouts</h3>
+<ul class="cps">
+<li class="cp" data-id="w3-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.6</span>Explain the <code>pod-template-hash</code>: why every ReplicaSet name ends in a hash, and how it prevents ReplicaSets from adopting each other's pods.</span></label>
+<details><summary>Under the hood</summary><p>The deployment controller hashes the pod template and injects <code>pod-template-hash=&lt;hash&gt;</code> into both the RS selector and pod labels. Change anything in the template → new hash → new ReplicaSet. A rollback isn't a revert of history: it just copies an old RS's template back into the Deployment, and that old RS scales up again (revision history <em>is</em> the set of retained old ReplicaSets, capped by <code>revisionHistoryLimit</code>).</p></details></li>
+<li class="cp" data-id="w3-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.7</span>Watch a rolling update live: <code>kubectl set image</code> then <code>kubectl get rs -w</code> — narrate maxSurge/maxUnavailable as the two ReplicaSets scale in opposite directions.</span></label></li>
+<li class="cp" data-id="w3-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.8</span>Drill the rollout command family: <code>rollout status</code>, <code>history</code>, <code>undo --to-revision</code>, <code>pause</code>/<code>resume</code>, and <code>--record</code>'s replacement (change-cause annotation).</span></label></li>
+<li class="cp" data-id="w3-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.9</span>Know when you get Recreate strategy behavior and why StatefulSets/DaemonSets roll differently (ordered, in-place per node).</span></label></li>
+<li class="cp" data-id="w3-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.10</span>Cover the rest of the workload zoo hands-on: Job (completions/parallelism/backoffLimit), CronJob (schedule, concurrencyPolicy), DaemonSet, StatefulSet basics (stable identity, headless service).</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Scheduling controls</h3>
+<ul class="cps">
+<li class="cp" data-id="w3-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.11</span>Master taints &amp; tolerations: the three effects (NoSchedule, PreferNoSchedule, NoExecute) and that NoExecute <em>evicts running pods</em>, optionally after <code>tolerationSeconds</code>.</span></label>
+<details><summary>Under the hood</summary><p>Taints are a <em>node-side</em> repellent evaluated in the scheduler's Filter phase; tolerations only neutralize them — they never attract. NoExecute is special: it's enforced <em>after</em> scheduling too, by the taint-manager evicting non-tolerating pods. The node lifecycle controller uses exactly this to drain unreachable nodes (<code>unreachable:NoExecute</code> + the default 300s toleration every pod silently gets).</p></details></li>
+<li class="cp" data-id="w3-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.12</span>Practice nodeSelector vs node affinity (required = hard filter, preferred = weighted score); write one of each from memory.</span></label></li>
+<li class="cp" data-id="w3-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.13</span>Write a pod anti-affinity rule that spreads replicas across nodes; understand <code>topologyKey</code> as "the label defining what counts as one bucket".</span></label></li>
+<li class="cp" data-id="w3-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.14</span>Understand priority &amp; preemption: PriorityClass, how the scheduler picks victims, and <code>nominatedNodeName</code>.</span></label>
+<details><summary>Under the hood</summary><p>When no node fits a high-priority pod, the PostFilter (preemption) plugin simulates removing lower-priority pods until one node would fit, evicts that minimal victim set (respecting graceful termination), and records the node in <code>status.nominatedNodeName</code>. The pod isn't guaranteed that node — it re-enters the queue and could land elsewhere if the world changed.</p></details></li>
+<li class="cp" data-id="w3-15"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.15</span>Cordon/drain/uncordon fluently, and know that <code>cordon</code> is just setting <code>spec.unschedulable</code> (a filter — running pods are untouched).</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Resources, QoS &amp; autoscaling</h3>
+<ul class="cps">
+<li class="cp" data-id="w3-16"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.16</span>Internalize the split: <strong>requests</strong> are scheduler bookkeeping only; <strong>limits</strong> are runtime enforcement via cgroups. Neither is ever "measured" at schedule time.</span></label>
+<details><summary>Under the hood</summary><p>Requests translate to <code>cpu.weight</code> (proportional share under contention); CPU limits become a <strong>CFS quota</strong> (<code>cpu.max</code>: e.g. 50ms runtime per 100ms period for 500m) — exceeding it means <em>throttling</em>, never killing. Memory limits set <code>memory.max</code>; exceeding that triggers the kernel <strong>OOM killer</strong> → container exit code <strong>137</strong>. CPU over limit = slow; memory over limit = dead. That asymmetry explains half of all container mysteries.</p></details></li>
+<li class="cp" data-id="w3-17"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.17</span>Know the three QoS classes (Guaranteed, Burstable, BestEffort), how they're derived, and their role in eviction order and <code>oom_score_adj</code>.</span></label></li>
+<li class="cp" data-id="w3-18"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.18</span>Understand kubelet node-pressure eviction (memory.available, nodefs, imagefs thresholds) vs API-initiated eviction (drain/PDB) — different machinery, different symptoms.</span></label></li>
+<li class="cp" data-id="w3-19"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.19</span>Install metrics-server in your lab; get <code>kubectl top nodes/pods</code> working (know it flows through the aggregated <code>metrics.k8s.io</code> API, secured by the front-proxy certs).</span></label></li>
+<li class="cp" data-id="w3-20"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.20</span>Create an HPA and load-test it; know the loop: query metrics every 15s, desired = ceil(current × actual/target), stabilization window damps scale-down.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>App configuration</h3>
+<ul class="cps">
+<li class="cp" data-id="w3-21"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.21</span>Consume a ConfigMap all four ways: env var (<code>valueFrom</code>), <code>envFrom</code>, volume mount, and command args. Same for Secrets.</span></label></li>
+<li class="cp" data-id="w3-22"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.22</span>Know the update-propagation rules cold: mounted ConfigMaps/Secrets update live (eventually); env vars <em>never</em> update; <code>subPath</code> mounts <em>never</em> update.</span></label>
+<details><summary>Under the hood</summary><p>The kubelet writes volume contents into a timestamped directory and flips a <code>..data</code> symlink <strong>atomically</strong>, so consumers never see half-written files. Env vars are baked in at container creation — only a restart re-reads them. subPath bind-mounts a file directly, bypassing the symlink dance, hence frozen forever. Exam questions love "why didn't my app pick up the new config?"</p></details></li>
+<li class="cp" data-id="w3-23"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.23</span>Know Secrets are only base64 (not encryption), stored in etcd; skim how EncryptionConfiguration enables encryption at rest on the apiserver.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Helm &amp; Kustomize</h3>
+<ul class="cps">
+<li class="cp" data-id="w3-24"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.24</span>Drill the Helm command set: <code>repo add/update</code>, <code>search repo</code>, <code>install</code>, <code>upgrade [--install]</code>, <code>list</code>, <code>history</code>, <code>rollback</code>, <code>uninstall</code>, <code>template</code>, and <code>--set</code>/<code>-f values.yaml</code>.</span></label>
+<details><summary>Under the hood</summary><p>Helm has no cluster-side component (Tiller died with v2). The client renders Go templates locally and applies the result; release state is stored as Secrets named <code>sh.helm.release.v1.&lt;name&gt;.v&lt;N&gt;</code> in the release namespace — each revision one Secret, which is what <code>rollback</code> re-applies. <code>helm template</code> renders without installing: your debugging tool for "what would this actually create?"</p></details></li>
+<li class="cp" data-id="w3-25"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.25</span>Install something real (e.g. ingress-nginx) via Helm, override a value, upgrade it, roll it back.</span></label></li>
+<li class="cp" data-id="w3-26"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.26</span>Build a Kustomize base + overlay: <code>kustomization.yaml</code> with <code>resources</code>, a strategic-merge patch, <code>images:</code> tag override; apply with <code>kubectl apply -k</code>.</span></label>
+<details><summary>Under the hood</summary><p>Kustomize is a purely declarative transformer pipeline — no templates, no variables. <code>configMapGenerator</code> appends a <strong>content hash</strong> to the ConfigMap name and rewrites every reference to it, so changing config produces a new name and automatically triggers a Deployment rollout — the idiomatic fix for "env-var configs don't update".</p></details></li>
+<li class="cp" data-id="w3-27"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">3.27</span>CRDs &amp; operators (curriculum item): install any operator (e.g. cert-manager), inspect its CRDs with <code>kubectl get crd</code> / <code>explain</code>, and articulate how a CR + controller = the same reconcile pattern from 1.16.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 4 ================= -->
+<section class="wk" id="w4" data-title="W4 · Networking">
+<div class="wk-head"><h2>Week 4 — Services &amp; networking, from veth up</h2><span class="badge">Services &amp; Networking · 20%</span></div>
+<p class="wk-goal">Build the network mental model bottom-up: Linux primitives → CNI → Services/kube-proxy → DNS → Ingress/Gateway API → NetworkPolicy. This is the week that makes network troubleshooting deterministic instead of guesswork.</p>
+
+<div class="grp"><h3>Linux networking foundations</h3>
+<ul class="cps">
+<li class="cp" data-id="w4-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.1</span>State the Kubernetes network model's two rules: every pod gets its own IP; all pods reach all pods without NAT. Everything else is implementation.</span></label></li>
+<li class="cp" data-id="w4-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.2</span>Build a "pod network" by hand on a scratch VM: <code>ip netns add</code>, a veth pair, move one end into the netns, attach the other to a bridge, assign IPs, ping across.</span></label>
+<details><summary>Under the hood</summary><p>This 10-minute exercise <em>is</em> what the bridge CNI plugin does per pod: a network namespace (owned by the pause container), a <strong>veth pair</strong> as a virtual cable — one end becomes <code>eth0</code> inside the pod, the other plugs into a node bridge — plus routes. Once you've built it manually, <code>ip addr</code>, <code>ip route</code>, and <code>ip netns exec</code> become debugging superpowers rather than incantations.</p></details></li>
+<li class="cp" data-id="w4-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.3</span>On a real node, find a running pod's veth peer: <code>ip link</code> on the host vs <code>kubectl exec ... -- ip addr</code>; match the interface indexes.</span></label></li>
+<li class="cp" data-id="w4-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.4</span>Know the three CIDR ranges of your cluster and where each is configured: pod CIDR (CNI / controller-manager <code>--cluster-cidr</code>), service CIDR (apiserver <code>--service-cluster-ip-range</code>), node network.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>CNI</h3>
+<ul class="cps">
+<li class="cp" data-id="w4-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.5</span>Learn the CNI contract: runtime executes binaries from <code>/opt/cni/bin</code>, config from <code>/etc/cni/net.d</code>, verbs ADD/DEL/CHECK, JSON on stdin, result (IPs) on stdout.</span></label>
+<details><summary>Under the hood</summary><p>CNI is beautifully dumb: not a daemon protocol but <em>exec-ing a binary per pod</em>. When the kubelet (via containerd) creates a sandbox, it runs the configured plugin chain: main plugin (bridge/calico/cilium) wires the interface, an <strong>IPAM</strong> plugin (host-local, etc.) hands out the IP, meta plugins (portmap, bandwidth) add extras. A node with no config file in <code>/etc/cni/net.d</code> sits <code>NotReady</code> with "cni plugin not initialized" — a staple exam fault.</p></details></li>
+<li class="cp" data-id="w4-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.6</span>Inspect your actual CNI: read the conflist in <code>/etc/cni/net.d</code>, list <code>/opt/cni/bin</code>, and find how pod CIDRs are split per node (<code>kubectl get node -o jsonpath='{.spec.podCIDR}'</code> or the CNI's IPAM).</span></label></li>
+<li class="cp" data-id="w4-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.7</span>Understand the two datapath families: overlay (VXLAN encapsulation — Flannel default) vs routed (BGP real routes — Calico) vs eBPF (Cilium). Know the tradeoffs at one-sentence depth each.</span></label>
+<details><summary>Under the hood</summary><p><strong>Overlay</strong>: pod packets are wrapped in UDP (VXLAN port 8472) between nodes — works on any network, costs encapsulation overhead and gives "why doesn't tcpdump show my pod IP?" moments. <strong>Routed</strong>: each node advertises its pod CIDR via BGP; pod IPs are first-class on the network, no encap. <strong>eBPF</strong> (Cilium) replaces much of iptables/kube-proxy with programs attached in the kernel.</p></details></li>
+<li class="cp" data-id="w4-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.8</span>Break it on purpose: move the CNI config file away on one node, restart kubelet, watch the node go NotReady and new pods stick at ContainerCreating; read the exact events/log lines; restore.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Services &amp; kube-proxy</h3>
+<ul class="cps">
+<li class="cp" data-id="w4-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.9</span>Internalize: a ClusterIP is a <em>virtual</em> IP — it's assigned from the service CIDR but exists on no interface anywhere; it works only because every node rewrites packets to it.</span></label></li>
+<li class="cp" data-id="w4-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.10</span>Walk the iptables chains on a node for one of your services: <code>iptables -t nat -L KUBE-SERVICES</code> → find your <code>KUBE-SVC-…</code> chain → the probabilistic jumps → <code>KUBE-SEP-…</code> DNAT targets.</span></label>
+<details><summary>Under the hood</summary><p>kube-proxy (iptables mode) renders Services+EndpointSlices into nat-table rules: <code>KUBE-SERVICES</code> matches <code>clusterIP:port</code> → <code>KUBE-SVC-XXX</code> picks a backend using the <code>statistic</code> module (random, weighted 1/n, 1/(n-1)…) → <code>KUBE-SEP-XXX</code> DNATs to <code>podIP:port</code>. <strong>conntrack</strong> remembers the choice so a TCP flow sticks with one backend. IPVS mode swaps the rule chains for kernel hash tables (O(1) at scale); nftables is the newest backend. kube-proxy is a rule <em>compiler</em>, not a proxy in the datapath.</p></details></li>
+<li class="cp" data-id="w4-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.11</span>Understand EndpointSlices: the controller lists pod IPs whose <strong>readiness</strong> is true; <code>kubectl get endpointslices</code> is your #1 "service not working" check.</span></label></li>
+<li class="cp" data-id="w4-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.12</span>Create all service types from memory and explain each: ClusterIP, NodePort (30000–32767, opens on <em>every</em> node), LoadBalancer (= NodePort + cloud LB), ExternalName (pure DNS CNAME).</span></label></li>
+<li class="cp" data-id="w4-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.13</span>Create a headless service (<code>clusterIP: None</code>) and dig it: DNS returns pod IPs directly, no proxying — the mechanism behind StatefulSet identity.</span></label></li>
+<li class="cp" data-id="w4-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.14</span>Nail the port trio: <code>port</code> (service's own), <code>targetPort</code> (container's), <code>nodePort</code>. Mismatched targetPort vs containerPort is the most-planted service bug.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>DNS &amp; CoreDNS</h3>
+<ul class="cps">
+<li class="cp" data-id="w4-15"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.15</span>Read the Corefile (ConfigMap <code>coredns</code> in kube-system) plugin by plugin: <code>kubernetes</code> (serves cluster.local from API watches), <code>forward . /etc/resolv.conf</code> (upstream), <code>cache</code>, <code>loop</code>, <code>ready</code>/<code>health</code>.</span></label></li>
+<li class="cp" data-id="w4-16"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.16</span>Inspect a pod's <code>/etc/resolv.conf</code> and explain every line: nameserver = kube-dns ClusterIP, the three search domains, and <code>ndots:5</code>.</span></label>
+<details><summary>Under the hood</summary><p><code>ndots:5</code> means any name with fewer than 5 dots is tried against the search list <em>first</em>: <code>db</code> → <code>db.myns.svc.cluster.local</code> → <code>db.svc.cluster.local</code> → … That's why bare service names resolve, and also why external lookups from pods generate several NXDOMAIN queries before succeeding. The kubelet writes this file per-pod based on <code>dnsPolicy</code> (ClusterFirst by default; ClusterFirstWithHostNet is the gotcha for hostNetwork pods).</p></details></li>
+<li class="cp" data-id="w4-17"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.17</span>Memorize the record shapes: <code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code> → A record; headless service → one A per pod; SRV records for named ports. Verify each with a dnsutils pod + <code>nslookup</code>/<code>dig</code>.</span></label></li>
+<li class="cp" data-id="w4-18"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.18</span>Break DNS on purpose (scale CoreDNS to 0, or corrupt the Corefile) and practice the debug ladder: pod resolv.conf → can you hit the kube-dns ClusterIP → CoreDNS pod logs → Corefile.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Ingress &amp; Gateway API</h3>
+<ul class="cps">
+<li class="cp" data-id="w4-19"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.19</span>Deploy an ingress controller in the lab and write an Ingress with host + path rules and a TLS secret; know <code>pathType: Prefix</code> vs <code>Exact</code> and <code>ingressClassName</code>.</span></label>
+<details><summary>Under the hood</summary><p>Ingress is <em>only data</em> — a rules object. The ingress <strong>controller</strong> (nginx, traefik…) watches Ingresses and renders them into its own proxy config, routing directly to pod IPs from EndpointSlices (bypassing the ClusterIP). No controller installed → Ingress objects sit there doing nothing, silently. That's both an exam fault and a real-world rite of passage.</p></details></li>
+<li class="cp" data-id="w4-20"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.20</span>Learn the Gateway API resource model and its role split: GatewayClass (implementation), Gateway (listeners — infra team), HTTPRoute (matching rules — app team) attached via <code>parentRefs</code>.</span></label></li>
+<li class="cp" data-id="w4-21"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.21</span>Write an HTTPRoute from memory: hostname + path match + <code>backendRefs</code> with weights (canary split); know header-based matching exists.</span></label></li>
+<li class="cp" data-id="w4-22"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.22</span>Be able to say why Gateway API exists: typed, role-separated, expressive routing vs Ingress's annotation soup — and that it's a genuinely new exam topic worth easy points.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>NetworkPolicy</h3>
+<ul class="cps">
+<li class="cp" data-id="w4-23"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.23</span>Internalize the model: policies select pods (<code>podSelector</code>); selected pods become default-deny <em>for the listed policyTypes</em>; rules are additive allows (there is no deny rule).</span></label>
+<details><summary>Under the hood</summary><p>Enforcement is done by the <strong>CNI plugin</strong>, not kube-proxy or the kernel by default — Flannel famously ignores NetworkPolicies entirely. The subtle trap: an empty <code>ingress: []</code> plus <code>policyTypes: [Ingress]</code> denies everything, while omitting policyTypes when you only wrote egress rules leaves ingress wide open. Also: <code>podSelector: {}</code> selects <em>all</em> pods in the namespace.</p></details></li>
+<li class="cp" data-id="w4-24"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.24</span>Write the classic three from memory: namespace default-deny-all; allow-from-one-app (podSelector + ports); allow-from-another-namespace (namespaceSelector).</span></label></li>
+<li class="cp" data-id="w4-25"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">4.25</span>Know the AND/OR trap: one <code>from</code> item with namespaceSelector <em>and</em> podSelector = AND; two separate <code>from</code> items = OR. Test both in the lab and verify with curl.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 5 ================= -->
+<section class="wk" id="w5" data-title="W5 · Storage & CSI">
+<div class="wk-head"><h2>Week 5 — Storage: PVs, PVCs &amp; CSI</h2><span class="badge">Storage · 10%</span></div>
+<p class="wk-goal">The smallest domain — one focused week. Learn the binding control loop and the CSI call sequence, and the exam's storage tasks become mechanical. Use the spare days to start week 6 early.</p>
+
+<div class="grp"><h3>Volume fundamentals</h3>
+<ul class="cps">
+<li class="cp" data-id="w5-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.1</span>Know the ephemeral volumes cold: <code>emptyDir</code> (pod-lifetime scratch, <code>medium: Memory</code> = tmpfs counted against memory limit), <code>hostPath</code> (node dir — and why it's a scheduling trap), plus configMap/secret/downwardAPI/projected.</span></label></li>
+<li class="cp" data-id="w5-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.2</span>Find where volumes actually live on the node: <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/…</code> — exec into a pod, write a file into an emptyDir, and find it on the host.</span></label></li>
+<li class="cp" data-id="w5-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.3</span>Get the object model straight: PV = cluster-scoped representation of real storage; PVC = namespaced request; pods mount <em>claims</em>, never PVs directly.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Binding internals</h3>
+<ul class="cps">
+<li class="cp" data-id="w5-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.4</span>Learn the binding control loop's matching rules: capacity ≥ request, accessModes compatible, storageClassName equal, selector match — then an exclusive 1:1 bind via <code>claimRef</code>.</span></label>
+<details><summary>Under the hood</summary><p>The PV controller runs the same reconcile pattern as everything else: watch unbound PVCs, find the <em>smallest</em> satisfying PV, stamp <code>claimRef</code> on the PV and <code>volumeName</code> on the PVC. The bind is exclusive even if the PV is far bigger than the request — a 100Gi PV bound to a 1Gi claim strands 99Gi. A PVC that finds no match just sits <strong>Pending</strong>, and so does any pod using it (with a clear event — always <code>describe</code> the PVC, not just the pod).</p></details></li>
+<li class="cp" data-id="w5-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.5</span>Create a static PV (hostPath) + matching PVC + pod chain from memory; deliberately mismatch accessModes once and read the resulting state.</span></label></li>
+<li class="cp" data-id="w5-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.6</span>Memorize access modes as <em>node-level</em> guarantees: RWO (one node), ROX (many nodes, read-only), RWX (many nodes), RWOP (one pod). RWO ≠ one pod.</span></label></li>
+<li class="cp" data-id="w5-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.7</span>Learn reclaim policies by doing: delete a PVC and watch a <code>Retain</code> PV go <code>Released</code> (unusable until you clear claimRef) vs <code>Delete</code> removing the PV.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>StorageClasses &amp; dynamic provisioning</h3>
+<ul class="cps">
+<li class="cp" data-id="w5-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.8</span>Read a StorageClass field by field: <code>provisioner</code>, <code>parameters</code>, <code>reclaimPolicy</code>, <code>volumeBindingMode</code>, <code>allowVolumeExpansion</code>; know the default-class annotation and what happens when a PVC omits storageClassName.</span></label></li>
+<li class="cp" data-id="w5-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.9</span>Understand <code>volumeBindingMode: WaitForFirstConsumer</code>: provisioning is deferred until a pod is scheduled, so the volume is created in the right zone/topology. PVC Pending with "waiting for first consumer" is <em>normal</em>, not a bug.</span></label></li>
+<li class="cp" data-id="w5-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.10</span>Install a dynamic provisioner in the lab (local-path-provisioner is perfect) and watch a PVC go Pending → Bound with a freshly minted PV.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>CSI internals</h3>
+<ul class="cps">
+<li class="cp" data-id="w5-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.11</span>Learn the CSI architecture: a controller plugin (Deployment + sidecars: external-provisioner, external-attacher, external-resizer) and a node plugin (DaemonSet) speaking gRPC.</span></label>
+<details><summary>Under the hood</summary><p>Kubernetes core knows nothing about any storage vendor. The <strong>sidecars</strong> translate API objects into gRPC calls on the driver: external-provisioner watches PVCs → <code>CreateVolume</code>; external-attacher watches VolumeAttachment objects → <code>ControllerPublishVolume</code> (attach disk to node). Then the kubelet calls the node plugin directly: <code>NodeStageVolume</code> (format + mount once per node into a global dir) → <code>NodePublishVolume</code> (bind-mount into the pod's volumes dir). Provision → Attach → Stage → Publish: knowing that sequence tells you which log to read when a mount hangs.</p></details></li>
+<li class="cp" data-id="w5-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.12</span>Trace one mount on a node: <code>mount | grep &lt;pvc-id&gt;</code> and find the staging dir and the pod bind-mount.</span></label></li>
+<li class="cp" data-id="w5-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.13</span>Practice volume expansion: edit the PVC size up (never down) with an <code>allowVolumeExpansion: true</code> class; know filesystem resize completes on the node, sometimes needing a pod restart.</span></label></li>
+<li class="cp" data-id="w5-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">5.14</span>Timed drill: from a bare cluster, create SC (if needed) + PVC + pod mounting it at <code>/data</code>, write a file, verify persistence across pod deletion — under 7 minutes.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 6 ================= -->
+<section class="wk" id="w6" data-title="W6 · Troubleshooting (30%)">
+<div class="wk-head"><h2>Week 6 — Troubleshooting: the 30% week</h2><span class="badge">Troubleshooting · 30%</span></div>
+<p class="wk-goal">The highest-weighted domain, and where weeks 1–5 pay off. The method: for every failure class, break your own cluster, fix it, and write down the <em>signature</em> (symptom → first command → root cause). Repetition builds the pattern library that makes exam tasks 3-minute tasks.</p>
+
+<div class="grp"><h3>Toolbox &amp; method</h3>
+<ul class="cps">
+<li class="cp" data-id="w6-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.1</span>Lock in the universal first moves: <code>kubectl get events --sort-by=.metadata.creationTimestamp -A</code>, <code>kubectl describe</code> (events at the bottom), <code>kubectl logs [--previous]</code>, <code>kubectl get pods -A -o wide</code>.</span></label></li>
+<li class="cp" data-id="w6-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.2</span>Know where logs physically live and the fallback ladder when kubectl can't help: <code>journalctl -u kubelet</code>, <code>crictl ps -a</code> / <code>crictl logs</code>, <code>/var/log/pods/</code> and <code>/var/log/containers/</code>.</span></label>
+<details><summary>Under the hood</summary><p><code>kubectl logs</code> is served <em>by the kubelet</em> reading the container's log file under <code>/var/log/pods/…</code> (the runtime writes each container's stdout there as JSON lines). So: apiserver down → use <code>crictl logs</code> on the node; kubelet down → read the files directly. Nothing about logs requires the control plane — that's your lifeline in control-plane-failure questions.</p></details></li>
+<li class="cp" data-id="w6-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.3</span>Practice <code>kubectl debug</code>: ephemeral containers (<code>kubectl debug -it pod --image=busybox --target=app</code>) for distroless pods, and <code>kubectl debug node/</code> for a host shell.</span></label></li>
+<li class="cp" data-id="w6-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.4</span>Write your personal triage flowchart on one page: symptom class → first three commands. You'll refine it all week.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Control plane failures</h3>
+<ul class="cps">
+<li class="cp" data-id="w6-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.5</span>Learn the apiserver-down ladder: kubectl times out → is kubelet running? (<code>systemctl</code>) → is the static manifest valid? → <code>crictl ps -a | grep api</code> → <code>crictl logs</code> on the dead container.</span></label></li>
+<li class="cp" data-id="w6-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.6</span>Have a partner (or script) plant faults in <code>kube-apiserver.yaml</code> — wrong image tag, typo'd flag, wrong etcd endpoint, bad cert path — and fix each. Note each one's distinct log signature.</span></label>
+<details><summary>Under the hood</summary><p>Learn to read the failure <em>mode</em>: wrong image → pod stuck ImagePullBackOff in <code>crictl</code>; bad flag → container starts and exits instantly, log says <code>unknown flag</code>; wrong etcd endpoint → apiserver runs but logs connection-refused storms and kubectl gives 500s; bad cert path → instant exit with "no such file". Same file, four different fingerprints.</p></details></li>
+<li class="cp" data-id="w6-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.7</span>Break the scheduler and controller-manager the same way; know their failure smell: cluster healthy but new pods stay Pending (scheduler) or Deployments/ReplicaSets stop reconciling (CM).</span></label></li>
+<li class="cp" data-id="w6-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.8</span>Simulate etcd trouble: stop etcd and observe exactly what still works (reads from watch caches, running pods keep running) vs what hangs (all writes).</span></label></li>
+<li class="cp" data-id="w6-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.9</span>Practice the expired-certificate scenario: recognize TLS errors in kubelet/apiserver logs, run <code>kubeadm certs check-expiration</code> → <code>renew</code> → restart static pods.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Node failures</h3>
+<ul class="cps">
+<li class="cp" data-id="w6-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.10</span>Drill the NotReady ladder: <code>kubectl describe node</code> (Conditions + taints) → ssh → <code>systemctl status kubelet</code> → <code>journalctl -u kubelet -f</code> → fix → verify Ready.</span></label></li>
+<li class="cp" data-id="w6-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.11</span>Plant and fix the kubelet classics: service stopped/disabled, wrong config path in the systemd unit, swap enabled, wrong CA path in kubelet.conf, containerd stopped.</span></label></li>
+<li class="cp" data-id="w6-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.12</span>Read node Conditions fluently: MemoryPressure, DiskPressure, PIDPressure — and connect each to the kubelet eviction thresholds from 3.18.</span></label></li>
+<li class="cp" data-id="w6-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.13</span>Rehearse the "node down" timeline from 1.22 end-to-end: kill a node, narrate lease expiry → NotReady → unreachable taint → 300s → eviction → rescheduling.</span></label></li>
+<li class="cp" data-id="w6-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.14</span>Know the ssh discipline for the exam: <code>ssh node01</code> → <code>sudo -i</code> → fix → <code>exit</code>, <code>exit</code>. Wrong-host commands are a notorious point-loser.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Workload failures</h3>
+<ul class="cps">
+<li class="cp" data-id="w6-15"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.15</span>Build the Pending-pod checklist: <code>describe</code> events → insufficient CPU/memory? untolerated taint? affinity unsatisfiable? unbound PVC? Reproduce each cause once in the lab.</span></label></li>
+<li class="cp" data-id="w6-16"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.16</span>Master CrashLoopBackOff: <code>logs --previous</code> is the key move; know the exit-code alphabet — 137 = SIGKILL (OOM or liveness kill), 1 = app error, 127 = command not found, 143 = SIGTERM.</span></label>
+<details><summary>Under the hood</summary><p>CrashLoopBackOff isn't an error — it's the kubelet saying "it keeps dying, so I'm waiting before the next restart" (backoff doubles 10s→20s→…→5m). The evidence is always in the <em>previous</em> container's logs or its <code>lastState.terminated</code> (reason: OOMKilled, exit code). Distinguish OOMKilled (kernel, over memory limit) from a liveness-probe kill (kubelet, events show "Liveness probe failed… Killing") — both restart the pod, different fixes.</p></details></li>
+<li class="cp" data-id="w6-17"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.17</span>Cover the image failures: ImagePullBackOff vs ErrImagePull — typo'd tag, private registry needing imagePullSecrets, wrong registry host. Reproduce and fix each.</span></label></li>
+<li class="cp" data-id="w6-18"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.18</span>Debug the quieter ones: pod Running but not Ready (readiness probe → out of endpoints), stuck Terminating (finalizers), Init:CrashLoopBackOff (init container logs by name: <code>logs pod -c init-x</code>).</span></label></li>
+<li class="cp" data-id="w6-19"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.19</span>Timed gauntlet day: have 6 broken workloads planted; fix all six in 30 minutes total, notes closed.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Network &amp; DNS debugging</h3>
+<ul class="cps">
+<li class="cp" data-id="w6-20"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.20</span>Drill the service-unreachable checklist in strict order: endpointslices non-empty? → selector matches pod labels? → targetPort matches containerPort? → pod Ready? → NetworkPolicy? → curl the ClusterIP from a test pod.</span></label>
+<details><summary>Under the hood</summary><p>The checklist works because it follows the machinery from 4.10–4.11: empty EndpointSlices mean kube-proxy programmed <em>no</em> DNAT targets (selector/readiness problem — the connection is refused or hangs); populated slices but bad targetPort means DNAT lands on a port nobody listens on. Each checklist step isolates one component of the chain: controller → proxy rules → pod.</p></details></li>
+<li class="cp" data-id="w6-21"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.21</span>Drill the DNS ladder from 4.18 until it's 4 commands from memory; keep a dnsutils pod YAML snippet in your head (<code>kubectl run tmp --image=busybox:1.36 -it --rm -- sh</code>).</span></label></li>
+<li class="cp" data-id="w6-22"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.22</span>Debug one planted NetworkPolicy fault: app can't reach db; find the policy with <code>kubectl get netpol -A</code>, read it against the AND/OR rules from 4.25, fix minimally.</span></label></li>
+<li class="cp" data-id="w6-23"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">6.23</span>Write the week-6 deliverable: your finished one-page triage sheet (symptom → commands → causes), refined by everything you broke this week. This is gold for week 8 review.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 7 ================= -->
+<section class="wk" id="w7" data-title="W7 · RBAC, auth & speed">
+<div class="wk-head"><h2>Week 7 — RBAC, ServiceAccounts &amp; speed drills</h2><span class="badge">closes out the 25% domain</span></div>
+<p class="wk-goal">Finish the Cluster Architecture domain with authentication and RBAC internals, then convert knowledge into speed: imperative-command drills and your first killer.sh session.</p>
+
+<div class="grp"><h3>Authentication &amp; authorization internals</h3>
+<ul class="cps">
+<li class="cp" data-id="w7-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.1</span>Consolidate authn: client certs (CN=user, O=groups — from 2.3), ServiceAccount JWTs (signed by sa.key — from 2.5), bootstrap tokens. Know there is no User object anywhere in the API.</span></label></li>
+<li class="cp" data-id="w7-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.2</span>Dissect a kubeconfig field by field: clusters (server + CA), users (cert/key or token), contexts (cluster+user+namespace); drill <code>kubectl config use-context / set-context --current --namespace</code>.</span></label></li>
+<li class="cp" data-id="w7-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.3</span>Onboard a human user via the CSR API, full flow from memory: openssl key+CSR → CertificateSigningRequest object (signerName <code>kubernetes.io/kube-apiserver-client</code>, base64 CSR) → approve → extract cert → build kubeconfig.</span></label></li>
+<li class="cp" data-id="w7-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.4</span>Understand modern ServiceAccount tokens: TokenRequest API, projected volume at <code>/var/run/secrets/kubernetes.io/serviceaccount</code>, audience- and time-bound, rotated by kubelet — legacy non-expiring Secret tokens are history.</span></label></li>
+<li class="cp" data-id="w7-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.5</span>Know the authorization-mode lineup on your apiserver (<code>Node,RBAC</code>): what the Node authorizer does and that authorizers are consulted in order, first-allow wins.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>RBAC in practice</h3>
+<ul class="cps">
+<li class="cp" data-id="w7-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.6</span>Get the four-object matrix straight — Role (ns) / ClusterRole (global) × RoleBinding (grants in one ns) / ClusterRoleBinding (grants everywhere) — including the reuse pattern: ClusterRole + RoleBinding = shared rule-set, namespace-scoped grant.</span></label>
+<details><summary>Under the hood</summary><p>The RBAC authorizer answers one question: does any binding connect this <em>subject</em> (user/group/SA) to a rule allowing this <em>verb</em> on this <em>resource</em> (apiGroup + resource + optional resourceNames) in this scope? Rules are purely additive — no deny exists, so "remove access" always means "delete/narrow a binding". Namespaced Role rules can never grant cluster-scoped things (like <code>nodes</code>) — a favorite trick question.</p></details></li>
+<li class="cp" data-id="w7-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.7</span>Drill the imperative forms until instant: <code>kubectl create role --verb=get,list --resource=pods</code>, <code>create rolebinding --role/--clusterrole --user/--serviceaccount=ns:name</code>.</span></label></li>
+<li class="cp" data-id="w7-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.8</span>Verify like the exam does: <code>kubectl auth can-i create deploy --as=jane -n dev</code>, <code>--as=system:serviceaccount:dev:app-sa</code>, and <code>auth can-i --list</code>.</span></label></li>
+<li class="cp" data-id="w7-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.9</span>Wire a pod to an SA end-to-end: create SA → grant a Role via binding → <code>serviceAccountName</code> in the pod spec → curl the API from inside the pod with the mounted token to prove the permission.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Speed drills</h3>
+<ul class="cps">
+<li class="cp" data-id="w7-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.10</span>Drill the imperative generators until they're reflexes: <code>k run</code>, <code>k create deploy --replicas</code>, <code>k expose</code>, <code>k create job/cronjob</code>, <code>k create cm/secret</code>, each with <code>$do</code> to scaffold YAML.</span></label></li>
+<li class="cp" data-id="w7-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.11</span>Get comfortable with output surgery: <code>-o jsonpath='{.items[*].metadata.name}'</code>, <code>--sort-by</code>, <code>-o custom-columns</code>, and <code>-o yaml | grep -A5</code> as the fast fallback.</span></label></li>
+<li class="cp" data-id="w7-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.12</span>Practice fast pod edits: <code>kubectl edit</code>, and for immutable fields: <code>kubectl get -o yaml &gt; f.yaml</code> → edit → <code>kubectl replace --force -f f.yaml</code>. Know which fields are immutable.</span></label></li>
+<li class="cp" data-id="w7-13"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.13</span>Run topic sprints with a timer: 10 mixed tasks from weeks 2–6, 6 minutes each, docs allowed but only kubernetes.io. Log which lookups cost you time and memorize those.</span></label></li>
+<li class="cp" data-id="w7-14"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.14</span><strong>killer.sh session 1</strong> — full 2 hours, exam conditions, no pausing. Expect it to feel harder than the real exam; score is irrelevant, the answer explanations are the product.</span></label></li>
+<li class="cp" data-id="w7-15"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.15</span>Spend a half-day on the killer.sh solutions: for every task you missed or solved slowly, redo it from scratch and file it into your triage sheet or command notes.</span></label></li>
+<li class="cp" data-id="w7-16"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">7.16</span>Revisit your week-0 self-assessment; schedule the weak domains into week 8's review slots explicitly.</span></label></li>
+</ul></div>
+</section>
+
+<!-- ================= WEEK 8 ================= -->
+<section class="wk" id="w8" data-title="W8 · Mocks & exam week">
+<div class="wk-head"><h2>Week 8 — Mock exams &amp; execution</h2><span class="badge dom">exam week</span></div>
+<p class="wk-goal">No new material. Convert everything into calm, timed execution: one more mock, targeted review, and exam-day mechanics.</p>
+
+<div class="grp"><h3>Final mocks</h3>
+<ul class="cps">
+<li class="cp" data-id="w8-1"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.1</span><strong>killer.sh session 2</strong> (it's the same questions — this run is about speed and zero hesitation). Target: finish with 20+ minutes spare.</span></label></li>
+<li class="cp" data-id="w8-2"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.2</span>Re-run your weak-domain drills from 7.16 one final time in the lab.</span></label></li>
+<li class="cp" data-id="w8-3"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.3</span>One last full-cluster lifecycle rehearsal: etcd backup → break something → restore → upgrade one node. The classics must be automatic.</span></label></li>
+<li class="cp" data-id="w8-4"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.4</span>Re-read your triage sheet (6.23) and command notes; prune them to the truly non-obvious.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Exam mechanics</h3>
+<ul class="cps">
+<li class="cp" data-id="w8-5"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.5</span>Internalize the format: ~15–20 weighted tasks, 120 minutes, 66 to pass, performance-only. The environment is a remote desktop (XFCE) in the PSI browser — terminal and Firefox live <em>inside</em> it.</span></label></li>
+<li class="cp" data-id="w8-6"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.6</span>Burn in the two per-question rituals: run the <code>kubectl config use-context …</code> line shown at the top of every task, and check whether the task wants you on a specific node via ssh (then <code>exit</code> when done).</span></label></li>
+<li class="cp" data-id="w8-7"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.7</span>Decide your time strategy now: first pass solves everything ≤6 minutes, flag and skip anything sticky, second pass for flagged items by weight. Never sink 15 minutes into one task.</span></label></li>
+<li class="cp" data-id="w8-8"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.8</span>Verify your answers as you go: after every task, run the <code>get</code>/<code>curl</code>/<code>rollout status</code> that proves it works — partial credit exists, silent typos don't score.</span></label></li>
+<li class="cp" data-id="w8-9"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.9</span>Prep the room per PSI rules: clear desk, ID ready, no second monitor, phone away, webcam pan expected. Do the official system check once more the day before.</span></label></li>
+</ul></div>
+
+<div class="grp"><h3>Final 48 hours</h3>
+<ul class="cps">
+<li class="cp" data-id="w8-10"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.10</span>Day −2: light review only — triage sheet, aliases, the etcd backup/restore commands. No new topics; confidence beats coverage now.</span></label></li>
+<li class="cp" data-id="w8-11"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.11</span>Day −1: rest. 20 minutes of flash review max. Sleep is measurably worth more points than cramming.</span></label></li>
+<li class="cp" data-id="w8-12"><label><input type="checkbox"><span class="box"></span><span class="txt"><span class="cp-id">8.12</span>Exam day: log in 30 minutes early for check-in, water within reach (clear container), take the two hours one task at a time. You've broken and fixed this system fifty times — this is just once more.</span></label></li>
+</ul></div>
+
+<div class="note"><b>If it doesn't go your way</b>You have a free retake. Most people who narrowly miss pass comfortably on round two — the retake exists precisely for that. Book it 2–3 weeks out and drill only the domains that hurt.</div>
+</section>
+
+<footer>
+Built for the current CKA curriculum (post-Feb-2025 revision: Gateway API, Helm, Kustomize, CRDs, CNI internals included). Verify domain weights against the official CNCF curriculum for your exam date. Progress is stored only in this browser's localStorage.
+</footer>
+</main>
+</div>
+
+<script>
+(function(){
+  var KEY='cka-prep-v1', DKEY='cka-exam-date';
+  var state={};
+  try{ state=JSON.parse(localStorage.getItem(KEY)||'{}'); }catch(e){ state={}; }
+  var cps=[].slice.call(document.querySelectorAll('.cp'));
+  var weeks=[].slice.call(document.querySelectorAll('section.wk'));
+  var nav=document.getElementById('nav');
+
+  weeks.forEach(function(w){
+    var li=document.createElement('li'), a=document.createElement('a');
+    a.href='#'+w.id;
+    a.innerHTML='<span>'+w.dataset.title+'</span><span class="count"></span>';
+    li.appendChild(a); nav.appendChild(li);
+    w._nav=a;
+  });
+
+  function refresh(){
+    var total=0, done=0;
+    weeks.forEach(function(w){
+      var list=[].slice.call(w.querySelectorAll('.cp')), d=0;
+      list.forEach(function(c){ if(c.classList.contains('is-done')) d++; });
+      total+=list.length; done+=d;
+      w._nav.querySelector('.count').textContent=d+'/'+list.length;
+      w._nav.classList.toggle('done-week', d===list.length && list.length>0);
+    });
+    var p= total? Math.round(done/total*100):0;
+    document.getElementById('pct').textContent=p+'%';
+    document.getElementById('done-count').textContent=done+' / '+total;
+    document.getElementById('ring').style.setProperty('--p', p);
+  }
+
+  cps.forEach(function(cp){
+    var id=cp.dataset.id, box=cp.querySelector('input');
+    if(state[id]){ box.checked=true; cp.classList.add('is-done'); }
+    box.addEventListener('change', function(){
+      cp.classList.toggle('is-done', box.checked);
+      if(box.checked) state[id]=1; else delete state[id];
+      localStorage.setItem(KEY, JSON.stringify(state));
+      refresh();
+    });
+  });
+
+  document.getElementById('reset').addEventListener('click', function(){
+    if(!confirm('Clear all checkpoint progress?')) return;
+    state={}; localStorage.setItem(KEY,'{}');
+    cps.forEach(function(cp){ cp.querySelector('input').checked=false; cp.classList.remove('is-done'); });
+    refresh();
+  });
+
+  var dateInput=document.getElementById('examdate');
+  var saved=localStorage.getItem(DKEY);
+  if(saved) dateInput.value=saved;
+  function days(){
+    var d=new Date(dateInput.value+'T09:00:00'), now=new Date();
+    var n=Math.ceil((d-now)/86400000);
+    document.getElementById('days').textContent=isNaN(n)?'—':(n>=0?n:'0');
+  }
+  dateInput.addEventListener('change', function(){ localStorage.setItem(DKEY, dateInput.value); days(); });
+  days(); refresh();
+
+  var TKEY='cka-theme', root=document.documentElement;
+  var savedTheme=localStorage.getItem(TKEY);
+  if(savedTheme) root.dataset.theme=savedTheme;
+  document.getElementById('theme').addEventListener('click', function(){
+    var current=root.dataset.theme ||
+      (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    var next=current==='dark' ? 'light' : 'dark';
+    root.dataset.theme=next;
+    localStorage.setItem(TKEY, next);
+  });
+})();
+</script>
+</body>
+</html>
