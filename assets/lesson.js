@@ -78,6 +78,50 @@
     });
   }
 
+  /* ---- collapse/expand groups (per page, persisted) ---- */
+  var GKEY='cka-grp-collapsed-v1', page=(location.pathname.split('/').pop()||'index');
+  var collapsed={};
+  try{ collapsed=JSON.parse(localStorage.getItem(GKEY)||'{}'); }catch(e){ collapsed={}; }
+  function gkey(g){ return page+'#'+g.id; }
+  function saveCollapsed(){ localStorage.setItem(GKEY, JSON.stringify(collapsed)); }
+  function setCollapsed(g, on){
+    g.classList.toggle('is-collapsed', on);
+    var t=g.querySelector('.grp-toggle');
+    if(t) t.setAttribute('aria-expanded', on? 'false':'true');
+    if(on) collapsed[gkey(g)]=1; else delete collapsed[gkey(g)];
+  }
+  grps.forEach(function(g){
+    var h=g.querySelector('h3');
+    if(!h) return;
+    var body=document.createElement('div');
+    body.className='grp-body';
+    while(h.nextSibling) body.appendChild(h.nextSibling);
+    g.appendChild(body);
+    var btn=document.createElement('button');
+    btn.className='grp-toggle'; btn.type='button'; btn.setAttribute('aria-expanded','true');
+    btn.innerHTML='<span>▾</span>';
+    h.insertBefore(btn, h.firstChild);
+    setCollapsed(g, !!collapsed[gkey(g)]);
+    btn.addEventListener('click', function(){
+      setCollapsed(g, !g.classList.contains('is-collapsed'));
+      saveCollapsed();
+    });
+    if(g._nav) g._nav.addEventListener('click', function(){ setCollapsed(g, false); saveCollapsed(); });
+  });
+  if(nav && grps.length){
+    var ctrl=document.createElement('div');
+    ctrl.className='sect-controls';
+    ctrl.innerHTML='<button type="button" id="expandAll">expand all</button>'+
+      '<button type="button" id="collapseAll">collapse all</button>';
+    nav.parentNode.parentNode.insertBefore(ctrl, nav.parentNode);
+    ctrl.querySelector('#expandAll').addEventListener('click', function(){
+      grps.forEach(function(g){ setCollapsed(g, false); }); saveCollapsed();
+    });
+    ctrl.querySelector('#collapseAll').addEventListener('click', function(){
+      grps.forEach(function(g){ setCollapsed(g, true); }); saveCollapsed();
+    });
+  }
+
   /* ---- copy buttons on command blocks ---- */
   [].slice.call(document.querySelectorAll('pre.cmd')).forEach(function(pre){
     var text=pre.textContent.replace(/\s+$/,'');
