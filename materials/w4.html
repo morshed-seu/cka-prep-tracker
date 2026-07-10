@@ -1,0 +1,1349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CKA prep Week 4 lessons: pod networking from veth up, CNI, Services and kube-proxy iptables, CoreDNS, Ingress and Gateway API, NetworkPolicy — with exact commands and expected output.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>W4 · Networking — CKA Prep Lessons</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>week 4 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="w0.html">W0 · Setup</a></li>
+    <li><a href="w1.html">W1 · Control plane</a></li>
+    <li><a href="w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="w3.html">W3 · Workloads</a></li>
+    <li><a href="w4.html">W4 · Networking</a></li>
+    <li><a href="../cheatsheets/etcd-card.html">Cheat sheet · etcd card</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../index.html#w4">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>Week 4 — Services &amp; networking, from veth up</h1>
+  <p>Networking is where most candidates guess; this week removes the guessing. You build a pod network by hand with <code>ip</code> commands, read the actual iptables rules a Service becomes, walk DNS resolution line by line, and wire Ingress and Gateway API against a real controller. Each layer sits on the previous one — once you can name the layer a packet died in, every networking task becomes mechanical. Ticking <em>done</em> here also ticks the tracker.</p>
+  <div class="flow"><span>Linux primitives</span><em>→</em><span>CNI</span><em>→</em><span>Services / kube-proxy</span><em>→</em><span>DNS</span><em>→</em><span>Ingress · Gateway API</span><em>→</em><span>NetworkPolicy</span></div>
+</header>
+
+<!-- ---------------- Linux networking foundations ---------------- -->
+<div class="grp" id="g-linux"><h3>Linux networking foundations</h3>
+
+<article class="lesson" id="cp-4-1" data-id="w4-1">
+<div class="lesson-head"><span class="cp-id">4.1</span><h4>The network model: two rules, everything else is implementation</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every networking exam task is an instance of "one of the two rules is being violated — find where". If you know what the model guarantees, you know what a healthy cluster must be able to do, and every check this week tests one of those guarantees.</p>
+<h5>The concept</h5>
+<p>Kubernetes imposes exactly two requirements on whatever network plugin you run:</p>
+<ul>
+<li><strong>Every pod gets its own IP address.</strong> Containers in one pod share that IP (they share the pod's network namespace) and talk to each other over <code>localhost</code>.</li>
+<li><strong>All pods can reach all pods, on every node, without NAT.</strong> The IP a pod sees as its own is the same IP everyone else uses to reach it. Node agents (kubelet probes, node-local daemons) can reach every pod on their node the same way.</li>
+</ul>
+<p>That's the whole contract. Overlay tunnels, BGP route programming, eBPF — those are just different ways plugins deliver the same two guarantees (4.7). Everything <em>above</em> the model — Services, DNS names, Ingress — is machinery built on top of these flat, NAT-free pod IPs: a ClusterIP is a rewrite <em>to</em> a pod IP (4.9), a DNS record is a name <em>for</em> one (4.17). NAT only appears at the cluster edge: traffic leaving to the outside world is masqueraded, and NodePort traffic gets rewritten on the way in.</p>
+<h5 class="verify">Verify</h5>
+<p>State from memory: what does a pod on <code>node01</code> see as the source IP of a packet from a pod on <code>node02</code>? (The other pod's real pod IP — no NAT in between. If you see the node's IP instead, the CNI is misconfigured or the traffic left the pod network.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The model says nothing about <em>Service</em> IPs — those are virtual, exist in no namespace, and very much do involve rewriting (4.9–4.10). Keep "pod IP = real, service IP = rules" as separate mental buckets; mixing them is the root of most DNS-vs-Service confusion.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Cluster Networking"</strong> — the model statement is at the top of that page.</p>
+</article>
+
+<article class="lesson" id="cp-4-2" data-id="w4-2">
+<div class="lesson-head"><span class="cp-id">4.2</span><h4>Build a pod network by hand: netns, veth pair, bridge</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This 15-minute exercise <em>is</em> what the bridge CNI plugin does for every pod. After it, <code>ip addr</code>, <code>ip route</code> and <code>ip netns exec</code> stop being incantations and become debugging tools you reach for on instinct.</p>
+<h5>The concept</h5>
+<p>Three Linux primitives make a pod network:</p>
+<ul>
+<li>A <strong>network namespace</strong> is an isolated copy of the kernel's network stack — own interfaces, own routing table, own iptables. A pod is a netns (created and held open by the <em>pause</em> container; app containers join it).</li>
+<li>A <strong>veth pair</strong> is a virtual patch cable: two interfaces, always created together; a packet in one end comes out the other. One end is moved into the pod's netns and renamed <code>eth0</code>; the other end stays in the node's root namespace.</li>
+<li>A <strong>bridge</strong> is a virtual L2 switch in the root namespace. All the host-side veth ends plug into it, so pods on one node reach each other through the bridge, and the node reaches pods via the bridge's own IP.</li>
+</ul>
+<svg viewBox="0 0 660 310" role="img" aria-label="A node with two network namespaces, each connected by a veth pair to a bridge in the root namespace">
+  <rect x="8" y="6" width="644" height="296" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="22" y="30" fill="var(--muted)" font-size="11" letter-spacing="2" font-weight="600">NODE — ROOT NETWORK NAMESPACE</text>
+
+  <rect x="60" y="50" width="220" height="94" rx="10" fill="none" stroke="var(--accent)"/>
+  <text x="74" y="72" fill="var(--accent)" font-size="11" letter-spacing="1" font-weight="600">netns red ("pod")</text>
+  <rect x="74" y="84" width="192" height="44" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="170" y="102" fill="var(--ink)" font-size="11.5" text-anchor="middle">eth0 — 10.42.0.2/24</text>
+  <text x="170" y="118" fill="var(--muted)" font-size="10" text-anchor="middle">renamed veth end</text>
+
+  <rect x="380" y="50" width="220" height="94" rx="10" fill="none" stroke="var(--accent)"/>
+  <text x="394" y="72" fill="var(--accent)" font-size="11" letter-spacing="1" font-weight="600">netns blue ("pod")</text>
+  <rect x="394" y="84" width="192" height="44" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="490" y="102" fill="var(--ink)" font-size="11.5" text-anchor="middle">eth0 — 10.42.0.3/24</text>
+  <text x="490" y="118" fill="var(--muted)" font-size="10" text-anchor="middle">renamed veth end</text>
+
+  <line x1="170" y1="144" x2="240" y2="216" stroke="var(--accent)" stroke-width="2"/>
+  <line x1="490" y1="144" x2="420" y2="216" stroke="var(--accent)" stroke-width="2"/>
+  <text x="150" y="186" fill="var(--muted)" font-size="10">veth-red (host end)</text>
+  <text x="430" y="186" fill="var(--muted)" font-size="10">veth-blue (host end)</text>
+
+  <rect x="200" y="216" width="260" height="46" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="330" y="235" fill="var(--ink)" font-size="12" text-anchor="middle" font-weight="600">bridge br-lab — 10.42.0.1/24</text>
+  <text x="330" y="252" fill="var(--muted)" font-size="10" text-anchor="middle">virtual switch; flannel calls its bridge cni0</text>
+
+  <text x="22" y="290" fill="var(--muted)" font-size="10.5">pods' default route: via 10.42.0.1 — the bridge is the pods' first-hop router</text>
+</svg>
+<h5>Lab</h5>
+<p>Run this on a scratch VM, or on <code>node01</code> — the names below don't clash with anything Kubernetes created, and step 7 removes everything.</p>
+<ol class="lab">
+<li>Create two "pods" (namespaces) and the "node bridge":
+<pre class="cmd">sudo ip netns add red
+sudo ip netns add blue
+sudo ip link add br-lab type bridge
+sudo ip addr add 10.42.0.1/24 dev br-lab
+sudo ip link set br-lab up
+ip netns list</pre>
+<pre class="out">blue
+red</pre></li>
+<li>Make a veth pair for <code>red</code> and push one end into the namespace:
+<pre class="cmd">sudo ip link add veth-red type veth peer name ceth-red
+sudo ip link set ceth-red netns red
+sudo ip link set veth-red master br-lab
+sudo ip link set veth-red up</pre></li>
+<li>Inside <code>red</code>: rename the interface to <code>eth0</code> (exactly what CNI does), give it an IP, bring it up:
+<pre class="cmd">sudo ip netns exec red ip link set ceth-red name eth0
+sudo ip netns exec red ip addr add 10.42.0.2/24 dev eth0
+sudo ip netns exec red ip link set eth0 up
+sudo ip netns exec red ip link set lo up
+sudo ip netns exec red ip route add default via 10.42.0.1</pre></li>
+<li>Repeat for <code>blue</code> with <code>10.42.0.3</code>:
+<pre class="cmd">sudo ip link add veth-blue type veth peer name ceth-blue
+sudo ip link set ceth-blue netns blue
+sudo ip link set veth-blue master br-lab
+sudo ip link set veth-blue up
+sudo ip netns exec blue ip link set ceth-blue name eth0
+sudo ip netns exec blue ip addr add 10.42.0.3/24 dev eth0
+sudo ip netns exec blue ip link set eth0 up
+sudo ip netns exec blue ip link set lo up
+sudo ip netns exec blue ip route add default via 10.42.0.1</pre></li>
+<li>Ping "pod to pod" through the bridge, and "pod to node":
+<pre class="cmd">sudo ip netns exec red ping -c1 10.42.0.3
+sudo ip netns exec red ping -c1 10.42.0.1</pre>
+<pre class="out"><b>64 bytes from 10.42.0.3: icmp_seq=1 ttl=64 time=0.08 ms</b>
+64 bytes from 10.42.0.1: icmp_seq=1 ttl=64 time=0.05 ms</pre></li>
+<li>Look at what you built with the same commands you'll use on real pods:
+<pre class="cmd">ip link show master br-lab
+sudo ip netns exec red ip addr show eth0</pre>
+<pre class="out">5: veth-red@if2: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... master br-lab
+7: veth-blue@if2: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... master br-lab
+2: eth0@if5: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... link-netnsid 0
+    inet 10.42.0.2/24 scope global eth0</pre>
+<p>Read <code>eth0@if5</code> as "my peer is host interface index 5" — that <code>@ifN</code> notation is how you'll match pods to veths in 4.3.</p></li>
+<li>Clean up (deleting a netns deletes the veth ends inside it; the pair dies with it):
+<pre class="cmd">sudo ip netns del red
+sudo ip netns del blue
+sudo ip link del br-lab</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The first ping in step 5 succeeds — you routed a packet between two isolated namespaces through a bridge you built. If it fails: check both veth host-ends are <code>UP</code> and <code>master br-lab</code>, and that the netns <code>eth0</code> has its IP.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If pings between namespaces fail even though everything is UP, suspect <code>br_netfilter</code> + firewall rules: with <code>net.bridge.bridge-nf-call-iptables=1</code> (which Kubernetes needs, W0.6), bridged traffic is run through iptables — a restrictive FORWARD chain policy can drop it. That exact interaction is why the sysctl exists: without it, same-node pod traffic would <em>bypass</em> kube-proxy and NetworkPolicy rules.</p>
+<h5>Docs</h5>
+<p class="docs-links">Not in the k8s docs — this is <code>man ip-netns</code> territory. The k8s side is docs search <strong>"Network Plugins"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-4-3" data-id="w4-3">
+<div class="lesson-head"><span class="cp-id">4.3</span><h4>Find a real pod's veth peer on the node</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Which host interface belongs to this pod?" is the move that lets you <code>tcpdump</code> a single pod's traffic from the node — the sharpest tool you have when a pod's network "just doesn't work".</p>
+<h5>The concept</h5>
+<p>Every veth end carries the interface <em>index</em> of its peer. Inside the pod, <code>eth0@if12</code> means "my other end is host ifindex 12"; the matching host interface shows <code>vethXXXX@if2</code> pointing back at the pod's ifindex. Match the numbers and you've matched pod to veth. Most images have no <code>ip</code> binary, but <code>/sys/class/net/eth0/iflink</code> holds the same peer index and needs no tools.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run a pod and see where it landed:
+<pre class="cmd">kubectl run web4 --image=nginx
+kubectl get pod web4 -o wide</pre>
+<pre class="out">NAME   READY   STATUS    RESTARTS   AGE   IP           NODE
+web4   1/1     Running   0          20s   10.244.1.8   <b>node01</b></pre></li>
+<li>Ask the pod for its peer's host-side index:
+<pre class="cmd">kubectl exec web4 -- cat /sys/class/net/eth0/iflink</pre>
+<pre class="out">12</pre></li>
+<li>On <code>node01</code>, find host interface 12:
+<pre class="cmd">ip link | grep '^12:'</pre>
+<pre class="out"><b>12: veth1a2b3c4d@if2:</b> &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 ... <b>master cni0</b></pre>
+<p><code>@if2</code> points back at the pod's <code>eth0</code> (ifindex 2 inside the pod); <code>master cni0</code> is flannel's bridge — the real-world <code>br-lab</code> from 4.2.</p></li>
+<li>Prove it's the right one — capture the pod's traffic from the node:
+<pre class="cmd">sudo tcpdump -ni veth1a2b3c4d -c2 icmp &amp;
+kubectl exec web4 -- ping -c1 10.244.1.1</pre>
+<pre class="out">10.244.1.8 &gt; 10.244.1.1: ICMP echo request
+10.244.1.1 &gt; 10.244.1.8: ICMP echo reply</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The iflink number from inside the pod equals the ifindex of a <code>veth*</code> interface on the node, and tcpdump on that veth shows the pod's ping.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Interface indexes are per-namespace and not stable across pod restarts — never script against them. And if <code>kubectl exec</code> is unavailable (crashed pod), you can still get the netns from the runtime: <code>sudo crictl inspectp &lt;sandbox-id&gt; | grep netns</code>, then <code>sudo nsenter --net=&lt;path&gt; ip addr</code>.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Debug Running Pods"</strong> — the ephemeral-container variant (<code>kubectl debug</code>) for distroless images lives there.</p>
+</article>
+
+<article class="lesson" id="cp-4-4" data-id="w4-4">
+<div class="lesson-head"><span class="cp-id">4.4</span><h4>Know your three CIDRs and where each is configured</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Half of network triage is "which range is this IP from?" — answer that and you know which subsystem to blame. A 10.244.x.x address that won't connect is a CNI problem; a 10.96.x.x address is a kube-proxy/Service problem; a node IP is plain Linux.</p>
+<h5>The concept</h5>
+<table>
+<tr><th>Range</th><th>Lab value</th><th>Configured at</th><th>Who consumes it</th></tr>
+<tr><td>Pod CIDR</td><td><code>10.244.0.0/16</code></td><td><code>kubeadm init --pod-network-cidr</code> → controller-manager <code>--cluster-cidr</code></td><td>Controller-manager slices one <code>/24</code> per node (<code>node.spec.podCIDR</code>); the CNI's IPAM hands out pod IPs from the node's slice</td></tr>
+<tr><td>Service CIDR</td><td><code>10.96.0.0/12</code> (default)</td><td>apiserver <code>--service-cluster-ip-range</code></td><td>apiserver assigns ClusterIPs; kube-proxy writes rules for them — no interface anywhere has these IPs</td></tr>
+<tr><td>Node network</td><td><code>10.211.64.0/24</code> (your Multipass subnet)</td><td>outside Kubernetes entirely</td><td>Node-to-node traffic, NodePorts, apiserver :6443, VXLAN tunnels</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the pod CIDR from the controller-manager's manifest, and the per-node slices:
+<pre class="cmd">sudo grep cluster-cidr /etc/kubernetes/manifests/kube-controller-manager.yaml
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'</pre>
+<pre class="out">    - --cluster-cidr=10.244.0.0/16
+cp      10.244.0.0/24
+node01  10.244.1.0/24
+node02  10.244.2.0/24</pre>
+<p>Now pod IPs tell you their node: <code>10.244.1.x</code> lives on node01. Use that constantly.</p></li>
+<li>Read the service CIDR from the apiserver manifest, and see its first IP in use:
+<pre class="cmd">sudo grep service-cluster-ip-range /etc/kubernetes/manifests/kube-apiserver.yaml
+kubectl get svc kubernetes kube-dns -A</pre>
+<pre class="out">    - --service-cluster-ip-range=10.96.0.0/12
+NAMESPACE     NAME         TYPE        CLUSTER-IP    PORT(S)
+default       kubernetes   ClusterIP   <b>10.96.0.1</b>    443/TCP
+kube-system   kube-dns     ClusterIP   <b>10.96.0.10</b>   53/UDP,53/TCP,9153/TCP</pre>
+<p>Convention worth memorizing: <code>.1</code> of the service range = the apiserver's Service; <code>.10</code> = cluster DNS.</p></li>
+<li>Node network — just the interfaces:
+<pre class="cmd">ip -4 -brief addr show</pre>
+<pre class="out">lo         UNKNOWN   127.0.0.1/8
+ens3       UP        10.211.64.11/24
+flannel.1  UNKNOWN   10.244.1.0/32
+cni0       UP        10.244.1.1/24</pre>
+<p>One node, all three worlds: <code>ens3</code> node network, <code>cni0</code> the pod bridge (.1 of the node's slice), <code>flannel.1</code> the VXLAN device (4.7).</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can answer instantly: which range is <code>10.96.130.5</code> from and which component assigned it? (Service CIDR, apiserver.) Which node hosts <code>10.244.2.9</code>? (node02.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The three ranges must never overlap — an exam-grade fault is a service CIDR overlapping the node network, which makes traffic to some ClusterIPs route out the physical NIC instead of hitting DNAT rules. Also: changing the pod CIDR after install is effectively a cluster rebuild; nodes keep their allocated <code>podCIDR</code> forever.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Cluster Networking"</strong> and <strong>"Virtual IPs and Service Proxies"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- CNI ---------------- -->
+<div class="grp" id="g-cni"><h3>CNI</h3>
+
+<article class="lesson" id="cp-4-5" data-id="w4-5">
+<div class="lesson-head"><span class="cp-id">4.5</span><h4>The CNI contract: exec a binary, JSON in, JSON out</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The 2025 curriculum added CNI <em>understanding</em> explicitly. More practically: "node NotReady, cni plugin not initialized" is a staple planted fault, and it only takes seconds to fix if you know the two directories involved.</p>
+<h5>The concept</h5>
+<p>CNI is deliberately dumb. It is not a daemon or an API — it's a convention for <strong>exec-ing a binary once per pod network event</strong>:</p>
+<ul>
+<li>When containerd creates a pod sandbox, it reads the first config file (lexicographic order) from <code>/etc/cni/net.d/</code>.</li>
+<li>It executes the named plugin binary from <code>/opt/cni/bin/</code> with the verb in the <code>CNI_COMMAND</code> env var — <strong>ADD</strong> (wire this pod), <strong>DEL</strong> (unwire it), <strong>CHECK</strong>, <strong>VERSION</strong> — the network config as JSON on <strong>stdin</strong>, and details like the netns path and container ID in more env vars.</li>
+<li>The plugin does its work (create veth, program routes) and prints a JSON <strong>result</strong> — the IPs it assigned — on stdout.</li>
+</ul>
+<p>Plugins <strong>chain</strong>: a <code>.conflist</code> file holds a list, each plugin's result feeding the next. The typical split: a main plugin wires the interface (<code>bridge</code>, or flannel/calico/cilium's own), an <strong>IPAM</strong> plugin picks the IP (<code>host-local</code> = a directory of allocated-IP files), and meta plugins add extras (<code>portmap</code> for hostPort, <code>bandwidth</code>). Flannel's plugin is famously thin: it reads the node's subnet from <code>/run/flannel/subnet.env</code> and <em>delegates to the standard bridge plugin</em> — the thing you built in 4.2, verbatim.</p>
+<div class="flow"><span>containerd: create sandbox netns</span><em>→</em><span>read /etc/cni/net.d</span><em>→</em><span class="hot">exec plugin: CNI_COMMAND=ADD, JSON on stdin</span><em>→</em><span>plugin wires veth + routes</span><em>→</em><span>IPAM assigns IP</span><em>→</em><span>result JSON on stdout → pod IP</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your cluster's CNI config (any node):
+<pre class="cmd">sudo cat /etc/cni/net.d/10-flannel.conflist</pre>
+<pre class="out">{
+  "name": "cbr0",
+  "cniVersion": "0.3.1",
+  "plugins": [
+    { "type": "flannel", "delegate": { "hairpinMode": true, "isDefaultGateway": true } },
+    { "type": "portmap", "capabilities": { "portMappings": true } }
+  ]
+}</pre>
+<p>Two chained plugins: <code>flannel</code> (which delegates to <code>bridge</code> + <code>host-local</code>), then <code>portmap</code>.</p></li>
+<li>List the binaries the runtime can exec:
+<pre class="cmd">ls /opt/cni/bin</pre>
+<pre class="out">bandwidth  bridge  dhcp  firewall  <b>flannel</b>  host-device  <b>host-local</b>  ipvlan
+loopback  macvlan  <b>portmap</b>  ptp  sbr  static  tuning  vlan  vrf</pre></li>
+<li>See host-local IPAM's "database" — one file per allocated IP, named by IP, containing the container ID:
+<pre class="cmd">sudo ls /var/lib/cni/networks/cbr0/ | head -4
+sudo cat /var/lib/cni/networks/cbr0/10.244.1.8</pre>
+<pre class="out">10.244.1.7
+10.244.1.8
+last_reserved_ip.0
+lock
+<b>3f9a1c…  (the pod sandbox's container ID)</b>  eth0</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can name, without looking: the config directory, the binary directory, the four verbs, and where the JSON goes in and comes out. (<code>/etc/cni/net.d</code>, <code>/opt/cni/bin</code>, ADD/DEL/CHECK/VERSION, stdin in / stdout out.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both directories are <em>per node</em> — a CNI broken on one node breaks only that node's pods (and only <em>new</em> pods: existing ones keep their already-wired veths). That asymmetry — old pods fine, new pods stuck in <code>ContainerCreating</code> on one node — is the CNI-fault signature, drilled in 4.8.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Network Plugins"</strong> (the CNI spec itself lives at github.com/containernetworking — not available in the exam, but the k8s page covers what you need).</p>
+</article>
+
+<article class="lesson" id="cp-4-6" data-id="w4-6">
+<div class="lesson-head"><span class="cp-id">4.6</span><h4>Inspect your actual CNI: flannel's moving parts</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Generic CNI knowledge (4.5) plus one concrete, fully-traced implementation is what makes the knowledge stick — and your lab's flannel is the simplest real CNI there is.</p>
+<h5>The concept</h5>
+<p>Flannel has exactly three moving parts per node: the <strong>flanneld DaemonSet pod</strong> (watches the apiserver, learns every node's pod slice, programs the VXLAN device and routes), the <strong>subnet.env file</strong> it writes (so the CNI plugin knows the node's slice without talking to the apiserver), and the <strong>CNI plugin binary</strong> (thin delegator to bridge+host-local, 4.5). The bridge <code>cni0</code> and the VXLAN device <code>flannel.1</code> are what they create.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>The daemon — one flannel pod per node:
+<pre class="cmd">kubectl -n kube-flannel get pods -o wide</pre>
+<pre class="out">NAME                    READY   STATUS    NODE
+kube-flannel-ds-7xk2p   1/1     Running   cp
+kube-flannel-ds-9rl4m   1/1     Running   node01
+kube-flannel-ds-tw8qn   1/1     Running   node02</pre></li>
+<li>The handoff file on <code>node01</code> — flanneld writes it, the CNI plugin reads it:
+<pre class="cmd">cat /run/flannel/subnet.env</pre>
+<pre class="out">FLANNEL_NETWORK=10.244.0.0/16
+<b>FLANNEL_SUBNET=10.244.1.1/24</b>
+FLANNEL_MTU=1450
+FLANNEL_IPMASQ=true</pre>
+<p>Note <code>FLANNEL_SUBNET</code> matches <code>node01</code>'s <code>spec.podCIDR</code> from 4.4 — that's the chain: controller-manager allocates → flanneld reads the Node object → writes this file → bridge plugin's IPAM uses it. MTU 1450 = 1500 minus 50 bytes of VXLAN header.</p></li>
+<li>The interfaces it built, in detail:
+<pre class="cmd">ip -d link show flannel.1 | head -3
+ip -d link show cni0 | head -3</pre>
+<pre class="out">4: flannel.1: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 ...
+    <b>vxlan id 1</b> local 10.211.64.11 dev ens3 srcport 0 0 <b>dstport 8472</b> nolearning
+5: cni0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 ...
+    <b>bridge</b> forward_delay 1500 hello_time 200 ...</pre></li>
+<li>The routing table that ties it together:
+<pre class="cmd">ip route | grep 10.244</pre>
+<pre class="out">10.244.0.0/24 via 10.244.0.0 dev flannel.1 onlink
+<b>10.244.1.0/24 dev cni0</b> proto kernel scope link src 10.244.1.1
+10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink</pre>
+<p>Read it aloud: "my own slice → local bridge; every other node's slice → into the VXLAN tunnel." That one routing table <em>is</em> flannel's whole datapath decision.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>For a pod IP on another node, you can trace the full path from memory: pod eth0 → veth → cni0 → route via flannel.1 → VXLAN over ens3 → peer flannel.1 → peer cni0 → veth → pod.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The MTU chain matters: pods inherit 1450 from cni0. If something resets an interface to 1500 (or an outer network drops to less), large packets blackhole while pings work — "small requests fine, big responses hang" is an MTU signature, not a policy one.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Cluster Networking"</strong>. Flannel specifics are on its GitHub (not exam-available — internalize the shape now).</p>
+</article>
+
+<article class="lesson" id="cp-4-7" data-id="w4-7">
+<div class="lesson-head"><span class="cp-id">4.7</span><h4>Datapath families: overlay vs routed vs eBPF</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The exam asks for understanding, not vendor trivia: given a cluster, can you tell how pod traffic actually crosses between nodes, and what that implies for debugging?</p>
+<h5>The concept</h5>
+<table>
+<tr><th>Family</th><th>How inter-node pod traffic moves</th><th>One-sentence tradeoff</th><th>Example</th></tr>
+<tr><td><strong>Overlay</strong></td><td>Pod packet is encapsulated in a UDP/VXLAN packet between node IPs (flannel: port <code>8472</code>)</td><td>Works on any network that passes UDP — costs ~50 bytes MTU and gives "tcpdump on the NIC doesn't show pod IPs" moments</td><td>Flannel (VXLAN), Calico in VXLAN/IPIP mode</td></tr>
+<tr><td><strong>Routed</strong></td><td>Nodes advertise their pod slice via BGP; pod IPs are real routes on the network, no encapsulation</td><td>Clean packets and full MTU — but the underlying network must accept/propagate the routes</td><td>Calico (BGP mode)</td></tr>
+<tr><td><strong>eBPF</strong></td><td>Programs attached in the kernel forward, load-balance and police traffic, replacing much of iptables and optionally kube-proxy</td><td>Fast and observable — needs a recent kernel and more operator sophistication</td><td>Cilium</td></tr>
+</table>
+<h5>Lab</h5>
+<p>Prove your cluster is an overlay by catching the encapsulation in the act.</p>
+<ol class="lab">
+<li>Start a cross-node ping: <code>web4</code> runs on node01 (4.3); ping it from a pod pinned to node02:
+<pre class="cmd">kubectl run pinger --image=busybox:1.36 \
+  --overrides='{"spec":{"nodeName":"node02"}}' \
+  --restart=Never -- ping -i0.5 10.244.1.8</pre></li>
+<li>On <code>node01</code>, capture on the <em>physical</em> NIC, filtering for the VXLAN port:
+<pre class="cmd">sudo tcpdump -ni ens3 udp port 8472 -c2</pre>
+<pre class="out"><b>10.211.64.12.51384 &gt; 10.211.64.11.8472: OTV, ... VXLAN, vni 1</b>
+<b>10.244.2.11 &gt; 10.244.1.8: ICMP echo request</b> ...</pre>
+<p>One line, two worlds: the outer packet is node02 → node01 on UDP 8472; tcpdump unwraps it and shows the inner pod-to-pod ICMP. That nesting <em>is</em> an overlay.</p></li>
+<li>Contrast: capture on <code>flannel.1</code> (inside the tunnel) — only pod IPs, no UDP wrapper:
+<pre class="cmd">sudo tcpdump -ni flannel.1 -c2 icmp
+kubectl delete pod pinger</pre>
+<pre class="out">10.244.2.11 &gt; 10.244.1.8: ICMP echo request
+10.244.1.8 &gt; 10.244.2.11: ICMP echo reply</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You saw the same ping twice: wrapped in VXLAN on <code>ens3</code>, naked on <code>flannel.1</code>. Say the routed-mode difference out loud: on Calico-BGP, the <code>ens3</code> capture would show the pod IPs directly.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Linux VXLAN defaults to port <strong>8472</strong>, not the IANA-standard 4789 — firewalls opened for 4789 silently break flannel. And remember for 4.23: <strong>flannel does not implement NetworkPolicy at all</strong> — datapath family and policy enforcement are separate capabilities, both belonging to the CNI.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Cluster Networking"</strong> → the "how to implement the model" section lists the plugin landscape.</p>
+</article>
+
+<article class="lesson" id="cp-4-8" data-id="w4-8">
+<div class="lesson-head"><span class="cp-id">4.8</span><h4>Break the CNI on purpose and read the signatures</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This exact fault — CNI config missing/broken on one node — appears in troubleshooting tasks because it produces confusing, asymmetric symptoms. Plant it yourself once and the symptoms become a signature you read in ten seconds.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>On <code>node01</code>, hide the CNI config and bounce the kubelet:
+<pre class="cmd">sudo mv /etc/cni/net.d/10-flannel.conflist /root/
+sudo systemctl restart kubelet</pre></li>
+<li>Watch the node condition flip (takes under a minute):
+<pre class="cmd">kubectl get node node01
+kubectl describe node node01 | grep -A1 'Ready '</pre>
+<pre class="out">NAME     STATUS     ROLES    AGE   VERSION
+node01   <b>NotReady</b>   &lt;none&gt;   25d   v1.35.x
+  Ready   False ... KubeletNotReady   <b>container runtime network not ready:
+  NetworkReady=false reason:NetworkPluginNotReady message:Network plugin
+  returns error: cni plugin not initialized</b></pre>
+<p>Memorize that message — it's verbatim what the exam shows you.</p></li>
+<li>Existing pods on node01 keep running (their veths are already wired). New pods pinned there stick:
+<pre class="cmd">kubectl run stuck --image=nginx --overrides='{"spec":{"nodeName":"node01"}}' --restart=Never
+kubectl get pod stuck
+kubectl describe pod stuck | tail -3</pre>
+<pre class="out">stuck   0/1     <b>ContainerCreating</b>   0     30s
+  Warning  FailedCreatePodSandBox ... failed to setup network for sandbox:
+  <b>plugin type="flannel" failed (add): open /run/flannel/subnet.env: no such file...</b>
+  — or: no valid networks found in /etc/cni/net.d</pre>
+<p>Note the split: <em>unscheduled</em> pods would still land here (NotReady doesn't stop the scheduler by itself — the node gets <code>node.kubernetes.io/not-ready:NoSchedule</code> via taints), but sandbox creation fails at the CNI ADD.</p></li>
+<li>Fix it and watch everything self-heal:
+<pre class="cmd">sudo mv /root/10-flannel.conflist /etc/cni/net.d/
+sudo systemctl restart kubelet
+kubectl get node node01 -w</pre>
+<pre class="out">node01   NotReady   &lt;none&gt;   25d   v1.35.x
+<b>node01   Ready      &lt;none&gt;   25d   v1.35.x</b></pre></li>
+<li>Clean up: <pre class="cmd">kubectl delete pod stuck --force --grace-period 0</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Node back to <code>Ready</code>, and a fresh <code>kubectl run test --image=nginx</code> pod reaches <code>Running</code> on node01. Delete it after.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Triage order for this family: <code>kubectl describe node</code> (the condition message names CNI explicitly) → <code>ls /etc/cni/net.d/</code> on that node → <code>ls /opt/cni/bin/</code> → flannel pod logs. Don't start at iptables or CoreDNS: <em>node NotReady + ContainerCreating points below Services and DNS</em>, at the CNI layer.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Troubleshooting Clusters"</strong> and <strong>"Network Plugins"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- Services & kube-proxy ---------------- -->
+<div class="grp" id="g-svc"><h3>Services &amp; kube-proxy</h3>
+
+<article class="lesson" id="cp-4-9" data-id="w4-9">
+<div class="lesson-head"><span class="cp-id">4.9</span><h4>A ClusterIP is a virtual IP — it exists only as rewrite rules</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Once you truly believe "the service IP is not on any interface, anywhere", a whole class of confusion dissolves: why you can't ping services, why services fail differently than pods, why "it resolves but doesn't connect" points at kube-proxy.</p>
+<h5>The concept</h5>
+<p>When you create a Service, the apiserver picks a free IP from the service CIDR and stores it in etcd. Nothing else happens — no interface is created, no route is announced. On <em>every node</em>, kube-proxy watches Services and EndpointSlices and writes netfilter rules: "a packet to 10.101.x.x:80? Rewrite its destination (DNAT) to one of these pod IPs". The illusion of a stable service IP is manufactured independently on each node at the moment a packet leaves a socket. Kill kube-proxy and existing rules keep working (they live in the kernel) but drift as pods churn — a uniquely sneaky failure mode.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a deployment and a service for it:
+<pre class="cmd">kubectl create deploy web --image=nginx --replicas=2
+kubectl expose deploy web --port 80
+kubectl get svc web</pre>
+<pre class="out">NAME   TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)
+web    ClusterIP   <b>10.101.44.7</b>    &lt;none&gt;        80/TCP</pre></li>
+<li>Hunt for that IP on a node — it isn't anywhere:
+<pre class="cmd">ip addr | grep 10.101.44.7 ; ip route get 10.101.44.7</pre>
+<pre class="out">(no interface match)
+10.101.44.7 via 10.211.64.1 dev ens3 src 10.211.64.11
+    — the routing table would send it to the default gateway!</pre></li>
+<li>And yet, from the same node, it works:
+<pre class="cmd">curl -s 10.101.44.7 | grep -o '&lt;title&gt;.*&lt;/title&gt;'
+ping -c1 -W1 10.101.44.7</pre>
+<pre class="out"><b>&lt;title&gt;Welcome to nginx!&lt;/title&gt;</b>
+1 packets transmitted, 0 received, <b>100% packet loss</b></pre>
+<p>curl works because the DNAT rule matches <code>tcp dpt:80</code> and rewrites the packet before routing happens. ping fails because there is no rule for ICMP — nothing answers, because <em>nothing owns the IP</em>. An unpingable-but-curlable IP is the fingerprint of a virtual IP.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>curl</code> to the ClusterIP succeeds while <code>ping</code> to it gets 100% loss — and you can explain why in one sentence.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Never use ping to test a Service — use <code>curl</code>/<code>wget</code> to the actual port, or <code>nc -zv</code>. In the exam, "I can't ping the service" is expected behavior, not the fault.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Virtual IPs and Service Proxies"</strong> — the page that explains everything this group covers.</p>
+</article>
+
+<article class="lesson" id="cp-4-10" data-id="w4-10">
+<div class="lesson-head"><span class="cp-id">4.10</span><h4>Walk the iptables chains behind one of your services</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You'll likely never edit these rules — but reading them turns kube-proxy from a black box into three greppable chain names, and lets you prove "the rules for this service exist / don't exist" during triage.</p>
+<h5>The concept</h5>
+<p>kube-proxy in iptables mode (still the default; IPVS and the newer nftables backend — GA since 1.33 — exist for scale) is a <strong>rule compiler, not a proxy</strong>: no packet passes through the kube-proxy process. It renders Services + EndpointSlices into three layers of nat-table chains, and <strong>conntrack</strong> pins each TCP flow to the backend chosen for its first packet:</p>
+<svg viewBox="0 0 660 260" role="img" aria-label="Packet path through kube-proxy's iptables chains: KUBE-SERVICES matches the ClusterIP, KUBE-SVC picks a backend probabilistically, KUBE-SEP does the DNAT to a pod IP">
+  <rect x="8" y="10" width="180" height="52" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="98" y="32" fill="var(--ink)" font-size="11.5" text-anchor="middle">packet: 10.101.44.7:80</text>
+  <text x="98" y="48" fill="var(--muted)" font-size="10" text-anchor="middle">PREROUTING / OUTPUT hook</text>
+  <line x1="188" y1="36" x2="238" y2="36" stroke="var(--accent)" stroke-width="2" />
+  <rect x="240" y="10" width="184" height="52" rx="8" fill="var(--code-bg)" stroke="var(--accent)"/>
+  <text x="332" y="32" fill="var(--ink)" font-size="11.5" text-anchor="middle" font-weight="600">KUBE-SERVICES</text>
+  <text x="332" y="48" fill="var(--muted)" font-size="10" text-anchor="middle">match dst IP + proto + port</text>
+  <line x1="424" y1="36" x2="474" y2="36" stroke="var(--accent)" stroke-width="2"/>
+  <rect x="476" y="10" width="176" height="52" rx="8" fill="var(--code-bg)" stroke="var(--accent)"/>
+  <text x="564" y="32" fill="var(--ink)" font-size="11.5" text-anchor="middle" font-weight="600">KUBE-SVC-&lt;hash&gt;</text>
+  <text x="564" y="48" fill="var(--muted)" font-size="10" text-anchor="middle">one per service:port</text>
+
+  <line x1="564" y1="62" x2="180" y2="120" stroke="var(--line)" stroke-width="1.5"/>
+  <line x1="564" y1="62" x2="400" y2="120" stroke="var(--line)" stroke-width="1.5"/>
+  <line x1="564" y1="62" x2="590" y2="120" stroke="var(--accent)" stroke-width="2"/>
+  <text x="250" y="98" fill="var(--muted)" font-size="10">statistic mode random: p=0.333…</text>
+  <text x="470" y="98" fill="var(--muted)" font-size="10">p=0.5</text>
+  <text x="600" y="98" fill="var(--muted)" font-size="10">rest</text>
+
+  <rect x="90" y="122" width="180" height="52" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="180" y="144" fill="var(--ink)" font-size="11.5" text-anchor="middle">KUBE-SEP-&lt;hash&gt;</text>
+  <text x="180" y="160" fill="var(--muted)" font-size="10" text-anchor="middle">DNAT → 10.244.1.8:80</text>
+  <rect x="310" y="122" width="180" height="52" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="400" y="144" fill="var(--ink)" font-size="11.5" text-anchor="middle">KUBE-SEP-&lt;hash&gt;</text>
+  <text x="400" y="160" fill="var(--muted)" font-size="10" text-anchor="middle">DNAT → 10.244.2.4:80</text>
+  <rect x="500" y="122" width="152" height="52" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="576" y="144" fill="var(--ink)" font-size="11.5" text-anchor="middle" font-weight="600">KUBE-SEP-&lt;hash&gt;</text>
+  <text x="576" y="160" fill="var(--muted)" font-size="10" text-anchor="middle">DNAT → 10.244.2.5:80</text>
+
+  <rect x="8" y="204" width="644" height="44" rx="8" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="330" y="222" fill="var(--ink)" font-size="11" text-anchor="middle">conntrack remembers the chosen backend → the whole TCP flow sticks to one pod</text>
+  <text x="330" y="240" fill="var(--muted)" font-size="10" text-anchor="middle">kube-proxy compiles these rules; it never touches a packet</text>
+</svg>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Give the walk three backends to find:
+<pre class="cmd">kubectl scale deploy web --replicas=3</pre></li>
+<li>Layer 1 — find your service in <code>KUBE-SERVICES</code> (on any node; kube-proxy tags every rule with a comment):
+<pre class="cmd">sudo iptables -t nat -L KUBE-SERVICES -n | grep default/web</pre>
+<pre class="out"><b>KUBE-SVC-LOLE4ISW44XBNF3G</b>  tcp -- 0.0.0.0/0  <b>10.101.44.7</b>  /* default/web cluster IP */  tcp dpt:80</pre></li>
+<li>Layer 2 — the per-service chain and its probabilistic split:
+<pre class="cmd">sudo iptables -t nat -L KUBE-SVC-LOLE4ISW44XBNF3G -n</pre>
+<pre class="out">KUBE-SEP-XVQ...  all -- ... /* default/web -&gt; 10.244.1.8:80 */  <b>statistic mode random probability 0.33333333349</b>
+KUBE-SEP-ZAB...  all -- ... /* default/web -&gt; 10.244.2.4:80 */  <b>statistic mode random probability 0.50000000000</b>
+KUBE-SEP-QRT...  all -- ... /* default/web -&gt; 10.244.2.5:80 */</pre>
+<p>Read the cascade: ⅓ chance of the first, else ½ of the remaining two, else the last — uniform ⅓ each. This is the load balancer: three lines of probability.</p></li>
+<li>Layer 3 — one endpoint chain, where the actual rewrite happens:
+<pre class="cmd">sudo iptables -t nat -L KUBE-SEP-XVQ... -n</pre>
+<pre class="out">KUBE-MARK-MASQ  all  --  10.244.1.8  0.0.0.0/0   /* hairpin: pod dialing itself via the svc */
+<b>DNAT   tcp ... to:10.244.1.8:80</b></pre></li>
+<li>See conntrack pinning a flow (install once: <code>sudo apt-get install -y conntrack</code>):
+<pre class="cmd">curl -s 10.101.44.7 &gt;/dev/null; sudo conntrack -L 2&gt;/dev/null | grep 10.101.44.7</pre>
+<pre class="out">tcp ... src=10.211.64.11 <b>dst=10.101.44.7</b> dport=80 ... src=<b>10.244.2.4</b> sport=80  [ASSURED]</pre>
+<p>Both truths in one line: the flow was addressed to the service IP, and conntrack knows it really talks to a pod.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You followed one service through all three layers, and the pod IPs in the KUBE-SEP chains match <code>kubectl get pods -l app=web -o wide</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A service with <strong>no ready endpoints</strong> compiles to a REJECT rule — "connection refused" instantly. No rules at all for the IP (kube-proxy dead) means packets route out the default gateway and you get a <em>timeout</em> instead. Refused vs timeout is a diagnostic fork, not noise. Also don't hand-edit KUBE-* chains: kube-proxy owns and rewrites them.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Virtual IPs and Service Proxies"</strong> — includes the proxy-mode comparison (iptables / ipvs / nftables).</p>
+</article>
+
+<article class="lesson" id="cp-4-11" data-id="w4-11">
+<div class="lesson-head"><span class="cp-id">4.11</span><h4>EndpointSlices: readiness decides who gets traffic</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>kubectl get endpointslices</code> is the single highest-yield command for "service not working" tasks: it answers, in one look, whether the service selects anything, whether those pods are ready, and what IPs traffic actually goes to.</p>
+<h5>The concept</h5>
+<p>The EndpointSlice controller watches Services and Pods: for each Service it finds pods matching the <code>selector</code> and writes their IPs into EndpointSlice objects (sliced at 100 endpoints each, for scale), <em>marking each endpoint with the pod's readiness</em>. kube-proxy compiles only <strong>ready</strong> endpoints into forwarding rules. So a failing readinessProbe doesn't just decorate <code>kubectl get pods</code> — it's the mechanism that pulls a pod out of every service that selects it. The chain: <em>selector → slice membership; readiness → traffic</em>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the slice behind your service:
+<pre class="cmd">kubectl get endpointslices -l kubernetes.io/service-name=web</pre>
+<pre class="out">NAME        ADDRESSTYPE   PORTS   ENDPOINTS                            AGE
+web-p7k2x   IPv4          80      <b>10.244.1.8,10.244.2.4,10.244.2.5</b>    9m</pre></li>
+<li>Give the pods a real readiness probe:
+<pre class="cmd">kubectl patch deploy web --type json -p '[{"op":"add",
+ "path":"/spec/template/spec/containers/0/readinessProbe",
+ "value":{"httpGet":{"path":"/","port":80},"periodSeconds":2}}]'
+kubectl rollout status deploy web</pre></li>
+<li>Break readiness in exactly one pod (nginx returns 403 when the index page is gone):
+<pre class="cmd">POD=$(kubectl get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+kubectl exec $POD -- rm /usr/share/nginx/html/index.html
+kubectl get pods -l app=web -w</pre>
+<pre class="out">web-6d4cf56db7-abcde   <b>0/1</b>     Running   0   3m   ← READY drops, pod still Running</pre></li>
+<li>Watch the endpoint flip to not-ready — and traffic stop going there:
+<pre class="cmd">kubectl get endpointslices -l kubernetes.io/service-name=web -o yaml | grep -B3 'ready:'
+for i in $(seq 1 12); do curl -s --max-time 2 10.101.44.7 &gt;/dev/null &amp;&amp; echo ok; done | sort | uniq -c</pre>
+<pre class="out">  - addresses: [10.244.1.8]
+    conditions:
+      <b>ready: false</b>
+     12 ok        ← every request served: the broken pod gets nothing</pre></li>
+<li>Heal it and watch it return:
+<pre class="cmd">kubectl exec $POD -- sh -c 'echo back &gt; /usr/share/nginx/html/index.html'</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>While the pod was not-ready, curls never failed; the slice showed <code>ready: false</code> for exactly that pod's IP; after healing, <code>ready: true</code> comes back within seconds.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The classic exam fault is upstream of readiness: a service <strong>selector that matches no pods</strong> — the slice exists but is empty (or missing). Triage ladder: <code>kubectl get endpointslices</code> → empty? compare <code>kubectl get svc -o yaml</code> selector to actual pod labels. Non-empty but not-ready? chase the readinessProbe. (You'll also see the legacy <code>kubectl get endpoints</code> — same information, being superseded.)</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"EndpointSlices"</strong> and <strong>"Debug Services"</strong> — the latter is the exam-day playbook for this whole group.</p>
+</article>
+
+<article class="lesson" id="cp-4-12" data-id="w4-12">
+<div class="lesson-head"><span class="cp-id">4.12</span><h4>All four service types, from memory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Expose deployment X on a NodePort" is close to free points — if the four types and their one-line create commands are reflexes.</p>
+<h5>The concept</h5>
+<p>The types are <strong>layers, not alternatives</strong> — each adds one mechanism on top of the previous:</p>
+<table>
+<tr><th>Type</th><th>Adds</th><th>Reachable from</th><th>Remember</th></tr>
+<tr><td><code>ClusterIP</code></td><td>virtual IP + DNAT rules (4.9/4.10)</td><td>inside the cluster only</td><td>the default; every other type still has one</td></tr>
+<tr><td><code>NodePort</code></td><td>a port from <strong>30000–32767</strong> opened on <em>every</em> node, forwarding into the ClusterIP machinery</td><td>anything that can reach any node IP</td><td>same port on all nodes; works even on nodes with no backing pod</td></tr>
+<tr><td><code>LoadBalancer</code></td><td>asks the cloud provider for an external LB pointed at the NodePorts</td><td>the internet (in a cloud)</td><td>= NodePort + external glue; in your lab there's no cloud, so it sits <code>&lt;pending&gt;</code> forever — normal, not broken</td></tr>
+<tr><td><code>ExternalName</code></td><td>nothing but a DNS CNAME — no ClusterIP, no proxying, no endpoints</td><td>n/a (it's a name)</td><td>points cluster clients at an external hostname</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>NodePort — expose and hit it via a node that runs no backend:
+<pre class="cmd">kubectl expose deploy web --name=web-np --type=NodePort --port=80
+kubectl get svc web-np
+curl -s http://cp:31543 | grep -o 'Welcome to nginx'</pre>
+<pre class="out">web-np   NodePort   10.108.61.2   &lt;none&gt;   <b>80:31543/TCP</b>
+Welcome to nginx   ← cp runs no web pod; the DNAT forwards across nodes</pre></li>
+<li>LoadBalancer — see the honest pending state:
+<pre class="cmd">kubectl expose deploy web --name=web-lb --type=LoadBalancer --port=80
+kubectl get svc web-lb</pre>
+<pre class="out">web-lb   LoadBalancer   10.104.9.14   <b>&lt;pending&gt;</b>   80:32011/TCP</pre>
+<p>Note it <em>still</em> got a ClusterIP and a NodePort — layers.</p></li>
+<li>ExternalName — pure DNS:
+<pre class="cmd">kubectl create service externalname extdb --external-name=db.example.com
+kubectl run tmpq --image=busybox:1.36 --restart=Never --rm -it -- nslookup extdb.default.svc.cluster.local</pre>
+<pre class="out">extdb.default.svc.cluster.local  <b>canonical name = db.example.com</b></pre></li>
+<li>Pick a specific NodePort when a task demands one (only via manifest — there's no flag on <code>expose</code>):
+<pre class="cmd">kubectl create service nodeport web-np2 --tcp=80 --node-port=30080 --dry-run=client -o yaml | head -20
+kubectl delete svc web-np web-lb extdb</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You created each type without opening the docs, and can say what each adds in one sentence.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>kubectl expose</code> copies the selector from the deployment — but <code>kubectl create service</code> does <em>not</em> know your deployment; it sets a selector of <code>app: &lt;name&gt;</code>. If a create-service'd service has no endpoints, that mismatch is why. Also: requesting a <code>--node-port</code> outside 30000–32767 is rejected by the apiserver.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Service"</strong> — the types are all on the one concepts page.</p>
+</article>
+
+<article class="lesson" id="cp-4-13" data-id="w4-13">
+<div class="lesson-head"><span class="cp-id">4.13</span><h4>Headless services: DNS straight to pod IPs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Headless services are the machinery behind StatefulSet identity (W3) and the standard answer to "the client wants to pick its own backend" (databases, peer discovery). The exam likes them because they test whether you know what a ClusterIP actually does — by taking it away.</p>
+<h5>The concept</h5>
+<p><code>clusterIP: None</code> means: no virtual IP, no kube-proxy rules, no load balancing. The service becomes <em>only</em> a DNS name plus endpoint tracking: CoreDNS answers the service name with <strong>one A record per ready pod</strong>. Clients get the whole list and connect to pod IPs directly. Behind a StatefulSet, each pod additionally gets a stable per-pod name: <code>&lt;pod&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a headless twin of your service:
+<pre class="cmd">kubectl expose deploy web --name=web-hl --cluster-ip=None --port=80
+kubectl get svc web web-hl</pre>
+<pre class="out">web      ClusterIP   10.101.44.7   &lt;none&gt;   80/TCP
+web-hl   ClusterIP   <b>None</b>          &lt;none&gt;   80/TCP</pre></li>
+<li>Ask DNS for both and compare (dnsutils pod from 4.17, or any busybox):
+<pre class="cmd">kubectl run tmpq --image=busybox:1.36 --restart=Never --rm -it -- sh -c \
+  'nslookup web; nslookup web-hl'</pre>
+<pre class="out">Name: web.default.svc.cluster.local
+Address: <b>10.101.44.7</b>              ← one answer: the virtual IP
+
+Name: web-hl.default.svc.cluster.local
+Address: <b>10.244.1.8</b>
+Address: <b>10.244.2.4</b>
+Address: <b>10.244.2.5</b>               ← one answer per ready pod</pre></li>
+<li>Confirm there's nothing to connect through — the pod IPs are the endpoints:
+<pre class="cmd">kubectl get endpointslices -l kubernetes.io/service-name=web-hl</pre>
+<pre class="out">web-hl-x2x9c   IPv4   80   10.244.1.8,10.244.2.4,10.244.2.5</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The normal service resolves to exactly one (virtual) IP; the headless one resolves to as many IPs as there are ready pods — and readiness (4.11) gates the DNS answers the same way it gates DNAT rules.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>clusterIP: None</code> must be set at creation — you can't edit a normal service into headless (the field is immutable; delete and recreate). And since there's no proxying, there's also no port remapping: clients hit the pods' real ports.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Headless Services"</strong> (a section of the Service page) and <strong>"DNS for Services and Pods"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-4-14" data-id="w4-14">
+<div class="lesson-head"><span class="cp-id">4.14</span><h4>port vs targetPort vs nodePort — and the most-planted service bug</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Almost every "service doesn't work" exam task is one of these three numbers being wrong. Knowing which is which — and which mistake produces which symptom — makes the fix a 30-second edit.</p>
+<h5>The concept</h5>
+<table>
+<tr><th>Field</th><th>Whose port</th><th>Seen by</th><th>Default</th></tr>
+<tr><td><code>port</code></td><td>the Service's own port on its ClusterIP</td><td>clients dialing the service</td><td>required</td></tr>
+<tr><td><code>targetPort</code></td><td>the <em>container's</em> port — where DNAT actually sends traffic</td><td>the pod</td><td>defaults to <code>port</code></td></tr>
+<tr><td><code>nodePort</code></td><td>the port opened on every node (NodePort/LB types)</td><td>external clients</td><td>auto-assigned 30000–32767</td></tr>
+</table>
+<p><code>targetPort</code> can be a <strong>name</strong>: if the container declares <code>ports: [{name: http, containerPort: 8080}]</code>, then <code>targetPort: http</code> follows whatever each pod calls <code>http</code> — the indirection that lets you change container ports without touching services.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Plant the classic bug — targetPort pointing where nothing listens:
+<pre class="cmd">kubectl expose deploy web --name=web-broken --port=80 --target-port=8080
+curl -s --max-time 3 $(kubectl get svc web-broken -o jsonpath='{.spec.clusterIP}')</pre>
+<pre class="out">curl: (7) Failed to connect to 10.99.203.1 port 80: <b>Connection refused</b></pre></li>
+<li>Read the symptom precisely — endpoints exist, but carry the wrong port:
+<pre class="cmd">kubectl get endpointslices -l kubernetes.io/service-name=web-broken -o jsonpath='{.items[0].ports}'</pre>
+<pre class="out">[{"name":"","port":<b>8080</b>,"protocol":"TCP"}]   ← pods are listed, DNAT goes to :8080, nginx listens on :80</pre>
+<p>Distinguish the refusals: <em>empty</em> endpoints (selector bug, 4.11) vs <em>present-but-wrong-port</em> endpoints (this bug). Same "connection refused", different fix.</p></li>
+<li>Fix it live:
+<pre class="cmd">kubectl patch svc web-broken -p '{"spec":{"ports":[{"port":80,"targetPort":80}]}}'
+curl -s $(kubectl get svc web-broken -o jsonpath='{.spec.clusterIP}') | grep -o 'Welcome to nginx'</pre>
+<pre class="out"><b>Welcome to nginx</b></pre></li>
+<li>Clean up: <pre class="cmd">kubectl delete svc web-broken</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can recite the diagnostic: refused + endpoints listed with an unexpected port ⇒ targetPort ≠ containerPort; refused + no endpoints ⇒ selector; timeout ⇒ look lower (kube-proxy, NetworkPolicy, CNI).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The mirrored trap: <code>containerPort</code> in a pod spec is <em>documentation only</em> — nginx listens on 80 whether or not the manifest declares it. A wrong <code>containerPort</code> breaks nothing… unless a service uses a <em>named</em> targetPort resolved through it. Check what the process actually binds, not what the YAML claims.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Service"</strong> (defining a service / multi-port sections) and <strong>"Debug Services"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- DNS & CoreDNS ---------------- -->
+<div class="grp" id="g-dns"><h3>DNS &amp; CoreDNS</h3>
+
+<article class="lesson" id="cp-4-15" data-id="w4-15">
+<div class="lesson-head"><span class="cp-id">4.15</span><h4>Read the Corefile plugin by plugin</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The Corefile is a ConfigMap you may be asked to modify (forward zones, upstream servers) — and a place faults get planted. It's nine lines; knowing what each does turns "scary config" into a checklist.</p>
+<h5>The concept</h5>
+<p>CoreDNS is a chain of plugins; the Corefile lists which are active for which zone. Your kubeadm default:</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Print it:
+<pre class="cmd">kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}'</pre>
+<pre class="out">.:53 {
+    errors
+    health { lameduck 5s }
+    ready
+    <b>kubernetes cluster.local in-addr.arpa ip6.arpa {
+       pods insecure
+       fallthrough in-addr.arpa ip6.arpa
+       ttl 30
+    }</b>
+    prometheus :9153
+    <b>forward . /etc/resolv.conf { max_concurrent 1000 }</b>
+    cache 30
+    loop
+    reload
+    loadbalance
+}</pre></li>
+<li>Map each line to its job:
+<table>
+<tr><th>Plugin</th><th>What it does</th><th>Why you care</th></tr>
+<tr><td><code>kubernetes</code></td><td>answers <code>cluster.local</code> (and reverse zones) from API watches on Services/EndpointSlices — no zone files anywhere</td><td>the reason service DNS "just exists"; scoped to its zones only</td></tr>
+<tr><td><code>forward . /etc/resolv.conf</code></td><td>everything non-cluster goes to the upstream resolvers of the <em>node</em> the CoreDNS pod runs on</td><td>the line you edit to change upstream DNS; broken node resolv.conf = broken external lookups for the whole cluster</td></tr>
+<tr><td><code>cache 30</code></td><td>caches answers up to 30s</td><td>why fixes can take ~30s to be visible from pods</td></tr>
+<tr><td><code>loop</code></td><td>sends a probe query; if it comes back, CoreDNS <strong>exits</strong></td><td>the famous CrashLoopBackOff when the node's resolv.conf points at localhost — see gotcha</td></tr>
+<tr><td><code>reload</code></td><td>watches the Corefile; applies edits within ~2 min without pod restarts</td><td>why <code>kubectl edit cm coredns</code> works — eventually; delete the pods to hurry</td></tr>
+<tr><td><code>health</code> / <code>ready</code></td><td>liveness :8080 / readiness :8181 endpoints</td><td>what the deployment's probes hit</td></tr>
+<tr><td><code>errors</code>, <code>prometheus</code>, <code>loadbalance</code></td><td>error logging · metrics :9153 · shuffles A-record order</td><td>mostly background; <code>log</code> can be added for per-query debugging (4.18)</td></tr>
+</table></li>
+<li>Match the probes to the plugins:
+<pre class="cmd">kubectl -n kube-system get deploy coredns -o yaml | grep -A2 'httpGet'</pre>
+<pre class="out">  httpGet: { path: /health, port: <b>8080</b> }   ← health plugin
+  httpGet: { path: /ready,  port: <b>8181</b> }   ← ready plugin</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Cover the output and recite the chain: which plugin serves cluster names, which handles everything else, and which two make edits/failures visible (<code>reload</code>, <code>loop</code>).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>loop</code> story is an exam-grade rabbit hole: on hosts running systemd-resolved, <code>/etc/resolv.conf</code> points to <code>127.0.0.53</code> — if CoreDNS forwarded there it would query <em>itself</em> via the node, loop forever, and crash. That's why the kubelet passes pods (and thus CoreDNS) <code>/run/systemd/resolve/resolv.conf</code> (the real upstreams) via its <code>resolvConf</code> config instead. CoreDNS crash-looping with <code>plugin/loop: Loop ... detected</code> ⇒ inspect the node's resolv.conf and the kubelet's <code>resolvConf</code> setting.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Customizing DNS Service"</strong> — the Corefile/ConfigMap how-to used for exam edits.</p>
+</article>
+
+<article class="lesson" id="cp-4-16" data-id="w4-16">
+<div class="lesson-head"><span class="cp-id">4.16</span><h4>A pod's resolv.conf, line by line — and the ndots:5 ladder</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every DNS behavior that surprises people — why bare service names work, why external lookups are slow from pods, why hostNetwork pods can't resolve services — is written in this three-line file.</p>
+<h5>The concept</h5>
+<p>The kubelet writes <code>/etc/resolv.conf</code> into every pod according to the pod's <code>dnsPolicy</code>. The default (<code>ClusterFirst</code>) yields:</p>
+<pre class="out">search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5</pre>
+<ul>
+<li><strong>nameserver</strong> — the <code>kube-dns</code> ClusterIP (4.4). All pod DNS goes to the service VIP, through the same DNAT machinery as any other service.</li>
+<li><strong>search</strong> — three suffixes, most-specific first, starting with the pod's own namespace.</li>
+<li><strong>ndots:5</strong> — a name with <em>fewer than 5 dots</em> is tried against the search list <em>before</em> being tried as-is.</li>
+</ul>
+<p>The resolution ladder for a bare name from namespace <code>default</code>:</p>
+<div class="flow"><span>db</span><em>→</em><span class="hot">db.default.svc.cluster.local</span><em>→</em><span>db.svc.cluster.local</span><em>→</em><span>db.cluster.local</span><em>→</em><span>db.</span></div>
+<p>First rung that answers wins — that's why <code>db</code> finds a service in your own namespace and <code>db.other</code> finds one in namespace <code>other</code> (second rung: <code>db.other.svc.cluster.local</code>). The cost: <code>www.example.com</code> has only 2 dots, so it climbs the whole ladder — three guaranteed-NXDOMAIN cluster queries — before the real lookup. Appending a trailing dot (<code>www.example.com.</code>) makes it absolute and skips the ladder.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read a pod's file:
+<pre class="cmd">kubectl exec web4 -- cat /etc/resolv.conf</pre>
+<pre class="out">search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5</pre></li>
+<li>Watch the ladder climb, live — turn on query logging and make a low-dot external lookup:
+<pre class="cmd">kubectl -n kube-system get cm coredns -o yaml | sed 's/    errors/    errors\n    log/' | kubectl apply -f -
+kubectl -n kube-system rollout restart deploy coredns   # skip the ~2min reload wait
+kubectl run tmpq --image=busybox:1.36 --restart=Never --rm -it -- nslookup example.com
+kubectl -n kube-system logs deploy/coredns | grep example.com | head -4</pre>
+<pre class="out">[INFO] ... "A IN <b>example.com.default.svc.cluster.local.</b>" NXDOMAIN ...
+[INFO] ... "A IN <b>example.com.svc.cluster.local.</b>" NXDOMAIN ...
+[INFO] ... "A IN <b>example.com.cluster.local.</b>" NXDOMAIN ...
+[INFO] ... "A IN <b>example.com.</b>" NOERROR ...</pre>
+<p>The ladder, verbatim, in the logs. Remove the <code>log</code> line the same way when done.</p></li>
+<li>Know the four dnsPolicy values (the names lie a little):
+<table>
+<tr><th>dnsPolicy</th><th>Meaning</th></tr>
+<tr><td><code>ClusterFirst</code></td><td>the default above — despite the name, it's not "try cluster first", it's this resolv.conf</td></tr>
+<tr><td><code>ClusterFirstWithHostNet</code></td><td>same file, for <code>hostNetwork: true</code> pods — <strong>which otherwise get the node's resolv.conf</strong></td></tr>
+<tr><td><code>Default</code></td><td>inherit the <em>node's</em> resolv.conf (confusingly named — it is not the default)</td></tr>
+<tr><td><code>None</code></td><td>you supply everything via <code>dnsConfig</code></td></tr>
+</table></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Predict, then confirm with the log trick: how many queries does resolving <code>db.other</code> take if the service exists? (Two-part name, first rung <code>db.other.default.svc...</code> fails, second rung <code>db.other.svc.cluster.local</code> answers.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The hostNetwork trap is a planted-fault favorite: a <code>hostNetwork: true</code> pod with default policy can't resolve <code>*.svc.cluster.local</code> at all — fix is one line, <code>dnsPolicy: ClusterFirstWithHostNet</code>. Recognize the symptom: only host-network pods failing DNS while normal pods are fine.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"DNS for Services and Pods"</strong> — policies, dnsConfig, and the record forms in one page.</p>
+</article>
+
+<article class="lesson" id="cp-4-17" data-id="w4-17">
+<div class="lesson-head"><span class="cp-id">4.17</span><h4>The record shapes: A, headless A, SRV — verify each with dig</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Tasks say "make the app reach the database at <code>db.prod</code>" — you need the full record grammar to know instantly what that name expands to and whether it can work.</p>
+<h5>The concept</h5>
+<table>
+<tr><th>Record</th><th>Shape</th><th>Answers with</th></tr>
+<tr><td>Service A</td><td><code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>the ClusterIP</td></tr>
+<tr><td>Headless service A</td><td>same shape</td><td>one A per ready pod (4.13)</td></tr>
+<tr><td>Pod-behind-headless A</td><td><code>&lt;hostname&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>that pod's IP — StatefulSet stable identity</td></tr>
+<tr><td>SRV (named ports)</td><td><code>_&lt;port&gt;._&lt;proto&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>port number + target host — how clients discover ports</td></tr>
+<tr><td>Pod A (rare)</td><td><code>&lt;ip-with-dashes&gt;.&lt;ns&gt;.pod.cluster.local</code></td><td>the pod IP (only useful for TLS-name tricks)</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run the standard debugging image (this exact pod is in the official DNS-debugging docs page):
+<pre class="cmd">kubectl run dnsutils --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 \
+  --restart=Never -- sleep infinity</pre></li>
+<li>Service A — short name, qualified name, absolute name all land the same place:
+<pre class="cmd">kubectl exec dnsutils -- dig +search +short web
+kubectl exec dnsutils -- dig +short web.default.svc.cluster.local</pre>
+<pre class="out">10.101.44.7
+10.101.44.7</pre>
+<p>(<code>dig</code> ignores the search list unless you pass <code>+search</code> — a classic "dig works differently than my app" confusion; <code>nslookup</code> searches by default.)</p></li>
+<li>Headless A — the pod list again:
+<pre class="cmd">kubectl exec dnsutils -- dig +short web-hl.default.svc.cluster.local</pre>
+<pre class="out">10.244.1.8
+10.244.2.4
+10.244.2.5</pre></li>
+<li>SRV — ports are discoverable for <em>named</em> ports; the API server's service names its port <code>https</code>:
+<pre class="cmd">kubectl exec dnsutils -- dig +short SRV _https._tcp.kubernetes.default.svc.cluster.local</pre>
+<pre class="out">0 100 <b>443</b> kubernetes.default.svc.cluster.local.</pre></li>
+<li>Reverse lookup — the ClusterIP maps back (the <code>in-addr.arpa</code> zone from the Corefile):
+<pre class="cmd">kubectl exec dnsutils -- dig +short -x 10.101.44.7</pre>
+<pre class="out">web.default.svc.cluster.local.</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>All four lookups return what the table predicts. Keep <code>dnsutils</code> running — 4.18 uses it.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Cross-namespace shorthand: from namespace <code>app</code>, the name <code>db</code> only finds services in <code>app</code>; reaching <code>prod</code> needs at least <code>db.prod</code>. And SRV records only exist for <strong>named</strong> ports — an unnamed single port produces no SRV.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"DNS for Services and Pods"</strong> (record forms) and <strong>"Debugging DNS Resolution"</strong> (the dnsutils recipe).</p>
+</article>
+
+<article class="lesson" id="cp-4-18" data-id="w4-18">
+<div class="lesson-head"><span class="cp-id">4.18</span><h4>Break DNS twice and drill the debug ladder</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Pods can't resolve names" is a guaranteed troubleshooting family. There are only about five places DNS can break; walking them in order beats every intuition.</p>
+<h5>The concept</h5>
+<p>The ladder, bottom of the stack to top:</p>
+<div class="flow"><span>1 pod resolv.conf sane?</span><em>→</em><span>2 kube-dns svc + endpoints exist?</span><em>→</em><span class="hot">3 can I query 10.96.0.10 directly?</span><em>→</em><span>4 CoreDNS pods running? logs?</span><em>→</em><span>5 Corefile valid?</span></div>
+<p>Step 3 is the pivot: if a direct <code>dig @10.96.0.10</code> works but normal resolution doesn't, the problem is the pod's resolv.conf (step 1 lied to you). If the direct query hangs, it's the service path (endpoints, kube-proxy, CNI) or CoreDNS itself (4–5).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault A — kill the backends.</strong> Scale CoreDNS away and watch resolution die:
+<pre class="cmd">kubectl -n kube-system scale deploy coredns --replicas=0
+kubectl exec dnsutils -- nslookup web</pre>
+<pre class="out">;; connection timed out; no servers could be reached</pre></li>
+<li>Walk the ladder and find the smoking gun at rung 2:
+<pre class="cmd">kubectl exec dnsutils -- cat /etc/resolv.conf | head -2
+kubectl -n kube-system get svc kube-dns
+kubectl -n kube-system get endpointslices -l k8s-app=kube-dns</pre>
+<pre class="out">search default.svc.cluster.local ...          ← rung 1: sane
+kube-dns   ClusterIP   10.96.0.10   53/UDP... ← rung 2a: svc exists
+kube-dns-x9k2p   IPv4   <b>&lt;unset&gt;</b>              ← rung 2b: <b>no endpoints — nothing behind the VIP</b></pre>
+<p>Timeout + empty endpoints = nobody home. Heal: <code>kubectl -n kube-system scale deploy coredns --replicas=2</code>.</p></li>
+<li><strong>Fault B — corrupt the Corefile.</strong> Insert a nonsense directive:
+<pre class="cmd">kubectl -n kube-system get cm coredns -o yaml | sed 's/    errors/    errors\n    bogus/' | kubectl apply -f -
+kubectl -n kube-system rollout restart deploy coredns
+kubectl -n kube-system get pods -l k8s-app=kube-dns</pre>
+<pre class="out">coredns-7c65d6cfc9-k2m4x   0/1   <b>CrashLoopBackOff</b>   2 (18s ago)</pre></li>
+<li>The logs name the exact line — this is rung 4 leading you to rung 5:
+<pre class="cmd">kubectl -n kube-system logs -l k8s-app=kube-dns --tail=3</pre>
+<pre class="out"><b>plugin/kubernetes: Corefile:3 - Error during parsing: Unknown directive 'bogus'</b></pre></li>
+<li>Fix the ConfigMap (remove the line), restart, confirm end-to-end:
+<pre class="cmd">kubectl -n kube-system edit cm coredns        # delete the 'bogus' line
+kubectl -n kube-system rollout restart deploy coredns
+kubectl exec dnsutils -- nslookup web | tail -2</pre>
+<pre class="out">Name: web.default.svc.cluster.local
+Address: 10.101.44.7</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Both faults produced <em>different</em> first symptoms (timeout vs CrashLoopBackOff) and you reached each root cause by ladder, not by flailing. Clean up: <code>kubectl delete pod dnsutils web4</code> if you're done with them.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A subtle third fault to know by signature: DNS works for <em>cluster</em> names but external names fail ⇒ the <code>forward</code> upstream is broken (node resolv.conf, or an edited forward line) — cluster answers come from API watches and never touch upstream. The reverse (external fine, cluster names dead) points at the <code>kubernetes</code> plugin's RBAC/zones or a wrong nameserver IP in pods.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Debugging DNS Resolution"</strong> — effectively this lesson as a checklist.</p>
+</article>
+</div>
+
+<!-- ---------------- Ingress & Gateway API ---------------- -->
+<div class="grp" id="g-ingress"><h3>Ingress &amp; Gateway API</h3>
+
+<article class="lesson" id="cp-4-19" data-id="w4-19">
+<div class="lesson-head"><span class="cp-id">4.19</span><h4>Deploy an ingress controller; write an Ingress with host, path and TLS</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Writing an Ingress from a task description — right host, right pathType, right backend, TLS secret attached — is a standing exam item. So is its trap: an Ingress that "does nothing" because no controller serves it.</p>
+<h5>The concept</h5>
+<p>An Ingress is <em>only data</em> — host/path routing rules in etcd. The ingress <strong>controller</strong> is a reverse proxy running as pods, watching Ingress objects and rendering them into live proxy config, forwarding to pod IPs from EndpointSlices (bypassing the ClusterIP). No controller → Ingresses sit inert, <em>silently</em>. The <code>ingressClassName</code> field says which controller should pick a rule set up.</p>
+<p>A 2026 note verified for this page: <strong>ingress-nginx is retired</strong> (archived March 2026, no more security patches) — fine as W3's Helm-mechanics specimen, wrong to build new things on. This lab replaces it with <strong>Traefik</strong>, which serves both Ingress <em>and</em> Gateway API (4.20) — one controller for the whole group, and more real Helm reps.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Retire the retiree — W3's exercise release (3.25) is still running; practice the clean teardown:
+<pre class="cmd">helm uninstall ingress-nginx -n ingress-nginx
+kubectl delete ns ingress-nginx</pre>
+<pre class="out">release "ingress-nginx" uninstalled</pre></li>
+<li>Install the controller with Helm, pinned to NodePorts so the lab needs no cloud LB:
+<pre class="cmd">helm repo add traefik https://traefik.github.io/charts &amp;&amp; helm repo update
+helm install traefik traefik/traefik --namespace traefik --create-namespace \
+  --set service.type=NodePort \
+  --set ports.web.nodePort=30080 \
+  --set ports.websecure.nodePort=30443
+kubectl -n traefik get pods
+kubectl get ingressclass</pre>
+<pre class="out">traefik-6b84c9d7f-x2j9q   1/1   Running   0   40s
+NAME      CONTROLLER                      PARAMETERS   AGE
+<b>traefik   traefik.io/ingress-controller</b>   &lt;none&gt;      40s</pre></li>
+<li>Make a TLS secret for a made-up host (self-signed is fine — the exam gives you cert files the same way):
+<pre class="cmd">openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -keyout tls.key -out tls.crt -subj "/CN=shop.lab.test"
+kubectl create secret tls shop-tls --cert=tls.crt --key=tls.key</pre></li>
+<li>Write the Ingress (this shape from memory is the exam skill — scaffold with <code>kubectl create ingress shop --rule="shop.lab.test/*=web:80,tls=shop-tls" $do</code> and compare):
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts: [shop.lab.test]
+    secretName: shop-tls
+  rules:
+  - host: shop.lab.test
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web
+            port:
+              number: 80
+EOF
+kubectl get ingress shop</pre>
+<pre class="out">NAME   CLASS     HOSTS           ADDRESS   PORTS     AGE
+shop   traefik   shop.lab.test             <b>80, 443</b>   10s</pre></li>
+<li>Test HTTP routing — the Host header is what selects your rule:
+<pre class="cmd">curl -s http://node01:30080/ -H 'Host: shop.lab.test' | grep -o 'Welcome to nginx'
+curl -s -o /dev/null -w '%{http_code}\n' http://node01:30080/</pre>
+<pre class="out"><b>Welcome to nginx</b>
+404        ← no Host match, no rule, controller's default response</pre></li>
+<li>Test TLS — <code>--resolve</code> maps the hostname to a node so SNI and the cert line up:
+<pre class="cmd">curl -sk --resolve shop.lab.test:30443:10.211.64.11 https://shop.lab.test:30443/ -o /dev/null -v 2&gt;&amp;1 | grep 'CN='</pre>
+<pre class="out">*  subject: <b>CN=shop.lab.test</b>   ← your secret's cert is being served</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Same URL, with vs without the Host header: rule match vs 404. TLS handshake presents your certificate.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>pathType</code> matters and is required: <code>Prefix</code> matches per path <em>segment</em> (<code>/app</code> matches <code>/app</code> and <code>/app/x</code>, not <code>/apple</code>); <code>Exact</code> matches only the literal path (<code>/app</code> does not match <code>/app/</code>). An Ingress with no <code>ingressClassName</code> is served only if some class is annotated as default — "my Ingress does nothing" usually means wrong/missing class or no controller at all. Check <code>kubectl get ingressclass</code> first.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Ingress"</strong> (pathType table, TLS section) and <strong>"Ingress Controllers"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-4-20" data-id="w4-20">
+<div class="lesson-head"><span class="cp-id">4.20</span><h4>Gateway API: the resource model and its role split</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Gateway API is the newest thing on the CKA curriculum, which makes it predictable exam material — and most candidates have never touched it. Thirty minutes here is disproportionate points.</p>
+<h5>The concept</h5>
+<p>Gateway API splits "get traffic into the cluster" into three resources, deliberately matching three roles:</p>
+<svg viewBox="0 0 660 300" role="img" aria-label="Gateway API resource chain: GatewayClass defines the implementation, Gateway defines listeners, HTTPRoute attaches via parentRefs and forwards to Services">
+  <rect x="8" y="14" width="200" height="76" rx="10" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="108" y="38" fill="var(--ink)" font-size="12" text-anchor="middle" font-weight="600">GatewayClass</text>
+  <text x="108" y="56" fill="var(--muted)" font-size="10" text-anchor="middle">"traefik" — which implementation</text>
+  <text x="108" y="72" fill="var(--muted)" font-size="10" text-anchor="middle">cluster-scoped · infra provider</text>
+  <line x1="208" y1="52" x2="238" y2="52" stroke="var(--accent)" stroke-width="2"/>
+  <rect x="240" y="14" width="200" height="76" rx="10" fill="var(--code-bg)" stroke="var(--accent)"/>
+  <text x="340" y="38" fill="var(--ink)" font-size="12" text-anchor="middle" font-weight="600">Gateway</text>
+  <text x="340" y="56" fill="var(--muted)" font-size="10" text-anchor="middle">listeners: port 80 HTTP, port 443 TLS…</text>
+  <text x="340" y="72" fill="var(--muted)" font-size="10" text-anchor="middle">namespaced · cluster operator</text>
+  <line x1="440" y1="52" x2="470" y2="52" stroke="var(--accent)" stroke-width="2"/>
+  <rect x="472" y="14" width="180" height="76" rx="10" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="562" y="38" fill="var(--ink)" font-size="12" text-anchor="middle" font-weight="600">HTTPRoute</text>
+  <text x="562" y="56" fill="var(--muted)" font-size="10" text-anchor="middle">hostnames, matches, backendRefs</text>
+  <text x="562" y="72" fill="var(--muted)" font-size="10" text-anchor="middle">namespaced · app developer</text>
+
+  <line x1="562" y1="90" x2="562" y2="130" stroke="var(--line)" stroke-width="1.5"/>
+  <text x="574" y="116" fill="var(--muted)" font-size="10">backendRefs</text>
+  <rect x="472" y="132" width="180" height="44" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="562" y="150" fill="var(--ink)" font-size="11.5" text-anchor="middle">Service web:80</text>
+  <text x="562" y="166" fill="var(--muted)" font-size="10" text-anchor="middle">→ pod IPs from EndpointSlices</text>
+
+  <line x1="340" y1="90" x2="500" y2="52" stroke="var(--line)" stroke-width="0"/>
+  <path d="M 472 40 C 452 110 380 116 342 92" fill="none" stroke="var(--line)" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="330" y="126" fill="var(--muted)" font-size="10" text-anchor="middle">parentRefs: the route asks to attach;</text>
+  <text x="330" y="140" fill="var(--muted)" font-size="10" text-anchor="middle">the Gateway's allowedRoutes decides who may</text>
+
+  <rect x="8" y="200" width="644" height="88" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="22" y="224" fill="var(--muted)" font-size="11" letter-spacing="2" font-weight="600">THE ROLE SPLIT — WHY THREE OBJECTS</text>
+  <text x="22" y="246" fill="var(--ink)" font-size="11.5">Infra chooses the implementation once (GatewayClass) · platform team owns ports, TLS and attachment policy (Gateway)</text>
+  <text x="22" y="264" fill="var(--ink)" font-size="11.5">· app teams write routes in their own namespaces (HTTPRoute) without touching listener or cert config.</text>
+  <text x="22" y="282" fill="var(--muted)" font-size="10.5">Ingress crammed all three roles into one object — hence the annotation soup (4.22).</text>
+</svg>
+<p>Standard-channel resources at <code>gateway.networking.k8s.io/v1</code>: <strong>GatewayClass, Gateway, HTTPRoute, GRPCRoute</strong> (plus ReferenceGrant at v1beta1 for cross-namespace backend permissions). They're CRDs — installed separately, not shipped with Kubernetes; that's why a fresh cluster answers <code>kubectl get gateway</code> with "the server doesn't have a resource type".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install the standard-channel CRDs (v1.6.0 current as of this writing):
+<pre class="cmd">kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.0/standard-install.yaml
+kubectl get crd | grep gateway</pre>
+<pre class="out">gatewayclasses.gateway.networking.k8s.io    ...
+gateways.gateway.networking.k8s.io          ...
+grpcroutes.gateway.networking.k8s.io        ...
+httproutes.gateway.networking.k8s.io        ...
+referencegrants.gateway.networking.k8s.io   ...</pre></li>
+<li>Turn on Traefik's Gateway provider — a Helm upgrade of your 4.19 release (<code>--reuse-values</code> keeps the NodePorts):
+<pre class="cmd">helm upgrade traefik traefik/traefik --namespace traefik --reuse-values \
+  --set providers.kubernetesGateway.enabled=true \
+  --set gateway.listeners.web.namespacePolicy.from=All</pre>
+<p>The second flag sets the Gateway's <code>allowedRoutes</code> so routes from <em>any</em> namespace may attach — by default a Gateway only accepts routes from its own namespace, and forgetting that is the #1 "my HTTPRoute is ignored" cause.</p></li>
+<li>See what the chart created — one GatewayClass, one Gateway with a listener on port 80:
+<pre class="cmd">kubectl get gatewayclass
+kubectl -n traefik get gateway</pre>
+<pre class="out">NAME      CONTROLLER                      ACCEPTED   AGE
+<b>traefik   traefik.io/gateway-controller   True</b>       30s
+NAME              CLASS     ADDRESS   PROGRAMMED   AGE
+<b>traefik-gateway   traefik             True</b>         30s</pre>
+<p><code>ACCEPTED</code> and <code>PROGRAMMED</code> are Gateway API's big improvement over Ingress's silence: every resource carries status conditions saying whether an implementation took it. <code>False</code>/missing here is your first debugging stop.</p></li>
+<li>Read the Gateway to anchor the model — listeners live here, not in routes:
+<pre class="cmd">kubectl -n traefik get gateway traefik-gateway -o yaml | grep -A6 listeners:</pre>
+<pre class="out">  listeners:
+  - <b>name: web</b>
+    <b>port: 80</b>
+    protocol: HTTP
+    allowedRoutes:
+      namespaces: { from: All }</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>GatewayClass shows <code>ACCEPTED True</code>, Gateway shows <code>PROGRAMMED True</code>, and you can name which role owns each of the three resources without looking.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Exam environments may pre-install the CRDs and a Gateway — then the entire task is "write an HTTPRoute" (4.21). Always <code>kubectl get gatewayclass,gateway -A</code> first to learn the names you must reference; a wrong <code>parentRefs</code> name fails with a condition on the route (<code>kubectl describe httproute</code> shows it), not an error at apply time.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Gateway API"</strong> — the k8s concepts page; deeper reference lives at gateway-api.sigs.k8s.io (not exam-allowed, so learn the shapes from the k8s page).</p>
+</article>
+
+<article class="lesson" id="cp-4-21" data-id="w4-21">
+<div class="lesson-head"><span class="cp-id">4.21</span><h4>Write an HTTPRoute from memory — including a weighted canary</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The HTTPRoute is the object an exam task will actually make you write. Its killer feature over Ingress — first-class traffic weights — is also the most likely thing to be asked, because Ingress simply can't do it.</p>
+<h5>The concept</h5>
+<p>An HTTPRoute has three parts: <code>parentRefs</code> (which Gateway to attach to), <code>hostnames</code>, and <code>rules</code> — each rule being <em>matches</em> (path/header/query) plus <em>backendRefs</em> (services, each with an optional <code>weight</code>). Weights split traffic proportionally: 90/10 below means one request in ten goes to the canary.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>A second backend that answers differently (Apache says "It works!", nginx says "Welcome to nginx"):
+<pre class="cmd">kubectl create deploy web-v2 --image=httpd
+kubectl expose deploy web-v2 --port 80</pre></li>
+<li>The route — write it by hand once, then check it against this:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-canary
+spec:
+  parentRefs:
+  - name: traefik-gateway
+    namespace: traefik
+  hostnames: ["gw.lab.test"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: web
+      port: 80
+      weight: 90
+    - name: web-v2
+      port: 80
+      weight: 10
+EOF
+kubectl describe httproute shop-canary | grep -A4 Conditions:</pre>
+<pre class="out">Conditions:
+  <b>Type: Accepted     Status: True</b>
+  Type: ResolvedRefs Status: True</pre></li>
+<li>Prove the split — 50 requests through the Gateway's listener (the web NodePort from 4.19):
+<pre class="cmd">for i in $(seq 1 50); do curl -s http://node01:30080/ -H 'Host: gw.lab.test'; done \
+  | grep -o 'Welcome to nginx\|It works' | sort | uniq -c</pre>
+<pre class="out">     <b>5 It works</b>
+    <b>45 Welcome to nginx</b>   ← ≈90/10; exact counts wobble, the ratio doesn't lie</pre></li>
+<li>Know that header matching exists — add a rule that routes testers to the canary regardless of weights:
+<pre class="cmd">    - matches:
+      - path: { type: PathPrefix, value: / }
+        headers:
+        - name: X-Canary
+          value: "yes"
+      backendRefs:
+      - { name: web-v2, port: 80 }</pre>
+<p>(Matches in one rule AND together; separate rules OR. More-specific rules win — the same AND/OR shape you'll meet again in NetworkPolicy, 4.25.)</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The 50-request loop lands ~45/5, and <code>describe httproute</code> shows <code>Accepted: True</code>. Try breaking <code>parentRefs.name</code> on purpose and watch the condition flip — that's the debugging signature to remember.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Two silent-failure classics: <code>parentRefs</code> must name the Gateway's <em>namespace</em> when the route lives elsewhere (default is the route's own namespace); and cross-namespace <em>backends</em> additionally need a ReferenceGrant in the backend's namespace — without it, <code>ResolvedRefs: False</code> and 500s.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Gateway API"</strong> — the HTTPRoute example on that page is the template to memorize.</p>
+</article>
+
+<article class="lesson" id="cp-4-22" data-id="w4-22">
+<div class="lesson-head"><span class="cp-id">4.22</span><h4>Say why Gateway API exists — the two-minute answer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Understanding-type questions ("which resource would you use to…") are cheap points if you hold the comparison crisply — and the reasoning tells you which tool a task wants even when it doesn't name one.</p>
+<h5>The pitch</h5>
+<ul>
+<li><strong>Ingress hit its ceiling.</strong> One object, one <code>host/path → service</code> vocabulary. Everything real — timeouts, rewrites, TLS options, canary weights — became controller-specific <em>annotations</em>: untyped strings, unvalidated, non-portable ("annotation soup"). Ingress is GA and frozen — it works forever, but gains nothing new.</li>
+<li><strong>Gateway API is typed and role-split.</strong> Weights, header matches, traffic filters are real schema'd fields; GatewayClass/Gateway/HTTPRoute separate infra, platform and app concerns (4.20); routes are namespaced and RBAC-able per team; every resource reports status conditions instead of failing silently.</li>
+<li><strong>The ecosystem has moved.</strong> ingress-nginx — the default choice for a decade — is retired (March 2026); its successors and every modern data plane (Envoy Gateway, Cilium, Traefik…) put Gateway API first. New clusters start there; Ingress remains for the installed base.</li>
+<li><strong>Exam angle:</strong> Gateway API entered the curriculum in the 2025 revision, killer.sh and the real exam both feature it, and most study material predates it — genuinely easy points for the prepared.</li>
+</ul>
+<h5 class="verify">Verify</h5>
+<p>Deliver the four bullets out loud in under two minutes to an imaginary colleague, then answer their follow-up: "so should we migrate our existing Ingresses?" (No rush — Ingress keeps working; new routes and anything needing weights/typed config go to Gateway API.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Don't say "Ingress is deprecated" — it isn't, and precision is the point of this checkpoint. It's <em>frozen</em>: stable, supported, not growing. The pressure to move comes from controller retirements and missing features, not an API removal.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Gateway API"</strong> and <strong>"Ingress"</strong> — the Ingress page itself points migrators at Gateway API.</p>
+</article>
+</div>
+
+<!-- ---------------- NetworkPolicy ---------------- -->
+<div class="grp" id="g-netpol"><h3>NetworkPolicy</h3>
+
+<article class="lesson" id="cp-4-23" data-id="w4-23">
+<div class="lesson-head"><span class="cp-id">4.23</span><h4>The NetworkPolicy model: select, default-deny, additive allows</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>NetworkPolicy questions are pure model questions — the YAML is short, and every mistake comes from misunderstanding one of three rules below. Nail the model and the YAML writes itself.</p>
+<h5>The concept</h5>
+<p>Three rules carry the whole thing:</p>
+<ul>
+<li><strong>Policies select pods, not traffic.</strong> <code>spec.podSelector</code> picks the pods this policy protects, within the policy's namespace. <code>podSelector: {}</code> selects <em>every</em> pod in the namespace.</li>
+<li><strong>Selection flips the default.</strong> An unselected pod accepts everything (Kubernetes is open by default). The moment <em>any</em> policy selects a pod, that pod becomes <strong>default-deny for the directions listed in <code>policyTypes</code></strong> — and only those directions.</li>
+<li><strong>Rules are additive allows.</strong> <code>ingress:</code>/<code>egress:</code> entries punch holes in that deny. There is <strong>no deny rule</strong> — you cannot write "block X"; you write "allow only Y" and let the default-deny do the blocking. Multiple policies on one pod union their allows.</li>
+</ul>
+<p>The precision trap lives in <code>policyTypes</code>: an empty rules list (<code>ingress: []</code> — or the key absent) with <code>policyTypes: [Ingress]</code> allows <em>nothing</em> in — full ingress lockdown. But writing only egress rules and <em>omitting</em> <code>policyTypes</code> means it defaults to just <code>[Egress]</code> — ingress stays wide open, which may not be what the task asked. State your policyTypes explicitly, always.</p>
+<p>And the enforcement asterisk: the <strong>CNI plugin</strong> implements NetworkPolicy — not kube-proxy, not the kernel by default. Calico and Cilium enforce; <strong>flannel ignores policies entirely</strong> — they apply cleanly and do nothing. The API accepting your object says nothing about enforcement.</p>
+<h5 class="verify">Verify</h5>
+<p>Answer without notes: a pod in namespace <code>a</code> is selected by one policy with <code>policyTypes: [Ingress]</code> and <code>ingress: []</code>. Can it still <em>reach out</em> to the internet? (Yes — egress was never restricted.) Can anything reach it? (No — not even pods in its own namespace.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Policies affect connection <em>establishment</em>, not replies: allowing ingress to a pod implicitly allows its responses back out (connection tracking) — you don't need a matching egress rule on the server for return traffic. But a client pod with locked-down egress does need an egress allow to initiate. Think in connections, not packets.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Network Policies"</strong> — the concepts page; its "behavior of to/from selectors" section is 4.25's material.</p>
+</article>
+
+<article class="lesson" id="cp-4-24" data-id="w4-24">
+<div class="lesson-head"><span class="cp-id">4.24</span><h4>The classic three policies, written and proven</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Default-deny-all, allow-from-one-app, allow-from-namespace — nearly every NetworkPolicy exam task is one of these or a two-line variation. Write them from memory, then <em>prove</em> them with curl, because unproven policies are how you lose silent points.</p>
+<h5>The concept</h5>
+<p>Your lab's flannel doesn't enforce policies (4.23), so this lab first swaps the CNI to Calico — itself excellent practice (it's 4.5–4.8 knowledge applied). The swap is protected by a snapshot; restore afterwards to return to the course's canonical flannel cluster.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Snapshot first (from the host):
+<pre class="cmd">for vm in cp node01 node02; do multipass stop $vm; multipass snapshot $vm --name pre-calico; multipass start $vm; done</pre></li>
+<li>Remove flannel and its leftovers (delete manifest cluster-wide; clean each node):
+<pre class="cmd">kubectl delete -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+# on cp, node01 AND node02:
+sudo rm /etc/cni/net.d/10-flannel.conflist
+sudo ip link del cni0; sudo ip link del flannel.1</pre></li>
+<li>Install Calico (v3.32.1 current at authoring), telling it your pod CIDR:
+<pre class="cmd">curl -sO https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/calico.yaml
+sed -i 's|# - name: CALICO_IPV4POOL_CIDR|- name: CALICO_IPV4POOL_CIDR|;
+        s|#   value: "192.168.0.0/16"|  value: "10.244.0.0/16"|' calico.yaml
+kubectl apply -f calico.yaml
+kubectl -n kube-system get pods -l k8s-app=calico-node -w   # wait for 3× Running
+kubectl delete pods -A --all   # re-wire every pod onto the new CNI</pre>
+<pre class="out">calico-node-4x2lp   1/1   Running   ... (one per node)</pre></li>
+<li>Test rig — a server and a client whose reachability you can check in one line:
+<pre class="cmd">kubectl create deploy web --image=nginx 2&gt;/dev/null; kubectl expose deploy web --port 80 2&gt;/dev/null
+kubectl run client --image=busybox:1.36 -l app=client --restart=Never -- sleep 1d
+alias probe="kubectl exec client -- wget -qO- --timeout=2 http://web"
+probe &amp;&amp; echo OPEN</pre>
+<pre class="out">&lt;title&gt;Welcome to nginx!&lt;/title&gt; ... <b>OPEN</b></pre></li>
+<li><strong>Policy 1 — namespace default-deny (ingress).</strong> Write, apply, watch the door close:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+EOF
+probe || echo BLOCKED</pre>
+<pre class="out">wget: download timed out
+<b>BLOCKED</b>     ← and note: a policy block is a TIMEOUT, not "refused"</pre></li>
+<li><strong>Policy 2 — allow one app in, on one port.</strong> Holes are additive on top of policy 1:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-client-to-web
+spec:
+  podSelector:
+    matchLabels: { app: web }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels: { app: client }
+    ports:
+    - protocol: TCP
+      port: 80
+EOF
+probe &amp;&amp; echo CLIENT-ALLOWED</pre>
+<pre class="out">... <b>CLIENT-ALLOWED</b>   ← a pod without app=client still times out — try it</pre></li>
+<li><strong>Policy 3 — allow another namespace.</strong> Uses the automatic name label every namespace carries:
+<pre class="cmd">kubectl create ns monitoring
+kubectl -n monitoring run prober --image=busybox:1.36 --restart=Never -- sleep 1d
+cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-ns
+spec:
+  podSelector:
+    matchLabels: { app: web }
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: monitoring }
+EOF
+kubectl -n monitoring exec prober -- wget -qO- --timeout=2 http://web.default &amp;&amp; echo NS-ALLOWED</pre>
+<pre class="out">... <b>NS-ALLOWED</b></pre></li>
+<li>When done with 4.25 too: restore the flannel cluster:
+<pre class="cmd">for vm in cp node01 node02; do multipass stop $vm; multipass restore $vm.pre-calico --destructive; multipass start $vm; done</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You observed all three transitions: open → blocked (policy 1), blocked → allowed for exactly the labeled client (policy 2), allowed from exactly the labeled namespace (policy 3) — each proven by a probe, not assumed.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Policy 2 quietly demonstrates scoping: it selects <code>app: web</code>, so the <em>client</em> pod was never selected and its egress never needed allowing. If the task also demands egress lockdown, the client needs its own policy — plus a DNS hole (<code>port 53, protocol UDP</code> to kube-system) or every name lookup dies before the connection is even attempted. Forgotten DNS egress is the #1 self-inflicted policy wound.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Network Policies"</strong> and <strong>"Declare Network Policy"</strong> (the task-style walkthrough).</p>
+</article>
+
+<article class="lesson" id="cp-4-25" data-id="w4-25">
+<div class="lesson-head"><span class="cp-id">4.25</span><h4>The AND/OR trap in from/to rules — test both</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the single most-tested NetworkPolicy subtlety, because two YAMLs differing by <em>one dash</em> mean opposite things — and both apply cleanly.</p>
+<h5>The concept</h5>
+<p>Inside one <code>from:</code> element, selectors combine with <strong>AND</strong> (all must match the same peer). Separate <code>from:</code> elements combine with <strong>OR</strong>:</p>
+<pre class="cmd"># A — ONE from element (no dash before podSelector): AND
+ingress:
+- from:
+  - namespaceSelector:
+      matchLabels: { team: qa }
+    podSelector:
+      matchLabels: { app: client }
+# meaning: pods labeled app=client IN namespaces labeled team=qa. Only them.
+
+# B — TWO from elements (note the extra dash): OR
+ingress:
+- from:
+  - namespaceSelector:
+      matchLabels: { team: qa }
+  - podSelector:
+      matchLabels: { app: client }
+# meaning: ANY pod in team=qa namespaces, PLUS app=client pods
+# from the policy's OWN namespace.</pre>
+<p>Second subtlety inside variant B: a bare <code>podSelector</code> in a <code>from</code> rule always means "in this policy's namespace" — it does not scan other namespaces.</p>
+<h5>Lab</h5>
+<p>(Continues on the Calico cluster from 4.24, with <code>default-deny-ingress</code> still in place. Delete <code>allow-client-to-web</code> and <code>allow-monitoring-ns</code> first so they don't add extra holes: <code>kubectl delete netpol allow-client-to-web allow-monitoring-ns</code>.)</p>
+<ol class="lab">
+<li>Build the test matrix — three probers:
+<pre class="cmd">kubectl create ns qa &amp;&amp; kubectl label ns qa team=qa
+kubectl -n qa run qa-client --image=busybox:1.36 -l app=client --restart=Never -- sleep 1d
+kubectl -n qa run qa-other  --image=busybox:1.36 --restart=Never -- sleep 1d
+# plus 'client' (app=client, default ns) from 4.24</pre></li>
+<li>Apply variant <strong>A</strong> (AND) targeting web, then probe all three:
+<pre class="cmd">kubectl -n qa exec qa-client -- wget -qO- -T2 http://web.default &gt;/dev/null &amp;&amp; echo qa-client:OK || echo qa-client:BLOCKED
+kubectl -n qa exec qa-other  -- wget -qO- -T2 http://web.default &gt;/dev/null &amp;&amp; echo qa-other:OK  || echo qa-other:BLOCKED
+kubectl exec client          -- wget -qO- -T2 http://web         &gt;/dev/null &amp;&amp; echo client:OK    || echo client:BLOCKED</pre>
+<pre class="out"><b>qa-client:OK</b>        ← matches BOTH selectors
+qa-other:BLOCKED     ← right namespace, wrong pod label
+client:BLOCKED       ← right label, wrong namespace</pre></li>
+<li>Swap in variant <strong>B</strong> (OR — add the dash), re-run the same three probes:
+<pre class="out">qa-client:OK         ← matches the namespace leg
+<b>qa-other:OK</b>          ← matches the namespace leg too
+<b>client:OK</b>            ← matches the podSelector leg (own namespace)</pre></li>
+<li>Clean up and restore flannel (step 8 of 4.24):
+<pre class="cmd">kubectl delete ns qa monitoring; kubectl delete netpol --all; kubectl delete pod client</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The probe matrix flipped exactly as predicted between A and B — 1/3 allowed vs 3/3 allowed — and you can point at the dash that did it.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>In the exam, indentation decides this. When copying a policy from the docs, check whether <code>podSelector</code> under <code>from</code> has its own <code>-</code>. Reading the rule back out loud — "from peers that are (X and Y)" vs "from X-peers, or Y-peers" — catches the error faster than staring at YAML.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Network Policies"</strong> — the concepts page shows this exact AND/OR pair side by side; find it once now so you can find it in three seconds then.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>Week 4 recall quiz</h3>
+<p>Answer out loud before revealing. Wrong or hesitant → redo that lesson's lab.</p>
+<ol>
+<li>The Kubernetes network model in two rules — and which common IP type is <em>outside</em> the model?
+<details class="reveal"><summary>Answer</summary><p>Every pod gets its own IP; all pods reach all pods without NAT. Service ClusterIPs are outside it — virtual, rule-manufactured, on no interface (4.1/4.9).</p></details></li>
+<li>What three Linux objects make up one pod's network plumbing, and who keeps the netns alive?
+<details class="reveal"><summary>Answer</summary><p>A network namespace, a veth pair (one end renamed <code>eth0</code> inside, the other on the node bridge), and the bridge (<code>cni0</code>). The <strong>pause container</strong> holds the namespace open (4.2).</p></details></li>
+<li>Node NotReady, message "cni plugin not initialized". Which two directories do you check, and why do existing pods keep working?
+<details class="reveal"><summary>Answer</summary><p><code>/etc/cni/net.d</code> (config) and <code>/opt/cni/bin</code> (binaries). Existing pods keep their already-wired veths — CNI is exec'd per pod <em>creation</em>, so only new sandboxes fail (4.5/4.8).</p></details></li>
+<li>You tcpdump the node NIC and can't see pod IPs, only node-to-node UDP on port 8472. What are you looking at?
+<details class="reveal"><summary>Answer</summary><p>A VXLAN overlay (flannel) — pod packets are encapsulated between nodes; Linux VXLAN defaults to 8472, not IANA's 4789. Capture on <code>flannel.1</code> to see the inner pod traffic (4.7).</p></details></li>
+<li>Why does <code>curl</code> to a ClusterIP work while <code>ping</code> to it shows 100% loss?
+<details class="reveal"><summary>Answer</summary><p>The IP exists only as nat-table rules matching <code>tcp dpt:80</code>; DNAT rewrites the curl packet to a pod IP. ICMP matches no rule and nothing owns the IP, so ping dies. Never test services with ping (4.9).</p></details></li>
+<li>Walk the three iptables layers for a service, and name what pins a TCP flow to one backend.
+<details class="reveal"><summary>Answer</summary><p><code>KUBE-SERVICES</code> (match ClusterIP:port) → <code>KUBE-SVC-*</code> (statistic-module random split) → <code>KUBE-SEP-*</code> (DNAT to podIP:port). <strong>conntrack</strong> pins the flow. kube-proxy compiles the rules; it proxies nothing (4.10).</p></details></li>
+<li>Service test: "connection refused" vs "timeout" — what does each point at?
+<details class="reveal"><summary>Answer</summary><p>Refused = something answered: no-ready-endpoints REJECT rule, or DNAT to a port nothing listens on (targetPort bug). Timeout = nothing answered: missing rules (kube-proxy), NetworkPolicy drop, or CNI/routing (4.10/4.14/4.24).</p></details></li>
+<li>What exact chain of events removes a pod from service load-balancing when its readinessProbe fails?
+<details class="reveal"><summary>Answer</summary><p>Probe fails → kubelet marks the pod not-ready → EndpointSlice controller sets that endpoint <code>ready: false</code> → kube-proxy recompiles rules without it (and CoreDNS drops it from headless answers). Selector picks members; readiness gates traffic (4.11/4.13).</p></details></li>
+<li>port, targetPort, nodePort — whose port is each, and which one is "the most-planted service bug"?
+<details class="reveal"><summary>Answer</summary><p><code>port</code> = the service's own; <code>targetPort</code> = the container's (DNAT destination, defaults to port, may be a name); <code>nodePort</code> = 30000–32767 on every node. The classic bug: targetPort ≠ what the container listens on — endpoints present, port wrong, connection refused (4.14).</p></details></li>
+<li>Why does a bare name like <code>db</code> resolve, and why is <code>ndots:5</code> a tax on external lookups?
+<details class="reveal"><summary>Answer</summary><p>Names with &lt;5 dots try the search list first: <code>db.&lt;ns&gt;.svc.cluster.local</code> → <code>db.svc.cluster.local</code> → <code>db.cluster.local</code> → <code>db.</code>. External names like <code>www.example.com</code> (2 dots) climb the same ladder — three NXDOMAINs before the real query; a trailing dot skips it (4.16).</p></details></li>
+<li>Only hostNetwork pods can't resolve <code>*.svc.cluster.local</code>. Diagnosis and the one-line fix?
+<details class="reveal"><summary>Answer</summary><p>hostNetwork pods inherit the <em>node's</em> resolv.conf under default policy. Fix: <code>dnsPolicy: ClusterFirstWithHostNet</code> (4.16).</p></details></li>
+<li>An Ingress object exists but "does nothing", silently. Name the two most likely causes and your first command.
+<details class="reveal"><summary>Answer</summary><p>No ingress controller running, or wrong/missing <code>ingressClassName</code>. First: <code>kubectl get ingressclass</code> (then check controller pods). Ingress is only data — a controller must render it (4.19).</p></details></li>
+<li>Gateway API's three resources — who owns each, and how does an HTTPRoute attach?
+<details class="reveal"><summary>Answer</summary><p>GatewayClass (implementation — infra), Gateway (listeners/TLS — platform), HTTPRoute (matching + backendRefs — app team), attached via <code>parentRefs</code> and admitted by the Gateway's <code>allowedRoutes</code>. Status conditions (<code>Accepted</code>/<code>Programmed</code>/<code>ResolvedRefs</code>) replace Ingress's silence (4.20/4.21).</p></details></li>
+<li>One <code>from:</code> element with namespaceSelector + podSelector vs two elements — and what does a policy with <code>policyTypes: [Ingress]</code>, <code>ingress: []</code> do?
+<details class="reveal"><summary>Answer</summary><p>One element = AND (both must match the same peer); two elements = OR (either suffices; the bare podSelector leg means the policy's own namespace). <code>ingress: []</code> + selection = full ingress default-deny for the selected pods — egress untouched. And remember flannel enforces none of it; policy enforcement belongs to the CNI (4.23–4.25).</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="w3.html">← Week 3 · Workloads &amp; scheduling</a><a href="../index.html#w5">Week 5 on the tracker →</a></nav>
+
+<footer>
+Authored against Kubernetes v1.35 (current exam version), Gateway API v1.6.0 (standard channel), Traefik 3 and Calico v3.32.1, on the post-Feb-2025 CKA curriculum. ingress-nginx retirement (March 2026) verified at authoring. IPs, interface names, chain hashes and ages will differ on your cluster; outputs are abridged.
+</footer>
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
