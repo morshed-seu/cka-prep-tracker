@@ -1,0 +1,95 @@
+/* Shared behavior for materials/lesson pages. Progress lives in the same
+   localStorage key as the tracker (index.html), so ticking a lesson here
+   ticks the checkpoint there. */
+(function(){
+  var KEY='cka-prep-v1', TKEY='cka-theme';
+  var state={};
+  try{ state=JSON.parse(localStorage.getItem(KEY)||'{}'); }catch(e){ state={}; }
+
+  /* ---- theme ---- */
+  var root=document.documentElement;
+  var savedTheme=localStorage.getItem(TKEY);
+  if(savedTheme) root.dataset.theme=savedTheme;
+  var tbtn=document.getElementById('theme');
+  if(tbtn) tbtn.addEventListener('click', function(){
+    var current=root.dataset.theme ||
+      (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    var next=current==='dark' ? 'light' : 'dark';
+    root.dataset.theme=next;
+    localStorage.setItem(TKEY, next);
+  });
+
+  /* ---- mark-done sync ---- */
+  var lessons=[].slice.call(document.querySelectorAll('.lesson[data-id]'));
+
+  function paint(){
+    lessons.forEach(function(l){
+      var on=!!state[l.dataset.id];
+      var box=l.querySelector('.donebox input');
+      if(box) box.checked=on;
+      l.classList.toggle('is-done', on);
+    });
+    refresh();
+  }
+
+  function refresh(){
+    var done=lessons.filter(function(l){ return l.classList.contains('is-done'); }).length;
+    var pct=document.getElementById('pct'), dc=document.getElementById('done-count'), ring=document.getElementById('ring');
+    if(pct) pct.textContent=(lessons.length? Math.round(done/lessons.length*100):0)+'%';
+    if(dc) dc.textContent=done+' / '+lessons.length;
+    if(ring) ring.style.setProperty('--p', lessons.length? Math.round(done/lessons.length*100):0);
+    navCounts();
+  }
+
+  lessons.forEach(function(l){
+    var box=l.querySelector('.donebox input');
+    if(!box) return;
+    box.addEventListener('change', function(){
+      if(box.checked) state[l.dataset.id]=1; else delete state[l.dataset.id];
+      localStorage.setItem(KEY, JSON.stringify(state));
+      l.classList.toggle('is-done', box.checked);
+      refresh();
+    });
+  });
+
+  window.addEventListener('storage', function(e){
+    if(e.key!==KEY) return;
+    try{ state=JSON.parse(e.newValue||'{}'); }catch(err){ state={}; }
+    paint();
+  });
+
+  /* ---- on-page nav (one entry per .grp) ---- */
+  var nav=document.getElementById('nav'), grps=[].slice.call(document.querySelectorAll('.grp[id]'));
+  if(nav) grps.forEach(function(g){
+    var h=g.querySelector('h3');
+    var li=document.createElement('li'), a=document.createElement('a');
+    a.href='#'+g.id;
+    a.innerHTML='<span>'+(h? h.textContent : g.id)+'</span><span class="count"></span>';
+    li.appendChild(a); nav.appendChild(li);
+    g._nav=a;
+  });
+  function navCounts(){
+    grps.forEach(function(g){
+      if(!g._nav) return;
+      var list=[].slice.call(g.querySelectorAll('.lesson[data-id]'));
+      var d=list.filter(function(l){ return l.classList.contains('is-done'); }).length;
+      g._nav.querySelector('.count').textContent=d+'/'+list.length;
+      g._nav.classList.toggle('done-week', d===list.length && list.length>0);
+    });
+  }
+
+  /* ---- copy buttons on command blocks ---- */
+  [].slice.call(document.querySelectorAll('pre.cmd')).forEach(function(pre){
+    var text=pre.textContent.replace(/\s+$/,'');
+    var b=document.createElement('button');
+    b.className='copy-btn'; b.type='button'; b.textContent='copy';
+    b.addEventListener('click', function(){
+      (navigator.clipboard? navigator.clipboard.writeText(text) : Promise.reject())
+        .then(function(){ b.textContent='copied'; setTimeout(function(){ b.textContent='copy'; },1200); })
+        .catch(function(){ b.textContent='select & copy'; });
+    });
+    pre.appendChild(b);
+  });
+
+  paint();
+})();
