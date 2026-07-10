@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Printable one-page CKA card: etcd backup and restore with exact etcdctl/etcdutl commands, cert flags, and health checks.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>etcd backup &amp; restore card — CKA Prep</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.cards{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:6px}
+.card{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:12px 14px; box-shadow:var(--shadow)}
+.card h2{font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--accent); margin:0 0 8px}
+.card p, .card li{font-size:13px; margin:.35em 0}
+.card ul{padding-left:18px; margin:.35em 0}
+.card pre{margin:.5em 0; font-size:11.5px; padding:8px 10px}
+.card table{border-collapse:collapse; font-size:12px; margin:.4em 0; width:100%}
+.card th, .card td{border:1px solid var(--line); padding:3px 7px; text-align:left}
+.card th{background:var(--code-bg); font-size:10.5px; text-transform:uppercase; letter-spacing:.05em}
+.card .warn{color:var(--weight); font-weight:600}
+.span2{grid-column:1 / -1}
+@media (max-width:760px){ .cards{grid-template-columns:1fr} }
+@media print{
+  .hero p{display:none}
+  h1{font-size:17px; margin-bottom:4px}
+  .cards{gap:8px}
+  .card{padding:7px 9px; break-inside:avoid; border-color:#bbb; box-shadow:none}
+  .card h2{font-size:9.5px; margin-bottom:4px}
+  .card p, .card li{font-size:9px}
+  .card pre{font-size:8.2px; padding:5px 6px; line-height:1.45}
+  .card table{font-size:8.5px}
+  .card th, .card td{padding:2px 4px}
+  footer{margin-top:10px; padding-top:6px; font-size:8px}
+}
+</style>
+</head>
+<body class="sheet">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="../materials/w0.html">W0 · Setup</a></li>
+    <li><a href="../materials/w1.html">W1 · Control plane</a></li>
+    <li><a href="../materials/w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="etcd-card.html">Cheat sheet · etcd card</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../materials/w2.html#cp-2-16">← Back to the W2 etcd lessons</a></p>
+<header class="hero">
+  <h1>etcd backup &amp; restore — one-page card</h1>
+  <p>Print this (it fits one page) and use it to <em>check</em> your drill runs, not to type from. The lessons behind it are <a href="../materials/w2.html#cp-2-16">2.16–2.18</a>.</p>
+</header>
+
+<div class="cards">
+
+<div class="card">
+<h2>0 · Read the flags off the manifest</h2>
+<pre>sudo grep -E 'listen-client|trusted-ca|cert-file|key-file' \
+  /etc/kubernetes/manifests/etcd.yaml | grep -v peer</pre>
+<table>
+<tr><th>Manifest flag</th><th>Your flag</th><th>kubeadm default</th></tr>
+<tr><td>--trusted-ca-file</td><td>--cacert</td><td>/etc/kubernetes/pki/etcd/ca.crt</td></tr>
+<tr><td>--cert-file</td><td>--cert</td><td>/etc/kubernetes/pki/etcd/server.crt</td></tr>
+<tr><td>--key-file</td><td>--key</td><td>/etc/kubernetes/pki/etcd/server.key</td></tr>
+<tr><td>--listen-client-urls</td><td>--endpoints</td><td>https://127.0.0.1:2379</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>1 · Backup (etcdctl — online, needs certs)</h2>
+<pre>sudo ETCDCTL_API=3 etcdctl snapshot save /backup/snap.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key</pre>
+<p>Exactly <b>one</b> endpoint, never a list. "context deadline exceeded" = wrong/missing cert flags, not the network.</p>
+</div>
+
+<div class="card">
+<h2>2 · Verify the snapshot (etcdutl — offline)</h2>
+<pre>sudo etcdutl snapshot status /backup/snap.db -w table</pre>
+<p>Healthy small cluster ≈ 1000+ keys, a few MB. Tiny file or 0 keys → you saved the wrong thing. (<code>etcdctl snapshot status</code> is deprecated — offline jobs use etcdutl.)</p>
+</div>
+
+<div class="card">
+<h2>3 · Restore (etcdutl — offline, no certs)</h2>
+<pre>sudo etcdutl snapshot restore /backup/snap.db \
+  --data-dir /var/lib/etcd-restore</pre>
+<p>Then edit <code>/etc/kubernetes/manifests/etcd.yaml</code> — change <b>only</b> the hostPath:</p>
+<pre>- hostPath:
+    path: /var/lib/etcd-restore   # ← was /var/lib/etcd
+    type: DirectoryOrCreate
+  name: etcd-data</pre>
+<p>Leave <code>--data-dir</code> and the volumeMount alone. Kubelet restarts etcd in ~60–90s; kubectl refuses connections meanwhile — normal.</p>
+</div>
+
+<div class="card">
+<h2>4 · Health checks</h2>
+<pre>sudo ETCDCTL_API=3 etcdctl endpoint health \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+# same flags: endpoint status -w table · member list</pre>
+<pre>sudo crictl ps -a | grep etcd      # is the container up/restarting?
+kubectl -n kube-system logs etcd-cp | tail
+journalctl -u kubelet | tail       # manifest syntax errors land here</pre>
+</div>
+
+<div class="card">
+<h2>⚠ Failure signatures</h2>
+<ul>
+<li><span class="warn">Edited --data-dir instead of hostPath</span> → etcd boots on an empty dir: cluster amnesia.</li>
+<li><span class="warn">Restore into existing /var/lib/etcd</span> → etcdutl refuses. Use a new dir; never rm live data.</li>
+<li><span class="warn">kubectl dead &gt;2 min after restore</span> → bounce the apiserver: move its manifest out of <code>/etc/kubernetes/manifests</code>, wait 30s, move back.</li>
+<li><span class="warn">Objects created after the snapshot are gone</span> → correct behavior, not a failure. Deleted-before = restored.</li>
+</ul>
+</div>
+
+<div class="card span2">
+<h2>Mental model (why restore works this way)</h2>
+<p><b>etcdctl = online</b> (talks to live etcd; snapshot save) · <b>etcdutl = offline</b> (operates on files; status + restore). Restore never touches the running etcd — it materializes a fresh data directory with a new member identity; the cluster switches over only when the manifest's hostPath points there and the kubelet restarts the pod. Controllers then reconcile the world back to the snapshot's state. Exam docs page: <b>"Operating etcd clusters for Kubernetes"</b>.</p>
+</div>
+
+</div>
+
+<footer>
+CKA prep · authored against Kubernetes v1.35 / etcd 3.6 · companion to <a href="../materials/w2.html">Week 2 lessons</a>. Verify flag paths against your own etcd.yaml — external etcd and non-kubeadm clusters differ.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
