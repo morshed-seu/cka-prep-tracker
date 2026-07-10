@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CKA prep Week 1 lessons: how the Kubernetes control plane actually works — apiserver, etcd, scheduler, controllers, kubelet and the container runtime, with labs on your own cluster.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>W1 · Control plane internals — CKA Prep Lessons</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>week 1 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="w0.html">W0 · Setup</a></li>
+    <li><a href="w1.html">W1 · Control plane</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../index.html#w1">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>Week 1 — How the control plane actually works</h1>
+  <p>Everything else in the exam sits on top of five binaries and a database. This week you learn each component's real job and — more valuable — its <em>failure signature</em>. Every lesson runs against the week-0 cluster: read a little, then go poke the live thing.</p>
+</header>
+
+<!-- ---------------- The big picture ---------------- -->
+<div class="grp" id="g-bigpicture"><h3>The big picture</h3>
+
+<article class="lesson" id="cp-1-1" data-id="w1-1">
+<div class="lesson-head"><span class="cp-id">1.1</span><h4>Draw the full architecture from memory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Troubleshooting (30% of the exam) is "which component failed?". You can only answer that fast if the map is in your head, not on a cheat sheet.</p>
+<h5>The concept</h5>
+<p>The one insight that organizes everything: <strong>every component talks only to the apiserver, and only the apiserver talks to etcd</strong>. The scheduler doesn't command kubelets. Controllers don't create containers. Each component runs its own loop against the API: watch desired state, converge, report back. Kubernetes is a set of independent control loops around a shared database — not a pipeline.</p>
+<svg viewBox="0 0 660 320" role="img" aria-label="Kubernetes architecture: scheduler, controller-manager and kubelet all talk only to the apiserver; only the apiserver talks to etcd">
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+  <rect x="8" y="6" width="400" height="306" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="20" y="28" fill="var(--muted)" font-size="11" letter-spacing="2">CONTROL PLANE NODE</text>
+  <rect x="430" y="46" width="220" height="240" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="444" y="70" fill="var(--muted)" font-size="11" letter-spacing="2">EVERY NODE</text>
+
+  <rect x="24" y="132" width="104" height="56" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="76" y="164" fill="var(--ink)" font-size="13" text-anchor="middle" font-weight="600">etcd</text>
+
+  <rect x="212" y="132" width="160" height="56" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="292" y="164" fill="var(--ink)" font-size="13" text-anchor="middle" font-weight="600">kube-apiserver</text>
+
+  <rect x="212" y="40" width="160" height="44" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="292" y="67" fill="var(--ink)" font-size="12.5" text-anchor="middle">kube-scheduler</text>
+
+  <rect x="212" y="236" width="160" height="44" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="292" y="258" fill="var(--ink)" font-size="12.5" text-anchor="middle">kube-controller-</text>
+  <text x="292" y="273" fill="var(--ink)" font-size="12.5" text-anchor="middle">manager</text>
+
+  <rect x="452" y="88" width="176" height="40" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="540" y="113" fill="var(--ink)" font-size="12.5" text-anchor="middle">kubelet</text>
+  <rect x="452" y="142" width="176" height="40" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="540" y="167" fill="var(--ink)" font-size="12.5" text-anchor="middle">kube-proxy</text>
+  <rect x="452" y="228" width="176" height="40" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="540" y="253" fill="var(--ink)" font-size="12.5" text-anchor="middle">containerd → runc</text>
+
+  <line x1="212" y1="160" x2="132" y2="160" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="172" y="152" fill="var(--muted)" font-size="10.5" text-anchor="middle">reads/writes</text>
+  <line x1="292" y1="84" x2="292" y2="128" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <text x="300" y="110" fill="var(--muted)" font-size="10.5">watch + write</text>
+  <line x1="292" y1="232" x2="292" y2="192" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arr)" marker-end="url(#arr)"/>
+  <line x1="452" y1="108" x2="376" y2="152" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="400" y="118" fill="var(--muted)" font-size="10.5">watch + status</text>
+  <line x1="452" y1="162" x2="380" y2="172" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="540" y1="128" x2="540" y2="224" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="548" y="200" fill="var(--muted)" font-size="10.5">CRI (gRPC)</text>
+</svg>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Close this page. On paper, draw every box and arrow above from memory, including <em>who initiates</em> each connection.</li>
+<li>Compare against the live cluster:
+<pre class="cmd">kubectl get pods -n kube-system -o wide</pre>
+<pre class="out">NAME                          READY   STATUS    NODE
+coredns-7db6d8ff4d-8x2mn      1/1     Running   node01
+coredns-7db6d8ff4d-tp9qk      1/1     Running   node02
+etcd-cp                       1/1     Running   cp
+kube-apiserver-cp             1/1     Running   cp
+kube-controller-manager-cp    1/1     Running   cp
+kube-flannel-ds-*   (x3)      1/1     Running   all nodes
+kube-proxy-*        (x3)      1/1     Running   all nodes
+kube-scheduler-cp             1/1     Running   cp</pre>
+<p>Map each pod to a box in your drawing. Note what's <em>per-cluster</em> (control plane, on <code>cp</code>) vs <em>per-node</em> (kube-proxy, CNI agent — they're DaemonSets).</p></li>
+<li>Redraw until you get it perfect twice in a row.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can narrate, without notes: "kubectl talks to ___, the scheduler learns about new pods by ___, containers get started when ___."</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The arrows' <em>direction</em> is the exam-relevant part: the apiserver does <strong>not</strong> push to kubelets (with one exception you'll meet later: it dials the kubelet for <code>logs</code>/<code>exec</code>). If the apiserver dies, kubelets keep running what they have — they just stop seeing changes. That asymmetry is the key to every control-plane-outage question.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Kubernetes Components"</strong> — the overview page with this same diagram, good for a 30-second exam refresher.</p>
+</article>
+
+<article class="lesson" id="cp-1-2" data-id="w1-2">
+<div class="lesson-head"><span class="cp-id">1.2</span><h4>Find out how each component actually runs on the node</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Fix the broken apiserver" means editing a file, not running a systemctl command — but only if you know which components are static pods and which is the one real systemd service.</p>
+<h5>The concept</h5>
+<p>Chicken-and-egg: the control plane runs as pods, but pods need a control plane. The escape hatch is <strong>static pods</strong>: the kubelet watches a directory (<code>staticPodPath: /etc/kubernetes/manifests</code> in its config) and runs whatever pod YAML appears there — no apiserver involved. It then reports read-only <strong>mirror pods</strong> to the API so you can <em>see</em> them (named <code>&lt;name&gt;-&lt;node&gt;</code>, e.g. <code>kube-apiserver-cp</code>). So the boot order is: systemd starts <strong>kubelet</strong> (the only real service) → kubelet starts etcd + apiserver + scheduler + controller-manager from manifest files → everything else arrives via the API.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>On <code>cp</code>, look at the static pod manifests:
+<pre class="cmd">ls /etc/kubernetes/manifests/</pre>
+<pre class="out">etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml</pre></li>
+<li>Confirm kubelet is the only systemd citizen:
+<pre class="cmd">systemctl status kubelet --no-pager | head -3
+systemctl list-units 'kube*'</pre>
+<pre class="out">● kubelet.service - kubelet: The Kubernetes Node Agent
+     Loaded: loaded (/usr/lib/systemd/system/kubelet.service; enabled)
+     Active: active (running)
+<b>only kubelet.service exists — no apiserver/scheduler units</b></pre></li>
+<li>Prove mirror pods are read-only — try to delete one:
+<pre class="cmd">kubectl delete pod kube-apiserver-cp -n kube-system
+kubectl get pod kube-apiserver-cp -n kube-system</pre>
+<pre class="out">pod "kube-apiserver-cp" deleted
+NAME                READY   STATUS    RESTARTS   AGE
+kube-apiserver-cp   1/1     Running   0          5s</pre>
+<p>You deleted the <em>mirror object</em>; the kubelet immediately re-created it because the manifest file still exists. The only way to actually stop a static pod is to move its file out of the manifests directory — try it:</p>
+<pre class="cmd">sudo mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/
+kubectl get pods -n kube-system | grep scheduler   # gone after ~20s
+sudo mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Scheduler pod disappeared when the file left the directory and returned when you put it back.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The kubelet rescans the directory every ~20 seconds — edits to these files feel <em>slightly</em> delayed; don't panic and re-edit. And a <strong>syntax error</strong> in a static pod manifest means the pod silently never comes back: nothing in <code>kubectl</code> will tell you why (the apiserver may be the thing that's down!) — the evidence is in <code>journalctl -u kubelet</code>. That's the week-6 bread and butter.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Create static Pods"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-1-3" data-id="w1-3">
+<div class="lesson-head"><span class="cp-id">1.3</span><h4>Trace one kubectl create deployment end-to-end</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every "why isn't my pod running?" question is answered by knowing which of the five actors in this chain stopped. This trace <em>is</em> the troubleshooting flowchart.</p>
+<h5>The concept</h5>
+<p>Five independent loops, no direct calls between them:</p>
+<ol>
+<li><strong>kubectl</strong> POSTs a Deployment object; the apiserver validates and persists it to etcd. Nothing is running yet.</li>
+<li>The <strong>deployment controller</strong> (in controller-manager) sees a Deployment with no ReplicaSet → creates a ReplicaSet.</li>
+<li>The <strong>replicaset controller</strong> sees an RS with 0 of 2 pods → creates 2 Pod objects with <code>spec.nodeName</code> <em>empty</em>. Still nothing running — these are database rows.</li>
+<li>The <strong>scheduler</strong> watches for pods with empty <code>nodeName</code>, filters and scores nodes, then writes a <strong>Binding</strong> — which sets <code>nodeName</code>. Still nothing running.</li>
+<li>The <strong>kubelet</strong> on the chosen node sees "a pod scheduled to me" in its watch → pulls images via CRI, starts containers, posts status back. <em>Now</em> it's running.</li>
+</ol>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a deployment and immediately capture the object chain:
+<pre class="cmd">kubectl create deployment trace --image=nginx --replicas=2
+kubectl get deploy,rs,pods -l app=trace</pre>
+<pre class="out">NAME                    READY   UP-TO-DATE   AVAILABLE
+deployment.apps/trace   2/2     2            2
+NAME                               DESIRED   CURRENT   READY
+replicaset.apps/trace-66cc6c9b8b   2         2         2
+NAME                         READY   STATUS    RESTARTS
+pod/trace-66cc6c9b8b-2m9ql   1/1     Running   0
+pod/trace-66cc6c9b8b-x7jwd   1/1     Running   0</pre>
+<p>Note the naming: pod name = RS name + suffix, RS name = deployment name + pod-template hash. That chain is your ownership breadcrumb.</p></li>
+<li>Read the story the cluster wrote about it:
+<pre class="cmd">kubectl get events --sort-by=.metadata.creationTimestamp | grep trace | head -8</pre>
+<pre class="out">... deployment-controller  Scaled up replica set trace-66cc6c9b8b to 2
+... replicaset-controller  Created pod: trace-66cc6c9b8b-2m9ql
+... default-scheduler      Successfully assigned default/trace-66cc6c9b8b-2m9ql to node01
+... kubelet                Pulling image "nginx"
+... kubelet                Created container nginx
+... kubelet                Started container nginx</pre>
+<p>Every actor from the concept list appears in the <code>SOURCE</code> column, in order. Events are the trace log of the control loops.</p></li>
+<li>Narrate the whole chain out loud on paper — then clean up: <code>kubectl delete deploy trace</code>.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can name which component acts at each step and — the useful inverse — what it looks like when each one is missing (deployment exists but no RS? controller-manager. Pod exists but Pending with no node? scheduler. Pod has a node but no containers? kubelet/runtime).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>People say "the scheduler starts pods" — it never does; it only writes a name into a field. Keeping "database write" and "container start" separate in your head is what makes control-plane failures legible: with the scheduler dead, pods still get <em>created</em>, they just stay <code>Pending</code> forever.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Deployments"</strong> and <strong>"Kubernetes Scheduler"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- kube-apiserver ---------------- -->
+<div class="grp" id="g-apiserver"><h3>kube-apiserver</h3>
+
+<article class="lesson" id="cp-1-4" data-id="w1-4">
+<div class="lesson-head"><span class="cp-id">1.4</span><h4>Learn the request pipeline in order</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This one ordered list explains RBAC questions, admission questions, and a whole class of "permission denied vs rejected" confusions. It's the most quotable fact in the exam's 25% architecture domain.</p>
+<h5>The concept</h5>
+<div class="flow"><span>authentication</span><em>→</em><span>authorization</span><em>→</em><span class="hot">mutating admission</span><em>→</em><span>schema validation</span><em>→</em><span class="hot">validating admission</span><em>→</em><span>persist to etcd</span></div>
+<ul>
+<li><strong>Authentication — who are you?</strong> Client certificate, bearer token (ServiceAccount JWT, bootstrap token), or OIDC. Modules are tried in turn; first success wins. Failure → <code>401 Unauthorized</code>.</li>
+<li><strong>Authorization — may you do this verb on this resource?</strong> The configured authorizers (on kubeadm: <code>Node,RBAC</code>) are consulted in order; first to allow wins; default is deny. Failure → <code>403 Forbidden</code>.</li>
+<li><strong>Mutating admission — webhooks may edit the object.</strong> This is how sidecar injectors and defaulters work.</li>
+<li><strong>Validation + validating admission — the object may be rejected but no longer changed.</strong></li>
+<li>Only then is it serialized into etcd. A watch event then fans out to whoever is watching.</li>
+</ul>
+<p>Reading errors backwards: <code>401</code> = authn (bad cert/token), <code>403</code> = authz (RBAC), <code>admission webhook denied</code> = admission. Three different fixes, and the status code tells you which lesson to apply.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See defaulting/mutation happen. Compare what you <em>send</em> with what gets <em>stored</em>:
+<pre class="cmd">kubectl run pipeline-demo --image=nginx $do > /tmp/sent.yaml
+kubectl apply -f /tmp/sent.yaml
+kubectl get pod pipeline-demo -o yaml | grep -E 'serviceAccountName|tolerations:|imagePullPolicy|node.kubernetes.io' </pre>
+<pre class="out">    imagePullPolicy: Always
+  serviceAccountName: default
+  tolerations:
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+...</pre>
+<p>You never wrote a serviceAccount, tolerations, or an imagePullPolicy — admission plugins and defaulting added them between your POST and etcd.</p></li>
+<li>See authorization answer a question directly:
+<pre class="cmd">kubectl auth can-i delete nodes
+kubectl auth can-i delete nodes --as=system:serviceaccount:default:default</pre>
+<pre class="out">yes
+no</pre></li>
+<li>Clean up: <code>kubectl delete pod pipeline-demo</code>.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Recite the pipeline in order from memory, and state which stage produces 401, 403, and "webhook denied" errors.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Order matters and is testable: authentication <em>always</em> precedes authorization (a bad token gives 401 even for an action anyone may do), and mutating admission runs <em>before</em> validating — so a webhook can fix an object that would otherwise fail validation.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Controlling Access to the Kubernetes API"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-1-5" data-id="w1-5">
+<div class="lesson-head"><span class="cp-id">1.5</span><h4>Read your live kube-apiserver.yaml and explain 10 flags</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Week-6 exam tasks plant faults <em>in this exact file</em>. Reading it fluently now means later you'll spot the wrong line in seconds.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Open it read-only (get in the habit — accidental edits restart the apiserver):
+<pre class="cmd">sudo less /etc/kubernetes/manifests/kube-apiserver.yaml</pre></li>
+<li>Find each flag and say its job out loud before checking the table:</li>
+</ol>
+<table>
+<tr><th>Flag</th><th>What it does / breaks</th></tr>
+<tr><td><code>--etcd-servers</code></td><td>Where state lives. Wrong URL → apiserver runs but every request 500s with connection-refused storms in its logs.</td></tr>
+<tr><td><code>--etcd-cafile / certfile / keyfile</code></td><td>Client TLS to etcd (etcd has its own CA — see 2.5).</td></tr>
+<tr><td><code>--client-ca-file</code></td><td>The CA that client certificates must chain to — this is what makes <code>kubectl</code> cert auth work.</td></tr>
+<tr><td><code>--tls-cert-file / --tls-private-key-file</code></td><td>The apiserver's own serving certificate (SANs matter — see 2.6).</td></tr>
+<tr><td><code>--authorization-mode=Node,RBAC</code></td><td>Authorizer chain, consulted in order (1.4).</td></tr>
+<tr><td><code>--enable-admission-plugins</code></td><td>Compiled-in admission plugins to enable (e.g. NodeRestriction).</td></tr>
+<tr><td><code>--service-cluster-ip-range</code></td><td>CIDR that ClusterIPs are allocated from (week 4).</td></tr>
+<tr><td><code>--service-account-issuer / --service-account-key-file</code></td><td>Issuing and verifying ServiceAccount JWTs (sa.key/sa.pub — 2.5, 7.4).</td></tr>
+<tr><td><code>--kubelet-client-certificate / -key</code></td><td>The apiserver's identity when <em>it</em> dials kubelets for logs/exec — the one reversed arrow from 1.1.</td></tr>
+<tr><td><code>--secure-port=6443</code></td><td>The port everything connects to; the one in your kubeconfig.</td></tr>
+</table>
+<h5 class="verify">Verify</h5>
+<p>Cover the right column and explain all ten from the flag name alone.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>It's a <em>pod manifest</em>, so flags live under <code>spec.containers[0].command</code> — planted faults hide there, plus in <code>volumeMounts</code>/<code>hostPath</code> volumes (a wrong cert <em>path</em> is as fatal as a wrong cert). Also note <code>livenessProbe</code>: a misconfigured apiserver can get restart-looped by its own probe.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"kube-apiserver"</strong> (the component reference lists every flag).</p>
+</article>
+
+<article class="lesson" id="cp-1-6" data-id="w1-6">
+<div class="lesson-head"><span class="cp-id">1.6</span><h4>Understand watches — see the HTTP request kubectl actually makes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Watch" is the verb that makes the whole architecture from 1.1 work. Understanding it explains <code>resourceVersion</code>, "object has been modified" errors, and why the control plane scales at all.</p>
+<h5>The concept</h5>
+<p>A watch is just a long-lived HTTP GET with <code>?watch=true&amp;resourceVersion=N</code>: "stream me every change to these objects since revision N". The apiserver keeps a <strong>watch cache</strong> per resource type, fed by a single etcd watch — so 5,000 kubelets watching pods cost etcd almost nothing. <code>resourceVersion</code> is literally etcd's MVCC revision counter (1.10): every write bumps it, and comparing versions is how optimistic concurrency ("the object has been modified; please apply your changes to the latest version") detects conflicting edits.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch kubectl's own HTTP calls with verbosity 6:
+<pre class="cmd">kubectl get pods -w -v6 2>&amp;1 | head -5</pre>
+<pre class="out">GET https://10.211.64.10:6443/api/v1/namespaces/default/pods?limit=500 200 OK in 12 ms
+GET https://10.211.64.10:6443/api/v1/namespaces/default/pods?resourceVersion=48211&amp;watch=true ...</pre>
+<p>Two requests: a LIST to get current state + its resourceVersion, then a WATCH from that version. Every informer in every controller does exactly this pair.</p></li>
+<li>In a second terminal, create and delete a pod; watch events stream in the first terminal without polling. <code>Ctrl-C</code> when convinced.</li>
+<li>Trigger the concurrency error once on purpose:
+<pre class="cmd">kubectl create deployment cas-demo --image=nginx
+kubectl get deploy cas-demo -o yaml > /tmp/a.yaml
+kubectl scale deploy cas-demo --replicas=3     # someone else changes it
+kubectl replace -f /tmp/a.yaml</pre>
+<pre class="out">Error from server (Conflict): ... "cas-demo" ... the object has been
+modified; please apply your changes to the latest version and try again</pre>
+<p>Your file carries the old <code>resourceVersion</code>; the server refuses the stale write. Fix: re-get and re-edit (or use <code>kubectl edit</code>/<code>apply</code>, which handle it). Clean up: <code>kubectl delete deploy cas-demo</code>.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can explain what the two <code>-v6</code> requests were and why the Conflict error happened.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>kubectl get -w</code> is also your best "is the fix working?" tool: keep one terminal watching (<code>k get pods -w</code>) while you repair things in another. It's cheaper than re-running <code>get</code> twenty times.</p>
+</article>
+
+<article class="lesson" id="cp-1-7" data-id="w1-7">
+<div class="lesson-head"><span class="cp-id">1.7</span><h4>Talk to the API without kubectl once</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Demystification with a practical payoff: in week 7 you'll prove ServiceAccount permissions by curling the API from inside a pod. Learn the shape of the REST API now.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start an authenticated local proxy (it borrows your kubeconfig credentials):
+<pre class="cmd">kubectl proxy &amp;</pre>
+<pre class="out">Starting to serve on 127.0.0.1:8001</pre></li>
+<li>Browse the API like a filesystem:
+<pre class="cmd">curl -s localhost:8001/api/v1/namespaces/default/pods | head -12
+curl -s localhost:8001/apis/apps/v1/namespaces/default/deployments | grep '"kind"' | head -2</pre>
+<pre class="out">{
+  "kind": "PodList",
+  "apiVersion": "v1",
+  ...
+  "kind": "DeploymentList",</pre>
+<p>Read the URL structure: core group is <code>/api/v1/...</code>, everything else is <code>/apis/&lt;group&gt;/&lt;version&gt;/...</code> — the same split you'll see in 1.8.</p></li>
+<li>Kill the proxy: <code>kill %1</code>.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can write the URL for "list deployments in namespace <code>web</code>" without looking: <code>/apis/apps/v1/namespaces/web/deployments</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>kubectl is <em>only</em> a REST client plus YAML formatting — every kubectl command has a URL underneath (<code>-v6</code> shows it, as in 1.6). Internalizing this makes API errors (404 no such group/version, 403 RBAC) read as HTTP, which they are.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Access Clusters Using the Kubernetes API"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-1-8" data-id="w1-8">
+<div class="lesson-head"><span class="cp-id">1.8</span><h4>Know API groups &amp; versions — and where objects live in etcd</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A typo'd <code>apiVersion</code> is one of the cheapest planted exam bugs, and <code>kubectl api-resources</code> is the tool that answers "what group is this thing in" in five seconds.</p>
+<h5>The concept</h5>
+<p>Resources are organized into groups: the original <strong>core</strong> group has no name (<code>apiVersion: v1</code> — Pods, Services, ConfigMaps, PVCs, Namespaces); later resources live in named groups (<code>apps/v1</code>: Deployments, ReplicaSets, StatefulSets, DaemonSets; <code>batch/v1</code>: Jobs, CronJobs; <code>networking.k8s.io/v1</code>: Ingress, NetworkPolicy; <code>rbac.authorization.k8s.io/v1</code>: Roles, Bindings; <code>storage.k8s.io/v1</code>: StorageClasses). In etcd, every object is stored <em>once</em>, at a path like <code>/registry/deployments/&lt;namespace&gt;/&lt;name&gt;</code>, in one canonical <em>storage version</em> — the apiserver converts between served versions on the fly, which is why version skew mostly "just works".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make the group table yourself:
+<pre class="cmd">kubectl api-resources | head -12
+kubectl api-resources --api-group=apps
+kubectl api-versions | head</pre>
+<pre class="out">NAME          SHORTNAMES   APIVERSION   NAMESPACED   KIND
+configmaps    cm           v1           true         ConfigMap
+...
+deployments   deploy       apps/v1      true         Deployment
+daemonsets    ds           apps/v1      true         DaemonSet
+...</pre>
+<p>Note the two bonus columns you'll use constantly: <strong>SHORTNAMES</strong> (deploy, svc, cm, netpol, pvc…) and <strong>NAMESPACED</strong> (nodes, PVs, StorageClasses are cluster-scoped — relevant to RBAC in week 7).</p></li>
+<li>Reproduce the classic planted bug and read its error:
+<pre class="cmd">kubectl create deploy broken --image=nginx $do | sed 's|apps/v1|apps/v1beta1|' | kubectl apply -f -</pre>
+<pre class="out">error: resource mapping not found for name: "broken" namespace: ""
+from "STDIN": no matches for kind "Deployment" in version "apps/v1beta1"</pre>
+<p>"No matches for kind X in version Y" always means: fix the <code>apiVersion</code> line; <code>kubectl api-resources | grep -i &lt;kind&gt;</code> tells you the right one.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking: which group/version are Deployment, Ingress, Job, Role, PersistentVolume in? (apps/v1, networking.k8s.io/v1, batch/v1, rbac.authorization.k8s.io/v1, core v1.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>CronJob is <code>batch/v1</code> and Ingress is <code>networking.k8s.io/v1</code> — old tutorials show <code>batch/v1beta1</code> and <code>extensions/v1beta1</code>, which no longer exist. When copying YAML from anywhere, the <code>apiVersion</code> line is the first thing to distrust.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"API Overview"</strong>; in the exam, <code>kubectl api-resources</code> is usually faster than the docs.</p>
+</article>
+</div>
+
+<!-- ---------------- etcd ---------------- -->
+<div class="grp" id="g-etcd"><h3>etcd</h3>
+
+<article class="lesson" id="cp-1-9" data-id="w1-9">
+<div class="lesson-head"><span class="cp-id">1.9</span><h4>Learn Raft at the "explain to a colleague" level</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You won't implement Raft in the exam — but quorum arithmetic explains etcd's failure behavior, and "what still works when etcd is down" is genuine exam material (6.8).</p>
+<h5>The concept</h5>
+<p>etcd members elect a <strong>leader</strong>; all writes go through it. The leader appends each write to its write-ahead log and replicates it to followers; the write <em>commits</em> once a <strong>quorum</strong> — a strict majority — has persisted it. If the leader dies, followers time out and elect a new one (elections take ~seconds; writes pause, reads from the apiserver's watch cache continue).</p>
+<table>
+<tr><th>Members</th><th>Quorum</th><th>Failures tolerated</th><th>Note</th></tr>
+<tr><td>1</td><td>1</td><td>0</td><td>your lab; fine for learning</td></tr>
+<tr><td>2</td><td>2</td><td>0</td><td><strong>worse than 1</strong> — either member down halts writes</td></tr>
+<tr><td>3</td><td>2</td><td>1</td><td>the production minimum</td></tr>
+<tr><td>5</td><td>3</td><td>2</td><td>bigger clusters slow writes; 5 is usually the ceiling</td></tr>
+</table>
+<p>Losing quorum makes etcd <strong>read-only</strong>: the apiserver still answers reads (its watch cache is warm) but every write hangs or errors. Pods already running keep running — the data plane doesn't depend on etcd at all.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask your (single-member) cluster who the leader is. Easiest path: exec etcdctl inside the etcd pod, where the certs and env are already set:
+<pre class="cmd">kubectl -n kube-system exec etcd-cp -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status -w table</pre>
+<pre class="out">+------------------------+-----------+---------+---------+-----------+...
+|        ENDPOINT        |    ID     | VERSION | DB SIZE | IS LEADER |
++------------------------+-----------+---------+---------+-----------+
+| https://127.0.0.1:2379 | 8e9e05c52 | 3.5.x   | 6.1 MB  |   <b>true</b>    |</pre></li>
+<li>Recite the quorum table for 3 and 5 members, and why 2 is worse than 1.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain to an imaginary colleague: where do writes go, when do they commit, what happens to reads and to running pods when quorum is lost.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"etcd down" ≠ "cluster down": workloads keep serving traffic. What stops is <em>change</em> — no new pods, no rescheduling, no scaling. That distinction is exactly what checkpoint 6.8 has you observe live.</p>
+</article>
+
+<article class="lesson" id="cp-1-10" data-id="w1-10">
+<div class="lesson-head"><span class="cp-id">1.10</span><h4>Understand etcd's MVCC model: revisions, compaction, defrag</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is where <code>resourceVersion</code> (1.6) physically comes from, and compaction/defrag show up both in real operations and in etcd's own log messages you'll read during troubleshooting.</p>
+<h5>The concept</h5>
+<p>etcd never updates a key in place: every write creates a new <strong>revision</strong> of the key in a bbolt B+tree, and the global revision counter ticks up on every write to anything. Watches are literally "replay every event since revision N" — that's why a watch can reconnect and miss nothing. Old revisions pile up until <strong>compaction</strong> discards history below some revision (Kubernetes' apiserver requests compaction every 5 minutes). Compaction frees <em>logical</em> space only; <strong>defragmentation</strong> (<code>etcdctl defrag</code>) rewrites the DB file to return space to the OS. A neglected etcd hits its space quota and goes into a read-only <code>alarm:NOSPACE</code> state — the pathological version of "writes hang".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch the revision counter move. Create anything and check an object's resourceVersion before/after:
+<pre class="cmd">kubectl create cm mvcc-demo --from-literal=a=1
+kubectl get cm mvcc-demo -o jsonpath='{.metadata.resourceVersion}'; echo
+kubectl patch cm mvcc-demo -p '{"data":{"a":"2"}}'
+kubectl get cm mvcc-demo -o jsonpath='{.metadata.resourceVersion}'; echo</pre>
+<pre class="out">51284
+51391</pre>
+<p>The jump is bigger than 1 — the whole cluster shares one counter, and other components wrote in between. Clean up: <code>kubectl delete cm mvcc-demo</code>.</p></li>
+<li>Find compaction in etcd's own logs:
+<pre class="cmd">kubectl -n kube-system logs etcd-cp | grep -i compact | tail -2</pre>
+<pre class="out">{"msg":"finished scheduled compaction","compact-revision":50812,"took":"12ms"}</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can define revision, compaction, defrag in one sentence each — and say which one returns disk space to the OS (only defrag).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>When you restore an etcd snapshot (week 2), all watchers' resourceVersions suddenly point into a different history — that's why the standard procedure restarts the control plane afterwards. It'll make sense mechanically now: watches are revision streams, and you just swapped the book they were reading.</p>
+</article>
+
+<article class="lesson" id="cp-1-11" data-id="w1-11">
+<div class="lesson-head"><span class="cp-id">1.11</span><h4>Extract the four etcdctl connection values from the manifest</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The etcd backup/restore exam task is guaranteed points <em>if</em> you can assemble the etcdctl command quickly. All four values you need are sitting in one file — knowing where beats memorizing them.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the etcd static pod manifest and pull out the TLS/endpoint flags:
+<pre class="cmd">sudo grep -E 'listen-client-urls|cert-file|key-file|trusted-ca-file' \
+  /etc/kubernetes/manifests/etcd.yaml</pre>
+<pre class="out">    - --cert-file=/etc/kubernetes/pki/etcd/server.crt
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --listen-client-urls=https://127.0.0.1:2379,https://10.211.64.10:2379
+    - --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt</pre></li>
+<li>Map manifest flags → etcdctl flags (this mapping <em>is</em> the exam skill):
+<table>
+<tr><th>etcd server flag (manifest)</th><th>etcdctl client flag</th><th>Typical value</th></tr>
+<tr><td><code>--listen-client-urls</code></td><td><code>--endpoints</code></td><td><code>https://127.0.0.1:2379</code></td></tr>
+<tr><td><code>--trusted-ca-file</code></td><td><code>--cacert</code></td><td><code>/etc/kubernetes/pki/etcd/ca.crt</code></td></tr>
+<tr><td><code>--cert-file</code></td><td><code>--cert</code></td><td><code>/etc/kubernetes/pki/etcd/server.crt</code></td></tr>
+<tr><td><code>--key-file</code></td><td><code>--key</code></td><td><code>/etc/kubernetes/pki/etcd/server.key</code></td></tr>
+</table></li>
+<li>Install a node-local etcdctl for the backup drills (the exam host has it preinstalled):
+<pre class="cmd">sudo apt-get install -y etcd-client
+etcdctl version</pre>
+<pre class="out">etcdctl version: 3.5.x
+API version: 3.5</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health</pre>
+<pre class="out">https://127.0.0.1:2379 is healthy: successfully committed proposal: took = 6.4ms</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>Using the <em>server</em> cert as the client cert (as above) works because kubeadm's etcd server cert allows client auth — standard exam practice. If a task provides dedicated healthcheck-client certs, use those. And remember it's <code>--cacert</code>, not <code>--ca-cert</code> — a 30-second typo hunt under exam pressure.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Operating etcd clusters for Kubernetes"</strong> — contains the full etcdctl snapshot commands you'll drill in week 2.</p>
+</article>
+
+<article class="lesson" id="cp-1-12" data-id="w1-12">
+<div class="lesson-head"><span class="cp-id">1.12</span><h4>Browse the raw data in etcd once</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Seeing objects at their real storage paths makes "the apiserver is a database frontend" concrete — and it permanently demystifies what an etcd backup actually contains.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>List some keys (using the same flags as 1.11 — make a shell alias if you're tired of typing them):
+<pre class="cmd">sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/pods --prefix --keys-only | head -6</pre>
+<pre class="out">/registry/pods/kube-system/coredns-7db6d8ff4d-8x2mn
+/registry/pods/kube-system/etcd-cp
+/registry/pods/kube-system/kube-apiserver-cp
+...</pre>
+<p>The path scheme: <code>/registry/&lt;resource&gt;/&lt;namespace&gt;/&lt;name&gt;</code>. Cluster-scoped resources skip the namespace segment (<code>/registry/minions/node01</code> — nodes keep their ancient internal name).</p></li>
+<li>Look at one value and see why you shouldn't edit it by hand:
+<pre class="cmd">sudo etcdctl ... get /registry/configmaps/kube-system/kubeadm-config | head -3</pre>
+<pre class="out">/registry/configmaps/kube-system/kubeadm-config
+k8s
+
+v1	ConfigMap�...   ← binary protobuf, not JSON</pre>
+<p>Objects are stored as protobuf. All reading and writing goes through the apiserver; etcdctl is for <em>backup, restore, health</em> — never object surgery.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can say where a Deployment named <code>web</code> in namespace <code>shop</code> lives: <code>/registry/deployments/shop/web</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Some tutorials pipe etcd values through <code>--print-value-only</code> expecting YAML — you'll get protobuf noise. Don't build any workflow on raw etcd reads; the exam never asks for it, this is purely a mental-model exercise.</p>
+</article>
+
+<article class="lesson" id="cp-1-13" data-id="w1-13">
+<div class="lesson-head"><span class="cp-id">1.13</span><h4>Check etcd health the way the exam expects</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two commands cover every "is etcd okay?" moment in troubleshooting tasks and in the backup/restore drill.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Health of the endpoint(s):
+<pre class="cmd">sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health</pre>
+<pre class="out">https://127.0.0.1:2379 is healthy: successfully committed proposal: took = 5.9ms</pre>
+<p>Note what it does: it <em>commits a proposal</em> — a real quorum write, not a ping. If quorum is lost, this hangs/fails even though the process is up. That's the difference between "running" and "healthy".</p></li>
+<li>Membership:
+<pre class="cmd">sudo etcdctl ... member list -w table</pre>
+<pre class="out">+-----------+---------+------+---------------------------+---------------------------+
+|    ID     | STATUS  | NAME |        PEER ADDRS         |       CLIENT ADDRS        |
++-----------+---------+------+---------------------------+---------------------------+
+| 8e9e05c52 | started | cp   | https://10.211.64.10:2380 | https://10.211.64.10:2379 |</pre>
+<p>Port map worth memorizing: <strong>2379</strong> = client traffic (apiserver→etcd), <strong>2380</strong> = peer traffic (etcd↔etcd replication).</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Both commands from memory, and you can state what 2379 vs 2380 carry.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If etcdctl can't connect at all, check you're on the right node (etcd runs on the control plane; <code>ssh cp</code> first) and that you used <code>sudo</code> (the key files are root-readable only). "Permission denied" on the key file is the most common self-inflicted etcdctl failure.</p>
+</article>
+</div>
+
+<!-- ---------------- Scheduler & controller-manager ---------------- -->
+<div class="grp" id="g-sched"><h3>Scheduler &amp; controller-manager</h3>
+
+<article class="lesson" id="cp-1-14" data-id="w1-14">
+<div class="lesson-head"><span class="cp-id">1.14</span><h4>Learn the scheduler's two-phase cycle</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Week 3's scheduling controls (taints, affinity, resources) all plug into this machinery, and "0/3 nodes are available" messages become readable once you know which phase produced them.</p>
+<h5>The concept</h5>
+<p>The scheduler watches for pods with empty <code>spec.nodeName</code> and runs each through two phases:</p>
+<div class="flow"><span>PreFilter</span><em>→</em><span class="hot">Filter</span><em>→</em><span>PostFilter (preemption)</span><em>→</em><span class="hot">Score</span><em>→</em><span>Reserve</span><em>→</em><span>bind (async)</span></div>
+<ul>
+<li><strong>Filter</strong> drops nodes that <em>can't</em> host the pod: not enough free <em>requests</em> (not actual usage!), untolerated taints, failed nodeSelector/affinity, port conflicts, volume topology. Survivors are "feasible".</li>
+<li><strong>PostFilter</strong> only runs when <em>zero</em> nodes survive — this is where <strong>preemption</strong> lives: evict lower-priority pods to make room, if the pod has higher priority.</li>
+<li><strong>Score</strong> ranks feasible nodes: least-allocated resources, topology spreading, image already present, affinity preferences. Highest total wins.</li>
+<li>The <strong>binding cycle</strong> then writes a Binding subresource asynchronously — the API write that sets <code>nodeName</code>. The scheduler never contacts any node.</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make Filter fail on every node and read the message:
+<pre class="cmd">kubectl run greedy --image=nginx --overrides='{"spec":{"containers":[{"name":"greedy","image":"nginx","resources":{"requests":{"cpu":"64"}}}]}}'
+kubectl describe pod greedy | tail -4</pre>
+<pre class="out">Warning  FailedScheduling  default-scheduler
+  0/3 nodes are available: 3 Insufficient cpu.
+  preemption: 0/3 nodes are available: 3 No preemption victims found
+  for incoming pod.</pre>
+<p>Read it precisely: Filter left 0 of 3 nodes (all failed the cpu check), then PostFilter/preemption also found nothing to evict. Every FailedScheduling message has this anatomy: <em>counts + per-node filter reasons + preemption verdict</em>.</p></li>
+<li>Fix by lowering the request and watch it schedule: <code>kubectl delete pod greedy</code>, re-run with <code>"cpu":"100m"</code>, confirm Running, then delete it.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the two phases, three Filter examples, two Score examples, and where preemption happens.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Scheduling is about <strong>requests, not usage</strong>: a node running nothing but with all CPU <em>requested</em> filters out. And a <code>Pending</code> pod with <em>no events at all</em> means the scheduler never saw it — scheduler down (or a nonexistent <code>schedulerName</code>), a different signature from FailedScheduling. That distinction is week-6 gold.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Kubernetes Scheduler"</strong> and <strong>"Scheduler Configuration"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-1-15" data-id="w1-15">
+<div class="lesson-head"><span class="cp-id">1.15</span><h4>Prove it: bypass the scheduler with a preset nodeName</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Ten minutes that permanently separates "the scheduler assigns pods" from "the kubelet runs pods". It also hands you a real repair tool: manual scheduling works even with the scheduler dead.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Stop the scheduler (static pod trick from 1.2):
+<pre class="cmd">sudo mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/</pre></li>
+<li>Show that normal pods now hang:
+<pre class="cmd">kubectl run waiting --image=nginx
+kubectl get pod waiting</pre>
+<pre class="out">NAME      READY   STATUS    RESTARTS   AGE
+waiting   0/1     Pending   0          30s   ← and no events: nobody is scheduling</pre></li>
+<li>Now cut the scheduler out of the loop — set <code>nodeName</code> yourself:
+<pre class="cmd">kubectl run direct --image=nginx --overrides='{"spec":{"nodeName":"node01"}}'
+kubectl get pod direct -o wide</pre>
+<pre class="out">NAME     READY   STATUS    NODE
+direct   1/1     Running   node01</pre>
+<p>The kubelet on node01 saw a pod bound to it and just ran it. <code>nodeName</code> preset = no scheduling, no Filter checks, <em>not even taints are honored</em>.</p></li>
+<li>Restore and clean up:
+<pre class="cmd">sudo mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/
+kubectl get pod waiting -o wide     # scheduled within seconds of scheduler return
+kubectl delete pod waiting direct</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>direct</code> ran with the scheduler dead; <code>waiting</code> sat Pending until the scheduler returned, then scheduled without you touching it (level-triggered recovery — see 1.16).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Because preset <code>nodeName</code> skips taint checks, it even lands pods on control-plane nodes. Exam angle: some troubleshooting tasks are fastest solved by pinning a pod to a specific node — and now you know why that always works.</p>
+</article>
+
+<article class="lesson" id="cp-1-16" data-id="w1-16">
+<div class="lesson-head"><span class="cp-id">1.16</span><h4>Understand the controller pattern: informer → queue → reconcile</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every controller — built-in or operator/CRD (which the 2025 curriculum expects you to understand) — is this same shape. Learn it once, recognize it everywhere.</p>
+<h5>The concept</h5>
+<p>A controller has three parts: an <strong>informer</strong> (the LIST+WATCH pair from 1.6 plus an in-memory cache) that turns API changes into events; a <strong>work queue</strong> where events land as object keys (<code>namespace/name</code>, deduplicated); and worker loops that pop a key and run <strong>reconcile</strong>: read desired state (the spec), read observed state (the world), do <em>one small step</em> toward convergence, requeue with backoff on error. Crucially this is <strong>level-triggered</strong>, not edge-triggered: reconcile looks at <em>current</em> state, not at the event that woke it — so missed events don't matter, and every informer resyncs periodically anyway. A controller that was down catches up by itself the moment it's back (you watched that happen in 1.15 step 4).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch reconciliation beat you in real time:
+<pre class="cmd">kubectl create deployment recon --image=nginx --replicas=3
+kubectl delete pod -l app=recon --wait=false &amp;&amp; kubectl get pods -l app=recon</pre>
+<pre class="out">NAME                     READY   STATUS              RESTARTS   AGE
+recon-5b8f6d9c44-7xk2p   0/1     Terminating         0          40s
+recon-5b8f6d9c44-9mtb4   0/1     <b>ContainerCreating</b>   0          1s
+recon-5b8f6d9c44-cq8vw   0/1     Terminating         0          40s
+recon-5b8f6d9c44-jw6ns   0/1     <b>ContainerCreating</b>   0          1s
+...</pre>
+<p>Replacements appear before the old pods finish terminating: the replicaset controller observed "desired 3, observed fewer", and acted. It doesn't care <em>why</em> pods vanished.</p></li>
+<li>Find the controller's identity in events: <code>kubectl get events | grep replicaset-controller | tail -3</code>. Clean up: <code>kubectl delete deploy recon</code>.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Define informer, work queue, reconcile, and level-triggered in one sentence each — and explain why a restarted controller needs no replay of missed events.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>This is also the mental model for CRDs + operators: a CRD adds a new <em>table</em> to the API; an operator is just a controller reconciling that table. Exam-wise you must locate CRDs (<code>kubectl get crd</code>) and their objects (<code>kubectl get &lt;kind&gt;</code>) — week 3 covers the commands; the machinery is what you just learned.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Controllers"</strong> (Concepts → Architecture).</p>
+</article>
+
+<article class="lesson" id="cp-1-17" data-id="w1-17">
+<div class="lesson-head"><span class="cp-id">1.17</span><h4>Follow an ownership chain live; understand cascade deletion</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Explains what actually happens on <code>kubectl delete deployment</code>, why deleting an RS pod "doesn't work", and gives you the <code>--cascade=orphan</code> trick.</p>
+<h5>The concept</h5>
+<p>Child objects carry an <code>ownerReferences</code> entry pointing at their parent. Nothing "cascades" imperatively: deleting a Deployment just deletes the Deployment row. The <strong>garbage collector controller</strong> then notices ReplicaSets whose owner no longer exists and deletes them; the same wave then takes the pods. It's reconciliation all the way down.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Inspect the chain:
+<pre class="cmd">kubectl create deployment owners --image=nginx --replicas=2
+kubectl get rs -l app=owners -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}{" "}{.items[0].metadata.ownerReferences[0].name}'; echo
+kubectl get pods -l app=owners -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}'; echo</pre>
+<pre class="out">Deployment owners
+ReplicaSet</pre></li>
+<li>Delete with orphaning and watch the pods survive:
+<pre class="cmd">kubectl delete deployment owners --cascade=orphan
+kubectl get rs,pods -l app=owners</pre>
+<pre class="out">NAME                                DESIRED   CURRENT   READY
+replicaset.apps/owners-66d9c8b444   2         2         2
+NAME                          READY   STATUS
+pod/owners-66d9c8b444-9k2lp   1/1     Running
+pod/owners-66d9c8b444-tv84q   1/1     Running</pre>
+<p>The RS and pods live on — their ownerReferences were stripped/left pointing at nothing that the GC was told to ignore. This is how you replace a Deployment's management without an outage.</p></li>
+<li>Now delete the RS normally and watch the full cascade: <code>kubectl delete rs -l app=owners</code> → pods terminate.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain who deletes the pods when you delete a Deployment (the GC controller, via ownerReferences — not kubectl, not the apiserver).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A pod that keeps coming back after delete has a living owner — check <code>ownerReferences</code> (or just <code>kubectl get rs,ds,sts</code>). Deleting children of a controller is almost never the fix; delete or scale the owner. Conversely a pod stuck <code>Terminating</code> forever usually has a <strong>finalizer</strong> — a related but different mechanism you'll meet in 6.18.</p>
+</article>
+
+<article class="lesson" id="cp-1-18" data-id="w1-18">
+<div class="lesson-head"><span class="cp-id">1.18</span><h4>Know leader election: why two controller-managers don't double-reconcile</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Explains HA control planes (relevant to multi-control-plane questions) and introduces Lease objects, which reappear in node heartbeats (1.22).</p>
+<h5>The concept</h5>
+<p>Controller-manager and scheduler replicas would conflict if all were active — imagine three replicaset controllers each creating 3 pods. So all replicas run, but only the one holding a <strong>Lease</strong> object acts; the rest hot-standby. The holder renews the lease every few seconds; if it dies, another replica acquires the lease when it expires and takes over. Same watch-and-write machinery as everything else — coordination through the API, no direct communication.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the leases:
+<pre class="cmd">kubectl get leases -n kube-system</pre>
+<pre class="out">NAME                      HOLDER                                      AGE
+kube-controller-manager   cp_a1b2c3d4-...                             1d
+kube-scheduler            cp_e5f6a7b8-...                             1d</pre></li>
+<li>Watch a renewal tick:
+<pre class="cmd">kubectl get lease kube-controller-manager -n kube-system \
+  -o jsonpath='{.spec.renewTime}'; echo; sleep 5
+kubectl get lease kube-controller-manager -n kube-system \
+  -o jsonpath='{.spec.renewTime}'; echo</pre>
+<pre class="out">2026-07-10T09:14:02.000000Z
+2026-07-10T09:14:07.000000Z</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can explain why running two controller-manager replicas doesn't create duplicate pods, and name the object that guarantees it.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>In your single-control-plane lab the election still runs — with one candidate. Symptom knowledge: if the controller-manager logs show it <em>waiting to acquire lease</em>, some other holder exists (or held it recently); that log line means "running but deliberately idle", not "broken".</p>
+</article>
+</div>
+
+<!-- ---------------- kubelet & container runtime ---------------- -->
+<div class="grp" id="g-kubelet"><h3>kubelet &amp; the container runtime</h3>
+
+<article class="lesson" id="cp-1-19" data-id="w1-19">
+<div class="lesson-head"><span class="cp-id">1.19</span><h4>Learn the kubelet's syncLoop and its three pod sources</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The kubelet is the component that turns database rows into running processes. Knowing its inputs and its health signals ("PLEG is not healthy") turns several week-6 log messages into instant diagnoses.</p>
+<h5>The concept</h5>
+<p>The kubelet merges pod specs from <strong>three sources</strong> into one desired set: (1) the apiserver watch — normal pods bound to this node; (2) the <strong>static pod directory</strong> (<code>staticPodPath</code>) — how the control plane bootstraps (1.2); (3) an HTTP endpoint (rarely used). Per-pod workers then converge reality: create the sandbox, pull images, start containers, run probes. Coming back the other way, the <strong>PLEG</strong> (Pod Lifecycle Event Generator) polls the runtime for container state changes and feeds them into the sync loop — that's how the kubelet notices "container died" and restarts it per <code>restartPolicy</code>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find the sources in the live config:
+<pre class="cmd">sudo grep -E 'staticPodPath|syncFrequency' /var/lib/kubelet/config.yaml</pre>
+<pre class="out">staticPodPath: /etc/kubernetes/manifests</pre></li>
+<li>Watch a sync cycle narrate itself — restart a pod's container and follow kubelet's log on that node (find the node with <code>kubectl get pod &lt;pod&gt; -o wide</code>, then on it):
+<pre class="cmd">kubectl run pleg-demo --image=nginx    # then on its node:
+sudo journalctl -u kubelet -f | grep -i pleg-demo &amp;
+kubectl exec pleg-demo -- kill 1       # kill nginx's PID 1</pre>
+<pre class="out">... SyncLoop (PLEG): "pleg-demo_default", event: ContainerDied
+... Container nginx failed liveness/exited, restarting ...</pre>
+<p>PLEG detected the death from the runtime side; the sync loop restarted the container. <code>kubectl get pod pleg-demo</code> now shows <code>RESTARTS: 1</code>. Clean up: <code>kubectl delete pod pleg-demo</code>.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the three pod sources and describe PLEG's job in one sentence.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Log signature to memorize: <code>PLEG is not healthy</code> in kubelet logs means the <em>runtime</em> is hung or desperately slow (often disk pressure or a containerd wedge) — the node soon flaps NotReady. The fix hunt starts at containerd, not at the kubelet.</p>
+</article>
+
+<article class="lesson" id="cp-1-20" data-id="w1-20">
+<div class="lesson-head"><span class="cp-id">1.20</span><h4>Understand CRI: kubelet → containerd → shim → runc</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>crictl</code> talks CRI directly to the runtime — no apiserver needed. It is <em>the</em> debugging tool for control-plane-down scenarios, so the chain it plugs into is worth knowing precisely.</p>
+<h5>The concept</h5>
+<p>The kubelet calls the runtime over gRPC on a Unix socket — two services: <code>RuntimeService</code> (sandboxes/containers) and <code>ImageService</code> (pulls). containerd receives the call and spawns a tiny <strong>shim</strong> process per pod, which invokes <strong>runc</strong>; runc assembles namespaces + cgroups per the OCI spec, starts the container's PID 1, and <em>exits</em>. The shim stays alive holding stdio and the exit code — which is why containerd itself can restart without killing your containers.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find the socket the kubelet uses:
+<pre class="cmd">cat /var/lib/kubelet/kubeadm-flags.env</pre>
+<pre class="out">KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.10"</pre></li>
+<li>Point crictl at it permanently (on every node):
+<pre class="cmd">sudo crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock
+sudo crictl ps | head -5</pre>
+<pre class="out">CONTAINER      IMAGE          STATE     NAME                      POD ID
+1a2b3c4d5e6f   a9dfdba8b719   Running   kube-apiserver            9f8e7d6c...
+2b3c4d5e6f7a   014faa467e29   Running   etcd                      8e7d6c5b...</pre>
+<p>Note: crictl sees containers <em>on this node only</em> — it's a node tool, not a cluster tool.</p></li>
+<li>See the shims:
+<pre class="cmd">ps -ef | grep containerd-shim | head -3</pre>
+<pre class="out">root  1234  1  ... /usr/bin/containerd-shim-runc-v2 -namespace k8s.io -id 9f8e7d6c...</pre>
+<p>One shim per pod, parented to PID 1 (not to containerd) — that's the restart-survival trick.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Draw the chain kubelet → CRI gRPC → containerd → shim → runc → container, and state which piece exits immediately (runc) and which holds the exit code (shim).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>crictl</code> without configuration may warn about deprecated endpoints or try multiple sockets — configure it once as above. Also memorize: images live under <code>ImageService</code>, so it's <code>crictl images</code> / <code>crictl pull</code>, and logs are <code>crictl logs &lt;container-id&gt;</code> (IDs from <code>crictl ps -a</code> — the <code>-a</code> matters, dead containers are the interesting ones).</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"crictl"</strong> (Debugging Kubernetes nodes with crictl).</p>
+</article>
+
+<article class="lesson" id="cp-1-21" data-id="w1-21">
+<div class="lesson-head"><span class="cp-id">1.21</span><h4>Meet the pause container</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The pause container is the physical answer to "why do containers in a pod share an IP?" — and it explains a whole family of crictl output you'll read in week 6.</p>
+<h5>The concept</h5>
+<p>Every pod starts with an invisible <strong>pause</strong> container (the "sandbox") whose only job is to sleep while <em>owning the pod's namespaces</em> — most importantly the network namespace. App containers <em>join</em> its namespaces. That's the whole mechanism behind "containers in a pod share an IP and localhost": they're in one netns, and the netns belongs to pause. When an app container crashes and restarts, the pod IP survives because pause never died. Only sandbox death (or pod deletion) releases the IP.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>On any worker, compare the two views:
+<pre class="cmd">sudo crictl pods | head -3
+sudo crictl ps | head -3</pre>
+<pre class="out">POD ID         STATE   NAME                     NAMESPACE
+9f8e7d6c5b4a   Ready   coredns-7db6d8ff4d-8x2   kube-system
+...
+CONTAINER      STATE     NAME      POD ID
+5e6f7a8b9c0d   Running   coredns   9f8e7d6c5b4a</pre>
+<p><code>pods</code> lists sandboxes; <code>ps</code> lists app containers joined to them. The pause containers themselves are hidden by default — see the processes instead:</p>
+<pre class="cmd">ps -ef | grep -c '/pause'</pre>
+<pre class="out">4     ← one per pod on this node</pre></li>
+<li>Prove IP survival: <code>kubectl run ip-demo --image=nginx</code>, note <code>kubectl get pod ip-demo -o wide</code> IP, then <code>kubectl exec ip-demo -- kill 1</code>, wait for the restart, check the IP again — unchanged. Delete the pod; a recreated one gets a <em>new</em> IP. Clean up.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain what owns a pod's IP, and why a container restart keeps it but a pod recreation doesn't.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The pause image (<code>registry.k8s.io/pause:3.x</code>) is set in <em>containerd's</em> config and kubelet flags — if a task or broken node shows sandbox creation failures ("failed to get sandbox image"), that's a runtime config problem, not a pod problem. Pod IPs are ephemeral <em>by design</em> — which is exactly why Services exist (week 4).</p>
+</article>
+
+<article class="lesson" id="cp-1-22" data-id="w1-22">
+<div class="lesson-head"><span class="cp-id">1.22</span><h4>Understand node heartbeats and the death timeline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Node died — why isn't my pod moving?" has a precise, numeric answer. Exam troubleshooting tasks and real life both hinge on these four numbers.</p>
+<h5>The concept</h5>
+<p>Two heartbeat channels: the kubelet renews a <strong>Lease</strong> in namespace <code>kube-node-lease</code> every <strong>10s</strong> (cheap), and patches <strong>NodeStatus</strong> every <strong>5m</strong> (or on change — expensive, full conditions report). When leases stop, the node-lifecycle controller (in controller-manager) marks the node <code>Unknown/NotReady</code> after <strong>~40s</strong> (<code>node-monitor-grace-period</code>) and adds the <code>node.kubernetes.io/unreachable:NoExecute</code> taint. Pods carry a default toleration for that taint of <strong>300s</strong> — after which they're evicted and their controllers create replacements elsewhere. Timeline: <em>death → ~40s NotReady → +300s pods evicted → replacements scheduled</em>. Roughly five and a half minutes of "nothing seems to happen" — by design.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See the leases ticking:
+<pre class="cmd">kubectl get leases -n kube-node-lease</pre>
+<pre class="out">NAME     HOLDER   AGE
+cp       cp       1d
+node01   node01   1d
+node02   node02   1d</pre></li>
+<li>Find the default tolerations on any pod you didn't write them into:
+<pre class="cmd">kubectl run tol-demo --image=nginx
+kubectl get pod tol-demo -o yaml | grep -A4 tolerations</pre>
+<pre class="out">  tolerations:
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+    tolerationSeconds: 300</pre>
+<p>Admission injected these (1.4!) — every pod tolerates an unreachable node for 300s. Clean up: <code>kubectl delete pod tol-demo</code>.</p></li>
+<li>Save the full kill-a-node rehearsal for 6.13 — this week you just need the numbers and the objects.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Recite the timeline with numbers: 10s lease renewals, ~40s to NotReady, 300s toleration, then eviction.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Evicted-because-unreachable pods can show as lingering <code>Terminating</code> ghosts on a node that never comes back — the kubelet that must confirm the deletion is dead. Force-delete (<code>$now</code>) is the accepted cleanup for that specific case. Also note: <strong>DaemonSet pods and static pods never reschedule</strong> — they're node-bound by definition.</p>
+</article>
+
+<article class="lesson" id="cp-1-23" data-id="w1-23">
+<div class="lesson-head"><span class="cp-id">1.23</span><h4>Explore /var/lib/kubelet — the kubelet's home directory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Week-6 kubelet faults hide in these files. Knowing the two config sources and what lives where makes "kubelet won't start" a two-minute fix.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Tour the directory on any node:
+<pre class="cmd">sudo ls /var/lib/kubelet/</pre>
+<pre class="out">config.yaml  cpu_manager_state  device-plugins  kubeadm-flags.env
+memory_manager_state  pki  plugins  plugins_registry  pod-resources  pods</pre></li>
+<li>Know the two config sources and their precedence:
+<table>
+<tr><th>File</th><th>What it is</th><th>Typical faults planted there</th></tr>
+<tr><td><code>config.yaml</code></td><td>KubeletConfiguration (from the <code>kubelet-config</code> ConfigMap at join time): staticPodPath, clusterDNS, cgroupDriver, eviction thresholds, cert rotation</td><td>wrong <code>clientCAFile</code> path, wrong <code>staticPodPath</code>, bogus clusterDNS</td></tr>
+<tr><td><code>kubeadm-flags.env</code></td><td>Extra CLI flags: runtime socket, pause image, node-ip</td><td>wrong container-runtime-endpoint</td></tr>
+</table>
+<p>Plus the systemd drop-in that wires them together: <code>/usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf</code> — it points at both files and at <code>/etc/kubernetes/kubelet.conf</code> (the kubeconfig with the node's client cert). Wrong paths <em>there</em> are the sneakiest planted fault.</p></li>
+<li>Peek at where pod volumes physically live:
+<pre class="cmd">sudo ls /var/lib/kubelet/pods/ | head -3
+sudo find /var/lib/kubelet/pods -maxdepth 3 -name volumes | head -2</pre>
+<pre class="out">1c02b6a1-93e8-4bcf-8a2e-...
+.../pods/1c02b6a1-.../volumes</pre>
+<p>emptyDirs, projected ServiceAccount tokens, and mounted PVs all materialize under <code>pods/&lt;uid&gt;/volumes/</code> — useful when tracing storage in week 5.</p></li>
+<li>Check cert rotation is on (ties into 2.8): <code>sudo grep rotate /var/lib/kubelet/config.yaml</code> → <code>rotateCertificates: true</code>.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the two kubelet config sources, the systemd drop-in that references them, and what's under <code>pods/&lt;uid&gt;/volumes</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>After editing <code>config.yaml</code> you must <code>systemctl restart kubelet</code> — nothing watches that file. And the error for a wrong path in the systemd unit shows up in <code>journalctl -u kubelet</code> as the service failing <em>before</em> any Kubernetes logic runs: "no such file or directory" right at startup.</p>
+</article>
+
+<article class="lesson" id="cp-1-24" data-id="w1-24">
+<div class="lesson-head"><span class="cp-id">1.24</span><h4>Weekend drill: stop the scheduler, then the controller-manager — narrate everything</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This drill converts the week from knowledge into <em>signatures</em>. After it, "Pending, no events" and "deployment exists, no pods" are instant diagnoses — each worth minutes in the exam.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Scheduler outage.</strong> Stop it, create work, observe, restore:
+<pre class="cmd">sudo mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/
+kubectl create deployment drill --image=nginx --replicas=2
+kubectl get pods -l app=drill
+kubectl describe pod -l app=drill | grep -A2 Events</pre>
+<pre class="out">NAME                     READY   STATUS    RESTARTS   AGE
+drill-7c9d8b6f4-k2m9x    0/1     <b>Pending</b>   0          30s
+drill-7c9d8b6f4-tq8vn    0/1     <b>Pending</b>   0          30s
+Events:  <b>&lt;none&gt;</b>        ← the signature: Pending with NO events</pre>
+<p><em>Narrate:</em> deployment controller made an RS (controller-manager is fine), RS made pods, pods sit with empty nodeName because nobody is scheduling. Restore and watch them go:</p>
+<pre class="cmd">sudo mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/
+kubectl get pods -l app=drill -w    # Running within ~30s; Ctrl-C, delete deployment</pre></li>
+<li><strong>Controller-manager outage.</strong> Different layer, different signature:
+<pre class="cmd">sudo mv /etc/kubernetes/manifests/kube-controller-manager.yaml /tmp/
+kubectl create deployment drill2 --image=nginx --replicas=2
+kubectl get deploy,rs,pods -l app=drill2</pre>
+<pre class="out">NAME                     READY   UP-TO-DATE   AVAILABLE
+deployment.apps/drill2   <b>0/2     0            0</b>
+<b>No resources found</b> (no ReplicaSet, no pods)</pre>
+<p><em>Narrate:</em> the Deployment row exists (apiserver fine) but no controller turned it into an RS. Existing pods elsewhere keep running — reconciliation is paused, not reversed. Restore and watch the RS + pods appear within seconds (level-triggered catch-up, 1.16):</p>
+<pre class="cmd">sudo mv /tmp/kube-controller-manager.yaml /etc/kubernetes/manifests/
+kubectl get deploy,rs,pods -l app=drill2</pre></li>
+<li>Clean up both deployments. Then write the two signatures into your notes: <em>Pending + no events = scheduler; object exists + no children = controller-manager.</em></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You performed both outages, narrated each chain aloud, and wrote the two signatures down.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Do the drill on the lab you can break (snapshot exists, right?). If a moved manifest doesn't come back, check you moved it back to <em>exactly</em> <code>/etc/kubernetes/manifests/</code> and give the kubelet its ~20s rescan. That recovery-of-your-own-drill is itself week-6 practice.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>Week 1 recall quiz</h3>
+<p>Answer out loud before revealing. Wrong or hesitant → redo that lesson's lab.</p>
+<ol>
+<li>Which component is the only one that talks to etcd, and which is the only one running as a systemd service?
+<details class="reveal"><summary>Answer</summary><p>The <strong>kube-apiserver</strong> talks to etcd; the <strong>kubelet</strong> is the only systemd service — everything else on the control plane is a static pod the kubelet starts from <code>/etc/kubernetes/manifests</code>.</p></details></li>
+<li>Recite the apiserver request pipeline in order. Which stages produce 401, 403, and "webhook denied"?
+<details class="reveal"><summary>Answer</summary><p>Authentication (401) → authorization (403) → mutating admission → validation → validating admission ("admission webhook … denied") → persist to etcd.</p></details></li>
+<li>kubectl says "the object has been modified; please apply your changes to the latest version". What mechanism fired?
+<details class="reveal"><summary>Answer</summary><p>Optimistic concurrency on <code>resourceVersion</code> (etcd's MVCC revision): your write carried a stale version, someone wrote in between. Re-get and re-apply.</p></details></li>
+<li>Why is a 2-member etcd cluster worse than 1 member?
+<details class="reveal"><summary>Answer</summary><p>Quorum of 2 is 2 — either member failing halts all writes. One member has quorum 1 and at least fails only when it fails.</p></details></li>
+<li>What still works when etcd is down? What stops?
+<details class="reveal"><summary>Answer</summary><p>Running pods keep running; apiserver serves (cached) reads. All writes hang: no new pods, no rescheduling, no scale operations.</p></details></li>
+<li>A pod is Pending with <em>no events at all</em>. A second pod is Pending with <code>FailedScheduling: 0/3 nodes available</code>. Diagnoses?
+<details class="reveal"><summary>Answer</summary><p>No events = the scheduler never saw it → scheduler down (or wrong <code>schedulerName</code>). FailedScheduling = scheduler alive, but Filter eliminated every node (resources/taints/affinity) and preemption found no victims.</p></details></li>
+<li>You delete a Deployment. Who actually deletes the pods?
+<details class="reveal"><summary>Answer</summary><p>The <strong>garbage collector controller</strong>, following <code>ownerReferences</code>: orphaned RS deleted first, then its pods. <code>--cascade=orphan</code> suppresses this.</p></details></li>
+<li>What does the pause container do, and what survives an app-container crash because of it?
+<details class="reveal"><summary>Answer</summary><p>It sleeps while owning the pod's namespaces (esp. network). The pod IP survives restarts because the netns owner (pause) never died.</p></details></li>
+<li>Node loses power. Walk the timeline until its pods run elsewhere.
+<details class="reveal"><summary>Answer</summary><p>Lease renewals (10s) stop → ~40s: node NotReady/Unknown + unreachable NoExecute taint → pods' default toleration runs out at 300s → eviction → controllers recreate, scheduler places on healthy nodes. ~5½ minutes total.</p></details></li>
+<li>Kubelet log says "PLEG is not healthy". Where do you look first?
+<details class="reveal"><summary>Answer</summary><p>At the container runtime — PLEG polls containerd for container states; unhealthy means the runtime is hung/slow (check <code>systemctl status containerd</code>, disk pressure, <code>crictl ps</code> responsiveness).</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="w0.html">← Week 0 · Lab setup</a><a href="../index.html#w2">Week 2 on the tracker →</a></nav>
+
+<footer>
+Authored against Kubernetes v1.35 and the post-Feb-2025 CKA curriculum. Output shown is abridged; hashes, IPs and ages will differ on your cluster.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
