@@ -1,0 +1,1639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CKA prep Week 3 lessons: pod lifecycle internals, how Deployments really roll, scheduling controls, resources & QoS, app configuration, Helm and Kustomize — with labs and expected output.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>W3 · Workloads &amp; scheduling — CKA Prep Lessons</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>week 3 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="w0.html">W0 · Setup</a></li>
+    <li><a href="w1.html">W1 · Control plane</a></li>
+    <li><a href="w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="w3.html">W3 · Workloads</a></li>
+    <li><a href="../cheatsheets/etcd-card.html">Cheat sheet · etcd card</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../index.html#w3">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>Week 3 — Workloads, scheduling &amp; app config</h1>
+  <p>This is the 15% "Workloads &amp; Scheduling" domain, but it earns more than its weight: pod lifecycle and rollout mechanics are the vocabulary every week-6 troubleshooting task is written in. The pattern of the week: each kubectl abstraction (probe, rollout, taint, limit) is a thin veneer over one concrete mechanism (a kubelet loop, two ReplicaSets, a scheduler filter, a cgroup file). Learn the mechanism and the veneer becomes obvious. Helm and Kustomize close the week — both are directly examinable since the 2025 revision.</p>
+</header>
+
+<!-- ---------------- Pod lifecycle internals ---------------- -->
+<div class="grp" id="g-lifecycle"><h3>Pod lifecycle internals</h3>
+
+<article class="lesson" id="cp-3-1" data-id="w3-1">
+<div class="lesson-head"><span class="cp-id">3.1</span><h4>Phases vs container states vs conditions — three different status vocabularies</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Why is this pod not working?" is the exam's favorite question, and the answer is always written in <code>.status</code> — if you know which of the three vocabularies to read. People who conflate them chase ghosts: a pod can be phase <code>Running</code> while crash-looping, and <code>CrashLoopBackOff</code> isn't a phase at all.</p>
+<h5>The concept</h5>
+<p>Pod status speaks three languages at once, at three levels:</p>
+<table>
+<tr><th>Vocabulary</th><th>Values</th><th>Where in status</th></tr>
+<tr><td><strong>Phase</strong> — one word for the whole pod</td><td><code>Pending</code>, <code>Running</code>, <code>Succeeded</code>, <code>Failed</code>, <code>Unknown</code></td><td><code>.status.phase</code></td></tr>
+<tr><td><strong>Container state</strong> — per container</td><td><code>Waiting</code> (with a <em>reason</em>), <code>Running</code> (with startedAt), <code>Terminated</code> (with exitCode + reason)</td><td><code>.status.containerStatuses[].state</code></td></tr>
+<tr><td><strong>Conditions</strong> — checklist of booleans</td><td><code>PodScheduled</code>, <code>Initialized</code>, <code>ContainersReady</code>, <code>Ready</code></td><td><code>.status.conditions[]</code></td></tr>
+</table>
+<p>The famous names you see in the <code>kubectl get pods</code> STATUS column — <code>CrashLoopBackOff</code>, <code>ImagePullBackOff</code>, <code>ErrImagePull</code>, <code>ContainerCreating</code> — are none of these officially: they're <strong>Waiting reasons</strong> of a container, surfaced by kubectl as a convenience. Meanwhile the <em>phase</em> of a crash-looping pod stays <code>Running</code> (it's Running as long as at least one container is running <em>or in the process of restarting</em>). The <code>Ready</code> condition is the one with teeth: it's what the EndpointSlice controller reads to decide whether the pod receives Service traffic.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>A healthy pod — read all three vocabularies:
+<pre class="cmd">k run web --image=nginx
+k get pod web -o jsonpath='{.status.phase}{"\n"}'
+k get pod web -o jsonpath='{.status.containerStatuses[0].state}{"\n"}'
+k get pod web -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'</pre>
+<pre class="out">Running
+{"running":{"startedAt":"2026-07-11T09:14:02Z"}}
+PodReadyToStartContainers=True
+Initialized=True
+Ready=True
+ContainersReady=True
+PodScheduled=True</pre></li>
+<li>A crash-looper — watch the vocabularies diverge:
+<pre class="cmd">k run crash --image=busybox -- sh -c 'exit 1'
+sleep 30
+k get pod crash
+k get pod crash -o jsonpath='{.status.phase}{"\n"}'
+k get pod crash -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'</pre>
+<pre class="out">NAME    READY   STATUS             RESTARTS      AGE
+crash   0/1     <b>CrashLoopBackOff</b>   2 (12s ago)   30s
+<b>Running</b>
+1</pre>
+<p>STATUS says CrashLoopBackOff (a Waiting <em>reason</em>); phase says Running. Both are correct — different vocabularies.</p></li>
+<li>A pod that finishes — the only route to <code>Succeeded</code>:
+<pre class="cmd">k run once --image=busybox --restart=Never -- true
+sleep 5; k get pod once -o jsonpath='{.status.phase}{"\n"}'</pre>
+<pre class="out">Succeeded</pre>
+<p>Only <code>restartPolicy: Never</code>/<code>OnFailure</code> pods can ever reach <code>Succeeded</code>/<code>Failed</code> — with the default <code>Always</code>, exited containers just restart forever.</p></li>
+<li>Clean up: <pre class="cmd">k delete pod web crash once $now</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can answer from memory: what's the phase of a crash-looping pod, and where exactly does the string <code>CrashLoopBackOff</code> live in the YAML? (Running; <code>containerStatuses[].state.waiting.reason</code>.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>Unknown</code> phase means the apiserver <em>lost contact with the kubelet</em> — a node problem, not a pod problem. And a pod stuck <code>Pending</code> splits on the <code>PodScheduled</code> condition: <code>False</code> → scheduler can't place it (read the condition's message); <code>True</code> but still Pending → it's placed but the kubelet can't start it (image pull, volumes — read the events).</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Pod Lifecycle"</strong> — the one page with phases, states and conditions side by side.</p>
+</article>
+
+<article class="lesson" id="cp-3-2" data-id="w3-2">
+<div class="lesson-head"><span class="cp-id">3.2</span><h4>Init containers: serial, to completion, in order</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Init containers are the standard "wait for X / prepare Y" tool, and a pod stuck in <code>Init:0/2</code> is a classic troubleshooting prompt — you must know at a glance what that notation means and where to look next.</p>
+<h5>The concept</h5>
+<p>The kubelet runs <code>initContainers</code> strictly one at a time, in list order, and each must <strong>exit 0</strong> before the next starts; app containers start only after the last init container succeeds. If an init container fails, the kubelet re-runs <em>that</em> init container per the pod's <code>restartPolicy</code> (with <code>Never</code>, the whole pod goes <code>Failed</code>). The STATUS column narrates progress: <code>Init:0/2</code> → <code>Init:1/2</code> → <code>PodInitializing</code> → <code>Running</code>. One scheduling subtlety: because init containers run <em>before</em> the app, the pod's effective resource request is <code>max(highest init request, sum of app requests)</code> — a fat init container inflates scheduling cost even though it exits.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a pod with two init containers slow enough to watch:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: init-demo}
+spec:
+  initContainers:
+  - name: step-a
+    image: busybox
+    command: [sh, -c, 'echo step-a running; sleep 8']
+  - name: step-b
+    image: busybox
+    command: [sh, -c, 'echo step-b running; sleep 8']
+  containers:
+  - name: app
+    image: nginx
+EOF
+k get pod init-demo -w</pre>
+<pre class="out">NAME        READY   STATUS            RESTARTS   AGE
+init-demo   0/1     <b>Init:0/2</b>          0          2s
+init-demo   0/1     <b>Init:1/2</b>          0          12s
+init-demo   0/1     PodInitializing   0          21s
+init-demo   1/1     Running           0          24s</pre>
+<p>(Ctrl-C to stop the watch.) Serial and in order: step-b never started until step-a finished.</p></li>
+<li>Logs are per container — init containers included:
+<pre class="cmd">k logs init-demo -c step-a</pre>
+<pre class="out">step-a running</pre></li>
+<li>See how a failing init container behaves — change step-a to <code>exit 1</code>:
+<pre class="cmd">k delete pod init-demo $now
+k run init-fail --image=nginx $do &gt; /tmp/initfail.yaml   # scaffold, then add under spec:
+#  initContainers:
+#  - {name: boom, image: busybox, command: [sh, -c, 'exit 1']}
+vim /tmp/initfail.yaml &amp;&amp; k apply -f /tmp/initfail.yaml
+sleep 20; k get pod init-fail</pre>
+<pre class="out">NAME        READY   STATUS                  RESTARTS      AGE
+init-fail   0/1     <b>Init:CrashLoopBackOff</b>   2 (10s ago)   20s</pre>
+<p>The app container never starts; the failing init container restarts with backoff.</p></li>
+<li>Clean up: <pre class="cmd">k delete pod init-fail $now</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>During step 1's watch you saw <code>Init:0/2</code> → <code>Init:1/2</code> in that order, and <code>k logs init-demo -c step-b</code> works after the fact.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>kubectl logs</code> on an <code>Init:…</code> pod without <code>-c</code> errors or shows the wrong container — always name the init container. And init containers re-run from the top if the pod is <em>recreated</em> (rescheduled, node reboot), so they must be idempotent.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Init Containers"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-3-3" data-id="w3-3">
+<div class="lesson-head"><span class="cp-id">3.3</span><h4>Native sidecars: an init container with restartPolicy: Always</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Sidecars (log shippers, proxies) are everywhere, and the native mechanism is recent enough (GA in v1.33) to be attractive exam material — it's one magic field with several behavioral consequences.</p>
+<h5>The concept</h5>
+<p>A <strong>native sidecar</strong> is an entry in <code>initContainers</code> with <code>restartPolicy: Always</code> (the only value allowed there). That one field changes the contract in three ways: (1) at startup it keeps init <em>ordering</em> but doesn't need to <em>exit</em> — it just needs to have started (or pass its startup probe) before the next container begins; (2) it keeps running for the pod's whole life, restarting if it dies, and counts toward the pod's READY column; (3) at shutdown, sidecars are terminated <strong>after</strong> the main containers, in reverse start order — so a log shipper sees the app's final lines. Before this existed, sidecars were plain app containers: proxies raced their apps at startup, and Jobs never completed because the sidecar kept the pod alive. Both problems die with one field — note that Jobs treat sidecars specially: the Job completes when the <em>main</em> containers finish.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>A log tailer sidecar sharing an emptyDir with the app:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: sidecar-demo}
+spec:
+  volumes:
+  - {name: logs, emptyDir: {}}
+  initContainers:
+  - name: tailer
+    image: busybox
+    restartPolicy: Always        # ← the whole feature
+    command: [sh, -c, 'tail -F /logs/app.log']
+    volumeMounts: [{name: logs, mountPath: /logs}]
+  containers:
+  - name: app
+    image: busybox
+    command: [sh, -c, 'while true; do date &gt;&gt; /logs/app.log; sleep 2; done']
+    volumeMounts: [{name: logs, mountPath: /logs}]
+EOF
+sleep 10; k get pod sidecar-demo</pre>
+<pre class="out">NAME           READY   STATUS    RESTARTS   AGE
+sidecar-demo   <b>2/2</b>     Running   0          10s</pre>
+<p>READY 2/2 — the "init" container is still running and counted. A normal init container would have shown 1/1.</p></li>
+<li>Prove the sidecar sees the app's output:
+<pre class="cmd">k logs sidecar-demo -c tailer --tail=3</pre>
+<pre class="out">Sat Jul 11 09:30:04 UTC 2026
+Sat Jul 11 09:30:06 UTC 2026
+Sat Jul 11 09:30:08 UTC 2026</pre></li>
+<li>Watch shutdown order — main container first, sidecar after:
+<pre class="cmd">k delete pod sidecar-demo &amp;
+sleep 1; k get pod sidecar-demo -o jsonpath='{range .status.containerStatuses[*]}{.name}: {.state}{"\n"}{end}{range .status.initContainerStatuses[*]}{.name}: {.state}{"\n"}{end}'</pre>
+<pre class="out">app: {"terminated":{...}}
+tailer: <b>{"running":{...}}</b></pre>
+<p>Mid-termination, the app is already gone while the tailer still runs — it gets its SIGTERM only after all main containers stop.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>k get pod</code> showed 2/2 with the sidecar under <code>initContainers</code>, and in step 3 the sidecar outlived the app container.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Setting <code>restartPolicy: OnFailure</code>/<code>Never</code> on an init container is rejected at admission — <code>Always</code> is the only legal value, and only in <code>initContainers</code> (app containers can't have per-container restartPolicy). If a sidecar has a readiness probe, its readiness gates the <em>pod's</em> Ready condition too.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Sidecar Containers"</strong>.</p>
+</article>
+<article class="lesson" id="cp-3-4" data-id="w3-4">
+<div class="lesson-head"><span class="cp-id">3.4</span><h4>The three probes and their three different consequences</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Add a probe to this deployment" is a straight exam task, and probe confusion is the most common <em>self-inflicted</em> production outage. The three probes differ not in how they check but in <strong>what happens on failure</strong>.</p>
+<h5>The concept</h5>
+<p>All probes are executed <strong>by the kubelet on the pod's node</strong> — an <code>httpGet</code> comes from the node's kubelet process, an <code>exec</code> runs inside the container via the CRI, <code>tcpSocket</code> just tries to connect. What differs is the consequence:</p>
+<table>
+<tr><th>Probe</th><th>On failure</th><th>Failure symptom</th></tr>
+<tr><td><strong>liveness</strong></td><td>kubelet <em>kills the container</em>; restartPolicy restarts it</td><td>RESTARTS climbing, container state Terminated → Running cycles</td></tr>
+<tr><td><strong>readiness</strong></td><td>pod's <code>Ready</code> condition → False; EndpointSlice controller <em>removes its IP from Services</em></td><td>READY 0/1, no restarts, Service has fewer endpoints</td></tr>
+<tr><td><strong>startup</strong></td><td>suspends the other two until it first succeeds; if it never does within <code>failureThreshold × periodSeconds</code>, kill like liveness</td><td>slow-starting app killed before it's up (when missing)</td></tr>
+</table>
+<p>Tuning fields (same for all three): <code>initialDelaySeconds</code> (default 0), <code>periodSeconds</code> (10), <code>timeoutSeconds</code> (1), <code>failureThreshold</code> (3), <code>successThreshold</code> (1). So an unconfigured probe declares failure after roughly 30 seconds of bad checks.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Readiness: a deployment + service whose pod signals readiness via a file:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: probed}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: probed}}
+  template:
+    metadata: {labels: {app: probed}}
+    spec:
+      containers:
+      - name: web
+        image: nginx
+        readinessProbe:
+          exec: {command: [cat, /tmp/ready]}
+          periodSeconds: 5
+EOF
+k expose deployment probed --port=80
+sleep 10; k get pods -l app=probed; k get endpointslices -l kubernetes.io/service-name=probed</pre>
+<pre class="out">NAME                      READY   STATUS    RESTARTS   AGE
+probed-6c4f8d9b7d-x2kfp   <b>0/1</b>     Running   0          10s
+NAME           ADDRESSTYPE   PORTS   ENDPOINTS   AGE
+probed-abc12   IPv4          80      <b>&lt;none&gt;</b>      10s</pre>
+<p>Running but not Ready: no restarts, and the Service has no endpoints — traffic would get nothing.</p></li>
+<li>Make it ready, watch the endpoint appear:
+<pre class="cmd">k exec deploy/probed -- touch /tmp/ready
+sleep 6; k get pods -l app=probed; k get endpointslices -l kubernetes.io/service-name=probed</pre>
+<pre class="out">NAME                      READY   STATUS    RESTARTS   AGE
+probed-6c4f8d9b7d-x2kfp   <b>1/1</b>     Running   0          45s
+NAME           ADDRESSTYPE   PORTS   ENDPOINTS      AGE
+probed-abc12   IPv4          80      <b>10.244.1.17</b>   45s</pre></li>
+<li>Liveness: add one that fails, watch the kubelet kill:
+<pre class="cmd">k patch deployment probed --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/livenessProbe","value":{"exec":{"command":["cat","/tmp/alive"]},"periodSeconds":5}}]'
+sleep 40; k get pods -l app=probed</pre>
+<pre class="out">NAME                      READY   STATUS    RESTARTS      AGE
+probed-59d88f7c55-m9qtw   0/1     Running   <b>2 (12s ago)</b>   40s</pre>
+<p>Nobody ever creates <code>/tmp/alive</code>, so the container is killed every ~15s (3 failures × 5s). Restart count climbing = liveness; endpoint removed without restarts = readiness. Memorize that signature pair.</p></li>
+<li>Read the evidence, then clean up:
+<pre class="cmd">k describe pod -l app=probed | grep -A2 'Liveness\|Killing'
+k delete deployment probed; k delete svc probed</pre>
+<pre class="out">  Warning  Unhealthy  ...  Liveness probe failed: cat: can't open '/tmp/alive': No such file or directory
+  Normal   <b>Killing</b>    ...  Container web failed liveness probe, will be restarted</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You produced both signatures on demand: READY 0/1 with empty endpoints (readiness) and RESTARTS climbing (liveness).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Liveness probes on an <em>overloaded</em> app are a death spiral: slow responses fail the probe, the restart makes it slower, repeat. Overload is a readiness problem (shed traffic), not a liveness problem (restart). Also: a pod with <em>no</em> readiness probe is Ready the moment it starts — nginx serving 502s counts as "ready" unless you probe something meaningful.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure Liveness, Readiness and Startup Probes"</strong> — copy probe YAML from here in the exam, never from memory.</p>
+</article>
+
+<article class="lesson" id="cp-3-5" data-id="w3-5">
+<div class="lesson-head"><span class="cp-id">3.5</span><h4>Graceful termination: SIGTERM, the grace period, and SIGKILL</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Explains three everyday mysteries: why deletes take 30 seconds, why exit code is 137, and why every serious deployment has a <code>preStop</code> sleep. Also why <code>$now</code> (<code>--force --grace-period 0</code>) exists.</p>
+<h5>The concept</h5>
+<p>Deleting a pod is a negotiation, not a kill. The apiserver only stamps <code>metadata.deletionTimestamp</code> plus the grace period (<code>terminationGracePeriodSeconds</code>, default 30). The kubelet sees that and, per container: runs the <code>preStop</code> hook if any (it counts against the grace period), then sends <strong>SIGTERM to PID 1</strong>. If the container is still alive when the grace period expires: <strong>SIGKILL</strong>, which reports as exit code <strong>137</strong> (128 + signal 9). In parallel — not before — the endpoints controller removes the pod from Services. That parallelism is a race: a proxy can still route a request to a pod that already got SIGTERM. The standard fix is a <code>preStop</code> hook of <code>sleep 5</code>: the pod keeps serving during the sleep while endpoint removal propagates, <em>then</em> gets SIGTERM. <code>--force --grace-period 0</code> skips the negotiation: the API object is deleted immediately without waiting for kubelet confirmation — fine for lab pods, dangerous for stateful things.</p>
+<div class="flow"><span>kubectl delete</span><em>→</em><span>deletionTimestamp set</span><em>→</em><span>preStop hook</span><em>→</em><span class="hot">SIGTERM → PID 1</span><em>→</em><span>grace period ticks (30s)</span><em>→</em><span class="hot">SIGKILL (exit 137)</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>A pod that handles SIGTERM exits fast:
+<pre class="cmd">k run polite --image=busybox -- sh -c 'trap "echo terminating; exit 0" TERM; while true; do sleep 1; done'
+sleep 5; time k delete pod polite</pre>
+<pre class="out">pod "polite" deleted
+
+real    <b>0m2.31s</b></pre></li>
+<li>A pod that ignores SIGTERM burns the whole grace period:
+<pre class="cmd">k run rude --image=busybox -- sleep 3600
+sleep 5; time k delete pod rude</pre>
+<pre class="out">pod "rude" deleted
+
+real    <b>0m31.18s</b></pre>
+<p><code>sleep</code> as PID 1 has no TERM handler, and PID 1 ignores unhandled signals — so the kubelet waits 30s and SIGKILLs. This is why <code>sh -c "…"</code> wrapper entrypoints (PID 1 = sh, which doesn't forward signals) make apps take the full 30s to die.</p></li>
+<li>Tune the grace period and add a preStop hook:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: hooked}
+spec:
+  terminationGracePeriodSeconds: 10
+  containers:
+  - name: c
+    image: busybox
+    command: [sleep, "3600"]
+    lifecycle:
+      preStop:
+        exec: {command: [sh, -c, 'sleep 5']}
+EOF
+sleep 8; time k delete pod hooked</pre>
+<pre class="out">pod "hooked" deleted
+
+real    <b>0m11.42s</b></pre>
+<p>~11s: 5s preStop + SIGTERM ignored + remaining grace → SIGKILL at the 10s mark.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The three timings ordered as predicted: ~2s (handler), ~31s (default grace), ~11s (10s grace incl. preStop).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>terminationGracePeriodSeconds</code> lives at <strong>pod spec level</strong>, not per container. A pod stuck in <code>Terminating</code> forever usually means its <em>node's kubelet is unreachable</em> — the API waits for a confirmation that never comes; that's when <code>--force</code> is legitimate. Exit code decoder: 137 = SIGKILL (OOM kill or grace expiry), 143 = SIGTERM handled and exited.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Pod Lifecycle"</strong> (§ Termination of Pods) and <strong>"Container Lifecycle Hooks"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- Deployments & rollouts ---------------- -->
+<div class="grp" id="g-rollouts"><h3>Deployments &amp; rollouts</h3>
+
+<article class="lesson" id="cp-3-6" data-id="w3-6">
+<div class="lesson-head"><span class="cp-id">3.6</span><h4>pod-template-hash: why every ReplicaSet name ends in gibberish</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Once you see that a Deployment is just a manager of hashed ReplicaSets, every rollout behavior — surges, rollbacks, revision history — stops being magic and becomes something you can inspect with <code>k get rs</code>.</p>
+<h5>The concept</h5>
+<p>A Deployment never touches pods. It manages <strong>ReplicaSets</strong>, one per distinct pod template. The deployment controller hashes the pod template and injects <code>pod-template-hash=&lt;hash&gt;</code> into three places: the ReplicaSet's name suffix, its label selector, and the pods' labels. Change <em>anything</em> in the template → different hash → the controller creates a <em>new</em> ReplicaSet and shifts replicas across. The hash in the selector is what stops ReplicaSets from adopting each other's pods — without it, two RSes with selector <code>app=web</code> would fight over the same pods. Old ReplicaSets aren't deleted, just scaled to 0: they <em>are</em> the revision history (capped by <code>revisionHistoryLimit</code>, default 10). A rollback is not time travel — it copies an old RS's template back into the Deployment, which makes that old hash "current" again and scales that RS back up.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a deployment and find the hash in all three places:
+<pre class="cmd">k create deployment web --image=nginx:1.27 --replicas=3
+k get rs -l app=web
+k get pods -l app=web --show-labels | head -2
+k get rs -l app=web -o jsonpath='{.items[0].spec.selector.matchLabels}{"\n"}'</pre>
+<pre class="out">NAME             DESIRED   CURRENT   READY   AGE
+web-<b>7c56dcdb95</b>   3         3         3       20s
+NAME                   READY   STATUS    ...   LABELS
+web-7c56dcdb95-8xk2p   1/1     Running   ...   app=web,<b>pod-template-hash=7c56dcdb95</b>
+{"app":"web","pod-template-hash":"<b>7c56dcdb95</b>"}</pre></li>
+<li>Change the template → new hash, new ReplicaSet:
+<pre class="cmd">k set image deployment/web nginx=nginx:1.29
+k get rs -l app=web</pre>
+<pre class="out">NAME             DESIRED   CURRENT   READY   AGE
+web-7c56dcdb95   <b>0</b>         0         0       2m
+web-<b>6d4b8859c4</b>   3         3         3       15s</pre>
+<p>The old RS is still there at 0 replicas — that's revision 1, retrievable.</p></li>
+<li>Roll back and watch the <em>old</em> RS scale up (no third RS appears):
+<pre class="cmd">k rollout undo deployment/web
+k get rs -l app=web; k rollout history deployment/web</pre>
+<pre class="out">NAME             DESIRED   CURRENT   READY   AGE
+web-<b>7c56dcdb95</b>   3         3         3       3m
+web-6d4b8859c4   0         0         0       1m
+REVISION  CHANGE-CAUSE
+2         &lt;none&gt;
+<b>3</b>         &lt;none&gt;</pre>
+<p>Same hash as step 1 — identical template, same RS. But it's now revision <strong>3</strong>: history moves forward even when content goes back.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>After the rollback, the RS from step 1 (same hash) is the one with 3 replicas, and <code>rollout history</code> shows the revision number advanced.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Scaling (<code>k scale deployment web --replicas=5</code>) does <em>not</em> create a new RS or revision — <code>replicas</code> lives outside the pod template. And never edit or delete the auto-created ReplicaSets directly: the deployment controller will fight you and win.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Deployments"</strong> — one long page that answers nearly every rollout question in the exam.</p>
+</article>
+
+<article class="lesson" id="cp-3-7" data-id="w3-7">
+<div class="lesson-head"><span class="cp-id">3.7</span><h4>Watch a rolling update live: maxSurge and maxUnavailable in action</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Exam tasks say things like "update the image ensuring at most one pod is unavailable" — that's a maxSurge/maxUnavailable sentence. You need to translate fluently in both directions.</p>
+<h5>The concept</h5>
+<p>During a rolling update two ReplicaSets scale in opposite directions under two constraints, both defaulting to 25% of desired replicas: <strong>maxSurge</strong> — how many pods may exist <em>above</em> desired (rounded <em>up</em>); <strong>maxUnavailable</strong> — how many may be missing from desired (rounded <em>down</em>). For 6 replicas: surge = ceil(1.5) = 2 → never more than 8 total; unavailable = floor(1.5) = 1 → never fewer than 5 ready. The controller repeatedly scales the new RS up to the surge ceiling, waits for readiness, scales the old RS down to the unavailable floor, repeat. Readiness probes are what make this safe: a pod counts as available only when Ready — bad image with no probe still "succeeds" the rollout. Corner cases worth knowing: <code>maxUnavailable: 0</code> forces surge-only (needs headroom); both can't be 0 (rejected).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Six replicas, then trigger an update and watch both ReplicaSets (two terminals, or run the watch in the background):
+<pre class="cmd">k scale deployment web --replicas=6 &amp;&amp; sleep 10
+k get rs -l app=web -w &amp;
+k set image deployment/web nginx=nginx:1.28</pre>
+<pre class="out">NAME             DESIRED   CURRENT   READY
+web-7c56dcdb95   6         6         6        ← old, steady state
+web-5f6cc7b678   <b>2</b>         2         0        ← new appears at surge quota (6+2=8 total)
+web-7c56dcdb95   <b>5</b>         5         5        ← old drops to the floor (5 ready min)
+web-5f6cc7b678   3         3         1
+web-5f6cc7b678   4         4         2
+web-7c56dcdb95   3         3         3
+...
+web-5f6cc7b678   6         6         6        ← new fully up
+web-7c56dcdb95   <b>0</b>         0         0        ← old at 0, kept as history</pre>
+<p>Narrate it as you watch: total never exceeded 8, ready never dropped below 5. (<code>fg</code> then Ctrl-C to stop the watch.)</p></li>
+<li>Confirm the strategy numbers you were just watching:
+<pre class="cmd">k get deployment web -o jsonpath='{.spec.strategy}{"\n"}'</pre>
+<pre class="out">{"rollingUpdate":{"maxSurge":"<b>25%</b>","maxUnavailable":"<b>25%</b>"},"type":"RollingUpdate"}</pre></li>
+<li>Now the exam sentence: "at most 1 above desired, none unavailable":
+<pre class="cmd">k patch deployment web -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+k set image deployment/web nginx=nginx:1.29 &amp;&amp; k rollout status deployment/web</pre>
+<pre class="out">Waiting for deployment "web" rollout to finish: 1 out of 6 new replicas have been updated...
+...
+deployment "web" <b>successfully rolled out</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>In the step-1 transcript you can point at the moment each constraint bound: the 8-pod ceiling (surge) and the 5-ready floor (unavailable).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Absolute numbers and percentages are both legal. Percentages compute against <code>spec.replicas</code>, not current count. And a rollout that "hangs" is usually maxUnavailable: 0 + a new pod that never goes Ready — the controller is waiting forever for readiness; <code>k rollout status</code> + <code>k describe pod</code> on the new RS's pod shows why.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Deployments"</strong> § Rolling Update Deployment; <code>k explain deployment.spec.strategy --recursive</code> is faster for field names.</p>
+</article>
+
+<article class="lesson" id="cp-3-8" data-id="w3-8">
+<div class="lesson-head"><span class="cp-id">3.8</span><h4>The rollout command family, drilled to reflex</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Rollback tasks are pure speed points: the whole answer is two commands <em>if</em> they're reflexes. This is also where <code>--record</code> trips up people studying from old material — it's gone.</p>
+<h5>The concept</h5>
+<p>Everything operates on the revision list from 3.6 (retained ReplicaSets). <code>--record</code> was removed; its replacement is setting the <code>kubernetes.io/change-cause</code> annotation on the Deployment after each change — <code>rollout history</code> displays it. <code>pause</code>/<code>resume</code> exist to batch several template edits into <em>one</em> revision (each <code>set image</code>/<code>set resources</code> normally triggers its own rollout).</p>
+<table>
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td><code>k rollout status deploy/web</code></td><td>blocks until done or stuck — your "did it work?" after any change</td></tr>
+<tr><td><code>k rollout history deploy/web [--revision=2]</code></td><td>list revisions / dump one revision's full template</td></tr>
+<tr><td><code>k rollout undo deploy/web [--to-revision=1]</code></td><td>previous revision, or a specific one</td></tr>
+<tr><td><code>k rollout pause/resume deploy/web</code></td><td>batch edits into one revision</td></tr>
+<tr><td><code>k rollout restart deploy/web</code></td><td>recreate all pods, same template (config reload trick — see 3.22)</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Annotate each change so history stops saying <code>&lt;none&gt;</code>:
+<pre class="cmd">k set image deployment/web nginx=nginx:1.27
+k annotate deployment/web kubernetes.io/change-cause="downgrade to 1.27 for bug X"
+k rollout history deployment/web | tail -3</pre>
+<pre class="out">4         &lt;none&gt;
+5         <b>downgrade to 1.27 for bug X</b></pre></li>
+<li>Inspect a specific revision before rolling back to it (what image was rev 4?):
+<pre class="cmd">k rollout history deployment/web --revision=4 | grep -i image</pre>
+<pre class="out">    Image:      nginx:<b>1.29</b></pre></li>
+<li>Targeted rollback, then confirm:
+<pre class="cmd">k rollout undo deployment/web --to-revision=4
+k rollout status deployment/web
+k get deployment web -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'</pre>
+<pre class="out">deployment "web" successfully rolled out
+nginx:<b>1.29</b></pre></li>
+<li>Pause, stack two changes, resume — one revision, not two:
+<pre class="cmd">k rollout history deployment/web | tail -1        # note the latest revision number
+k rollout pause deployment/web
+k set image deployment/web nginx=nginx:1.29
+k set resources deployment/web -c nginx --requests=cpu=100m
+k get rs -l app=web                               # nothing rolling — paused
+k rollout resume deployment/web
+k rollout history deployment/web | tail -1</pre>
+<pre class="out">6         &lt;none&gt;
+...
+<b>7</b>         &lt;none&gt;    ← both edits landed as a single new revision</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From a cold prompt: image of revision N, roll back to it, confirm — under 60 seconds.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>undo --to-revision</code> to a revision whose RS was pruned (past <code>revisionHistoryLimit</code>) fails — history only reaches as far as retained ReplicaSets. And remember from 3.6: a successful undo <em>consumes</em> the old revision number and issues a new one; don't be confused when "revision 2" disappears from the list after you roll back to it.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"kubectl rollout"</strong> (reference) or the Deployments page § Rolling Back.</p>
+</article>
+
+<article class="lesson" id="cp-3-9" data-id="w3-9">
+<div class="lesson-head"><span class="cp-id">3.9</span><h4>Recreate strategy, and why StatefulSets &amp; DaemonSets roll differently</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Not every workload can surge. Recognizing "this can't run two versions at once" or "this is one-per-node" tells you which rollout semantics — and which failure modes — apply.</p>
+<h5>The concept</h5>
+<p><strong>Deployment, strategy Recreate</strong>: kill <em>all</em> old pods, wait, then create all new ones — full downtime window, but never two versions alive. You want it when versions can't coexist: a ReadWriteOnce volume both versions would mount, a DB schema migration, a singleton with a lock. <strong>StatefulSet</strong> (<code>updateStrategy: RollingUpdate</code>): pods are updated <em>one at a time, highest ordinal first</em> (web-2, then web-1, then web-0), each must be Ready before the next — identity-preserving, never a surge pod (there is no "web-1a"). Its <code>partition</code> field is a built-in canary: only ordinals ≥ partition update. <strong>DaemonSet</strong>: one pod per node, so surging is meaningless — the controller deletes the pod on a node and recreates it <em>on the same node</em>, <code>maxUnavailable</code> (default 1) nodes at a time. Both StatefulSet and DaemonSet also support <code>updateStrategy: OnDelete</code>: the controller updates nothing until you delete pods by hand.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Flip web to Recreate and watch the gap:
+<pre class="cmd">k patch deployment web --type=json -p='[{"op":"replace","path":"/spec/strategy","value":{"type":"Recreate"}}]'
+k set image deployment/web nginx=nginx:1.28; k get pods -l app=web -w</pre>
+<pre class="out">web-5f6cc7b678-2jkfp   1/1     Terminating   ...
+web-5f6cc7b678-8prmx   1/1     Terminating   ...   ← all six die first
+...
+<b>(a moment with zero app=web pods)</b>
+web-84c8b5f7d9-x2vnh   0/1     ContainerCreating     ← only then do new ones appear
+...</pre>
+<p>(Ctrl-C, then restore: <code>k patch deployment web --type=json -p='[{"op":"replace","path":"/spec/strategy","value":{"type":"RollingUpdate"}}]'</code>.)</p></li>
+<li>Read the two other controllers' knobs — this is <code>explain</code> territory:
+<pre class="cmd">k explain statefulset.spec.updateStrategy.rollingUpdate --recursive
+k explain daemonset.spec.updateStrategy.rollingUpdate --recursive</pre>
+<pre class="out">FIELDS:
+  maxUnavailable        &lt;IntOrString&gt;
+  <b>partition     &lt;integer&gt;</b>          ← StatefulSet: ordinals &gt;= partition update
+FIELDS:
+  maxSurge      &lt;IntOrString&gt;
+  <b>maxUnavailable        &lt;IntOrString&gt;</b>  ← DaemonSet: nodes at a time</pre></li>
+<li>See ordered StatefulSet behavior for real (uses the sts from 3.10 if you've built it — otherwise return after 3.10):
+<pre class="cmd">k set image statefulset/db nginx=nginx:1.28; k get pods -l app=db -w</pre>
+<pre class="out">db-<b>1</b>   1/1   Terminating   ← highest ordinal first
+db-1   1/1   Running       ← must be Ready before...
+db-<b>0</b>   1/1   Terminating   ← ...the next one goes</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You observed the zero-pod moment under Recreate, and can say from memory which controller updates highest-ordinal-first and which updates in place per node.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Deployment strategy is <code>spec.strategy</code>; StatefulSet/DaemonSet call it <code>spec.updateStrategy</code> — a favorite exam-yaml typo. Also: changing a StatefulSet's <code>volumeClaimTemplates</code> or a Deployment's <code>selector</code> is immutable — you get an apply error, and the fix is delete + recreate, not editing harder.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"StatefulSets"</strong> § Update strategies, <strong>"Perform a Rolling Update on a DaemonSet"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-3-10" data-id="w3-10">
+<div class="lesson-head"><span class="cp-id">3.10</span><h4>The rest of the workload zoo: Job, CronJob, DaemonSet, StatefulSet</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Each of these is a likely one-task exam appearance: "create a CronJob that…", "run this to completion 6 times", "run one pod on every node". The generators (<code>k create job/cronjob</code>) make them fast points.</p>
+<h5>The concept</h5>
+<table>
+<tr><th>Controller</th><th>Reconciles toward</th><th>Fields that matter</th></tr>
+<tr><td><strong>Job</strong></td><td>N successful completions</td><td><code>completions</code> (total successes needed), <code>parallelism</code> (concurrent pods), <code>backoffLimit</code> (retries before Failed, default 6), <code>activeDeadlineSeconds</code></td></tr>
+<tr><td><strong>CronJob</strong></td><td>a Job per schedule tick</td><td><code>schedule</code> (cron syntax), <code>concurrencyPolicy</code> (Allow/Forbid/Replace), <code>startingDeadlineSeconds</code>, <code>successfulJobsHistoryLimit</code></td></tr>
+<tr><td><strong>DaemonSet</strong></td><td>one pod on every (matching) node</td><td><code>nodeSelector</code>/affinity to restrict; tolerations to include tainted nodes</td></tr>
+<tr><td><strong>StatefulSet</strong></td><td>N pods with stable identity</td><td><code>serviceName</code> (headless Service), <code>volumeClaimTemplates</code> (one PVC per pod, survives pod)</td></tr>
+</table>
+<p>Two internals worth having: Job pods must use <code>restartPolicy: Never</code> or <code>OnFailure</code> (Always is rejected — the <em>Job</em> handles retry, by making new pods or restarting containers). StatefulSet identity = predictable names (<code>db-0</code>, <code>db-1</code>…) plus per-pod DNS (<code>db-0.db.default.svc</code>) that only exists because the headless Service (<code>clusterIP: None</code>) publishes individual pod records instead of one virtual IP.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Job with completions and parallelism (scaffold with the generator, add two fields):
+<pre class="cmd">k create job hello --image=busybox $do -- sh -c 'echo processing; sleep 3' &gt; /tmp/job.yaml
+vim /tmp/job.yaml     # under spec: add  completions: 6  and  parallelism: 2
+k apply -f /tmp/job.yaml &amp;&amp; k get pods -l batch.kubernetes.io/job-name=hello -w</pre>
+<pre class="out">hello-9wkfl   0/1   Completed   ← never more than <b>2</b> Running at once,
+hello-x2m8p   1/1   Running       until <b>6</b> have Completed
+...
+job.batch/hello   <b>Complete</b></pre></li>
+<li>CronJob every minute, then trigger one run manually without waiting:
+<pre class="cmd">k create cronjob tick --image=busybox --schedule="*/1 * * * *" -- date
+k create job tick-now --from=cronjob/tick
+k get jobs; k logs job/tick-now</pre>
+<pre class="out">NAME        STATUS     COMPLETIONS   AGE
+tick-now    Complete   1/1           8s
+Sat Jul 11 09:58:41 UTC 2026</pre>
+<p><code>--from=cronjob/</code> is the exam's "test this CronJob" move. Check <code>k explain cronjob.spec.concurrencyPolicy</code>: <code>Forbid</code> skips a tick if the last Job still runs; <code>Replace</code> kills it.</p></li>
+<li>DaemonSet — no generator exists, so scaffold from a deployment and edit:
+<pre class="cmd">k create deployment agent --image=busybox $do -- sleep 3600 &gt; /tmp/ds.yaml
+vim /tmp/ds.yaml   # kind: DaemonSet, delete replicas: and strategy:
+k apply -f /tmp/ds.yaml &amp;&amp; k get pods -l app=agent -o wide</pre>
+<pre class="out">NAME          READY   STATUS    NODE
+agent-b6zpl   1/1     Running   <b>node01</b>
+agent-hw4st   1/1     Running   <b>node02</b></pre>
+<p>Two pods, not three: the control-plane taint excludes <code>cp</code>. Add a toleration for <code>node-role.kubernetes.io/control-plane</code> to cover it — that's exactly how kube-proxy and Flannel run everywhere (peek: <code>k get ds -n kube-system kube-proxy -o yaml | grep -B2 -A4 tolerations</code>).</p></li>
+<li>StatefulSet + headless Service, then check the stable identity:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Service
+metadata: {name: db}
+spec:
+  clusterIP: None
+  selector: {app: db}
+  ports: [{port: 80}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: db}
+spec:
+  serviceName: db
+  replicas: 2
+  selector: {matchLabels: {app: db}}
+  template:
+    metadata: {labels: {app: db}}
+    spec:
+      containers: [{name: nginx, image: nginx:1.27}]
+EOF
+k get pods -l app=db
+k run tmp --rm -it --image=busybox --restart=Never -- nslookup db-0.db.default.svc.cluster.local</pre>
+<pre class="out">NAME   READY   STATUS    RESTARTS   AGE
+<b>db-0</b>   1/1     Running   0          30s
+<b>db-1</b>   1/1     Running   0          20s
+Name:    db-0.db.default.svc.cluster.local
+Address: 10.244.1.23</pre>
+<p>Ordinal names, created in order (0 then 1), and per-pod DNS through the headless Service. Delete <code>db-0</code> and it returns <em>as db-0</em>. (Keep this sts — 3.9's step 3 uses it.)</p></li>
+<li>Clean up the disposables: <pre class="cmd">k delete job hello tick-now; k delete cronjob tick; k delete ds agent</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The Job showed ≤2 concurrent pods and 6 completions; <code>db-0</code> resolves in DNS; the DaemonSet landed on exactly the untainted nodes.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>CronJob schedules are evaluated in the <em>controller-manager's</em> timezone (UTC on your lab) unless <code>spec.timeZone</code> is set. A Job whose pod template has <code>restartPolicy: Always</code> is rejected with a validation error people misread as a YAML bug. DaemonSet pods bypass the scheduler's normal flow less than they used to — since 1.12 they use the default scheduler with node affinity, so cordoning (unschedulable) does <em>not</em> stop DaemonSet pods: they tolerate the unschedulable taint.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Jobs"</strong>, <strong>"CronJob"</strong>, <strong>"DaemonSet"</strong>, <strong>"StatefulSet Basics"</strong> (tutorial with headless-service DNS).</p>
+</article>
+</div>
+
+<!-- ---------------- Scheduling controls ---------------- -->
+<div class="grp" id="g-scheduling"><h3>Scheduling controls</h3>
+
+<article class="lesson" id="cp-3-11" data-id="w3-11">
+<div class="lesson-head"><span class="cp-id">3.11</span><h4>Taints &amp; tolerations: the three effects, and the one that evicts</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Why won't anything schedule on this node?" and "why did my pods suddenly disappear from node X?" are both taint questions. Taints are also how Kubernetes itself manages nodes — control-plane isolation and dead-node eviction are just taints.</p>
+<h5>The concept</h5>
+<p>First, the map this whole group hangs on. Week 1 gave you the scheduler framework; here's where each <em>control</em> you're about to learn plugs in:</p>
+<svg viewBox="0 0 680 330" role="img" aria-label="Scheduling decision tree: queue sorted by priority, then hard filters (cordon, taints, nodeSelector, required affinity, resource requests), preemption if no node survives, then soft scoring (preferred affinity, spreading), then bind">
+  <defs><marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+  <rect x="8" y="100" width="126" height="66" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="71" y="126" fill="var(--ink)" font-size="12" text-anchor="middle" font-weight="600">queue</text>
+  <text x="71" y="144" fill="var(--muted)" font-size="10.5" text-anchor="middle">sorted by priority (3.14)</text>
+
+  <rect x="176" y="16" width="200" height="216" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="276" y="40" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">FILTER — hard, yes/no</text>
+  <text x="190" y="66" fill="var(--ink)" font-size="11">✗ unschedulable (cordon, 3.15)</text>
+  <text x="190" y="90" fill="var(--ink)" font-size="11">✗ taint without toleration (3.11)</text>
+  <text x="190" y="114" fill="var(--ink)" font-size="11">✗ nodeSelector mismatch (3.12)</text>
+  <text x="190" y="138" fill="var(--ink)" font-size="11">✗ required (anti-)affinity (3.12/13)</text>
+  <text x="190" y="162" fill="var(--ink)" font-size="11">✗ requests don't fit free</text>
+  <text x="203" y="178" fill="var(--ink)" font-size="11">allocatable (3.16)</text>
+  <text x="190" y="206" fill="var(--muted)" font-size="10.5">survivors: a node <tspan font-style="italic">set</tspan></text>
+
+  <rect x="418" y="16" width="182" height="216" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="509" y="40" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">SCORE — soft, weighted</text>
+  <text x="432" y="66" fill="var(--ink)" font-size="11">+ preferred affinity × weight</text>
+  <text x="432" y="90" fill="var(--ink)" font-size="11">+ preferred anti-affinity /</text>
+  <text x="445" y="106" fill="var(--ink)" font-size="11">spreading (3.13)</text>
+  <text x="432" y="130" fill="var(--ink)" font-size="11">+ least/balanced allocation</text>
+  <text x="432" y="154" fill="var(--ink)" font-size="11">+ image locality</text>
+  <text x="432" y="206" fill="var(--muted)" font-size="10.5">winner: one node</text>
+
+  <rect x="614" y="100" width="58" height="66" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="643" y="137" fill="var(--ink)" font-size="12" text-anchor="middle" font-weight="600">bind</text>
+
+  <line x1="134" y1="133" x2="172" y2="133" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#sarr)"/>
+  <line x1="376" y1="124" x2="414" y2="124" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#sarr)"/>
+  <line x1="600" y1="124" x2="610" y2="124" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#sarr)"/>
+
+  <rect x="176" y="264" width="424" height="52" rx="8" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="190" y="285" fill="var(--ink)" font-size="11.5" font-weight="600">PostFilter: preemption (3.14)</text>
+  <text x="190" y="303" fill="var(--muted)" font-size="10.5">evict cheapest lower-priority victims, set nominatedNodeName, re-queue the pod</text>
+  <line x1="276" y1="232" x2="276" y2="260" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#sarr)"/>
+  <text x="284" y="252" fill="var(--muted)" font-size="10.5">0 nodes survive</text>
+  <line x1="172" y1="290" x2="71" y2="290" stroke="var(--muted)" stroke-width="1.5"/>
+  <line x1="71" y1="290" x2="71" y2="170" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#sarr)"/>
+</svg>
+<p>Now taints. A taint is a <em>node-side</em> repellent: <code>key=value:effect</code>. A toleration on a pod only <strong>neutralizes</strong> a taint — it never attracts the pod (attraction is affinity's job, 3.12). The three effects escalate: <code>PreferNoSchedule</code> — avoid if possible (a Score-time nudge); <code>NoSchedule</code> — hard Filter, but <em>already-running pods stay</em>; <code>NoExecute</code> — hard Filter <em>plus eviction of running pods</em> that don't tolerate it, enforced after scheduling by the taint manager. A toleration can carry <code>tolerationSeconds</code> for NoExecute: "I'll stay N seconds, then leave". Kubernetes runs on this: the control-plane node carries <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, and dead-node handling is the node lifecycle controller adding <code>node.kubernetes.io/unreachable:NoExecute</code> — every pod silently gets a 300s toleration for it, which is exactly why pods on a dead node take 5 minutes to move.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Taint node01, then watch where new pods go:
+<pre class="cmd">k taint node node01 team=blue:NoSchedule
+k create deployment spread --image=nginx --replicas=4
+sleep 10; k get pods -l app=spread -o wide | awk '{print $1, $7}'</pre>
+<pre class="out">NAME NODE
+spread-7bd9c4d8f6-4jkml <b>node02</b>
+spread-7bd9c4d8f6-8xwpq <b>node02</b>
+spread-7bd9c4d8f6-kv2rt <b>node02</b>
+spread-7bd9c4d8f6-zm9fh <b>node02</b></pre>
+<p>All four on node02 — node01 filtered out, cp filtered by its control-plane taint.</p></li>
+<li>Escalate to NoExecute on <em>node02</em> and watch running pods get evicted:
+<pre class="cmd">k taint node node02 quarantine=true:NoExecute
+k get pods -l app=spread -o wide</pre>
+<pre class="out">NAME                      READY   STATUS    NODE
+spread-7bd9c4d8f6-b8snw   0/1     <b>Pending</b>   &lt;none&gt;
+spread-7bd9c4d8f6-hd4kt   0/1     <b>Pending</b>   &lt;none&gt;
+...</pre>
+<p>Evicted immediately, and the replacements are Pending — no node in the cluster is now schedulable for them.</p></li>
+<li>A toleration lets pods back onto node01 (neutralize, not attract):
+<pre class="cmd">k patch deployment spread -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"team","operator":"Equal","value":"blue","effect":"NoSchedule"}]}}}}'
+sleep 10; k get pods -l app=spread -o wide | awk '{print $1, $7}' | sort -k2 | uniq -c -f1</pre>
+<pre class="out">      4 spread-... <b>node01</b></pre></li>
+<li>See the default tolerations every pod gets without asking:
+<pre class="cmd">k get pod -l app=spread -o jsonpath='{.items[0].spec.tolerations}' | python3 -m json.tool</pre>
+<pre class="out">[
+  {"key": "team", ...},
+  {"key": "node.kubernetes.io/not-ready", "operator": "Exists",
+   "effect": "NoExecute", <b>"tolerationSeconds": 300</b>},
+  {"key": "node.kubernetes.io/unreachable", "operator": "Exists",
+   "effect": "NoExecute", <b>"tolerationSeconds": 300</b>}
+]</pre></li>
+<li>Untaint both nodes (trailing <code>-</code> removes) and clean up:
+<pre class="cmd">k taint node node01 team-
+k taint node node02 quarantine-
+k delete deployment spread</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">k describe node node01 node02 | grep Taints</pre>
+<pre class="out">Taints:             &lt;none&gt;
+Taints:             &lt;none&gt;</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>The taint command's syntax is directional: <code>k taint node node01 key=value:NoSchedule</code> adds, the same with a trailing <code>-</code> removes. NoSchedule does <em>not</em> touch running pods — if an exam task says "ensure no pods run on this node", that's NoExecute or a drain, not NoSchedule. And a toleration with <code>operator: Exists</code> and no key tolerates <em>everything</em> — that's how DaemonSets like kube-proxy survive any taint.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Taints and Tolerations"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-3-12" data-id="w3-12">
+<div class="lesson-head"><span class="cp-id">3.12</span><h4>nodeSelector vs node affinity: hard filter vs weighted score</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Schedule this pod on a node with label X" is one of the most literal recurring exam tasks. The skill being tested is writing the affinity YAML shape from memory — it's the most deeply nested spec in the exam.</p>
+<h5>The concept</h5>
+<p>Three tools, one decision (see the diagram in 3.11): <strong>nodeSelector</strong> — flat key:value match, pure Filter, three lines of YAML; use it whenever the task says nothing about "prefer". <strong>requiredDuringSchedulingIgnoredDuringExecution</strong> node affinity — also a hard Filter, but with expressions (<code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>Gt</code>…); multiple <code>matchExpressions</code> in one term AND together, multiple <code>nodeSelectorTerms</code> OR together. <strong>preferredDuringSchedulingIgnoredDuringExecution</strong> — a Score-time nudge with a <code>weight</code> (1–100); the pod schedules <em>somewhere</em> even if nothing matches. The suffix "IgnoredDuringExecution" is a promise worth reading literally: the rule is checked at scheduling only — later label changes don't move a running pod.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>The three-line tool first:
+<pre class="cmd">k label node node02 disk=ssd
+k run picky --image=nginx $do &gt; /tmp/picky.yaml
+vim /tmp/picky.yaml    # under spec: add ─  nodeSelector: {disk: ssd}
+k apply -f /tmp/picky.yaml &amp;&amp; sleep 5 &amp;&amp; k get pod picky -o wide | awk '{print $1, $7}'</pre>
+<pre class="out">picky <b>node02</b></pre></li>
+<li>Required affinity — write this shape until your fingers know it:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: affine}
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - {key: disk, operator: In, values: [ssd, nvme]}
+  containers: [{name: c, image: nginx}]
+EOF
+sleep 5; k get pod affine -o wide | awk '{print $1, $7}'</pre>
+<pre class="out">affine <b>node02</b></pre>
+<p>The nesting mnemonic: affinity → nodeAffinity → required… → nodeSelectorTerms (OR list) → matchExpressions (AND list). Five levels before you say anything useful.</p></li>
+<li>Preferred affinity for a label nothing has — pod still schedules:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: wishful}
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 80
+        preference:
+          matchExpressions:
+          - {key: disk, operator: In, values: [nvme]}
+  containers: [{name: c, image: nginx}]
+EOF
+sleep 5; k get pod wishful -o wide | awk '{print $1, $7}'</pre>
+<pre class="out">wishful <b>node01</b></pre>
+<p>No <code>disk=nvme</code> anywhere → the preference scores 0 everywhere → normal spreading decides. A <em>required</em> rule for nvme would have left it Pending.</p></li>
+<li>Prove "IgnoredDuringExecution":
+<pre class="cmd">k label node node02 disk- &amp;&amp; k get pod picky affine -o wide | awk '{print $1, $8}'</pre>
+<pre class="out">picky Running
+affine Running</pre>
+<p>Label gone, pods stay. Clean up: <code>k delete pod picky affine wishful $now</code></p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Close the page and write both a nodeSelector and a required-affinity pod from memory; <code>k apply --dry-run=server -f</code> accepts them.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If nodeSelector <em>and</em> affinity are both set, both must pass (AND). A required-affinity pod stuck Pending tells you why in its events: <code>k describe pod</code> → "node(s) didn't match Pod's node affinity/selector" — read the counts, they enumerate every filter that excluded nodes. Spelling trap: it's <code>values:</code> (a list), not <code>value:</code>.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Assign Pods to Nodes using Node Affinity"</strong> (task page with copyable YAML) and <strong>"Assigning Pods to Nodes"</strong> (concept).</p>
+</article>
+
+<article class="lesson" id="cp-3-13" data-id="w3-13">
+<div class="lesson-head"><span class="cp-id">3.13</span><h4>Pod anti-affinity: spreading replicas, and what topologyKey really means</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Ensure no two replicas run on the same node" is a classic task, and <code>topologyKey</code> is the field people wave their hands about. It has a precise meaning you can hold onto.</p>
+<h5>The concept</h5>
+<p>Pod (anti-)affinity differs from node affinity in what it matches: the <code>labelSelector</code> matches <strong>other pods</strong>, and <code>topologyKey</code> names a <em>node label</em> that defines what counts as "together". Mentally: group all nodes into buckets by their value of the topologyKey label; anti-affinity means "not in the same <em>bucket</em> as a matching pod". <code>topologyKey: kubernetes.io/hostname</code> → each node is its own bucket → "not on the same node". <code>topology.kubernetes.io/zone</code> → "not in the same zone". Like node affinity it comes in <code>required</code> (Filter) and <code>preferred</code> (Score) flavors. For the common "spread N replicas" need, modern Kubernetes also offers <code>topologySpreadConstraints</code> (maxSkew arithmetic) — know it exists; anti-affinity is what the exam phrasing usually points at.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Three replicas, required anti-affinity, two schedulable nodes — predict before you run:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ha}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: ha}}
+  template:
+    metadata: {labels: {app: ha}}
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: {app: ha}
+            topologyKey: kubernetes.io/hostname
+      containers: [{name: c, image: nginx}]
+EOF
+sleep 10; k get pods -l app=ha -o wide | awk '{print $1, $3, $7}'</pre>
+<pre class="out">ha-6f7d8c9b4-2kmpl Running <b>node01</b>
+ha-6f7d8c9b4-8wxqr Running <b>node02</b>
+ha-6f7d8c9b4-ztv4n <b>Pending</b> &lt;none&gt;</pre>
+<p>One per hostname-bucket, and the third has nowhere legal to go. Its event says it all: <code>k describe pod</code> → "didn't match pod anti-affinity rules".</p></li>
+<li>Soften to preferred — the standard production pattern:
+<pre class="cmd">k patch deployment ha --type=json -p='[{"op":"replace","path":"/spec/template/spec/affinity/podAntiAffinity","value":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":{"app":"ha"}},"topologyKey":"kubernetes.io/hostname"}}]}}]'
+sleep 15; k get pods -l app=ha -o wide | awk '{print $1, $3, $7}'</pre>
+<pre class="out">ha-59f86b7d9c-4jklm Running node01
+ha-59f86b7d9c-9wnpq Running node02
+ha-59f86b7d9c-x2vrt Running <b>node01</b></pre>
+<p>All three run; the spread is best-effort. Note the preferred flavor wraps the term in <code>podAffinityTerm</code> next to <code>weight</code> — a nesting difference from required that bites hand-writers.</p></li>
+<li>Clean up: <pre class="cmd">k delete deployment ha</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You predicted the third pod's Pending before running step 1, and can define topologyKey in one sentence ("the node label whose value defines one bucket").</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Anti-affinity's labelSelector matches pods <em>in the same namespace</em> only, unless you add <code>namespaces:</code>/<code>namespaceSelector</code>. Required pod anti-affinity is evaluated at <em>scheduling</em> — two matching pods can end up colocated if one was there first and rules changed (IgnoredDuringExecution again).</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Assigning Pods to Nodes"</strong> § Inter-pod affinity and anti-affinity; <strong>"Topology Spread Constraints"</strong> for the alternative.</p>
+</article>
+
+<article class="lesson" id="cp-3-14" data-id="w3-14">
+<div class="lesson-head"><span class="cp-id">3.14</span><h4>Priority &amp; preemption: how the scheduler chooses victims</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Priority explains two things you'll meet in troubleshooting: why <em>your</em> pod was suddenly evicted with no node pressure, and how system components always find room. It's also a tidy "create a PriorityClass and use it" task.</p>
+<h5>The concept</h5>
+<p>A <strong>PriorityClass</strong> is a tiny cluster-scoped object: a name bound to an integer <code>value</code> (plus optional <code>globalDefault</code> and <code>preemptionPolicy</code>). Pods reference it by name; the admission controller stamps the integer into <code>pod.spec.priority</code>. It acts twice (see 3.11's diagram): in the <em>queue</em> — higher priority pods sort first — and in <strong>PostFilter</strong>: when no node passes the filters for a high-priority pod, the scheduler simulates removing lower-priority pods node by node until one would fit, then evicts that <em>minimal victim set</em> (respecting graceful termination, 3.5) and writes the node's name into the pod's <code>status.nominatedNodeName</code>. The nomination is not a reservation — the pod re-enters the queue and may land elsewhere if the world changes. Two built-ins tower over everything: <code>system-cluster-critical</code> (2000000000) and <code>system-node-critical</code> (2000001000) — that's how kube-proxy and CoreDNS never lose.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create two classes:
+<pre class="cmd">k create priorityclass low --value=1000
+k create priorityclass high --value=100000
+k get priorityclass | grep -v system</pre>
+<pre class="out">NAME   VALUE    GLOBAL-DEFAULT   AGE
+high   100000   false            5s
+low    1000     false            8s</pre></li>
+<li>Fill the workers with low-priority ballast. First read what fits (values below assume ~2-CPU workers — adjust to yours):
+<pre class="cmd">k get node node01 node02 -o jsonpath='{range .items[*]}{.metadata.name}: {.status.allocatable.cpu}{"\n"}{end}'
+k create deployment ballast --image=nginx --replicas=4 $do &gt; /tmp/ballast.yaml
+vim /tmp/ballast.yaml   # in the container: resources: {requests: {cpu: 800m}}
+                        # in pod spec:      priorityClassName: low
+k apply -f /tmp/ballast.yaml &amp;&amp; sleep 10 &amp;&amp; k get pods -l app=ballast -o wide | awk '{print $1, $3, $7}'</pre>
+<pre class="out">node01: 2
+node02: 2
+ballast-... Running node01
+ballast-... Running node01
+ballast-... Running node02
+ballast-... Running <b>node02</b></pre>
+<p>4 × 800m ≈ all the schedulable CPU on two 2-CPU workers (system pods hold some).</p></li>
+<li>Now a high-priority pod that can't fit without violence:
+<pre class="cmd">k run vip --image=nginx --overrides='{"spec":{"priorityClassName":"high","containers":[{"name":"vip","image":"nginx","resources":{"requests":{"cpu":"800m"}}}]}}'
+sleep 15; k get pods -o wide | awk '{print $1, $3, $7}'; k get events --field-selector reason=Preempted -o custom-columns=MSG:.message | head -2</pre>
+<pre class="out">ballast-... Running node01
+ballast-... Running node01
+ballast-... <b>Pending</b> &lt;none&gt;     ← the victim's replacement, now unschedulable
+vip Running <b>node02</b>
+MSG
+Preempted by pod ... on node node02</pre>
+<p>One ballast pod was evicted (the minimal set), vip took its seat, and the ReplicaSet's replacement queues behind it forever — priority inversion made visible.</p></li>
+<li>Catch <code>nominatedNodeName</code> while vip is still Pending (rerun step 3 after <code>k delete pod vip</code> if you missed it):
+<pre class="cmd">k get pod vip -o jsonpath='{.status.nominatedNodeName}{"\n"}'</pre>
+<pre class="out">node02</pre>
+<p>Written at preemption time, while the victim is still gracefully terminating.</p></li>
+<li>Clean up: <pre class="cmd">k delete deployment ballast; k delete pod vip $now; k delete priorityclass low high</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You saw the Preempted event name the victim and <code>nominatedNodeName</code> point at the node before vip landed.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Priority without preemption exists: <code>preemptionPolicy: Never</code> makes a class that queues ahead but never evicts. Preemption respects <code>terminationGracePeriodSeconds</code> but <strong>not</strong> PodDisruptionBudgets as a hard constraint (it tries, then violates if it must) — a surprise worth quoting in week 6. And pods with no priorityClassName get priority 0 (unless some class set <code>globalDefault: true</code>) — everything is a potential victim by default.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Pod Priority and Preemption"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-3-15" data-id="w3-15">
+<div class="lesson-head"><span class="cp-id">3.15</span><h4>Cordon, drain, uncordon — fluently, and knowing what each really does</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You already ran drains inside week 2's upgrade drill; this lesson makes the mechanism explicit and the command a reflex, because node-maintenance tasks are near-guaranteed and worth easy points.</p>
+<h5>The concept</h5>
+<p><strong>Cordon is one boolean.</strong> <code>k cordon node02</code> sets <code>spec.unschedulable: true</code> on the Node object; the node controller mirrors it as a <code>node.kubernetes.io/unschedulable:NoSchedule</code> taint. It's purely a Filter (diagram, 3.11): new pods avoid the node, <em>running pods are untouched</em>. <strong>Drain = cordon + evictions.</strong> kubectl (client-side!) cordons, then creates an <strong>Eviction</strong> for every pod — the polite, PDB-respecting API delete with graceful termination. The three refusals and their flags, from week 2: DaemonSet pods (<code>--ignore-daemonsets</code> — they'd be recreated instantly anyway, and they tolerate the cordon taint), emptyDir data (<code>--delete-emptydir-data</code> — it's destroyed), bare pods (<code>--force</code> — nothing will recreate them). <strong>Uncordon clears the boolean</strong> — and nothing comes back on its own: evicted pods were rescheduled elsewhere and stay there.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Cordon and inspect what it actually did:
+<pre class="cmd">k create deployment moveme --image=nginx --replicas=4
+k cordon node02
+k get node node02 -o jsonpath='unschedulable: {.spec.unschedulable}{"\n"}taint: {.spec.taints[0].key}{"\n"}'
+k get pods -l app=moveme -o wide | awk '{print $7}' | sort | uniq -c</pre>
+<pre class="out">unschedulable: <b>true</b>
+taint: <b>node.kubernetes.io/unschedulable</b>
+   2 node01
+   2 node02      ← still there: cordon never evicts</pre></li>
+<li>Drain, watching the eviction language:
+<pre class="cmd">k drain node02 --ignore-daemonsets --delete-emptydir-data</pre>
+<pre class="out">node/node02 already cordoned
+WARNING: ignoring DaemonSet-managed Pods: kube-flannel/kube-flannel-ds-xxxxx, kube-system/kube-proxy-xxxxx
+<b>evicting pod</b> default/moveme-7c9d8b6f54-2kmpl
+<b>evicting pod</b> default/moveme-7c9d8b6f54-8wxqr
+node/node02 drained</pre></li>
+<li>Everything now on node01; uncordon and confirm nothing moves back:
+<pre class="cmd">k get pods -l app=moveme -o wide | awk '{print $7}' | sort | uniq -c
+k uncordon node02
+sleep 10; k get pods -l app=moveme -o wide | awk '{print $7}' | sort | uniq -c</pre>
+<pre class="out">   4 node01
+node/node02 uncordoned
+   4 <b>node01</b>     ← rebalancing never happens by itself</pre>
+<p>Clean up: <code>k delete deployment moveme</code></p></li>
+<li>Speed drill — the exam sequence as one muscle memory, target &lt; 20 seconds to type:
+<pre class="cmd">k drain node02 --ignore-daemonsets --delete-emptydir-data --force
+# ... maintenance ...
+k uncordon node02</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">k get nodes</pre>
+<pre class="out">NAME     STATUS   ROLES           AGE   VERSION
+cp       Ready    control-plane   3w    v1.35.x
+node01   Ready    &lt;none&gt;          3w    v1.35.x
+node02   <b>Ready</b>    &lt;none&gt;          3w    v1.35.x   ← no SchedulingDisabled left behind</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most common real mistake: drain succeeds, maintenance happens, and the <strong>uncordon is forgotten</strong> — days later "why does nothing schedule on node02?" (<code>k get nodes</code> says <code>Ready,SchedulingDisabled</code>). A drain that hangs forever is usually a PDB with no budget (week 6 material) — the eviction API politely retries forever. And DaemonSet pods being "ignored" means they <em>keep running</em> through your maintenance — if that matters, stop them another way.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Safely Drain a Node"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- Resources, QoS & autoscaling ---------------- -->
+<div class="grp" id="g-resources"><h3>Resources, QoS &amp; autoscaling</h3>
+
+<article class="lesson" id="cp-3-16" data-id="w3-16">
+<div class="lesson-head"><span class="cp-id">3.16</span><h4>Requests vs limits: scheduler bookkeeping vs cgroup enforcement</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"CPU over limit = slow; memory over limit = dead." That asymmetry explains half of all container mysteries, including the exam's beloved exit code 137.</p>
+<h5>The concept</h5>
+<p>The two fields live in different worlds. <strong>Requests</strong> exist only in the scheduler's ledger: "requests fit free allocatable" is a Filter (diagram, 3.11) computed from <em>other pods' requests</em>, never from measured usage — a node full of idle pods with fat requests is "full". <strong>Limits</strong> are runtime enforcement, translated by the kubelet into cgroup v2 files on the node:</p>
+<table>
+<tr><th>Spec field</th><th>cgroup file</th><th>Enforcement</th></tr>
+<tr><td><code>requests.cpu: 500m</code></td><td><code>cpu.weight</code></td><td>proportional share <em>under contention only</em> — no cap</td></tr>
+<tr><td><code>limits.cpu: 500m</code></td><td><code>cpu.max</code> = <code>50000 100000</code></td><td>CFS quota: 50ms runtime per 100ms period → <strong>throttling</strong>, never killing</td></tr>
+<tr><td><code>limits.memory: 64Mi</code></td><td><code>memory.max</code></td><td>exceed → kernel <strong>OOM killer</strong> → exit code <strong>137</strong>, reason OOMKilled</td></tr>
+<tr><td><code>requests.memory</code></td><td>(bookkeeping + eviction ranking, 3.18)</td><td>no runtime enforcement</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a pod with both, then find its cgroup files on the node:
+<pre class="cmd">k run boxed --image=nginx --overrides='{"spec":{"containers":[{"name":"boxed","image":"nginx","resources":{"requests":{"cpu":"250m","memory":"64Mi"},"limits":{"cpu":"500m","memory":"128Mi"}}}]}}'
+sleep 5; k get pod boxed -o jsonpath='{.spec.nodeName} {.metadata.uid}{"\n"}'</pre>
+<pre class="out">node01 <b>7f3a2b1c-...-9d8e</b></pre></li>
+<li>On that node (<code>multipass shell node01</code>), read what the kubelet wrote:
+<pre class="cmd">POD_CG=$(sudo find /sys/fs/cgroup -type d -name "*7f3a2b1c*" | head -1)   # your uid, dots→underscores
+cat $POD_CG/cpu.max $POD_CG/cpu.weight $POD_CG/memory.max</pre>
+<pre class="out"><b>50000 100000</b>      ← limits.cpu 500m: 50ms per 100ms period
+10                ← cpu.weight derived from requests.cpu
+<b>134217728</b>         ← limits.memory: 128Mi in bytes</pre></li>
+<li>Memory over limit — watch the kernel kill it:
+<pre class="cmd">k run oomer --image=busybox --overrides='{"spec":{"containers":[{"name":"oomer","image":"busybox","command":["sh","-c","x=x; while true; do x=\"$x$x\"; done"],"resources":{"limits":{"memory":"64Mi"}}}]}}'
+sleep 20; k get pod oomer
+k get pod oomer -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason} {.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'</pre>
+<pre class="out">NAME    READY   STATUS      RESTARTS     AGE
+oomer   0/1     CrashLoopBackOff   2 (8s ago)   20s
+<b>OOMKilled 137</b></pre></li>
+<li>CPU over limit — throttled, never killed:
+<pre class="cmd">k run spinner --image=busybox --overrides='{"spec":{"containers":[{"name":"spinner","image":"busybox","command":["sh","-c","while true; do :; done"],"resources":{"limits":{"cpu":"100m"}}}]}}'
+sleep 30; k get pod spinner   # Running, 0 restarts — forever
+# on its node:
+CG=$(sudo find /sys/fs/cgroup -type d -name "*$(k get pod spinner -o jsonpath='{.metadata.uid}' | tr - _)*" | head -1)
+grep -E 'nr_throttled|throttled_usec' $CG/cpu.stat; sleep 5; grep nr_throttled $CG/cpu.stat</pre>
+<pre class="out">NAME      READY   STATUS    RESTARTS   AGE
+spinner   1/1     Running   <b>0</b>          30s
+nr_throttled 273
+throttled_usec 24913055
+nr_throttled <b>321</b>      ← still climbing: the spin loop hits the quota every period</pre>
+<p>Clean up: <code>k delete pod boxed oomer spinner $now</code></p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can state each mapping (requests.cpu→cpu.weight, limits.cpu→cpu.max, limits.memory→memory.max) and the two failure signatures: 137/OOMKilled vs nr_throttled climbing with zero restarts.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>OOMKilled is the <em>kernel's</em> doing, not the kubelet's — it can strike even when the <em>node</em> has free memory, because the cgroup limit is what was exceeded. A pod Pending with "Insufficient cpu" is a <em>requests</em> ledger problem: nothing may be actually busy; sum other pods' requests, don't stare at <code>top</code>. Also: setting limits without requests silently sets requests = limits.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Resource Management for Pods and Containers"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-3-17" data-id="w3-17">
+<div class="lesson-head"><span class="cp-id">3.17</span><h4>QoS classes: derived, not declared — and what they buy you at OOM time</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>When a node runs out of memory, QoS decides who dies first. Exam questions probe whether you know the classes are <em>computed from</em> requests/limits — there is no <code>qos:</code> field to set.</p>
+<h5>The concept</h5>
+<p>The apiserver derives one of three classes from the pod's resource spec and records it in <code>status.qosClass</code>:</p>
+<table>
+<tr><th>Class</th><th>Rule</th><th><code>oom_score_adj</code> (kernel OOM priority)</th></tr>
+<tr><td><strong>Guaranteed</strong></td><td>every container: requests == limits for <em>both</em> cpu and memory</td><td><b>-997</b> — nearly untouchable</td></tr>
+<tr><td><strong>Burstable</strong></td><td>at least one request or limit set, but not Guaranteed</td><td>2–999, scaled <em>down</em> as memory request grows (≈ <code>1000 − 1000×memRequest/nodeMem</code>)</td></tr>
+<tr><td><strong>BestEffort</strong></td><td>no requests, no limits anywhere</td><td><b>1000</b> — first against the wall</td></tr>
+</table>
+<p>The kubelet plants <code>oom_score_adj</code> on every container process so that if the <em>kernel</em> OOM-kills (node out of memory before the kubelet can react), the sacrifice order is BestEffort → Burstable (low request first) → Guaranteed. The kubelet's own <em>eviction</em> ranking (3.18) is related but distinct: it ranks by whether usage exceeds requests, then priority, then usage-over-requests — QoS influences it indirectly, since BestEffort pods by definition exceed their zero requests.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>One pod per class, then read the derived field:
+<pre class="cmd">k run qos-g --image=nginx --overrides='{"spec":{"containers":[{"name":"c","image":"nginx","resources":{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"cpu":"100m","memory":"64Mi"}}}]}}'
+k run qos-b --image=nginx --overrides='{"spec":{"containers":[{"name":"c","image":"nginx","resources":{"requests":{"memory":"64Mi"}}}]}}'
+k run qos-be --image=nginx
+sleep 10; k get pods -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass</pre>
+<pre class="out">NAME     QOS
+qos-b    <b>Burstable</b>
+qos-be   <b>BestEffort</b>
+qos-g    <b>Guaranteed</b></pre></li>
+<li>Verify the kernel-side effect on the node running qos-g and qos-be (check with <code>-o wide</code>; shell into it):
+<pre class="cmd">PID=$(pgrep -f 'nginx: master' | head -1)      # repeat per nginx process, or:
+for p in $(pgrep -f 'nginx: master'); do echo "$p: $(cat /proc/$p/oom_score_adj)"; done</pre>
+<pre class="out">14231: <b>-997</b>       ← the Guaranteed pod's nginx
+14780: <b>1000</b>       ← the BestEffort pod's nginx
+15012: 968        ← Burstable: scaled by its memory request</pre></li>
+<li>Prove one container can spoil Guaranteed: edit qos-g's clone to drop the cpu limit and re-check — it derives Burstable. Clean up: <pre class="cmd">k delete pod qos-g qos-b qos-be $now</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">k get pods -A -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass | grep -c Guaranteed</pre>
+<pre class="out">(nonzero — note which kube-system pods earn Guaranteed and which only Burstable)</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>Guaranteed requires requests == limits for <strong>both resources in every container</strong> — one missing cpu limit anywhere demotes the whole pod to Burstable, silently. QoS is immutable after creation (it's derived from an immutable spec). And "Guaranteed" guarantees <em>survival priority</em>, not performance — a Guaranteed pod with a tiny cpu limit is still throttled to it (3.16).</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure Quality of Service for Pods"</strong>; <strong>"Node-pressure Eviction"</strong> has the oom_score_adj table.</p>
+</article>
+
+<article class="lesson" id="cp-3-18" data-id="w3-18">
+<div class="lesson-head"><span class="cp-id">3.18</span><h4>Two evictions that share a name: node-pressure vs API-initiated</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Pod was evicted" has two completely different diagnoses depending on <em>which machinery</em> evicted it. Telling them apart in one look is a week-6 superpower.</p>
+<h5>The concept</h5>
+<p><strong>Node-pressure eviction</strong> is the kubelet defending its node. It watches signals against thresholds — defaults: <code>memory.available &lt; 100Mi</code>, <code>nodefs.available &lt; 10%</code>, <code>imagefs.available &lt; 15%</code>, <code>nodefs.inodesFree &lt; 5%</code> — and when breached: sets a node condition (<code>MemoryPressure</code>/<code>DiskPressure</code>, mirrored as NoSchedule taints), tries to reclaim (image GC first for disk), then kills pods ranked by: usage exceeding requests? → pod priority → how far usage exceeds requests. It's a local decision: <strong>no Eviction API call, PDBs ignored</strong>, hard-threshold kills get no grace period. The corpse stays visible: <code>Failed</code> pod, reason <code>Evicted</code>. <strong>API-initiated eviction</strong> is what drain (3.15) does: an Eviction object per pod — a polite delete that <em>respects PodDisruptionBudgets</em> and full graceful termination, refused with 429 when the budget is empty.</p>
+<table>
+<tr><th></th><th>Node-pressure</th><th>API-initiated (drain/PDB)</th></tr>
+<tr><td>Who decides</td><td>kubelet, locally</td><td>API server, on an Eviction request</td></tr>
+<tr><td>Respects PDBs</td><td><b>no</b></td><td><b>yes</b> (that's its whole point)</td></tr>
+<tr><td>Grace period</td><td>none on hard thresholds</td><td>full graceful termination</td></tr>
+<tr><td>Telltale</td><td>pod Failed/<code>Evicted</code>, node condition + pressure taint, kubelet log</td><td><code>evicting pod …</code> in drain output, Eviction audit events</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your kubelet's live thresholds (they're rarely in the config file when defaulted):
+<pre class="cmd">k get --raw /api/v1/nodes/node01/proxy/configz | python3 -m json.tool | grep -A6 evictionHard</pre>
+<pre class="out">"evictionHard": {
+    "imagefs.available": "<b>15%</b>",
+    "memory.available": "<b>100Mi</b>",
+    "nodefs.available": "<b>10%</b>",
+    "nodefs.inodesFree": "5%"
+}</pre></li>
+<li>Check the pressure conditions on a healthy node — learn the healthy baseline:
+<pre class="cmd">k describe node node01 | grep -A6 'Conditions:'</pre>
+<pre class="out">Conditions:
+  Type             Status  ...  Reason                       Message
+  MemoryPressure   <b>False</b>   ...  KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     <b>False</b>   ...  KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   ...  KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    ...  KubeletReady                 kubelet is posting ready status</pre></li>
+<li>Optional (snapshot first, 0.8): induce real DiskPressure on node02 by filling <code>/</code> past 90% — <code>multipass shell node02</code>, then <code>fallocate -l &lt;size&gt;G /tmp/ballast</code> sized to cross it. Within a minute or two: condition flips, a <code>node.kubernetes.io/disk-pressure:NoSchedule</code> taint appears, and the kubelet starts image GC then evictions. <code>rm /tmp/ballast</code> to recover, and note the condition takes ~5 min to clear (eviction-pressure-transition-period).</li>
+<li>Know both signatures cold — where you'd look:
+<pre class="cmd">k get pods -A | grep -i evicted                 # node-pressure leaves Failed pods behind
+sudo journalctl -u kubelet | grep -i "eviction" # kubelet narrates its decisions</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can fill in this sentence instantly: "Evicted pods + MemoryPressure condition + no PDB involvement = <em>&lt;which machinery?&gt;</em>" (kubelet node-pressure).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Evicted pods from a Deployment are replaced (the RS makes new ones), but the Failed husks accumulate until you delete them — seeing 30 Evicted pods does <em>not</em> mean 30 are dead <em>now</em>; check timestamps. Memory-pressure eviction is the kubelet reacting in user space — under a fast memory spike the <em>kernel</em> OOM killer (3.16/3.17) fires first, and then you get exit 137 + restarts instead of Evicted pods. Different corpse, different culprit.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Node-pressure Eviction"</strong> and <strong>"API-initiated Eviction"</strong> — two pages, deliberately.</p>
+</article>
+
+<article class="lesson" id="cp-3-19" data-id="w3-19">
+<div class="lesson-head"><span class="cp-id">3.19</span><h4>Install metrics-server and understand the aggregated API it rides on</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>kubectl top</code> is your resource-troubleshooting instrument, exam included. Installing metrics-server is also the one place you'll <em>touch</em> the API aggregation layer and the front-proxy certs kubeadm generated in week 2.</p>
+<h5>The concept</h5>
+<p><code>kubectl top</code> queries <code>metrics.k8s.io</code> — an API group the apiserver doesn't implement. An <strong>APIService</strong> object tells the apiserver "delegate this group to a Service in the cluster": the apiserver <em>proxies</em> the request to the metrics-server pod, authenticating itself with the <code>front-proxy-client</code> cert (the third kubeadm CA from week 2 — this is what it exists for; metrics-server verifies it against the requestheader CA). Metrics-server, in turn, scrapes every kubelet's <code>/metrics/resource</code> endpoint on port 10250 over TLS. And there's the lab friction: kubeadm kubelets serve <strong>self-signed</strong> certs, so metrics-server can't verify them — hence the famous <code>--kubelet-insecure-tls</code> flag for labs (production fixes it properly with kubelet serving-cert rotation signed by the CA).</p>
+<div class="flow"><span>kubectl top</span><em>→</em><span>apiserver</span><em>→</em><span class="hot">APIService metrics.k8s.io → proxy w/ front-proxy cert</span><em>→</em><span>metrics-server pod</span><em>→</em><span class="hot">every kubelet :10250/metrics/resource</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install, and observe the certificate failure you now understand:
+<pre class="cmd">k apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+sleep 30; k get pods -n kube-system -l k8s-app=metrics-server
+k logs -n kube-system -l k8s-app=metrics-server --tail=2</pre>
+<pre class="out">NAME                             READY   STATUS    RESTARTS   AGE
+metrics-server-8d97c76bf-k4xlp   <b>0/1</b>     Running   0          30s
+E0711 ... scraper.go: ... Get "https://10.211.64.11:10250/metrics/resource": <b>tls: failed to verify certificate: x509: cannot validate certificate</b> for 10.211.64.11 because it doesn't contain any IP SANs</pre></li>
+<li>Add the lab flag and watch it go Ready:
+<pre class="cmd">k patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+k rollout status deployment/metrics-server -n kube-system</pre>
+<pre class="out">deployment "metrics-server" <b>successfully rolled out</b></pre></li>
+<li>Inspect the aggregation plumbing:
+<pre class="cmd">k get apiservice v1beta1.metrics.k8s.io</pre>
+<pre class="out">NAME                     SERVICE                      AVAILABLE   AGE
+v1beta1.metrics.k8s.io   <b>kube-system/metrics-server</b>   <b>True</b>        2m</pre>
+<p>SERVICE is the delegation target; <code>AVAILABLE False (MissingEndpoints)</code> here is the diagnostic when top is broken.</p></li>
+<li>Use it (give it a minute to complete a scrape cycle):
+<pre class="cmd">k top nodes; k top pods -A --sort-by=memory | head -5</pre>
+<pre class="out">NAME     CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+cp       231m         11%      1102Mi          29%
+node01   48m          2%       520Mi           13%
+node02   52m          2%       534Mi           14%
+NAMESPACE     NAME                          CPU(cores)   MEMORY(bytes)
+kube-system   etcd-cp                       28m          89Mi
+...</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">k top nodes 2&gt;&amp;1 | head -1</pre>
+<pre class="out">NAME     CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)     ← not "Metrics API not available"</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>error: Metrics API not available</code> right after a successful install just means no scrape has completed — wait 60s before debugging. The exam cluster has metrics-server pre-installed — your job there is <em>using</em> <code>k top pods --sort-by=cpu|memory</code> (and knowing <code>--containers</code>), not installing it. Keep this install: 3.20 needs it.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Resource metrics pipeline"</strong>. The components.yaml URL isn't in the docs — exam tasks provide manifest URLs when needed.</p>
+</article>
+
+<article class="lesson" id="cp-3-20" data-id="w3-20">
+<div class="lesson-head"><span class="cp-id">3.20</span><h4>HPA: the control loop, the formula, and a real load test</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Create an HPA that scales deployment X between 1 and 10 replicas at 50% CPU" is a one-liner worth full points — <em>if</em> you also understand why it scales up fast, down slow, and never quite when you expect.</p>
+<h5>The concept</h5>
+<p>The HPA controller (in kube-controller-manager) wakes every <strong>15 seconds</strong>, reads pod metrics from <code>metrics.k8s.io</code> (3.19), and computes: <code>desired = ceil(current × actualUtilization / targetUtilization)</code>. Utilization is measured <em>against requests</em> — an HPA on a deployment without cpu requests fails with "missing request for cpu". A ±10% tolerance band suppresses jitter (configurable per-HPA since 1.33 via <code>spec.behavior</code> tolerance). The asymmetry is deliberate: scale-<em>up</em> acts immediately (stabilization window 0s); scale-<em>down</em> looks at the <strong>highest</strong> recommendation over a 300-second stabilization window — so load spikes are answered in seconds, but calm must persist five minutes before replicas drop. Use <code>autoscaling/v2</code> for anything YAML (v1 only does CPU).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Deploy the docs' demo app (image burns CPU per request; note it sets <code>requests.cpu: 200m</code>) and the HPA:
+<pre class="cmd">k apply -f https://k8s.io/examples/application/php-apache.yaml
+k autoscale deployment php-apache --cpu-percent=50 --min=1 --max=10
+k get hpa</pre>
+<pre class="out">NAME         REFERENCE               TARGETS       MINPODS   MAXPODS   REPLICAS
+php-apache   Deployment/php-apache   cpu: <b>0%/50%</b>   1         10        1</pre>
+<p>(<code>&lt;unknown&gt;/50%</code> that persists = metrics problem → revisit 3.19.)</p></li>
+<li>Generate load from a second terminal and watch the loop react:
+<pre class="cmd">k run load --rm -it --image=busybox --restart=Never -- /bin/sh -c 'while sleep 0.01; do wget -q -O- http://php-apache; done'
+# terminal 1:
+k get hpa php-apache -w</pre>
+<pre class="out">NAME         REFERENCE               TARGETS        MINPODS  MAXPODS  REPLICAS
+php-apache   Deployment/php-apache   cpu: <b>248%/50%</b>  1        10       1
+php-apache   Deployment/php-apache   cpu: 248%/50%  1        10       <b>5</b>
+php-apache   Deployment/php-apache   cpu: 65%/50%   1        10       5
+php-apache   Deployment/php-apache   cpu: 48%/50%   1        10       <b>7</b></pre>
+<p>Check the math against the formula: ceil(1 × 248/50) = 5. The controller did exactly that in one step.</p></li>
+<li>Stop the load (Ctrl-C in terminal 2), keep watching — and time the scale-down:
+<pre class="out">php-apache   Deployment/php-apache   cpu: <b>0%/50%</b>   1   10   7     ← load gone...
+(≈5 minutes of nothing — the stabilization window)
+php-apache   Deployment/php-apache   cpu: 0%/50%    1   10   <b>1</b>     ← then collapse</pre></li>
+<li>Read the v2 shape you'd write in YAML tasks, then clean up:
+<pre class="cmd">k get hpa php-apache -o yaml | grep -A8 'metrics:'
+k delete hpa php-apache; k delete -f https://k8s.io/examples/application/php-apache.yaml</pre>
+<pre class="out">  metrics:
+  - resource:
+      name: cpu
+      target:
+        <b>averageUtilization: 50</b>
+        type: Utilization
+    type: Resource</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You predicted the first scale-up number from the formula before the watch printed it, and the scale-down took ~5 minutes, not seconds.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>HPA and a fixed <code>replicas:</code> in your Deployment manifest fight each other — remove <code>replicas</code> from manifests once an HPA owns the count (each <code>kubectl apply</code> would reset it). HPA never scales to zero (min is 1). And it scales on <em>average</em> utilization across pods — one hot pod among ten cool ones moves nothing.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"HorizontalPodAutoscaler Walkthrough"</strong> — this lab is a compressed version of it; the php-apache YAML lives there.</p>
+</article>
+</div>
+
+<!-- ---------------- App configuration ---------------- -->
+<div class="grp" id="g-config"><h3>App configuration</h3>
+
+<article class="lesson" id="cp-3-21" data-id="w3-21">
+<div class="lesson-head"><span class="cp-id">3.21</span><h4>Consume a ConfigMap (and a Secret) all four ways</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Config plumbing appears in half the exam's workload tasks as a sub-step ("the app reads DB_HOST from the ConfigMap…"). Fluency in all four consumption shapes means these are never the part you slow down on.</p>
+<h5>The concept</h5>
+<p>A ConfigMap is just a map of strings in etcd; the four consumption paths differ in <em>who</em> injects the data and <em>when</em>: (1) <code>env.valueFrom.configMapKeyRef</code> — one key, one env var; (2) <code>envFrom.configMapRef</code> — every key becomes an env var (optionally prefixed); (3) a <code>configMap</code> volume — every key becomes a file, injected by the kubelet at mount time; (4) command/args interpolation — <code>$(VAR)</code> in <code>command:</code>/<code>args:</code> expands env vars defined by (1)/(2) at container start. Secrets mirror all four shapes with <code>secretKeyRef</code>/<code>secretRef</code>/<code>secret:</code> volumes; the only differences are base64 storage (3.23) and tmpfs-backed mounts.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create the sources (know both imperative forms cold):
+<pre class="cmd">k create configmap app-cfg --from-literal=COLOR=blue --from-literal=MODE=fast
+k create secret generic db-pass --from-literal=password=hunter2
+k describe configmap app-cfg | tail -6</pre>
+<pre class="out">Data
+====
+COLOR:
+----
+blue
+MODE:
+----
+fast</pre></li>
+<li>One pod, all four paths at once:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: consumer}
+spec:
+  restartPolicy: Never
+  volumes:
+  - name: cfg
+    configMap: {name: app-cfg}
+  containers:
+  - name: c
+    image: busybox
+    command: [sh, -c, 'echo "arg-expansion says: $(COLOR)"; env | grep -E "COLOR|CFG_|DB_"; ls /etc/cfg; cat /etc/cfg/MODE; sleep 3600']
+    env:
+    - name: COLOR                              # (1) one key → one var
+      valueFrom:
+        configMapKeyRef: {name: app-cfg, key: COLOR}
+    - name: DB_PASSWORD                        # (1) secret flavor
+      valueFrom:
+        secretKeyRef: {name: db-pass, key: password}
+    envFrom:
+    - prefix: CFG_                             # (2) all keys, prefixed
+      configMapRef: {name: app-cfg}
+    volumeMounts:
+    - {name: cfg, mountPath: /etc/cfg}         # (3) keys → files
+EOF
+sleep 8; k logs consumer</pre>
+<pre class="out">arg-expansion says: <b>blue</b>        ← (4) $(COLOR) expanded in command
+COLOR=blue
+CFG_COLOR=blue
+CFG_MODE=fast
+DB_PASSWORD=hunter2
+<b>COLOR  MODE</b>                     ← ls /etc/cfg: one file per key
+fast</pre></li>
+<li>Look at what the volume path really mounted:
+<pre class="cmd">k exec consumer -- ls -la /etc/cfg</pre>
+<pre class="out">lrwxrwxrwx  ..data -&gt; <b>..2026_07_11_10_42_18.123456789</b>
+lrwxrwxrwx  COLOR -&gt; ..data/COLOR
+lrwxrwxrwx  MODE -&gt; ..data/MODE</pre>
+<p>Symlinks into a timestamped directory — remember this for 3.22; it's the whole update story.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The pod log shows the same value arriving via all four paths, and you can scaffold path (1) and (3) from memory (<code>k explain pod.spec.containers.env.valueFrom --recursive</code> when stuck).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Referencing a missing ConfigMap key in <code>valueFrom</code> keeps the pod in <code>CreateContainerConfigError</code> — the events name the missing key; a missing <em>volume</em> ConfigMap holds the pod in <code>ContainerCreating</code> instead. Different stall, same root cause family. <code>$(VAR)</code> expansion is Kubernetes, not shell — it only sees env vars declared in the manifest, and an undefined <code>$(TYPO)</code> is passed through literally.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure a Pod to Use a ConfigMap"</strong> — all four shapes are copyable from this one task page. Also <strong>"Distribute Credentials Securely Using Secrets"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-3-22" data-id="w3-22">
+<div class="lesson-head"><span class="cp-id">3.22</span><h4>Update propagation: volumes update, env never, subPath never</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"I changed the ConfigMap, why does my app still use the old config?" is both a real-life classic and prime exam-trap material. The answer is mechanical, not mysterious.</p>
+<h5>The concept</h5>
+<p>Three rules, all consequences of 3.21's symlink discovery. <strong>Mounted ConfigMaps/Secrets update live</strong>: the kubelet periodically re-syncs, writes new contents into a fresh timestamped directory, and flips the <code>..data</code> symlink <strong>atomically</strong> — consumers never see half-written files, and the change lands within about a minute (kubelet sync period + cache). <strong>Env vars never update</strong>: they were baked into the container's process environment at <em>container creation</em>; only a restart re-reads them. <strong>subPath mounts never update</strong>: <code>subPath: COLOR</code> bind-mounts the file <em>directly</em>, bypassing the <code>..data</code> symlink — the bind mount keeps pointing at the old timestamped directory forever. The idiomatic escape hatches: <code>kubectl rollout restart</code> after config changes, or Kustomize's <code>configMapGenerator</code> (3.26), which renames the ConfigMap on every content change so a rollout happens by construction.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Using the <code>consumer</code> pod from 3.21 (recreate it if gone), change the source:
+<pre class="cmd">k patch configmap app-cfg -p '{"data":{"MODE":"turbo"}}'
+sleep 70; k exec consumer -- cat /etc/cfg/MODE; k exec consumer -- sh -c 'echo $CFG_MODE'</pre>
+<pre class="out"><b>turbo</b>      ← the mounted file updated (watch the ..data timestamp change too)
+<b>fast</b>       ← the env var never will</pre></li>
+<li>Prove the subPath freeze — a pod mounting one key via subPath:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: subpather}
+spec:
+  volumes:
+  - name: cfg
+    configMap: {name: app-cfg}
+  containers:
+  - name: c
+    image: busybox
+    command: [sleep, "3600"]
+    volumeMounts:
+    - {name: cfg, mountPath: /etc/mode, subPath: MODE}
+EOF
+sleep 8; k exec subpather -- cat /etc/mode
+k patch configmap app-cfg -p '{"data":{"MODE":"ludicrous"}}'
+sleep 90; k exec subpather -- cat /etc/mode; k exec consumer -- cat /etc/cfg/MODE</pre>
+<pre class="out">turbo
+<b>turbo</b>          ← subPath: frozen at mount time, forever
+<b>ludicrous</b>      ← the normal mount moved on</pre></li>
+<li>The universal fix, worth typing until automatic:
+<pre class="cmd">k rollout restart deployment &lt;name&gt;     # for anything deployment-managed
+k delete pod consumer subpather $now    # (our bare pods: just recreate; also cleans up)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You watched the same edit reach the volume mount, skip the env var, and skip the subPath mount — and you can explain each via the <code>..data</code> symlink mechanism.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A ConfigMap with <code>immutable: true</code> never propagates <em>by design</em> (and the kubelet stops watching it — a scalability feature); to change it you must create a new one. Update latency is "eventually, ≤ ~1 min" — an exam-lab check 5 seconds after the edit will mislead you into thinking propagation is broken. And remember the direction of the trap: it's never "volumes are stale", it's always env or subPath.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"ConfigMaps"</strong> § Mounted ConfigMaps are updated automatically (the subPath exception is stated right there).</p>
+</article>
+
+<article class="lesson" id="cp-3-23" data-id="w3-23">
+<div class="lesson-head"><span class="cp-id">3.23</span><h4>Secrets are base64, not encryption — and what encryption at rest actually is</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The exam expects sober knowledge here: create and consume Secrets fast, know exactly what security they do <em>not</em> provide, and recognize the EncryptionConfiguration shape when a task or troubleshooting scenario shows it.</p>
+<h5>The concept</h5>
+<p>Base64 is an <em>encoding</em> — a reversible representation for arbitrary bytes, zero secrecy. By default a Secret sits in etcd as a plain protobuf record containing those bytes: anyone with etcd access (or a copy of your week-2 snapshot!) reads every secret in the cluster. Real protections are: RBAC on the Secrets API, filesystem protection of etcd, and <strong>encryption at rest</strong> — an apiserver-side layer configured by an <code>EncryptionConfiguration</code> file passed via <code>--encryption-provider-config</code>. It lists resources and an ordered list of providers (<code>aescbc</code>, <code>secretbox</code>, <code>kms</code>, or <code>identity</code> = plaintext): the <strong>first provider encrypts all new writes; the rest can only decrypt existing data</strong>. Existing objects stay in their old form until rewritten — which is why enabling encryption ends with a mass rewrite command.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Decode a secret two ways — both trivially:
+<pre class="cmd">k get secret db-pass -o jsonpath='{.data.password}'
+echo; k get secret db-pass -o jsonpath='{.data.password}' | base64 -d; echo</pre>
+<pre class="out">aHVudGVyMg==
+<b>hunter2</b></pre></li>
+<li>Read it straight from etcd (on <code>cp</code>, using week 2's etcdctl invocation) — no Kubernetes credentials involved:
+<pre class="cmd">sudo ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/default/db-pass | strings | grep -A1 password</pre>
+<pre class="out">password
+<b>hunter2</b>      ← plaintext on disk. Your etcd snapshot from 2.20 contains this too.</pre></li>
+<li>Skim the fix — read this shape until you could recognize a broken one (a wrong key or missing file here is a "apiserver won't start" fault in week 6):
+<pre class="cmd">cat &lt;&lt;'EOF'   # /etc/kubernetes/enc/enc.yaml on cp, referenced by --encryption-provider-config
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources: [secrets]
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: &lt;base64 of 32 random bytes&gt;   # head -c32 /dev/urandom | base64
+  - identity: {}    # still able to READ old plaintext data during migration
+EOF</pre></li>
+<li>Optional full drill (snapshot first — an error here stops the apiserver): create the file, mount its directory into the kube-apiserver static pod, add the flag, wait for restart, then re-encrypt everything already stored and re-run step 2 — the value now reads as <code>k8s:enc:aescbc:v1:key1:&lt;ciphertext&gt;</code>:
+<pre class="cmd">k get secrets -A -o json | k replace -f -</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can state the order rule from memory: first provider = write format; <code>identity</code> first means "writes are plaintext" no matter what else is listed.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>stringData:</code> (write plaintext, apiserver encodes) vs <code>data:</code> (you must pre-encode) — mixing them up produces double-encoded garbage. When encrypting <code>echo -n</code> matters: <code>echo secret | base64</code> smuggles a newline into the password. And encryption at rest protects <em>etcd's disk</em>, not the API: anyone RBAC-allowed to <code>get secrets</code> still sees plaintext — that's the correct behavior, not a bug.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Secrets"</strong> (concept) and <strong>"Encrypt Confidential Data at Rest"</strong> (the full migration procedure lives there — never do it from memory).</p>
+</article>
+</div>
+
+<!-- ---------------- Helm & Kustomize ---------------- -->
+<div class="grp" id="g-helm"><h3>Helm &amp; Kustomize</h3>
+
+<article class="lesson" id="cp-3-24" data-id="w3-24">
+<div class="lesson-head"><span class="cp-id">3.24</span><h4>The Helm command set, drilled on a real chart</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Helm is explicitly in the post-2025 curriculum, and <code>helm.sh/docs</code> is one of your three allowed doc sites. The exam expects operational fluency: install, override, upgrade, roll back — not chart authoring.</p>
+<h5>The concept</h5>
+<p>Helm 3 has <strong>no cluster-side component</strong> (Tiller died with v2): the client renders a chart's Go templates against values locally and applies the result. A <strong>chart</strong> is the package, a <strong>release</strong> is one named installation of it, and release state lives <em>in the cluster</em> as Secrets named <code>sh.helm.release.v1.&lt;release&gt;.v&lt;N&gt;</code> in the release's namespace — one Secret per revision; that's the entire mechanism behind <code>history</code> and <code>rollback</code>. Values flow lowest-to-highest precedence: chart defaults → <code>-f values.yaml</code> → <code>--set key=value</code>. <code>helm template</code> renders without touching the cluster — your "what would this actually create?" debugger.</p>
+<table>
+<tr><th>Command</th><th>Purpose</th></tr>
+<tr><td><code>helm repo add &lt;name&gt; &lt;url&gt;</code> / <code>repo update</code></td><td>register a chart source / refresh its index</td></tr>
+<tr><td><code>helm search repo &lt;term&gt; [--versions]</code></td><td>find charts and versions in added repos</td></tr>
+<tr><td><code>helm install &lt;release&gt; &lt;repo/chart&gt; [-n ns --create-namespace]</code></td><td>new release</td></tr>
+<tr><td><code>helm upgrade &lt;release&gt; &lt;repo/chart&gt; [--install]</code></td><td>new revision (<code>--install</code>: install if absent)</td></tr>
+<tr><td><code>helm list -A</code> / <code>history</code> / <code>status</code> / <code>get values</code></td><td>what's installed, its revisions, its overrides</td></tr>
+<tr><td><code>helm rollback &lt;release&gt; [rev]</code> / <code>uninstall</code></td><td>re-apply an old revision's manifests / remove</td></tr>
+<tr><td><code>helm template</code> / <code>show values &lt;repo/chart&gt;</code></td><td>render locally / dump a chart's tunable values</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install helm on <code>cp</code> and add a small, stable chart repo:
+<pre class="cmd">curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm repo add podinfo https://stefanprodan.github.io/podinfo
+helm repo update &amp;&amp; helm search repo podinfo</pre>
+<pre class="out">NAME              CHART VERSION   APP VERSION   DESCRIPTION
+podinfo/podinfo   6.9.x           6.9.x         Podinfo Helm chart for Kubernetes</pre></li>
+<li>Preview, then install with an override:
+<pre class="cmd">helm show values podinfo/podinfo | grep -m1 replicaCount
+helm install demo podinfo/podinfo --set replicaCount=2
+helm list; k get pods -l app.kubernetes.io/name=podinfo</pre>
+<pre class="out">replicaCount: 1
+NAME   NAMESPACE   REVISION   STATUS     CHART           APP VERSION
+demo   default     <b>1</b>          deployed   podinfo-6.9.x   6.9.x
+NAME                    READY   STATUS    RESTARTS   AGE
+demo-podinfo-...        1/1     Running   0          30s
+demo-podinfo-...        1/1     Running   0          30s     ← the override took</pre></li>
+<li>Upgrade (new revision), inspect state, roll back:
+<pre class="cmd">helm upgrade demo podinfo/podinfo --set replicaCount=3 --set ui.color="#dc2626"
+helm history demo
+k get secrets | grep sh.helm</pre>
+<pre class="out">REVISION   STATUS       CHART           DESCRIPTION
+1          superseded   podinfo-6.9.x   Install complete
+<b>2          deployed</b>     podinfo-6.9.x   Upgrade complete
+sh.helm.release.v1.demo.<b>v1</b>   helm.sh/release.v1   1      3m
+sh.helm.release.v1.demo.<b>v2</b>   helm.sh/release.v1   1      20s   ← history IS these secrets</pre>
+<pre class="cmd">helm rollback demo 1 &amp;&amp; helm history demo | tail -1; helm get values demo</pre>
+<pre class="out">3          deployed     podinfo-6.9.x   <b>Rollback to 1</b>
+replicaCount: <b>2</b>          ← revision-1 values are back (rollback = new revision, old content)</pre></li>
+<li>Render without installing, then uninstall:
+<pre class="cmd">helm template demo podinfo/podinfo --set replicaCount=5 | grep -B2 'replicas:'
+helm uninstall demo</pre>
+<pre class="out">kind: Deployment
+...
+  replicas: <b>5</b>       ← rendered locally; the cluster was never touched
+release "demo" uninstalled</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>helm history demo</code> (before uninstall) told the whole story — install, upgrade, rollback-as-revision-3 — and you found the matching <code>sh.helm.release.v1</code> Secrets.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The big one: <code>helm upgrade</code> <em>without</em> repeating your <code>--set</code>/<code>-f</code> flags <strong>reverts those values to chart defaults</strong> — an upgrade is a fresh render, not a patch (mitigate with <code>--reuse-values</code>, or keep a values.yaml and always pass it). <code>helm list</code> shows nothing? You're in the wrong namespace — releases are namespaced; use <code>-A</code>. And <code>helm search repo</code> searches repos you've added, not the internet — <code>hub</code> searches Artifact Hub.</p>
+<h5>Docs</h5>
+<p class="docs-links"><code>helm.sh/docs</code> is exam-allowed: <strong>"Using Helm"</strong> covers this entire lesson; <strong>"Helm Commands"</strong> is the flag reference.</p>
+</article>
+
+<article class="lesson" id="cp-3-25" data-id="w3-25">
+<div class="lesson-head"><span class="cp-id">3.25</span><h4>Install something real: ingress-nginx via Helm, override → upgrade → roll back</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The exam's Helm task is likely exactly this shape: "install/upgrade chart X in namespace Y with value Z". Bonus: the ingress controller you install here is the one week 4's Ingress lessons run against — leave it installed.</p>
+<h5>The concept</h5>
+<p>Everything from 3.24 plus the two realities of installing an ingress controller in a bare-metal lab: charts of real infrastructure have <em>hundreds</em> of values, so you navigate with <code>helm show values | grep</code> rather than reading; and the chart's default Service type <code>LoadBalancer</code> stays <code>&lt;pending&gt;</code> forever outside a cloud — in the lab you switch it to <code>NodePort</code>. Value paths mirror the values.yaml tree: the Service type lives at <code>controller.service.type</code>, replica count at <code>controller.replicaCount</code>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install into its own namespace, lab-adapted:
+<pre class="cmd">helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  -n ingress-nginx --create-namespace \
+  --set controller.service.type=NodePort
+k get pods,svc -n ingress-nginx</pre>
+<pre class="out">NAME                                            READY   STATUS    RESTARTS   AGE
+pod/ingress-nginx-controller-7d56c...           1/1     Running   0          60s
+NAME                                         TYPE       CLUSTER-IP     PORT(S)
+service/ingress-nginx-controller             <b>NodePort</b>   10.104.18.9    80:<b>31234</b>/TCP,443:32001/TCP
+service/ingress-nginx-controller-admission   ClusterIP  10.99.201.44   443/TCP</pre></li>
+<li>Prove it answers (404 from nginx = the controller is alive, no routes yet):
+<pre class="cmd">curl -s http://node01:31234   # your NodePort from above</pre>
+<pre class="out">&lt;html&gt;...&lt;center&gt;<b>404 Not Found</b>&lt;/center&gt;...<b>nginx</b>...</pre></li>
+<li>Upgrade with a new override — note the gotcha from 3.24 in action: repeat the old value or lose it:
+<pre class="cmd">helm upgrade ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx \
+  --set controller.service.type=NodePort \
+  --set controller.replicaCount=2
+k get pods -n ingress-nginx | grep controller; helm history ingress-nginx -n ingress-nginx</pre>
+<pre class="out">ingress-nginx-controller-7d56c...   1/1   Running   0     5m
+ingress-nginx-controller-9f82b...   1/1   Running   0     30s   ← now 2
+REVISION   STATUS       DESCRIPTION
+1          superseded   Install complete
+<b>2          deployed     Upgrade complete</b></pre></li>
+<li>Roll back to one replica and verify both ways:
+<pre class="cmd">helm rollback ingress-nginx 1 -n ingress-nginx
+sleep 15; k get pods -n ingress-nginx | grep -c controller
+helm get values ingress-nginx -n ingress-nginx</pre>
+<pre class="out">1
+controller:
+  <b>replicaCount is gone</b>; service.type: NodePort remains   ← revision 1's values exactly</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">helm list -n ingress-nginx; curl -s -o /dev/null -w '%{http_code}\n' http://node01:31234</pre>
+<pre class="out">NAME            NAMESPACE       REVISION   STATUS     CHART
+ingress-nginx   ingress-nginx   3          <b>deployed</b>   ingress-nginx-4.x.x
+404</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>Forgetting <code>-n ingress-nginx</code> on <em>every</em> subsequent helm command is the time sink here — releases are invisible from the wrong namespace. If a task gives you a specific chart <em>version</em>, that's <code>--version 4.11.2</code> on install/upgrade (chart version, not app version). Keep this release installed: week 4 needs a running ingress controller.</p>
+<h5>Docs</h5>
+<p class="docs-links">Chart-specific values aren't in the docs sites — <code>helm show values</code> <em>is</em> the documentation. For flags: <code>helm.sh/docs</code> → "Helm Install/Upgrade/Rollback".</p>
+</article>
+
+<article class="lesson" id="cp-3-26" data-id="w3-26">
+<div class="lesson-head"><span class="cp-id">3.26</span><h4>Kustomize: a base, an overlay, and kubectl apply -k</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Kustomize is the curriculum's other config tool, and it's built into kubectl — no install, just <code>-k</code>. The exam shape: "apply this kustomization" or "make overlay X change image/replicas/namespace".</p>
+<h5>The concept</h5>
+<p>Where Helm templates text, Kustomize <strong>transforms objects</strong>: a <code>kustomization.yaml</code> names input <code>resources</code> and a pipeline of declarative transformations — no variables, no template syntax, plain YAML in and out. A <strong>base</strong> is a self-contained kustomization; an <strong>overlay</strong> is another kustomization that imports it (<code>resources: [../../base]</code>) and layers changes: cross-cutting fields (<code>namespace</code>, <code>namePrefix</code>, <code>commonLabels</code>), targeted <code>patches</code> (strategic-merge or JSON6902, auto-detected), and dedicated transformers like <code>images</code> (retag without touching manifests) and <code>replicas</code>. Note for old study material: <code>patchesStrategicMerge:</code> is deprecated since kustomize v5 — write <code>patches:</code>. The one generator worth knowing: <code>configMapGenerator</code> creates ConfigMaps with a <strong>content-hash suffix</strong> in the name and rewrites all references — changed config = new name = automatic rollout, the designed fix for 3.22's frozen env vars.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the base:
+<pre class="cmd">mkdir -p ~/kapp/base ~/kapp/overlays/prod
+cat &lt;&lt;'EOF' &gt; ~/kapp/base/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      containers: [{name: nginx, image: nginx:1.27}]
+EOF
+cat &lt;&lt;'EOF' &gt; ~/kapp/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- deployment.yaml
+EOF</pre></li>
+<li>Build the prod overlay — namespace, name prefix, a strategic-merge patch, an image retag:
+<pre class="cmd">cat &lt;&lt;'EOF' &gt; ~/kapp/overlays/prod/replicas.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web}
+spec:
+  replicas: 4
+EOF
+cat &lt;&lt;'EOF' &gt; ~/kapp/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base
+namespace: prod
+namePrefix: prod-
+patches:
+- path: replicas.yaml
+images:
+- name: nginx
+  newTag: "1.29"
+EOF</pre></li>
+<li>Render first (always), then apply:
+<pre class="cmd">k kustomize ~/kapp/overlays/prod</pre>
+<pre class="out">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: <b>prod-web</b>
+  namespace: <b>prod</b>
+spec:
+  replicas: <b>4</b>
+  ...
+      containers:
+      - image: nginx:<b>1.29</b></pre>
+<pre class="cmd">k create namespace prod
+k apply -k ~/kapp/overlays/prod
+k get deploy -n prod</pre>
+<pre class="out">NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+prod-web   4/4     4            4           30s</pre>
+<p>All four transformations landed; the base directory was never edited.</p></li>
+<li>See configMapGenerator close the 3.22 loop:
+<pre class="cmd">cd ~/kapp/overlays/prod
+cat &lt;&lt;'EOF' &gt;&gt; kustomization.yaml
+configMapGenerator:
+- name: web-cfg
+  literals: [MODE=fast]
+EOF
+k kustomize . | grep -m1 'name: prod-web-cfg'</pre>
+<pre class="out">  name: prod-web-cfg-<b>7g2ff8b5m4</b>     ← content hash in the name; change MODE and it changes</pre></li>
+<li>Clean up: <pre class="cmd">k delete ns prod</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>k kustomize</code> output matched all four expectations <em>before</em> you applied, and <code>k get deploy -n prod</code> confirmed after.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>kubectl apply -k dir/</code> takes the <em>directory</em> (containing kustomization.yaml), not the file — <code>-f</code> with a kustomization.yaml is a different, wrong thing. <code>namespace:</code> in the kustomization doesn't create the namespace. And name-reference rewriting only works for references Kustomize understands — a name mentioned inside a container's <code>args</code> string won't be rewritten when <code>namePrefix</code> or the generator hash renames the object.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Declarative Management of Kubernetes Objects Using Kustomize"</strong> — the kubernetes.io page with every field used here (exam-allowed, unlike kubectl.docs.kubernetes.io).</p>
+</article>
+
+<article class="lesson" id="cp-3-27" data-id="w3-27">
+<div class="lesson-head"><span class="cp-id">3.27</span><h4>CRDs &amp; operators: install one, inspect it, recognize the pattern</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Custom Resource Definitions and operators" is a named 2025-revision curriculum bullet at the <em>understand and use</em> level: install an operator, find its CRDs, create a custom resource — not write controllers.</p>
+<h5>The concept</h5>
+<p>A <strong>CRD</strong> teaches the apiserver a new resource type: post one CustomResourceDefinition and the API instantly grows endpoints for it — storage in etcd, RBAC, <code>kubectl get</code>, even <code>explain</code> (CRDs carry an OpenAPI schema) — with <em>zero behavior</em>. Behavior comes from a <strong>controller</strong> watching those objects and reconciling the world toward them; an <strong>operator</strong> is just the bundle: CRDs + a controller Deployment, usually installed from one manifest or Helm chart. The punchline of the whole track: this is <em>exactly</em> the architecture you learned in week 1 — Deployment + deployment-controller and Certificate + cert-manager are the same watch/reconcile loop, one built-in, one installed. The API machinery is uniform; that's why kubectl works on resources that didn't exist yesterday.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install cert-manager (a real operator, and week-4-adjacent):
+<pre class="cmd">k apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+k get pods -n cert-manager</pre>
+<pre class="out">NAME                                       READY   STATUS    RESTARTS   AGE
+cert-manager-5f6b885b4-tkwmc               1/1     Running   0          60s
+cert-manager-cainjector-...                1/1     Running   0          60s
+cert-manager-webhook-...                   1/1     Running   0          60s</pre></li>
+<li>Find what it taught the API:
+<pre class="cmd">k get crd | grep cert-manager | head -4
+k api-resources | grep cert-manager | head -4
+k explain certificate.spec | head -12</pre>
+<pre class="out">certificaterequests.cert-manager.io    2026-07-11T...
+certificates.cert-manager.io           2026-07-11T...
+challenges.acme.cert-manager.io        2026-07-11T...
+clusterissuers.cert-manager.io         2026-07-11T...
+certificates    cert    cert-manager.io/v1    true    Certificate
+...
+KIND:       Certificate
+VERSION:    cert-manager.io/v1
+FIELD: spec ...
+     Desired state of the Certificate resource.   ← explain works: the CRD ships a schema</pre></li>
+<li>Create custom resources and watch the reconcile loop do real work:
+<pre class="cmd">cat &lt;&lt;'EOF' | k apply -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: selfsigned, namespace: default}
+spec: {selfSigned: {}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: demo-cert, namespace: default}
+spec:
+  secretName: demo-cert-tls
+  issuerRef: {name: selfsigned}
+  dnsNames: [demo.example.internal]
+EOF
+sleep 10; k get certificate; k get secret demo-cert-tls</pre>
+<pre class="out">NAME        READY   SECRET          AGE
+demo-cert   <b>True</b>    demo-cert-tls   10s
+NAME            TYPE                DATA   AGE
+demo-cert-tls   <b>kubernetes.io/tls</b>   3      8s</pre>
+<p>You wrote desired state (a Certificate); a controller you installed noticed and made reality match (a signed keypair in a Secret) and wrote status back (<code>READY True</code>). Same loop as 1.16, different author.</p></li>
+<li>Say the answer to "how would you find all custom resources in a cluster?" out loud, then run it:
+<pre class="cmd">k api-resources --api-group='' --no-headers | wc -l   # core is what's built-in...
+k get crd | wc -l                                     # ...CRDs are everything taught later</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">k get certificate demo-cert -o jsonpath='{.status.conditions[0].type}={.status.conditions[0].status}{"\n"}'</pre>
+<pre class="out">Ready=<b>True</b></pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>CRD names are always plural.group (<code>certificates.cert-manager.io</code>) — that full string is what <code>k get crd &lt;name&gt;</code> wants. Deleting a CRD deletes <strong>every instance</strong> of that resource cluster-wide, instantly — treat it like dropping a database table. If a CR apply fails with "no matches for kind", the CRD isn't installed (or the apiVersion group/version is wrong) — check <code>k api-resources | grep &lt;kind&gt;</code> first.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Custom Resources"</strong> (concept) and <strong>"Extend the Kubernetes API with CustomResourceDefinitions"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>Week 3 recall quiz</h3>
+<p>Answer out loud before revealing. If any answer surprises you, redo that lesson's lab.</p>
+<ol>
+<li>A pod shows <code>CrashLoopBackOff</code>. What is its <em>phase</em>, and where exactly does that string live in the status YAML?
+<details class="reveal"><summary>Answer</summary><p>Phase is <strong>Running</strong> (restarting counts). The string is a container <em>Waiting reason</em>: <code>.status.containerStatuses[].state.waiting.reason</code>. Phases, container states and conditions are three separate vocabularies (3.1).</p></details></li>
+<li>What single field turns an init container into a sidecar, and in what order do sidecars stop at pod shutdown?
+<details class="reveal"><summary>Answer</summary><p><code>restartPolicy: Always</code> on an <code>initContainers</code> entry (the only value allowed there; GA in v1.33). At shutdown they stop <strong>after</strong> the main containers, in reverse start order — so a log shipper sees the app's final output (3.3).</p></details></li>
+<li>Failing readiness probe vs failing liveness probe — give the observable signature of each.
+<details class="reveal"><summary>Answer</summary><p>Readiness: READY 0/1, <strong>zero restarts</strong>, pod IP removed from Service EndpointSlices. Liveness: <strong>RESTARTS climbing</strong> (kubelet kills, restartPolicy restarts). Overloaded apps need readiness (shed traffic), never liveness (restart storm) (3.4).</p></details></li>
+<li>Why does a container whose entrypoint is <code>sh -c "myapp"</code> typically take exactly 30 seconds to terminate, and with what exit code?
+<details class="reveal"><summary>Answer</summary><p>PID 1 is <code>sh</code>, which doesn't forward SIGTERM and, as PID 1, ignores unhandled signals — so nothing reacts until the grace period (default 30s) expires and the kubelet sends SIGKILL: exit code <strong>137</strong> (128+9) (3.5).</p></details></li>
+<li>What three places carry the <code>pod-template-hash</code>, and what does a rollback actually do?
+<details class="reveal"><summary>Answer</summary><p>The ReplicaSet's name suffix, its selector, and the pods' labels — preventing RSes from adopting each other's pods. Rollback copies an old (retained, scaled-to-0) RS's template back into the Deployment, scaling that RS up again under a <strong>new</strong> revision number (3.6, 3.8).</p></details></li>
+<li>A 6-replica deployment rolls with default strategy. Maximum total pods, minimum ready pods, and the rounding rule?
+<details class="reveal"><summary>Answer</summary><p>maxSurge 25% of 6 = 1.5, rounded <strong>up</strong> → 2 → max 8 total. maxUnavailable 25% = 1.5, rounded <strong>down</strong> → 1 → min 5 ready (3.7).</p></details></li>
+<li>NoSchedule vs NoExecute — and why do pods on an unreachable node move only after ~5 minutes?
+<details class="reveal"><summary>Answer</summary><p>NoSchedule filters new placements only; <strong>NoExecute also evicts running pods</strong> that don't tolerate it. Dead nodes get <code>node.kubernetes.io/unreachable:NoExecute</code>, and every pod carries an automatic toleration for it with <code>tolerationSeconds: 300</code> — hence the 5-minute delay (3.11).</p></details></li>
+<li>Define <code>topologyKey</code> in one sentence, and say what <code>topologyKey: kubernetes.io/hostname</code> means for anti-affinity.
+<details class="reveal"><summary>Answer</summary><p>The node label whose <em>value</em> defines what counts as one bucket. With hostname, every node is its own bucket, so anti-affinity means "never two matching pods on the same node" (3.13).</p></details></li>
+<li>Requests vs limits: name the cgroup mechanism behind each, and the two opposite failure symptoms.
+<details class="reveal"><summary>Answer</summary><p>requests.cpu → <code>cpu.weight</code> (share under contention) and scheduler bookkeeping only; limits.cpu → <code>cpu.max</code> CFS quota → <strong>throttling</strong> (slow, zero restarts, nr_throttled climbing); limits.memory → <code>memory.max</code> → kernel <strong>OOM kill</strong> (exit 137, OOMKilled, restarts). CPU over = slow; memory over = dead (3.16).</p></details></li>
+<li>Derive the QoS class: a pod with one container that sets <code>requests.memory = limits.memory</code> but no CPU values at all.
+<details class="reveal"><summary>Answer</summary><p><strong>Burstable</strong>. Guaranteed requires requests == limits for <em>both</em> cpu and memory in <em>every</em> container. Derived, never declared: read it at <code>.status.qosClass</code> (3.17).</p></details></li>
+<li>You find pods with status <code>Evicted</code> and the node has a <code>MemoryPressure</code> condition. Which eviction machinery was it, and did PDBs apply?
+<details class="reveal"><summary>Answer</summary><p>Kubelet <strong>node-pressure eviction</strong> — a local decision against thresholds (memory.available &lt; 100Mi etc.). <strong>PDBs did not apply</strong>; they only bind API-initiated eviction (drain). Hard-threshold kills also skip the grace period (3.18).</p></details></li>
+<li>An HPA targets 50% CPU; one pod currently averages 240%. How many replicas next, and why does scale-<em>down</em> take ~5 minutes?
+<details class="reveal"><summary>Answer</summary><p>desired = ceil(1 × 240/50) = <strong>5</strong>, applied on the next 15-second loop. Scale-down uses the highest recommendation over a 300s stabilization window, so calm must persist five minutes (3.20).</p></details></li>
+<li>You edit a ConfigMap. Which consumers see the change, and which never will?
+<details class="reveal"><summary>Answer</summary><p>Volume mounts update within ~a minute via the atomic <code>..data</code> symlink flip. Env vars <strong>never</strong> (baked at container creation) and <code>subPath</code> mounts <strong>never</strong> (bind-mounted past the symlink). Fixes: <code>rollout restart</code>, or Kustomize's configMapGenerator hash-rename (3.22, 3.26).</p></details></li>
+<li>Where does Helm store release history, and what's the classic <code>helm upgrade</code> value-loss trap?
+<details class="reveal"><summary>Answer</summary><p>As Secrets named <code>sh.helm.release.v1.&lt;release&gt;.v&lt;N&gt;</code> in the release namespace — one per revision; rollback re-applies one. Upgrading without repeating <code>--set</code>/<code>-f</code> reverts those values to chart defaults (fresh render, not a patch) — repeat them or use <code>--reuse-values</code> (3.24, 3.25).</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="w2.html">← Week 2 · kubeadm &amp; PKI</a><a href="../index.html#w4">Week 4 on the tracker →</a></nav>
+
+<footer>
+Authored against Kubernetes v1.35 (current exam version) and the post-Feb-2025 CKA curriculum. Chart and app versions (podinfo, ingress-nginx, cert-manager) float — outputs show the pattern, your versions will differ. Output is abridged; hashes, IPs and ages will differ on your cluster.
+</footer>
+
+
+
+
+
+
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>

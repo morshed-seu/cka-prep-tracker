@@ -11,8 +11,8 @@ The full approved plan is in [`docs/PLAN.md`](docs/PLAN.md). Decisions already m
 | P0 | Scaffolding: site.css, lesson.js, 📖 links, check scripts | ✅ done (`5877d46`) |
 | P1 | materials/w0.html + w1.html | ✅ done (`02c3276`) |
 | P2 | materials/w2.html (kubeadm/PKI/lifecycle) + cheatsheets/etcd-card.html | ✅ done |
-| P3 | materials/w3.html (workloads/scheduling/Helm/Kustomize) | ⬜ next |
-| P4 | materials/w4.html (networking; heaviest diagrams) | ⬜ |
+| P3 | materials/w3.html (workloads/scheduling/Helm/Kustomize) | ✅ done |
+| P4 | materials/w4.html (networking; heaviest diagrams) | ⬜ next |
 | P5 | materials/w5.html (storage/CSI) | ⬜ |
 | P6 | materials/w6.html + labs/faults/*.sh + cheatsheets/triage-template.html | ⬜ |
 | P7 | materials/w7.html (RBAC/auth/speed) + cheatsheets/commands.html | ⬜ |
