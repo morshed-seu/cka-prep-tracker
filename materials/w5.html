@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CKA prep Week 5 lessons: volumes, PV/PVC binding internals, StorageClasses and dynamic provisioning, CSI architecture — with exact commands and expected output.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>W5 · Storage — CKA Prep Lessons</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>week 5 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="w0.html">W0 · Setup</a></li>
+    <li><a href="w1.html">W1 · Control plane</a></li>
+    <li><a href="w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="w3.html">W3 · Workloads</a></li>
+    <li><a href="w4.html">W4 · Networking</a></li>
+    <li><a href="w5.html">W5 · Storage</a></li>
+    <li><a href="../cheatsheets/etcd-card.html">Cheat sheet · etcd card</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../index.html#w5">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>Week 5 — Storage: PVs, PVCs &amp; CSI</h1>
+  <p>Storage is the smallest exam domain and the most mechanical — one control loop (binding), one call sequence (CSI), a handful of YAML shapes. This week you watch the PV controller match and bind claims, install two real dynamic provisioners, trace a volume from API object to a mount on a node's disk, and collect the exact error signatures for every way a claim can get stuck. By Friday a storage task should feel like filling in a form. Ticking <em>done</em> here also ticks the tracker.</p>
+  <div class="flow"><span>ephemeral volumes</span><em>→</em><span>PV / PVC binding</span><em>→</em><span>StorageClasses</span><em>→</em><span>dynamic provisioning</span><em>→</em><span>CSI machinery</span></div>
+</header>
+
+<!-- ---------------- Volume fundamentals ---------------- -->
+<div class="grp" id="g-fundamentals"><h3>Volume fundamentals</h3>
+
+<article class="lesson" id="cp-5-1" data-id="w5-1">
+<div class="lesson-head"><span class="cp-id">5.1</span><h4>The ephemeral volumes, cold: emptyDir, hostPath, and the config projections</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Most exam volume work isn't persistent at all — it's "add a scratch volume", "mount this ConfigMap at /etc/app", "share a dir between two containers". These are two-minute tasks if the shapes are memorized, and one of them (<code>medium: Memory</code>) hides a genuine trap.</p>
+<h5>The concept</h5>
+<p>An ephemeral volume lives and dies with its <em>pod</em> — which is longer than a <em>container</em>: containers restart in place, and the volume survives every restart. Only deleting or rescheduling the pod loses the data.</p>
+<table>
+<tr><th>Type</th><th>What it is</th><th>The thing to remember</th></tr>
+<tr><td><code>emptyDir</code></td><td>Fresh empty dir on the node, created when the pod starts</td><td>Survives container restarts, dies with the pod. Shared by all containers that mount it — the standard sidecar handoff.</td></tr>
+<tr><td><code>emptyDir</code> + <code>medium: Memory</code></td><td>tmpfs (RAM-backed)</td><td>Every byte written <strong>counts against the container's memory limit</strong> — a full tmpfs can OOM-kill the pod.</td></tr>
+<tr><td><code>hostPath</code></td><td>A directory that already exists on whatever node the pod lands on</td><td>Data does <em>not</em> follow the pod: reschedule to another node and the path is empty (or different). It's a node inspection tool, not storage.</td></tr>
+<tr><td><code>configMap</code> / <code>secret</code></td><td>Keys projected as read-only files</td><td>Updates propagate to the mounted files (kubelet sync, up to ~a minute) — <em>except</em> through a <code>subPath</code> mount, which never updates.</td></tr>
+<tr><td><code>downwardAPI</code></td><td>Pod metadata (labels, annotations, resources) as files</td><td>How an app learns its own labels without calling the API.</td></tr>
+<tr><td><code>projected</code></td><td>Several of the above combined into one mount point</td><td>What the ServiceAccount token mount uses (you'll dissect that in 7.4).</td></tr>
+</table>
+<h5>Lab</h5>
+<ol class="lab">
+<li>A pod with a RAM-backed scratch dir, memory limit 128Mi:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: scratch}
+spec:
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep","1d"]
+    resources: {limits: {memory: "128Mi"}}
+    volumeMounts: [{name: cache, mountPath: /cache}]
+  volumes:
+  - name: cache
+    emptyDir: {medium: Memory}
+EOF</pre></li>
+<li>Prove it's tmpfs, and that tmpfs sizing follows the pod's memory limit:
+<pre class="cmd">kubectl exec scratch -- df -h /cache</pre>
+<pre class="out">Filesystem   Size   Used  Available  Use%  Mounted on
+<b>tmpfs        128.0M  0    128.0M     0%    /cache</b></pre></li>
+<li>Write a file, then kill PID 1 so the container crashes and restarts:
+<pre class="cmd">kubectl exec scratch -- sh -c 'echo survives-restarts &gt; /cache/note'
+kubectl exec scratch -- kill 1
+kubectl get pod scratch          # wait for RESTARTS to hit 1
+kubectl exec scratch -- cat /cache/note</pre>
+<pre class="out">NAME      READY   STATUS    RESTARTS      AGE
+scratch   1/1     Running   <b>1 (5s ago)</b>   2m
+<b>survives-restarts</b></pre>
+<p>New container, same volume: the volume belongs to the <em>pod</em> (the kubelet keeps it in the pod's dir on the node — 5.2), and the fresh container gets it re-mounted.</p></li>
+<li>Now the trap — fill the tmpfs past the memory limit:
+<pre class="cmd">kubectl exec scratch -- sh -c 'dd if=/dev/zero of=/cache/big bs=1M count=200' ; kubectl get pod scratch</pre>
+<pre class="out">NAME      READY   STATUS      RESTARTS   AGE
+scratch   0/1     <b>OOMKilled</b>   1          3m</pre>
+<p>The 200Mi file is memory, memory is over the 128Mi limit, the kernel kills the container. "My pod OOMs but the app barely allocates" — check what it writes to tmpfs.</p></li>
+<li>Clean up: <pre class="cmd">kubectl delete pod scratch</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You saw both behaviors: the file survived a container restart (volume &gt; container lifetime), and writing past the memory limit into <code>medium: Memory</code> got the pod OOMKilled.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>hostPath</code> is also a <em>scheduling</em> trap: the pod schedules anywhere (the path isn't a constraint), then behaves differently per node. If an exam task hands you a hostPath pod that "works on one node only", that's the whole story. And remember <code>subPath</code> freezes ConfigMap/Secret content at mount time — the classic "I updated the ConfigMap but the file didn't change".</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Volumes"</strong> — one page, every type, with YAML for each. Know its layout; you'll copy from it in the exam.</p>
+</article>
+
+<article class="lesson" id="cp-5-2" data-id="w5-2">
+<div class="lesson-head"><span class="cp-id">5.2</span><h4>Where volumes actually live: /var/lib/kubelet/pods/&lt;uid&gt;/volumes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every volume a pod mounts is a real directory on the node, at a predictable path. Once you've found one by hand, "storage" stops being abstract — and in week 6 this path is how you rescue data from a pod that won't start and decode kubelet mount errors.</p>
+<h5>The concept</h5>
+<p>The kubelet's volume manager prepares each pod's volumes under a fixed layout, then the runtime bind-mounts them into containers:</p>
+<pre class="out">/var/lib/kubelet/pods/<b>&lt;pod-uid&gt;</b>/volumes/<b>kubernetes.io~&lt;plugin&gt;</b>/<b>&lt;volume-name&gt;</b>/
+                                      kubernetes.io~empty-dir/cache/      ← plain dir
+                                      kubernetes.io~secret/token/         ← tmpfs (never touches disk)
+                                      kubernetes.io~nfs/pvc-…/            ← the actual NFS mount (5.12)
+                                      kubernetes.io~csi/pvc-…/mount/      ← CSI publish target (5.12)</pre>
+<p>The pod UID comes from <code>.metadata.uid</code>. Because the container sees the volume through a bind mount, the directory is the <em>same inode</em> from both sides — a write from the pod is instantly visible on the host path and vice versa.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run a pod with an emptyDir, pinned to node01 so you know where to look, and grab its UID:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: findme}
+spec:
+  nodeName: node01
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep","1d"]
+    volumeMounts: [{name: cache, mountPath: /cache}]
+  volumes: [{name: cache, emptyDir: {}}]
+EOF
+kubectl exec findme -- sh -c 'echo hello-from-pod &gt; /cache/msg'
+kubectl get pod findme -o jsonpath='{.metadata.uid}{"\n"}'</pre>
+<pre class="out"><b>1f8b2c3d-9a4e-4f7b-b2d1-0c5e6a7f8d90</b></pre></li>
+<li>On <code>node01</code>, walk to it (substitute your UID):
+<pre class="cmd">UID=1f8b2c3d-9a4e-4f7b-b2d1-0c5e6a7f8d90
+sudo ls /var/lib/kubelet/pods/$UID/volumes/
+sudo cat /var/lib/kubelet/pods/$UID/volumes/kubernetes.io~empty-dir/cache/msg</pre>
+<pre class="out">kubernetes.io~empty-dir  kubernetes.io~projected
+<b>hello-from-pod</b></pre>
+<p>The <code>~projected</code> neighbor is the ServiceAccount token mount — every pod has it.</p></li>
+<li>Prove the bind mount works both ways — write from the host, read from the pod:
+<pre class="cmd">echo hello-from-node | sudo tee /var/lib/kubelet/pods/$UID/volumes/kubernetes.io~empty-dir/cache/reply &gt;/dev/null</pre>
+<p>Back on <code>cp</code>:</p>
+<pre class="cmd">kubectl exec findme -- cat /cache/reply</pre>
+<pre class="out"><b>hello-from-node</b></pre></li>
+<li>See which volumes are RAM, not disk (secrets and Memory-medium emptyDirs):
+<pre class="cmd">mount | grep "$UID" | grep tmpfs</pre>
+<pre class="out">tmpfs on /var/lib/kubelet/pods/1f8b…/volumes/<b>kubernetes.io~projected</b>/kube-api-access-x7k2p type tmpfs (rw,relatime,size=…)</pre></li>
+<li>Clean up: <pre class="cmd">kubectl delete pod findme</pre> Then confirm on node01 that <code>/var/lib/kubelet/pods/$UID</code> is gone — the kubelet garbage-collects the whole pod dir.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The file you wrote inside the pod was readable at the host path, and the file you wrote at the host path appeared inside the pod — same directory, two views.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>emptyDir data lives on the node's disk (under <code>/var/lib/kubelet</code>), so it counts against the node's ephemeral storage and the pod's <code>ephemeral-storage</code> limit — a runaway emptyDir triggers pod <em>eviction</em>, a different failure than the tmpfs OOM from 5.1. And the pod dir is deleted the moment the pod is — if you need evidence out of a crashing pod's volume, copy it <em>before</em> you delete/recreate.</p>
+<h5>Docs</h5>
+<p class="docs-links">This layout is kubelet internals — not really documented. The exam-relevant docs page remains <strong>"Volumes"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-5-3" data-id="w5-3">
+<div class="lesson-head"><span class="cp-id">5.3</span><h4>The object model: PV is cluster infrastructure, PVC is a namespaced request</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every storage exam task is some slice of one chain: <strong>PV ← bound to ← PVC ← mounted by ← Pod</strong>. Get the scoping straight now and the YAML writes itself; get it wrong and you'll hunt for a namespace flag that doesn't exist.</p>
+<h5>The concept</h5>
+<p>The split mirrors nodes and pods:</p>
+<ul>
+<li>A <strong>PersistentVolume</strong> is <em>cluster-scoped</em> — a piece of real storage (an NFS export, a cloud disk, a directory) represented as an API object, created by an admin or minted by a provisioner. Like a Node, it has no namespace.</li>
+<li>A <strong>PersistentVolumeClaim</strong> is <em>namespaced</em> — an application's request: "I need 1Gi, ReadWriteOnce, of class X". Like a Pod, it lives with the workload.</li>
+<li>Pods mount <strong>claims, never PVs</strong>: <code>volumes: [{persistentVolumeClaim: {claimName: …}}]</code>. There is no way to reference a PV from a pod spec.</li>
+</ul>
+<p>The indirection is the point: the app author asks for storage by size and behavior; <em>which</em> disk satisfies it is the cluster's problem. The PVC is the boundary between those two worlds, and the pod+PVC pair is portable across clusters whose PVs look completely different.</p>
+<div class="flow"><span>Pod (ns)</span><em>→</em><span>claimName</span><em>→</em><span>PVC (ns)</span><em>→</em><span>bound 1:1</span><em>→</em><span>PV (cluster)</span><em>→</em><span>real storage</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask the API itself about the scoping:
+<pre class="cmd">kubectl api-resources | grep -E '^persistentvolume|NAMESPACED'</pre>
+<pre class="out">NAME                     SHORTNAMES   APIVERSION   NAMESPACED   KIND
+<b>persistentvolumeclaims   pvc          v1           true         PersistentVolumeClaim</b>
+<b>persistentvolumes        pv           v1           false        PersistentVolume</b></pre></li>
+<li>Confirm a pod can only name a claim:
+<pre class="cmd">kubectl explain pod.spec.volumes.persistentVolumeClaim</pre>
+<pre class="out">FIELDS:
+  <b>claimName    &lt;string&gt; -required-</b>
+    claimName is the name of a PersistentVolumeClaim in the same namespace
+    as the pod using this volume.
+  readOnly     &lt;boolean&gt;</pre>
+<p>Read that sentence twice: <em>same namespace as the pod</em>. That constraint decides where your PVC YAML needs a <code>namespace:</code> and where it must not.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Say it without looking: which of PV / PVC / Pod take <code>-n &lt;namespace&gt;</code>? (PVC and Pod. <code>kubectl get pv -n anything</code> silently ignores the flag — PVs are cluster-wide.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Exam tasks encode the scoping in their wording: "create a PersistentVolume" (no namespace given — there isn't one) then "create a PersistentVolumeClaim <em>in namespace project-x</em>". If a pod can't find its claim, check the namespace before anything else — a PVC in the wrong namespace produces <code>persistentvolumeclaim "data" not found</code> on the pod even though <code>kubectl get pvc -A</code> plainly shows it.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Persistent Volumes"</strong> — the long concepts page. Storage answers live either here or on the task page <strong>"Configure a Pod to Use a PersistentVolume for Storage"</strong>; learn both layouts.</p>
+</article>
+</div>
+
+<!-- ---------------- Binding internals ---------------- -->
+<div class="grp" id="g-binding"><h3>Binding internals</h3>
+
+<article class="lesson" id="cp-5-4" data-id="w5-4">
+<div class="lesson-head"><span class="cp-id">5.4</span><h4>The binding control loop: match, then an exclusive 1:1 claim</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every Pending PVC you will ever debug is this loop failing to find a match. Know the four matching rules and the failure stops being mysterious — you just check them in order.</p>
+<h5>The concept</h5>
+<p>The PV controller (inside kube-controller-manager) runs the standard reconcile pattern: watch unbound PVCs, and for each one scan the Available PVs for candidates. A PV is a candidate only if <em>all four</em> hold:</p>
+<ul>
+<li><strong>Capacity</strong>: PV capacity ≥ PVC request.</li>
+<li><strong>Access modes</strong>: the PV offers every mode the PVC asks for (PV modes ⊇ PVC modes).</li>
+<li><strong>storageClassName</strong>: string-equal on both sides. This is pure label-matching — the class doesn't have to exist as an object for static binding.</li>
+<li><strong>Selector</strong>: if the PVC has <code>spec.selector</code>, the PV's labels must match it.</li>
+</ul>
+<p>Among candidates it picks the <strong>smallest PV that satisfies the claim</strong> (to waste the least), then binds by stamping both sides: <code>claimRef</code> (namespace+name+UID of the PVC) onto the PV, <code>volumeName</code> onto the PVC. The bind is <strong>exclusive and 1:1</strong> — even if the PV is 100× bigger than the request, no second claim can share it; a 100Gi PV bound to a 1Gi claim strands 99Gi. No candidate? The PVC just sits <strong>Pending</strong>, retried forever, and so does any pod that mounts it.</p>
+<svg viewBox="0 0 660 330" role="img" aria-label="State machine: a PVC moves from Pending to Bound; a PV moves from Available to Bound to Released, then back to Available (Retain, after claimRef is cleared) or is deleted (Delete)">
+  <text x="16" y="26" fill="var(--muted)" font-size="11" letter-spacing="2" font-weight="600">PVC (NAMESPACED)</text>
+  <rect x="16" y="40" width="130" height="42" rx="9" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="81" y="66" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">Pending</text>
+  <line x1="146" y1="61" x2="266" y2="61" stroke="var(--accent)" stroke-width="2"/>
+  <polygon points="266,61 257,56 257,66" fill="var(--accent)"/>
+  <text x="206" y="52" fill="var(--muted)" font-size="10" text-anchor="middle">match found →</text>
+  <text x="206" y="78" fill="var(--muted)" font-size="10" text-anchor="middle">volumeName stamped</text>
+  <rect x="268" y="40" width="130" height="42" rx="9" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="333" y="66" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">Bound</text>
+  <line x1="398" y1="61" x2="512" y2="61" stroke="var(--line)" stroke-width="2" stroke-dasharray="5 4"/>
+  <polygon points="512,61 503,56 503,66" fill="var(--line)"/>
+  <text x="455" y="52" fill="var(--muted)" font-size="10" text-anchor="middle">kubectl delete pvc</text>
+  <text x="546" y="65" fill="var(--muted)" font-size="12">(gone)</text>
+
+  <text x="16" y="140" fill="var(--muted)" font-size="11" letter-spacing="2" font-weight="600">PV (CLUSTER-SCOPED)</text>
+  <rect x="16" y="154" width="130" height="42" rx="9" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="81" y="180" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">Available</text>
+  <line x1="146" y1="175" x2="266" y2="175" stroke="var(--accent)" stroke-width="2"/>
+  <polygon points="266,175 257,170 257,180" fill="var(--accent)"/>
+  <text x="206" y="166" fill="var(--muted)" font-size="10" text-anchor="middle">claimRef stamped</text>
+  <rect x="268" y="154" width="130" height="42" rx="9" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="333" y="180" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">Bound</text>
+  <line x1="398" y1="175" x2="512" y2="175" stroke="var(--ink)" stroke-width="2"/>
+  <polygon points="512,175 503,170 503,180" fill="var(--ink)"/>
+  <text x="455" y="166" fill="var(--muted)" font-size="10" text-anchor="middle">PVC deleted</text>
+  <rect x="514" y="154" width="130" height="42" rx="9" fill="var(--code-bg)" stroke="var(--ink)"/>
+  <text x="579" y="180" fill="var(--ink)" font-size="12.5" text-anchor="middle" font-weight="600">Released</text>
+
+  <path d="M 579 196 L 579 250 L 81 250 L 81 196" fill="none" stroke="var(--accent)" stroke-width="2"/>
+  <polygon points="81,196 76,205 86,205" fill="var(--accent)"/>
+  <text x="330" y="243" fill="var(--accent)" font-size="10.5" text-anchor="middle" font-weight="600">Retain: data kept — admin clears claimRef, PV becomes Available again</text>
+
+  <line x1="614" y1="196" x2="614" y2="286" stroke="var(--line)" stroke-width="2" stroke-dasharray="5 4"/>
+  <polygon points="614,286 609,277 619,277" fill="var(--line)"/>
+  <text x="606" y="300" fill="var(--muted)" font-size="10.5" text-anchor="end">Delete: provisioner removes PV + backing storage</text>
+
+  <text x="16" y="318" fill="var(--muted)" font-size="10.5">Released ≠ Available: claimRef still points at the dead PVC, so nothing new can bind (5.7)</text>
+</svg>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Offer two static PVs — 10Gi and 1Gi, same class <code>manual</code> (create the backing dirs on node01 first: <code>sudo mkdir -p /srv/pv-big /srv/pv-small</code>):
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: pv-big}
+spec:
+  capacity: {storage: 10Gi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  hostPath: {path: /srv/pv-big}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: pv-small}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  hostPath: {path: /srv/pv-small}
+EOF
+kubectl get pv</pre>
+<pre class="out">NAME       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM
+pv-big     10Gi       RWO            Retain           <b>Available</b>
+pv-small   1Gi        RWO            Retain           <b>Available</b></pre></li>
+<li>Claim 1Gi and watch which PV the controller picks:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: claim-a}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  resources: {requests: {storage: 1Gi}}
+EOF
+kubectl get pvc claim-a; kubectl get pv</pre>
+<pre class="out">NAME      STATUS   VOLUME     CAPACITY   ACCESS MODES   STORAGECLASS
+claim-a   <b>Bound    pv-small</b>  1Gi        RWO            manual
+
+NAME       …   STATUS      CLAIM
+pv-big     …   Available
+pv-small   …   <b>Bound       default/claim-a</b></pre>
+<p>Smallest satisfying PV wins — <code>pv-big</code> stays free for a bigger claim.</p></li>
+<li>Inspect both halves of the stamp:
+<pre class="cmd">kubectl get pv pv-small -o jsonpath='{.spec.claimRef.namespace}/{.spec.claimRef.name}{"\n"}'
+kubectl get pvc claim-a -o jsonpath='{.spec.volumeName}{"\n"}'</pre>
+<pre class="out"><b>default/claim-a</b>
+<b>pv-small</b></pre></li>
+<li>Now a claim nothing can satisfy — 5Gi would fit pv-big, but ask for a mode neither PV offers:
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: claim-b}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  resources: {requests: {storage: 5Gi}}
+EOF
+kubectl describe pvc claim-b | tail -3</pre>
+<pre class="out">Events:
+  Type     Reason              Age   From                         Message
+  Warning  <b>ProvisioningFailed</b>  4s    persistentvolume-controller  <b>storageclass.storage.k8s.io "manual" not found</b></pre>
+<p>Decode that event: static matching found no PV (the RWX ask disqualified both), so the controller fell through to "dynamically provision, then" — and there's no StorageClass object named <code>manual</code> to do it. On a claim you expected to bind statically, <em>"storageclass not found" means "no PV matched"</em>. Fix the mismatch, not the class.</p></li>
+<li>Keep <code>claim-a</code>/<code>pv-small</code> for 5.7; delete the experiment claim: <pre class="cmd">kubectl delete pvc claim-b</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>claim-a</code> bound to <code>pv-small</code> (not <code>pv-big</code>), and you can read the bind from both directions: <code>claimRef</code> on the PV, <code>volumeName</code> on the PVC.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>When a pod is stuck Pending on storage, <strong>describe the PVC, not the pod</strong> — the pod event only says "unbound PersistentVolumeClaims"; the PVC event says <em>why</em>. And once a default StorageClass exists (you'll install one in 5.10), a PVC that omits <code>storageClassName</code> entirely gets the default stamped at admission — and will then never match your <code>storageClassName: manual</code> PV. Static-PV tasks must set the class name explicitly on <em>both</em> objects.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Persistent Volumes"</strong> → <em>Binding</em> and <em>Phase</em> sections.</p>
+</article>
+
+<article class="lesson" id="cp-5-5" data-id="w5-5">
+<div class="lesson-head"><span class="cp-id">5.5</span><h4>The static chain from memory: PV + PVC + pod</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This trio <em>is</em> the canonical storage exam task, nearly verbatim. It's worth over-practicing: three objects, zero thinking, under five minutes — that's points banked for the hard troubleshooting tasks.</p>
+<h5>The concept</h5>
+<p>Nothing new — this is 5.3's chain plus 5.4's matching rules, typed out. The fields that must agree, and where each lives:</p>
+<pre class="out">PV:   capacity ≥ ─────────┐   accessModes ⊇ ─┐   storageClassName = ─┐
+PVC:  resources.requests ──┘   accessModes ───┘   storageClassName ───┘
+Pod:  volumes[].persistentVolumeClaim.claimName = PVC name  (+ same namespace)
+      containers[].volumeMounts[].name = volumes[].name</pre>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Prepare the backing dir on node01, then write all three objects <em>from memory</em> (peek only after trying):
+<pre class="cmd">ssh node01 'sudo mkdir -p /srv/app-data'</pre>
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: app-pv}
+spec:
+  capacity: {storage: 2Gi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath: {path: /srv/app-data}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: app-data}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: app}
+spec:
+  nodeName: node01
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep","1d"]
+    volumeMounts: [{name: data, mountPath: /data}]
+  volumes:
+  - name: data
+    persistentVolumeClaim: {claimName: app-data}
+EOF</pre></li>
+<li>Write, destroy the pod, recreate, read:
+<pre class="cmd">kubectl exec app -- sh -c 'echo persistent &gt; /data/proof'
+kubectl delete pod app
+# re-apply just the Pod block from step 1, then:
+kubectl exec app -- cat /data/proof</pre>
+<pre class="out"><b>persistent</b></pre>
+<p>The data outlived the pod — that's the entire value proposition, witnessed.</p></li>
+<li>Now the deliberate mismatch. Delete pod + PVC (PV stays), and re-create the claim asking RWX:
+<pre class="cmd">kubectl delete pod app pvc app-data
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: app-data}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  resources: {requests: {storage: 2Gi}}
+EOF
+kubectl get pvc app-data</pre>
+<pre class="out">NAME       STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+app-data   <b>Pending</b>                                      manual</pre>
+<p><code>describe</code> shows 5.4's <code>storageclass "manual" not found</code> event — the RWO-only PV was silently disqualified. Note what you did <em>not</em> get: no error at <code>apply</code> time. Binding failures are asynchronous; the objects are valid, they just never meet.</p></li>
+<li>Fix the claim back to RWO, watch it bind (the PV is Released from step 3's delete if it had been bound — see 5.7 for that wrinkle; here <code>app-pv</code> went Released when you deleted the first claim, so clear it):
+<pre class="cmd">kubectl patch pv app-pv --type=merge -p '{"spec":{"claimRef":null}}'
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: app-data}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  resources: {requests: {storage: 2Gi}}
+EOF
+kubectl get pvc app-data</pre>
+<pre class="out">NAME       STATUS   VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+app-data   <b>Bound    app-pv</b>   2Gi        RWO            manual</pre>
+<p>(You just previewed 5.7: deleting a bound PVC leaves a Retain PV <em>Released</em>, and clearing <code>claimRef</code> is the unlock.)</p></li>
+<li>Clean up: <pre class="cmd">kubectl delete pvc app-data; kubectl delete pv app-pv</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Round 1: file survived pod deletion. Round 2: the mismatched claim sat Pending with no apply-time error, and you knew which field to check first.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A hostPath PV records <em>no node</em> — Kubernetes will happily run your pod on node02 against an empty <code>/srv/app-data</code> there. That's why this lab pins with <code>nodeName</code>. Real single-node storage uses <code>local:</code> PVs, which embed a required <code>nodeAffinity</code> so the scheduler follows the data; hostPath PVs are a lab convenience, not a pattern.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure a Pod to Use a PersistentVolume for Storage"</strong> — the task page with all three YAMLs in copyable form. This is your exam source; practice finding it fast.</p>
+</article>
+
+<article class="lesson" id="cp-5-6" data-id="w5-6">
+<div class="lesson-head"><span class="cp-id">5.6</span><h4>Access modes are node-level guarantees — RWO does not mean one pod</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Can two pods share a ReadWriteOnce volume?" is a classic trick question (yes — if they're on the same node), and choosing an impossible mode is a classic planted fault (the PVC just never binds, as you saw in 5.5).</p>
+<h5>The concept</h5>
+<table>
+<tr><th>Mode</th><th>Short</th><th>Guarantee unit</th><th>Meaning</th></tr>
+<tr><td>ReadWriteOnce</td><td>RWO</td><td><strong>node</strong></td><td>Volume mounts read-write on <em>one node</em>. Any number of pods on that node share it freely.</td></tr>
+<tr><td>ReadOnlyMany</td><td>ROX</td><td>node</td><td>Mounts read-only on many nodes.</td></tr>
+<tr><td>ReadWriteMany</td><td>RWX</td><td>node</td><td>Mounts read-write on many nodes — needs a shared filesystem (NFS &amp; friends); block-device drivers can't do it.</td></tr>
+<tr><td>ReadWriteOncePod</td><td>RWOP</td><td><strong>pod</strong></td><td>The only pod-level mode: exactly one pod in the whole cluster, enforced by the scheduler. GA since v1.29.</td></tr>
+</table>
+<p>Two more framing facts: on the PV, modes list what the storage <em>can</em> do (a PV may offer several); on the PVC, what the workload demands — matching needs PV ⊇ PVC (5.4). And the mode is an <em>attach/mount</em>-time rule, not a data-safety feature: nothing about RWO stops same-node writers from corrupting each other's files; the application still needs its own locking.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>An RWO claim shared by <em>two</em> pods on the same node (reuse the 5.4 leftovers — <code>claim-a</code> is Bound to <code>pv-small</code>):
+<pre class="cmd">for n in one two; do kubectl apply -f - &lt;&lt;EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: writer-$n}
+spec:
+  nodeName: node01
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep","1d"]
+    volumeMounts: [{name: d, mountPath: /shared}]
+  volumes: [{name: d, persistentVolumeClaim: {claimName: claim-a}}]
+EOF
+done
+kubectl exec writer-one -- sh -c 'echo from-one &gt;&gt; /shared/log'
+kubectl exec writer-two -- sh -c 'echo from-two &gt;&gt; /shared/log'
+kubectl exec writer-one -- cat /shared/log</pre>
+<pre class="out"><b>from-one
+from-two</b></pre>
+<p>Two pods, both writing, one RWO volume — perfectly legal, because they share a node. RWO ≠ one pod. (You'll build the true multi-<em>node</em> RWX version in 5.10 with NFS.)</p></li>
+<li>Now RWOP, the one that really is single-pod. New PV+PVC pair (<code>sudo mkdir -p /srv/pv-solo</code> on node01 first):
+<pre class="cmd">kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: pv-solo}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOncePod]
+  storageClassName: manual
+  hostPath: {path: /srv/pv-solo}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: claim-solo}
+spec:
+  accessModes: [ReadWriteOncePod]
+  storageClassName: manual
+  resources: {requests: {storage: 1Gi}}
+EOF</pre></li>
+<li>Point the same two-pod trick at it — the second pod must lose:
+<pre class="cmd"># same pod YAML as step 1, names solo-one / solo-two, claimName claim-solo
+kubectl get pods solo-one solo-two
+kubectl describe pod solo-two | tail -2</pre>
+<pre class="out">NAME       READY   STATUS    RESTARTS   AGE
+solo-one   1/1     Running   0          30s
+solo-two   0/1     <b>Pending</b>   0          25s
+
+  Warning  FailedScheduling  …  0/3 nodes are available: <b>1 node has pod using PersistentVolumeClaim
+  with the same name and ReadWriteOncePod access mode</b>, 2 node(s) had untolerated taint …</pre>
+<p>The scheduler itself enforces RWOP — the second pod never even reaches a kubelet.</p></li>
+<li>Clean up everything from this group's experiments:
+<pre class="cmd">kubectl delete pod writer-one writer-two solo-one solo-two
+kubectl delete pvc claim-a claim-solo
+kubectl delete pv pv-big pv-small pv-solo</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Both RWO pods wrote to the shared file; the second RWOP pod stayed Pending with the scheduler event naming the claim.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The deadly real-world version: a Deployment with an RWO PVC and the default RollingUpdate strategy on a multi-node cluster. The new replica starts on another node <em>before</em> the old one stops, can't attach the volume there, and the rollout wedges. Fix: <code>strategy: Recreate</code>, or RWX storage. Also remember <code>kubectl get pv/pvc</code> prints modes abbreviated (RWO, ROX, RWX, RWOP) — read them fluently.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Persistent Volumes"</strong> → <em>Access Modes</em> — includes the per-driver support matrix.</p>
+</article>
+
+<article class="lesson" id="cp-5-7" data-id="w5-7">
+<div class="lesson-head"><span class="cp-id">5.7</span><h4>Reclaim policies by doing: Released is not Available</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Make sure the data survives PVC deletion" and "why won't this PV re-bind?" are both exam material, and both are answered by one field: <code>persistentVolumeReclaimPolicy</code>.</p>
+<h5>The concept</h5>
+<p>The policy answers: <em>when the bound PVC is deleted, what happens to the PV and the data?</em></p>
+<table>
+<tr><th>Policy</th><th>On PVC delete</th><th>Data</th><th>Default for</th></tr>
+<tr><td><code>Retain</code></td><td>PV goes <strong>Released</strong> and stays</td><td>Kept — admin recovers or wipes manually</td><td>statically created PVs</td></tr>
+<tr><td><code>Delete</code></td><td>PV object <em>and</em> backing storage removed</td><td>Gone</td><td>dynamically provisioned PVs (inherited from the StorageClass)</td></tr>
+</table>
+<p>The trap is the <strong>Released</strong> state (bottom lane of 5.4's diagram): the PV still carries <code>claimRef</code> pointing at the deceased PVC — including its UID — so the binder will <em>never</em> give it to a new claim, even an identical one. That's deliberate: the volume still holds the old claimant's data, and handing it silently to a new tenant would be a leak. Clearing <code>claimRef</code> is the admin saying "I've dealt with the data — back into the pool."</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>A Retain PV + claim (backing dir: <code>sudo mkdir -p /srv/pv-retain</code> on node01):
+<pre class="cmd">kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: pv-retain}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath: {path: /srv/pv-retain}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: claim-r}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  resources: {requests: {storage: 1Gi}}
+EOF</pre></li>
+<li>Delete the claim; watch the PV's phase:
+<pre class="cmd">kubectl delete pvc claim-r
+kubectl get pv pv-retain</pre>
+<pre class="out">NAME        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS     CLAIM
+pv-retain   1Gi        RWO            Retain           <b>Released   default/claim-r</b></pre></li>
+<li>Re-create the identical claim — and watch it <em>not</em> bind:
+<pre class="cmd"># re-apply the PVC block from step 1
+kubectl get pvc claim-r</pre>
+<pre class="out">NAME      STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+claim-r   <b>Pending</b>                                      manual</pre>
+<p>Same name isn't same claim — the old <code>claimRef</code> pins the PV to the deleted PVC's UID.</p></li>
+<li>Do the admin move — clear the claimRef, watch both objects snap together:
+<pre class="cmd">kubectl patch pv pv-retain --type=merge -p '{"spec":{"claimRef":null}}'
+kubectl get pv/pv-retain pvc/claim-r</pre>
+<pre class="out">NAME        …   STATUS      CLAIM
+pv-retain   …   <b>Available → Bound</b>   default/claim-r     (within a few seconds)
+
+NAME      STATUS   VOLUME
+claim-r   <b>Bound    pv-retain</b></pre></li>
+<li>For contrast, flip the policy on the live PV (a real exam micro-task):
+<pre class="cmd">kubectl patch pv pv-retain -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+kubectl get pv pv-retain -o jsonpath='{.spec.persistentVolumeReclaimPolicy}{"\n"}'</pre>
+<pre class="out"><b>Delete</b></pre>
+<p>(Don't actually delete the claim now unless you want the PV gone — for hostPath, "Delete" removes the PV object; a real driver would also destroy the disk.) Clean up: <code>kubectl delete pvc claim-r; kubectl delete pv pv-retain --ignore-not-found</code>.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You saw the full circle: Bound → (PVC deleted) → Released → identical new claim stays Pending → clear <code>claimRef</code> → Available → Bound.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Clearing <code>claimRef</code> re-exposes whatever the previous claimant left on the volume — in production you wipe first, rebind second. Know the patch cold: <code>kubectl patch pv NAME --type=merge -p '{"spec":{"claimRef":null}}'</code>. And "protect this volume from deletion" in a task means: patch reclaimPolicy to <code>Retain</code> <em>before</em> touching the PVC.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Change the Reclaim Policy of a PersistentVolume"</strong> — a short task page with the exact patch command.</p>
+</article>
+</div>
+
+<!-- ---------------- StorageClasses & dynamic provisioning ---------------- -->
+<div class="grp" id="g-sc"><h3>StorageClasses &amp; dynamic provisioning</h3>
+
+<article class="lesson" id="cp-5-8" data-id="w5-8">
+<div class="lesson-head"><span class="cp-id">5.8</span><h4>StorageClass, field by field — and what "default class" really does</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The exam cluster provisions storage dynamically — you'll be handed a StorageClass and expected to read it at a glance: does it expand? does it bind immediately? what happens to my PVC if I name no class at all?</p>
+<h5>The concept</h5>
+<p>A StorageClass is a named <em>recipe for minting PVs</em>. When a PVC references one (and no static PV matches first), a provisioner creates real storage plus a PV object to represent it, pre-bound to that claim.</p>
+<table>
+<tr><th>Field</th><th>What it controls</th></tr>
+<tr><td><code>provisioner</code></td><td>Who gets called — a CSI driver name (<code>ebs.csi.aws.com</code>) or an external provisioner (<code>rancher.io/local-path</code>). The class is inert if nothing in the cluster answers to this name.</td></tr>
+<tr><td><code>parameters</code></td><td>Opaque key/values passed to the provisioner (disk type, filesystem, replication). Kubernetes doesn't interpret them — the driver does.</td></tr>
+<tr><td><code>reclaimPolicy</code></td><td>Stamped onto every PV this class mints. Defaults to <code>Delete</code>.</td></tr>
+<tr><td><code>volumeBindingMode</code></td><td><code>Immediate</code> (provision the moment the PVC appears) or <code>WaitForFirstConsumer</code> (wait for a pod — 5.9).</td></tr>
+<tr><td><code>allowVolumeExpansion</code></td><td>Whether PVCs of this class may be resized upward (5.13). One of the few mutable SC fields.</td></tr>
+<tr><td><code>mountOptions</code>, <code>allowedTopologies</code></td><td>Mount flags for minted PVs; zone/node restrictions for where volumes may be created.</td></tr>
+</table>
+<p>The <strong>default class</strong> is marked by the annotation <code>storageclass.kubernetes.io/is-default-class: "true"</code>. Its effect happens at <em>admission</em>: a PVC created with <strong>no <code>storageClassName</code> field at all</strong> gets the default's name written into its spec permanently. A PVC with explicit <code>storageClassName: ""</code> opts out — "static PVs only, never provision". Unset vs empty-string are different requests; that distinction is exam-grade. (If several classes are marked default, the newest wins — but treat that as a misconfiguration to fix.)</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Your kubeadm cluster ships with no classes at all — which is <em>why</em> everything so far needed hand-made PVs:
+<pre class="cmd">kubectl get storageclass</pre>
+<pre class="out"><b>No resources found</b></pre></li>
+<li>Prove a StorageClass is just a pointer — create one whose provisioner doesn't exist:
+<pre class="cmd">kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: ghost}
+provisioner: example.com/does-not-exist
+EOF
+kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: claim-ghost}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ghost
+  resources: {requests: {storage: 1Gi}}
+EOF
+kubectl describe pvc claim-ghost | tail -3</pre>
+<pre class="out">Events:
+  Type    Reason                Age   From                         Message
+  Normal  <b>ExternalProvisioning</b>  5s   persistentvolume-controller  <b>Waiting for a volume to be created either by the external provisioner 'example.com/does-not-exist' or manually by the system administrator…</b></pre>
+<p>Note it's a <em>Normal</em> event, and the PVC waits forever, politely. A valid class whose provisioner isn't running looks exactly like this — in week 6, this signature means "go check the provisioner's pods".</p></li>
+<li>Read a class the way the exam expects — columns first, YAML second:
+<pre class="cmd">kubectl get sc ghost
+kubectl explain storageclass | head -20</pre>
+<pre class="out">NAME    PROVISIONER                  RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+ghost   example.com/does-not-exist   <b>Delete          Immediate           false</b>                  1m</pre>
+<p>Three defaults you didn't write, all visible in the headline columns.</p></li>
+<li>Clean up: <pre class="cmd">kubectl delete pvc claim-ghost; kubectl delete sc ghost</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can answer from the <code>kubectl get sc</code> line alone: will PVCs of this class expand? bind before a pod exists? leave PVs behind on delete?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Once a PVC is created, its <code>storageClassName</code> is effectively fixed — the default-class annotation does <em>not</em> retroactively adopt existing claims that already sat Pending before the default existed... with one nuance: a claim with the field truly unset may still be adopted by a later default (retroactive assignment). Keep the practical rule: <strong>decide the class at creation time, explicitly</strong>, and you never depend on the subtle path. Most SC spec fields (provisioner, parameters) are immutable — "change the parameters" means create a new class and migrate.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Storage Classes"</strong>; the default-class mechanics live under <strong>"Change the default StorageClass"</strong>.</p>
+</article>
+
+<article class="lesson" id="cp-5-9" data-id="w5-9">
+<div class="lesson-head"><span class="cp-id">5.9</span><h4>WaitForFirstConsumer: the Pending that isn't a bug</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A WFFC PVC sits Pending by design, and the exam (and real dashboards) love to show you one next to a genuinely broken one. Knowing the one event message that separates them saves you from "fixing" healthy clusters.</p>
+<h5>The concept</h5>
+<p>With <code>volumeBindingMode: Immediate</code>, provisioning happens the moment the PVC is created — before any pod exists, before anyone knows where that pod will run. For topology-constrained storage (a disk in zone A, a directory on node01) that's a gamble: the volume lands somewhere, and the scheduler is then forced to put the pod next to it, even if that node/zone can't fit the pod's CPU, affinity, or taints.</p>
+<p><code>WaitForFirstConsumer</code> inverts the order:</p>
+<ol>
+<li>PVC created → nothing happens; it sits Pending with event <code>WaitForFirstConsumer</code>.</li>
+<li>A pod using the claim appears → the <em>scheduler</em> picks a node using <strong>all</strong> constraints (resources, affinity, taints, other volumes) and records it on the claim: annotation <code>volume.kubernetes.io/selected-node</code>.</li>
+<li>The provisioner reads the annotation and creates the volume <em>there</em>; PVC binds; kubelet mounts; pod starts.</li>
+</ol>
+<p>Storage placement becomes a scheduling <em>output</em> instead of a constraint. Local and zonal storage classes all use WFFC — including <code>local-path</code>, which you're about to install.</p>
+<h5>Lab</h5>
+<p>This lab uses the <code>local-path</code> class — run step 1 of 5.10 first if you haven't (one <code>kubectl apply</code>), then come back.</p>
+<ol class="lab">
+<li>Create a claim and watch it deliberately <em>not</em> provision:
+<pre class="cmd">kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-local}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: {requests: {storage: 1Gi}}
+EOF
+kubectl get pvc data-local; kubectl describe pvc data-local | tail -3</pre>
+<pre class="out">NAME         STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+data-local   <b>Pending</b>                                      local-path
+
+  Type    Reason                Age   From                         Message
+  Normal  <b>WaitForFirstConsumer</b>  8s    persistentvolume-controller  <b>waiting for first consumer to be created before binding</b></pre>
+<p>Memorize that message. It is the "everything is fine" Pending.</p></li>
+<li>Give it a consumer:
+<pre class="cmd">kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: consumer}
+spec:
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep","1d"]
+    volumeMounts: [{name: d, mountPath: /data}]
+  volumes: [{name: d, persistentVolumeClaim: {claimName: data-local}}]
+EOF
+kubectl get pvc data-local -w</pre>
+<pre class="out">NAME         STATUS    VOLUME                                     CAPACITY
+data-local   Pending
+data-local   Pending   pvc-8c1a…                                  0
+data-local   <b>Bound     pvc-8c1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8   1Gi</b></pre></li>
+<li>See where the scheduler's decision was recorded:
+<pre class="cmd">kubectl get pvc data-local -o jsonpath='{.metadata.annotations.volume\.kubernetes\.io/selected-node}{"\n"}'
+kubectl get pod consumer -o wide --no-headers | awk '{print $7}'</pre>
+<pre class="out"><b>node02</b>
+<b>node02</b></pre>
+<p>Scheduler chose, annotation carried the choice, provisioner obeyed. Keep this pod+PVC — 5.10 and 5.13 build on them.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The claim stayed Pending with <code>waiting for first consumer…</code> until the pod existed, then bound — and the selected-node annotation matches where the pod runs.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>With WFFC, provisioning problems surface on the <em>pod</em> (FailedScheduling / stuck ContainerCreating), not just the PVC — describe both. And don't sit watching a WFFC claim waiting for Bound before you create the workload; it will never happen. In a timed exam that's minutes gone.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Storage Classes"</strong> → <em>Volume Binding Mode</em>.</p>
+</article>
+
+<article class="lesson" id="cp-5-10" data-id="w5-10">
+<div class="lesson-head"><span class="cp-id">5.10</span><h4>Install two real provisioners: local-path, then NFS for true RWX</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Watching a provisioner mint a PV closes the loop on everything above — and it upgrades your lab: from here on (week 6 faults, the mock exam) the cluster provisions storage like the exam's does. The NFS half also gives you the only honest way to see ReadWriteMany work.</p>
+<h5>The concept</h5>
+<p>A dynamic provisioner is just a controller running the watch-and-reconcile loop you know from week 1: watch PVCs whose class names <em>me</em>, create the backing storage, then create a PV object with <code>claimRef</code> already stamped so it binds instantly.</p>
+<ul>
+<li><strong>local-path-provisioner</strong> (Rancher): on the selected node, a short-lived helper pod runs <code>mkdir</code> under <code>/opt/local-path-provisioner</code>, and the PV it mints is a hostPath pointing there. WFFC, RWO-only (it's one node's disk), reclaim Delete.</li>
+<li><strong>nfs-subdir-external-provisioner</strong>: one NFS export, one subdirectory per PVC. Because NFS is a shared filesystem, its PVs honestly support RWX. Immediate binding (any node can mount NFS — no topology to wait for).</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Part A — local-path.</strong> One manifest installs namespace, RBAC, the controller Deployment, and the class:
+<pre class="cmd">kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml
+kubectl -n local-path-storage get pods
+kubectl get sc</pre>
+<pre class="out">NAME                                      READY   STATUS    RESTARTS   AGE
+<b>local-path-provisioner-5b577f66ff-x2m4q   1/1     Running   0          30s</b>
+
+NAME         PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION
+<b>local-path   rancher.io/local-path   Delete          WaitForFirstConsumer   false</b></pre></li>
+<li>Mark it the cluster default (the exam cluster has one; yours should too):
+<pre class="cmd">kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+kubectl get sc</pre>
+<pre class="out">NAME                   PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      …
+<b>local-path (default)</b>   rancher.io/local-path   Delete          WaitForFirstConsumer   …</pre></li>
+<li>You already have a minted PV from 5.9 (<code>data-local</code> + <code>consumer</code>). Find its bytes on the node it landed on (node02 in our run):
+<pre class="cmd">kubectl get pv   # note the pvc-… name
+ssh node02 'ls /opt/local-path-provisioner/'</pre>
+<pre class="out">NAME        CAPACITY  ACCESS MODES  RECLAIM POLICY  STATUS  CLAIM
+pvc-8c1a…   1Gi       RWO           <b>Delete</b>          Bound   default/data-local
+
+<b>pvc-8c1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8_default_data-local</b></pre>
+<p>Directory name = PV name + namespace + claim name. Dynamic PVs inherit <code>Delete</code> from the class — delete the PVC (don't, yet; 5.13 needs it) and this directory evaporates with the PV. That's the reclaim-policy story from 5.7 running on autopilot.</p></li>
+<li><strong>Part B — NFS server on cp.</strong> Export a directory to the node subnet:
+<pre class="cmd">sudo apt-get install -y nfs-kernel-server
+sudo mkdir -p /srv/nfs/k8s
+echo '/srv/nfs/k8s 10.211.64.0/24(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+sudo exportfs -ra &amp;&amp; sudo exportfs -v</pre>
+<pre class="out"><b>/srv/nfs/k8s   10.211.64.0/24(rw,…,no_root_squash)</b></pre>
+<p>Every node that will <em>mount</em> NFS needs the client tools — this is the classic silent missing piece:</p>
+<pre class="cmd">ssh node01 'sudo apt-get install -y nfs-common'
+ssh node02 'sudo apt-get install -y nfs-common'</pre></li>
+<li>Install the provisioner with Helm (from week 3), pointing it at the export:
+<pre class="cmd">helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+helm install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+  --namespace nfs-provisioner --create-namespace \
+  --set nfs.server=10.211.64.10 --set nfs.path=/srv/nfs/k8s
+kubectl get sc nfs-client</pre>
+<pre class="out">NAME         PROVISIONER                                     RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION
+<b>nfs-client   cluster.local/nfs-provisioner-nfs-subdir-…      Delete          Immediate           true</b></pre></li>
+<li>The payoff — an RWX claim shared by pods on <em>different nodes</em>:
+<pre class="cmd">kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-nfs}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: nfs-client
+  resources: {requests: {storage: 1Gi}}
+EOF
+kubectl get pvc data-nfs</pre>
+<pre class="out">NAME       STATUS   VOLUME      CAPACITY   ACCESS MODES   STORAGECLASS
+data-nfs   <b>Bound    pvc-3e9f…   1Gi        RWX            nfs-client</b></pre>
+<p>Bound with no pod anywhere — Immediate mode, compare with 5.9. Now two writers, pinned to different nodes (same pod YAML pattern as 5.6 step 1: names <code>nfs-one</code> on node01 / <code>nfs-two</code> on node02, <code>claimName: data-nfs</code>):</p>
+<pre class="cmd">kubectl exec nfs-one -- sh -c 'echo written-on-node01 &gt;&gt; /shared/log'
+kubectl exec nfs-two -- sh -c 'echo written-on-node02 &gt;&gt; /shared/log'
+kubectl exec nfs-one -- cat /shared/log</pre>
+<pre class="out"><b>written-on-node01
+written-on-node02</b></pre>
+<p>Cross-node shared writes — that's RWX, and no block-device driver could have done it. On cp, the bytes are in <code>/srv/nfs/k8s/default-data-nfs-pvc-3e9f…/log</code>.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>kubectl get sc</code> shows <code>local-path (default)</code> and <code>nfs-client</code>; a file written from node01 is readable from node02 through the RWX claim. Keep <code>data-nfs</code> and <code>data-local</code> — 5.12 and 5.13 use them.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If an NFS-mounting pod sticks in ContainerCreating with <code>bad option; for several filesystems (e.g. nfs, cifs) you might need a /sbin/mount.&lt;type&gt; helper program</code> — that node is missing <code>nfs-common</code>. It's a per-node package; installing it on one node fixes one node. Also: neither of these provisioners enforces the requested size — <code>1Gi</code> on NFS or local-path is bookkeeping, not a quota. Cloud CSI drivers do enforce it; don't let the lab teach you otherwise.</p>
+<h5>Docs</h5>
+<p class="docs-links">Both are third-party (GitHub: <code>rancher/local-path-provisioner</code>, <code>kubernetes-sigs/nfs-subdir-external-provisioner</code>) — fine for the lab, not exam material. The exam cluster's classes come pre-installed; your job is only ever to <em>read</em> them (5.8).</p>
+</article>
+</div>
+
+<!-- ---------------- CSI internals ---------------- -->
+<div class="grp" id="g-csi"><h3>CSI internals</h3>
+
+<article class="lesson" id="cp-5-11" data-id="w5-11">
+<div class="lesson-head"><span class="cp-id">5.11</span><h4>CSI architecture: sidecars translate API objects into four gRPC calls</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>When a real cluster's volume won't mount, the fix starts with knowing <em>which of four steps</em> died — because each step logs in a different place. Provision→Attach→Stage→Publish is the storage equivalent of week 4's packet path.</p>
+<h5>The concept</h5>
+<p>Kubernetes core contains no vendor storage code — it was all extracted ("CSI migration") into drivers that speak one gRPC interface, the Container Storage Interface. A driver ships two halves, and stock Kubernetes <strong>sidecar</strong> containers do all the Kubernetes-facing work, so the vendor only implements storage verbs:</p>
+<ul>
+<li><strong>Controller plugin</strong> — a Deployment/StatefulSet, anywhere in the cluster. Sidecars watch API objects and call the driver: <em>external-provisioner</em> (sees PVC → <code>CreateVolume</code>), <em>external-attacher</em> (sees VolumeAttachment → <code>ControllerPublishVolume</code>, i.e. "attach disk to that node"), <em>external-resizer</em> (sees PVC size edit → <code>ControllerExpandVolume</code>).</li>
+<li><strong>Node plugin</strong> — a DaemonSet on every node. The <em>node-driver-registrar</em> sidecar registers the driver's socket with the kubelet; from then on the <strong>kubelet calls the driver directly</strong>: <code>NodeStageVolume</code> (format if needed + mount once per node into a global staging dir), then <code>NodePublishVolume</code> (bind-mount the staged volume into each pod's volumes dir — the paths from 5.2).</li>
+</ul>
+<svg viewBox="0 0 660 388" role="img" aria-label="CSI call flow: sidecars in the controller plugin call CreateVolume and ControllerPublishVolume; on the node, the kubelet calls NodeStageVolume then NodePublishVolume on the node plugin">
+  <rect x="8" y="6" width="644" height="180" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="22" y="28" fill="var(--muted)" font-size="11" letter-spacing="2" font-weight="600">CONTROLLER PLUGIN — DEPLOYMENT (runs anywhere)</text>
+  <rect x="26" y="44" width="186" height="38" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="119" y="61" fill="var(--ink)" font-size="11" text-anchor="middle" font-weight="600">external-provisioner</text>
+  <text x="119" y="75" fill="var(--muted)" font-size="9.5" text-anchor="middle">watches PVCs</text>
+  <rect x="26" y="92" width="186" height="38" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="119" y="109" fill="var(--ink)" font-size="11" text-anchor="middle" font-weight="600">external-attacher</text>
+  <text x="119" y="123" fill="var(--muted)" font-size="9.5" text-anchor="middle">watches VolumeAttachments</text>
+  <rect x="26" y="140" width="186" height="38" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="119" y="157" fill="var(--ink)" font-size="11" text-anchor="middle" font-weight="600">external-resizer</text>
+  <text x="119" y="171" fill="var(--muted)" font-size="9.5" text-anchor="middle">watches PVC size edits</text>
+
+  <rect x="420" y="44" width="212" height="134" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="526" y="66" fill="var(--ink)" font-size="11.5" text-anchor="middle" font-weight="600">vendor driver — controller service</text>
+  <text x="526" y="86" fill="var(--muted)" font-size="10" text-anchor="middle">talks to the storage backend API</text>
+
+  <line x1="212" y1="63" x2="420" y2="63" stroke="var(--accent)" stroke-width="2"/><polygon points="420,63 411,58 411,68" fill="var(--accent)"/>
+  <text x="316" y="55" fill="var(--ink)" font-size="10.5" text-anchor="middle" font-weight="600">① CreateVolume</text>
+  <line x1="212" y1="111" x2="420" y2="111" stroke="var(--accent)" stroke-width="2"/><polygon points="420,111 411,106 411,116" fill="var(--accent)"/>
+  <text x="316" y="103" fill="var(--ink)" font-size="10.5" text-anchor="middle" font-weight="600">② ControllerPublishVolume</text>
+  <text x="316" y="126" fill="var(--muted)" font-size="9.5" text-anchor="middle">(attach disk to the chosen node)</text>
+  <line x1="212" y1="159" x2="420" y2="159" stroke="var(--line)" stroke-width="2"/><polygon points="420,159 411,154 411,164" fill="var(--line)"/>
+  <text x="316" y="151" fill="var(--muted)" font-size="10.5" text-anchor="middle">ControllerExpandVolume (5.13)</text>
+
+  <rect x="8" y="204" width="644" height="150" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+  <text x="22" y="226" fill="var(--muted)" font-size="11" letter-spacing="2" font-weight="600">EVERY NODE — NODE PLUGIN (DaemonSet) + KUBELET</text>
+  <rect x="26" y="242" width="186" height="88" rx="8" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="119" y="264" fill="var(--ink)" font-size="11.5" text-anchor="middle" font-weight="600">kubelet</text>
+  <text x="119" y="282" fill="var(--muted)" font-size="9.5" text-anchor="middle">calls the driver over a local</text>
+  <text x="119" y="295" fill="var(--muted)" font-size="9.5" text-anchor="middle">unix socket (registered by</text>
+  <text x="119" y="308" fill="var(--muted)" font-size="9.5" text-anchor="middle">node-driver-registrar)</text>
+
+  <rect x="420" y="242" width="212" height="88" rx="8" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="526" y="264" fill="var(--ink)" font-size="11.5" text-anchor="middle" font-weight="600">vendor driver — node service</text>
+  <text x="526" y="282" fill="var(--muted)" font-size="10" text-anchor="middle">mkfs / mount / resize2fs</text>
+
+  <line x1="212" y1="268" x2="420" y2="268" stroke="var(--accent)" stroke-width="2"/><polygon points="420,268 411,263 411,273" fill="var(--accent)"/>
+  <text x="316" y="260" fill="var(--ink)" font-size="10.5" text-anchor="middle" font-weight="600">③ NodeStageVolume</text>
+  <text x="316" y="283" fill="var(--muted)" font-size="9.5" text-anchor="middle">format + mount once per node → …/plugins/…/globalmount</text>
+  <line x1="212" y1="306" x2="420" y2="306" stroke="var(--accent)" stroke-width="2"/><polygon points="420,306 411,301 411,311" fill="var(--accent)"/>
+  <text x="316" y="298" fill="var(--ink)" font-size="10.5" text-anchor="middle" font-weight="600">④ NodePublishVolume</text>
+  <text x="316" y="321" fill="var(--muted)" font-size="9.5" text-anchor="middle">bind-mount per pod → …/pods/&lt;uid&gt;/volumes/kubernetes.io~csi/…</text>
+
+  <text x="22" y="376" fill="var(--muted)" font-size="10.5">① provision → ② attach → ③ stage → ④ publish — mount hangs? name the step, then read that step's log (5.12)</text>
+</svg>
+<p>The staging step exists so a volume mounted by several pods on one node is formatted and fsck'd <em>once</em>; each pod then gets a cheap bind mount. Bookkeeping objects you can inspect: <code>CSIDriver</code> (driver's capabilities — e.g. whether it needs the attach step at all), <code>CSINode</code> (which drivers are registered on each node), <code>VolumeAttachment</code> (one per attached disk-node pair — the attacher's to-do list).</p>
+<h5>Lab</h5>
+<p>Your lab runs no full CSI driver (local-path and NFS are external provisioners — provision-only, no attach/stage machinery), so this is an inspection lab; you'll meet real driver pods on the exam-adjacent clusters (killer.sh) in week 7.</p>
+<ol class="lab">
+<li>The registration objects exist even with no drivers — one CSINode per node, empty:
+<pre class="cmd">kubectl get csinodes
+kubectl get csinode node01 -o jsonpath='{.spec}{"\n"}'
+kubectl get csidrivers</pre>
+<pre class="out">NAME     DRIVERS   AGE
+cp       <b>0</b>         5w
+node01   <b>0</b>         5w
+node02   0         5w
+<b>{}</b>
+No resources found</pre></li>
+<li>Know where the sockets and staging dirs will appear when a driver does exist:
+<pre class="cmd">ssh node01 'sudo ls /var/lib/kubelet/plugins_registry/ /var/lib/kubelet/plugins/ 2&gt;/dev/null'</pre>
+<pre class="out">(empty — with a driver installed you'd see e.g. ebs.csi.aws.com-reg.sock and
+ /var/lib/kubelet/plugins/kubernetes.io/csi/&lt;driver&gt;/&lt;hash&gt;/globalmount)</pre></li>
+<li>And the attacher's queue object type is registered regardless:
+<pre class="cmd">kubectl api-resources | grep -E 'volumeattachments|csi'</pre>
+<pre class="out"><b>csidrivers          storage.k8s.io/v1   false   CSIDriver
+csinodes            storage.k8s.io/v1   false   CSINode</b>
+csistoragecapacities storage.k8s.io/v1  true    CSIStorageCapacity
+<b>volumeattachments   storage.k8s.io/v1   false   VolumeAttachment</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From memory: the four calls in order, who makes each (sidecar, sidecar, kubelet, kubelet), and which API object each watches (PVC, VolumeAttachment, —, —).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The triage mapping is the exam skill: <strong>PVC Pending</strong> → provisioning → <code>describe pvc</code> + external-provisioner sidecar logs. <strong>Pod stuck with "FailedAttachVolume"</strong> → attach → <code>kubectl get volumeattachment</code> + attacher logs. <strong>Pod stuck ContainerCreating with "MountVolume.SetUp failed" / timeouts</strong> → stage/publish → <code>journalctl -u kubelet</code> <em>on that node</em>. Wrong log = wasted minutes.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Container Storage Interface"</strong> (concepts) and <strong>"CSI Volume Cloning"</strong>-adjacent pages. The deep spec lives at kubernetes-csi.github.io — good study, <em>not</em> among the allowed exam docs.</p>
+</article>
+
+<article class="lesson" id="cp-5-12" data-id="w5-12">
+<div class="lesson-head"><span class="cp-id">5.12</span><h4>Trace one mount end to end on the node</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is 5.2 applied to persistent storage: prove to yourself that a Bound PVC is, in the end, one line in <code>mount</code> output on one node. When mounts fail in week 6, you'll be reading exactly this plumbing — knowing what healthy looks like is the prerequisite.</p>
+<h5>The concept</h5>
+<p>For the NFS-backed pod from 5.10, the chain on disk is:</p>
+<pre class="out">on cp:      /srv/nfs/k8s/default-data-nfs-pvc-3e9f…/          ← the actual files
+on node01:  10.211.64.10:/srv/nfs/k8s/default-data-nfs-pvc-3e9f…
+              mounted at /var/lib/kubelet/pods/&lt;uid&gt;/volumes/kubernetes.io~nfs/pvc-3e9f…/
+in the pod: /shared                                            ← bind of the above</pre>
+<p>A CSI driver adds one more hop (the <code>globalmount</code> staging dir between device and pod dir), but the shape — <em>real storage → node mount under the pod's volumes dir → bind into the container</em> — is universal. The tools: <code>mount | grep</code>, <code>findmnt</code>, <code>df</code>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Get the pod UID and PV name for <code>nfs-one</code> (on node01):
+<pre class="cmd">kubectl get pod nfs-one -o jsonpath='{.metadata.uid}{"\n"}'
+kubectl get pvc data-nfs -o jsonpath='{.spec.volumeName}{"\n"}'</pre>
+<pre class="out">7a2c9e1f-3b4d-4c5e-8f90-1a2b3c4d5e6f
+pvc-3e9f4a5b-6c7d-8e9f-a0b1-c2d3e4f5a6b7</pre></li>
+<li>On <code>node01</code>, find the mount by PVC id — the tracker's <code>mount | grep &lt;pvc-id&gt;</code> move:
+<pre class="cmd">mount | grep pvc-3e9f</pre>
+<pre class="out"><b>10.211.64.10:/srv/nfs/k8s/default-data-nfs-pvc-3e9f…</b> on <b>/var/lib/kubelet/pods/7a2c9e1f-…/volumes/kubernetes.io~nfs/pvc-3e9f…</b> type nfs4 (rw,relatime,…)</pre>
+<p>One line tells you: the backend (cp's export), the consumer (pod UID in the path), the plugin (<code>~nfs</code>), and the mount options.</p></li>
+<li>Cross-check from inside the pod — same filesystem, pod-side path:
+<pre class="cmd">kubectl exec nfs-one -- df -h /shared</pre>
+<pre class="out">Filesystem                                          Size   Used  Available  Mounted on
+<b>10.211.64.10:/srv/nfs/k8s/default-data-nfs-pvc-3e9f…</b>  9.7G  2.1G  7.6G     <b>/shared</b></pre>
+<p>Note the size: the whole export, not the claim's 1Gi — 5.10's "no quota" gotcha, visible.</p></li>
+<li>Walk the same file at all three layers (write once, read thrice):
+<pre class="cmd">kubectl exec nfs-one -- sh -c 'echo trace-me &gt; /shared/marker'
+ssh node01 'sudo cat /var/lib/kubelet/pods/7a2c9e1f-*/volumes/kubernetes.io~nfs/pvc-3e9f*/marker'
+sudo cat /srv/nfs/k8s/default-data-nfs-pvc-3e9f*/marker     # on cp</pre>
+<pre class="out"><b>trace-me
+trace-me</b></pre></li>
+<li>Bonus — see the kubelet do the mount. Delete and recreate <code>nfs-one</code>, then on node01:
+<pre class="cmd">sudo journalctl -u kubelet --since '2 min ago' | grep -i 'volume' | head -4</pre>
+<pre class="out">… reconciler: operationExecutor.<b>VerifyControllerAttachedVolume</b> started for volume "pvc-3e9f…"
+… operationExecutor.<b>MountVolume</b> started for volume "pvc-3e9f…" (UniqueName: "kubernetes.io/nfs/…")
+… <b>MountVolume.SetUp succeeded</b> for volume "pvc-3e9f…"</pre>
+<p><code>MountVolume.SetUp succeeded</code> is the healthy signature; its <code>failed</code> twin plus a reason is what week-6 mount faults print.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The same <code>marker</code> file is visible in the pod, under the pod's kubelet volumes dir on node01, and in the export dir on cp — one file, three vantage points.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A pod force-deleted while its node was down can leave the mount behind; the kubelet then logs <code>orphaned pod "…" found, but volume paths are still present on disk</code> on every sync. Harmless-looking, but it blocks the pod dir cleanup — the fix is unmounting/removing the leftover under <code>/var/lib/kubelet/pods/&lt;uid&gt;</code>. File the message now so it's an old friend in week 6.</p>
+<h5>Docs</h5>
+<p class="docs-links">The paths are kubelet internals; the exam-usable reference is still <strong>"Volumes"</strong> + <strong>"Persistent Volumes"</strong>. <code>findmnt</code> and <code>df</code> are <code>man</code> territory.</p>
+</article>
+
+<article class="lesson" id="cp-5-13" data-id="w5-13">
+<div class="lesson-head"><span class="cp-id">5.13</span><h4>Volume expansion: up only, class permitting — and three failure signatures</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Increase the PVC to 5Gi" is a plausible exam one-liner. It's ten seconds when allowed — and when it's not, the error messages tell you exactly why, <em>if</em> you've seen them before. This lab manufactures all three.</p>
+<h5>The concept</h5>
+<p>Rules of the resize game:</p>
+<ul>
+<li><strong>Up only.</strong> Shrinking is rejected by API validation, always. (One exception below.)</li>
+<li><strong>The class must allow it</strong>: <code>allowVolumeExpansion: true</code>, and only dynamically provisioned PVCs qualify.</li>
+<li>The flow on a real CSI driver: edit <code>spec.resources.requests.storage</code> up → external-resizer calls <code>ControllerExpandVolume</code> (grow the disk) → if a filesystem grow is needed, the PVC gets condition <code>FileSystemResizePending</code> and the <em>kubelet</em> finishes with <code>NodeExpandVolume</code> — often online, but some drivers only resize at mount time, i.e. <strong>after a pod restart</strong>.</li>
+<li>You're done when <code>status.capacity</code> catches up to the spec. Spec &gt; status = expansion still in flight.</li>
+<li>The exception: since v1.34 (GA), a <em>stuck</em> expansion may be walked back — you can lower the request again as long as you stay at or above what the volume actually allocated.</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Signature 1 — shrink.</strong> Try to take <code>data-nfs</code> (1Gi) down to 500Mi:
+<pre class="cmd">kubectl patch pvc data-nfs -p '{"spec":{"resources":{"requests":{"storage":"500Mi"}}}}'</pre>
+<pre class="out">The PersistentVolumeClaim "data-nfs" is invalid: spec.resources.requests.storage:
+<b>Forbidden: field can not be less than previous value</b></pre>
+<p>Instant, synchronous, non-negotiable.</p></li>
+<li><strong>Signature 2 — class forbids.</strong> Try to grow <code>data-local</code> (its class has <code>allowVolumeExpansion: false</code> — you read that column in 5.10):
+<pre class="cmd">kubectl patch pvc data-local -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'</pre>
+<pre class="out">Error from server (Forbidden): persistentvolumeclaims "data-local" is forbidden:
+<b>only dynamically provisioned pvcs can be resized and the storageclass that provisions
+the pvc must support resize</b></pre>
+<p>Also synchronous. In an exam task that hits this, the move is: <code>kubectl patch sc &lt;class&gt; -p '{"allowVolumeExpansion":true}'</code> (it's a mutable field), then retry the PVC edit.</p></li>
+<li><strong>Signature 3 — allowed but nobody's listening.</strong> <code>nfs-client</code> ships <code>allowVolumeExpansion: true</code>, but the nfs-subdir provisioner has no resizer. Grow <code>data-nfs</code>:
+<pre class="cmd">kubectl patch pvc data-nfs -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
+kubectl describe pvc data-nfs | tail -4</pre>
+<pre class="out">persistentvolumeclaim/data-nfs patched     ← accepted!
+Events:
+  Type     Reason             Age   From                         Message
+  Warning  <b>ExternalExpanding</b>  6s    volume_expand                <b>Ignoring the PVC: didn't find a plugin
+  capable of expanding the volume; waiting for an external controller to process this PVC.</b></pre>
+<p>The API said yes (the class allows it); the machinery that would do the work doesn't exist. Spec vs reality:</p>
+<pre class="cmd">kubectl get pvc data-nfs -o jsonpath='request={.spec.resources.requests.storage}  actual={.status.capacity.storage}{"\n"}'</pre>
+<pre class="out">request=<b>2Gi</b>  actual=<b>1Gi</b></pre>
+<p>That spec/status gap is the universal "expansion in flight (or stuck)" tell — on healthy CSI drivers it closes in seconds.</p></li>
+<li><strong>Recover</strong> — walk the stuck request back down to what's actually allocated (legal since the v1.34 GA of expansion-failure recovery):
+<pre class="cmd">kubectl patch pvc data-nfs -p '{"spec":{"resources":{"requests":{"storage":"1Gi"}}}}'
+kubectl get pvc data-nfs</pre>
+<pre class="out">NAME       STATUS   VOLUME      CAPACITY   ACCESS MODES   STORAGECLASS
+data-nfs   <b>Bound    pvc-3e9f…   1Gi</b>        RWX            nfs-client</pre>
+<p>Spec = status again; the claim is clean. (This shrink is allowed precisely because it doesn't go below the real 1Gi allocation — rule 1 still stands.)</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can name, from the message alone, which rule each of the three signatures violated: validation (shrink), admission/class (no expansion), missing resizer (stuck ExternalExpanding).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>On real drivers, the classic end-state confusion: PVC says 2Gi, <code>df</code> in the pod still says 1Gi → check <code>kubectl get pvc -o yaml</code> for the <code>FileSystemResizePending</code> condition — the disk grew, the filesystem waits for the next mount. <strong>Restart the pod</strong> and it completes. Never <code>kubectl edit</code> the PV's capacity to "help" — the PV size is the record of reality, not a knob.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Persistent Volumes"</strong> → <em>Expanding Persistent Volumes Claims</em>.</p>
+</article>
+
+<article class="lesson" id="cp-5-14" data-id="w5-14">
+<div class="lesson-head"><span class="cp-id">5.14</span><h4>Timed drill: SC → PVC → pod → proof, under 7 minutes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Storage tasks are the exam's most formulaic points. The drill converts this week from knowledge into a reflex with a clock on it — the same way week 7 will drill everything else.</p>
+<h5>The concept</h5>
+<p>One wrinkle to internalize before the clock starts: there is <strong>no imperative generator for PVCs</strong> — no <code>kubectl create pvc</code>. Your two fast paths are (a) type the ~10-line YAML from memory, or (b) pull the skeleton from the docs task page ("Configure a Pod to Use a PersistentVolume for Storage") and edit three fields. Practice both; (a) is faster once it's automatic. For the pod, scaffold with the generator and splice the volume in:</p>
+<pre class="cmd">kubectl run app --image=busybox:1.36 --dry-run=client -o yaml --command -- sleep 1d &gt; pod.yaml
+# then add volumeMounts: + volumes: — 5 lines you must know cold</pre>
+<h5>Lab</h5>
+<p>The task, exam-styled — set a timer for 7 minutes and go. Do the whole thing in namespace <code>drill</code>:</p>
+<ol class="lab">
+<li>Create namespace <code>drill</code>. In it, create a PVC <code>cache-pvc</code>: 500Mi, ReadWriteOnce, using the cluster's default StorageClass (i.e. <em>don't</em> set storageClassName).</li>
+<li>Create pod <code>cache-pod</code> (image <code>busybox:1.36</code>, command <code>sleep 1d</code>) mounting the claim at <code>/data</code>.</li>
+<li>Write <code>hello</code> into <code>/data/f</code>, delete the pod, recreate it, and prove the file survived.</li>
+<li>Self-check commands and the target end-state:
+<pre class="cmd">kubectl -n drill get pvc,pod
+kubectl -n drill exec cache-pod -- cat /data/f</pre>
+<pre class="out">NAME                              STATUS   VOLUME      CAPACITY   ACCESS MODES   STORAGECLASS
+persistentvolumeclaim/cache-pvc   <b>Bound</b>    pvc-91d2…   500Mi      RWO            local-path
+
+NAME            READY   STATUS    RESTARTS   AGE
+pod/cache-pod   1/1     <b>Running</b>   0          40s
+
+<b>hello</b></pre></li>
+<li>Timing budget to beat: PVC ≤ 2 min, pod ≤ 3 min, write/delete/recreate/verify ≤ 2 min. Over budget on a step → that step's YAML isn't memorized yet; redo the drill tomorrow (fresh namespace, delete <code>drill</code> after: <code>kubectl delete ns drill</code>).</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Timer under 7:00 with <code>hello</code> printed at the end — <em>including</em> the recreate. If your PVC sat "Pending" and you waited on it before creating the pod, reread 5.9: with a WFFC default class, the pod is what unblocks the claim.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Three habit-formers, straight from the graders' pet peeves: the task says <em>which namespace</em> — every object goes there, not in default; don't create a PV (the class provisions — hand-made PVs on a dynamic task are wasted minutes); and finish with the verification read (8.8's habit) — an unread <code>cat</code> is a typo waiting to cost the task.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure a Pod to Use a PersistentVolume for Storage"</strong> — decide today which skeletons you'll copy from it vs type from memory, and drill accordingly.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>Week 5 recall quiz</h3>
+<p>Answer out loud before revealing. Wrong or hesitant → redo that lesson's lab.</p>
+<ol>
+<li>An emptyDir with <code>medium: Memory</code> — what's the hidden interaction with the container's resources, and what's the failure mode?
+<details class="reveal"><summary>Answer</summary><p>tmpfs bytes count against the container's <em>memory limit</em>; fill the volume past the limit and the kernel OOM-kills the container even though the app allocated little (5.1).</p></details></li>
+<li>A volume's data survives which of these: container restart? pod deletion? For emptyDir vs a PVC-backed volume?
+<details class="reveal"><summary>Answer</summary><p>Container restart: both survive (volumes belong to the pod). Pod deletion: emptyDir dies with the pod dir under /var/lib/kubelet; PVC data lives in the PV and survives — that's its whole job (5.1/5.5).</p></details></li>
+<li>Where exactly on a node do you find a running pod's emptyDir contents?
+<details class="reveal"><summary>Answer</summary><p><code>/var/lib/kubelet/pods/&lt;pod-uid&gt;/volumes/kubernetes.io~empty-dir/&lt;volume-name&gt;/</code> — UID from <code>.metadata.uid</code>; it's a bind mount, so writes are visible from both sides (5.2).</p></details></li>
+<li>Which of PV / PVC / StorageClass are namespaced?
+<details class="reveal"><summary>Answer</summary><p>Only the PVC. PV and StorageClass are cluster-scoped — exam wording reflects it ("create a PVC in namespace X", no namespace for the PV). Pods mount claims, never PVs (5.3).</p></details></li>
+<li>The four matching rules the PV controller checks, and which candidate it picks when several qualify?
+<details class="reveal"><summary>Answer</summary><p>Capacity ≥ request, PV's accessModes ⊇ PVC's, storageClassName string-equal, selector match (if set). It binds the <em>smallest</em> satisfying PV — exclusively, 1:1, via claimRef + volumeName (5.4).</p></details></li>
+<li>A PVC meant for a static PV shows <code>storageclass.storage.k8s.io "manual" not found</code>. What does that event actually mean?
+<details class="reveal"><summary>Answer</summary><p>Static matching found no PV (size/modes/class/selector mismatch), so the controller fell through to dynamic provisioning and found no class either. Fix the PV↔PVC mismatch — don't create a StorageClass (5.4/5.5).</p></details></li>
+<li>Can two pods write to one ReadWriteOnce volume? And what does RWOP change?
+<details class="reveal"><summary>Answer</summary><p>Yes — RWO is a <em>node</em>-level guarantee; any number of pods on that one node share it. ReadWriteOncePod is the only pod-level mode: the scheduler blocks a second pod cluster-wide (5.6).</p></details></li>
+<li>You delete a PVC bound to a Retain PV, then recreate the identical PVC. What state is everything in, and what's the fix?
+<details class="reveal"><summary>Answer</summary><p>PV is <strong>Released</strong> (claimRef still pins the old claim's UID); new PVC sits Pending. Fix: <code>kubectl patch pv NAME --type=merge -p '{"spec":{"claimRef":null}}'</code> → Available → binds. Released ≠ Available (5.7).</p></details></li>
+<li>PVC with no <code>storageClassName</code> field vs <code>storageClassName: ""</code> — what does each get?
+<details class="reveal"><summary>Answer</summary><p>Unset → the default class's name is stamped in at admission (if a default exists). Empty string → explicit opt-out: static PVs only, never provision. Different requests; static-PV tasks set the class explicitly on both sides (5.8).</p></details></li>
+<li>A PVC is Pending with event <code>waiting for first consumer to be created before binding</code>. What do you do?
+<details class="reveal"><summary>Answer</summary><p>Nothing — create the workload. WaitForFirstConsumer defers provisioning until the scheduler places a pod (recorded in the <code>volume.kubernetes.io/selected-node</code> annotation) so the volume lands where the pod can run (5.9).</p></details></li>
+<li>Provision → attach → stage → publish: who makes each call, and where do you look when each step fails?
+<details class="reveal"><summary>Answer</summary><p>external-provisioner (CreateVolume; watch PVCs) → external-attacher (ControllerPublishVolume; watches VolumeAttachments) → kubelet (NodeStageVolume, once per node into globalmount) → kubelet (NodePublishVolume, bind into the pod dir). Fail-points: describe pvc / get volumeattachment + sidecar logs / journalctl -u kubelet on the node for both node calls (5.11).</p></details></li>
+<li>Three resize attempts, three messages: shrink a PVC; grow one whose class lacks allowVolumeExpansion; grow one whose class allows it but the provisioner has no resizer. Name each signature.
+<details class="reveal"><summary>Answer</summary><p>Shrink → validation error "field can not be less than previous value". Class forbids → "only dynamically provisioned pvcs can be resized and the storageclass … must support resize" (fix: patch the SC — it's mutable). No resizer → patch accepted, then stuck with <code>ExternalExpanding</code> "waiting for an external controller", spec &gt; status.capacity; recoverable by lowering back to the allocated size (GA v1.34) (5.13).</p></details></li>
+<li>A pod using an NFS PVC is stuck ContainerCreating; the kubelet log says <code>bad option; … you might need a /sbin/mount.&lt;type&gt; helper program</code>. Diagnosis?
+<details class="reveal"><summary>Answer</summary><p>That node is missing the NFS client package (<code>nfs-common</code> on Ubuntu) — mount helpers are per-node system packages, outside Kubernetes. Install it on <em>that</em> node (5.10/5.12).</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="w4.html">← Week 4 · Networking</a><a href="../index.html#w6">Week 6 on the tracker →</a></nav>
+
+<footer>
+Authored against Kubernetes v1.35 (current exam version), local-path-provisioner v0.0.36 and nfs-subdir-external-provisioner v4.0.2, on the post-Feb-2025 CKA curriculum. Expansion-failure recovery GA (v1.34) verified at authoring. UIDs, PV names and ages will differ on your cluster; outputs are abridged.
+</footer>
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
