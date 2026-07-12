@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Original CKA mock exam: 16 weighted tasks, 120-minute countdown, built for the 3-VM lab cluster. Domain weights mirror the real v1.35 curriculum.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>Mock exam 1 · 16 tasks — CKA Prep</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.timerbar{position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:14px;
+  background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:10px 16px;
+  margin:0 0 18px; box-shadow:var(--shadow)}
+.timerbar .clock{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:26px; font-weight:700;
+  letter-spacing:.04em; min-width:118px}
+.timerbar.warn .clock{color:var(--weight)}
+.timerbar.crit .clock{color:#d33}
+.timerbar .lbl{color:var(--muted); font-size:12.5px}
+.timerbar button{border:1px solid var(--line); background:var(--code-bg); color:var(--ink);
+  border-radius:8px; padding:6px 14px; font-size:13px; cursor:pointer}
+.timerbar button:hover{border-color:var(--accent)}
+.task{border:1px solid var(--line); border-radius:10px; background:var(--surface);
+  padding:16px 18px; margin:16px 0; box-shadow:var(--shadow)}
+.task h2{display:flex; align-items:center; gap:10px; font-size:16px; margin:0 0 4px}
+.task h2 .tno{color:var(--accent); font-family:ui-monospace,Menlo,Consolas,monospace}
+.task .meta{display:flex; gap:8px; margin:2px 0 10px}
+.task .dom, .task .pts{font-size:10.5px; text-transform:uppercase; letter-spacing:.07em;
+  border:1px solid var(--line); border-radius:20px; padding:2px 9px; color:var(--muted)}
+.task .pts{color:var(--weight); border-color:var(--weight); font-weight:700}
+.task p, .task li{font-size:14px}
+.task ul{padding-left:20px}
+.rules{border:1px solid var(--line); border-radius:10px; padding:14px 18px; background:var(--code-bg); font-size:13.5px}
+.rules li{margin:.35em 0}
+@media print{ .timerbar{display:none} }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="../materials/w7.html">W7 · RBAC &amp; speed</a></li>
+    <li><a href="../materials/w8.html">W8 · Exam week</a></li>
+    <li><a href="solutions-1.html">Mock exam · solutions (after!)</a></li>
+    <li><a href="../cheatsheets/commands.html">Cheat sheet · kubectl commands</a></li>
+    <li><a href="../cheatsheets/exam-day.html">Cheat sheet · exam day</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../materials/w8.html">← Week 8 lessons</a></p>
+<header class="hero">
+  <h1>Mock exam 1 — 16 tasks · 120 minutes · pass ≥ 66/100</h1>
+  <p>An original exam built for <em>your</em> lab cluster, weighted like the real curriculum: 30% troubleshooting, 25% cluster architecture, 20% networking, 15% workloads &amp; scheduling, 10% storage. Treat it as the real thing: one extra browser tab (kubernetes.io docs only), no notes, no peeking at the <a href="solutions-1.html">solutions page</a> until the timer rings.</p>
+</header>
+
+<div class="timerbar" id="timerbar">
+  <span class="clock" id="clock">120:00</span>
+  <button type="button" id="tstart">start</button>
+  <button type="button" id="treset">reset</button>
+  <span class="lbl" id="tlbl">The countdown survives page reloads — start it once and work.</span>
+</div>
+
+<div class="rules">
+<b>Before you start</b>
+<ol>
+<li>Provision the environment (some objects are planted broken on purpose — don't investigate anything before the timer runs):
+<pre class="cmd">wget https://raw.githubusercontent.com/morshed-seu/cka-prep-tracker/main/mock/setup-exam-1.sh
+sudo bash setup-exam-1.sh        # on cp; type 'begin' when asked</pre></li>
+<li>Every task begins with its context line — your lab has one context, run it anyway; the ritual (lesson 8.6) is what you're rehearsing. Tasks that name a node expect you to shell into it (<code>multipass shell node01</code>) and <code>exit</code> when done.</li>
+<li>Answer files go exactly where each task says (under <code>/root/exam/</code> on <code>cp</code>) — wrong path scores zero.</li>
+<li>First pass ≤6 minutes per task; flag and skip anything sticky (write its number down), second pass by points. Verify every task before calling it done.</li>
+<li>When the timer rings: hands off, then grade honestly with <a href="solutions-1.html">solutions-1</a> (per-task rubric, 66 points to pass). Clean up afterwards: <code>sudo bash setup-exam-1.sh cleanup</code>.</li>
+</ol>
+</div>
+
+<section class="task" id="t1">
+<h2><span class="tno">Task 1</span> RBAC for a deployment bot</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>In namespace <code>neptune</code>:</p>
+<ul>
+<li>Create a ServiceAccount <code>deploy-bot</code>.</li>
+<li>Create a Role <code>deployment-manager</code> that allows exactly <code>get</code>, <code>list</code> and <code>create</code> on <code>deployments</code>.</li>
+<li>Bind it to the ServiceAccount with a RoleBinding <code>deploy-bot-binding</code>.</li>
+</ul>
+<p>The ServiceAccount must be able to create deployments in <code>neptune</code> but must <em>not</em> be able to delete them, and must have no access outside <code>neptune</code>.</p>
+</section>
+
+<section class="task" id="t2">
+<h2><span class="tno">Task 2</span> A deployment that won't schedule</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Deployment <code>web-frontend</code> in namespace <code>mercury</code> should run 2 replicas, but none are available. Diagnose why and fix it so the deployment reports <code>2/2</code> ready. You must not change the image, the replica count, or delete/recreate the deployment.</p>
+</section>
+
+<section class="task" id="t3">
+<h2><span class="tno">Task 3</span> Static PV, PVC and a writer pod</h2>
+<div class="meta"><span class="dom">storage</span><span class="pts">5 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<ul>
+<li>Create a PersistentVolume <code>exam-pv</code>: capacity <code>1Gi</code>, access mode <code>ReadWriteOnce</code>, <code>storageClassName: manual</code>, hostPath <code>/srv/exam-pv</code>.</li>
+<li>Create a PersistentVolumeClaim <code>exam-pvc</code> in namespace <code>pluto</code> requesting <code>500Mi</code> from storage class <code>manual</code>.</li>
+<li>Create a pod <code>pv-writer</code> in <code>pluto</code> (image <code>busybox:1.36</code>) that mounts the claim at <code>/data</code> and writes the current date to <code>/data/out.txt</code> at startup, then sleeps.</li>
+</ul>
+<p>The PVC must end up <code>Bound</code> and the pod <code>Running</code>.</p>
+</section>
+
+<section class="task" id="t4">
+<h2><span class="tno">Task 4</span> ConfigMap-driven deployment + rolling update</h2>
+<div class="meta"><span class="dom">workloads &amp; scheduling</span><span class="pts">8 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>In namespace <code>pluto</code>:</p>
+<ul>
+<li>Create a ConfigMap <code>app-config</code> with keys <code>APP_MODE=production</code> and <code>APP_COLOR=blue</code>.</li>
+<li>Create a deployment <code>webapp</code>, image <code>nginx:1.28-alpine</code>, <code>3</code> replicas, whose containers receive <em>all</em> keys of <code>app-config</code> as environment variables.</li>
+<li>Once all replicas are ready, perform a rolling update of the image to <code>nginx:1.29-alpine</code> and wait for it to complete.</li>
+</ul>
+<p>Afterwards: rollout history must show revision 2, all 3 replicas ready on the new image, and <code>APP_MODE</code> visible in the environment of a running pod.</p>
+</section>
+
+<section class="task" id="t5">
+<h2><span class="tno">Task 5</span> NodePort service + its DNS name</h2>
+<div class="meta"><span class="dom">networking</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Expose deployment <code>web-portal</code> in namespace <code>jupiter</code> with a Service <code>web-portal-svc</code>: type <code>NodePort</code>, service port <code>80</code>, node port <code>30300</code>.</p>
+<p>Then write the fully qualified DNS name by which pods in <em>other</em> namespaces reach this service (the full form ending in the cluster domain) to <code>/root/exam/dns.txt</code> on <code>cp</code>.</p>
+<p>Verify: <code>curl http://10.211.64.11:30300</code> from any lab VM returns the nginx welcome page.</p>
+</section>
+
+<section class="task" id="t6">
+<h2><span class="tno">Task 6</span> A service with no endpoints</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Service <code>db-service</code> in namespace <code>venus</code> is supposed to route traffic on port 80 to the pods of deployment <code>db</code>, but requests hang and the service has no endpoints. Fix the <strong>Service only</strong> — the deployment is correct and must not be modified.</p>
+<p>Verify: <code>kubectl -n venus run check --rm -it --restart=Never --image=busybox:1.36 -- wget -qO- -T2 http://db-service</code> returns the nginx welcome page.</p>
+</section>
+
+<section class="task" id="t7">
+<h2><span class="tno">Task 7</span> etcd backup, verified</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">7 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes   # then work on cp</pre>
+<p>On <code>cp</code>:</p>
+<ul>
+<li>Create a snapshot of the cluster's etcd at <code>/root/exam/etcd-backup.db</code>, authenticating with the etcd server certificates from the cluster's PKI directory.</li>
+<li>Verify the snapshot's integrity offline and save the status table (the <code>-w table</code> output) to <code>/root/exam/etcd-status.txt</code>.</li>
+</ul>
+<p>The snapshot must be restorable (non-zero keys); the running cluster must not be disturbed.</p>
+</section>
+
+<section class="task" id="t8">
+<h2><span class="tno">Task 8</span> Pin a pod to labeled hardware, with limits</h2>
+<div class="meta"><span class="dom">workloads &amp; scheduling</span><span class="pts">7 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<ul>
+<li>Label node <code>node02</code> with <code>disk=fast</code>.</li>
+<li>Create pod <code>fast-worker</code> in namespace <code>pluto</code>: image <code>nginx:1.29-alpine</code>, scheduled <em>only</em> onto nodes labeled <code>disk=fast</code> (use a node selector), requesting <code>200m</code> CPU / <code>128Mi</code> memory with limits <code>500m</code> CPU / <code>256Mi</code> memory.</li>
+</ul>
+<p>The pod must be Running on <code>node02</code>.</p>
+</section>
+
+<section class="task" id="t9">
+<h2><span class="tno">Task 9</span> A crash-looping deployment</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Deployment <code>api</code> in namespace <code>mars</code> is crash-looping. Determine the cause from the pod's logs, then fix the deployment so its pod is Running and Ready. Do not change the image.</p>
+</section>
+
+<section class="task" id="t10">
+<h2><span class="tno">Task 10</span> Route traffic through the Gateway</h2>
+<div class="meta"><span class="dom">networking</span><span class="pts">7 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>The cluster runs a Gateway <code>traefik-gateway</code> in namespace <code>traefik</code> (HTTP listener on port 80, routes allowed from all namespaces). Namespace <code>jupiter</code> contains a deployment <code>shop</code> with a ClusterIP service <code>shop</code> on port 80.</p>
+<p>Create an HTTPRoute <code>shop-route</code> in namespace <code>jupiter</code> that attaches to that Gateway and forwards all requests for hostname <code>shop.exam.test</code> to service <code>shop</code> on port 80.</p>
+<p>Verify: <code>curl -s -H 'Host: shop.exam.test' http://10.211.64.11:30080</code> returns the nginx welcome page.</p>
+</section>
+
+<section class="task" id="t11">
+<h2><span class="tno">Task 11</span> Dynamic provisioning with the default class</h2>
+<div class="meta"><span class="dom">storage</span><span class="pts">5 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<ul>
+<li>Create a PersistentVolumeClaim <code>data-pvc</code> in namespace <code>pluto</code>: <code>500Mi</code>, <code>ReadWriteOnce</code>, storage class <code>local-path</code>.</li>
+<li>Create a pod <code>data-pod</code> in <code>pluto</code> (image <code>busybox:1.36</code>, sleeping) that mounts the claim at <code>/data</code>.</li>
+</ul>
+<p>End state: PVC <code>Bound</code>, pod <code>Running</code>. (If the PVC sits <code>Pending</code> before the pod exists, that is not an error — think about the storage class's binding mode.)</p>
+</section>
+
+<section class="task" id="t12">
+<h2><span class="tno">Task 12</span> Extract the error lines</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Pod <code>logger</code> in namespace <code>saturn</code> writes a mixed application log. Save all log lines containing <code>ERROR</code> (the complete lines, nothing else) to <code>/root/exam/errors.txt</code> on <code>cp</code>.</p>
+</section>
+
+<section class="task" id="t13">
+<h2><span class="tno">Task 13</span> Kustomize overlay</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes   # then work on cp</pre>
+<p>A Kustomize base at <code>/root/exam/kustomize/base</code> defines a deployment <code>hello</code>. Create an overlay at <code>/root/exam/kustomize/overlays/prod</code> that, without modifying the base:</p>
+<ul>
+<li>deploys into namespace <code>neptune</code>,</li>
+<li>prefixes resource names with <code>prod-</code>,</li>
+<li>sets the <code>hello</code> deployment to <code>3</code> replicas.</li>
+</ul>
+<p>Apply the overlay with <code>kubectl -k</code>. End state: deployment <code>prod-hello</code> in <code>neptune</code> with 3/3 ready.</p>
+</section>
+
+<section class="task" id="t14">
+<h2><span class="tno">Task 14</span> Find the CPU hog</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Namespace <code>uranus</code> runs three pods. Using the cluster's resource-metrics pipeline, determine which pod consumes the most CPU and write <em>only its name</em> to <code>/root/exam/high-cpu.txt</code> on <code>cp</code>. (Metrics need a minute or two of pod runtime to appear — if <code>kubectl top</code> comes back empty, wait and retry.)</p>
+</section>
+
+<section class="task" id="t15">
+<h2><span class="tno">Task 15</span> A static pod on node01</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">6 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes   # then: multipass shell node01</pre>
+<p>On <code>node01</code>, create a <strong>static pod</strong> named <code>static-web</code>: image <code>nginx:1.29-alpine</code>, container port 80, manifest placed in the kubelet's static-pod directory. Remember to <code>exit</code> the node when done.</p>
+<p>End state, seen from <code>cp</code>: a pod <code>static-web-node01</code> is Running in the <code>default</code> namespace.</p>
+</section>
+
+<section class="task" id="t16">
+<h2><span class="tno">Task 16</span> Lock down the database pod</h2>
+<div class="meta"><span class="dom">networking</span><span class="pts">7 pts</span></div>
+<pre class="cmd">kubectl config use-context kubernetes-admin@kubernetes</pre>
+<p>Namespace <code>jupiter</code> contains pods <code>frontend</code> (label <code>role=frontend</code>), <code>backend</code> (label <code>role=backend</code>) and <code>db</code> (label <code>role=db</code>).</p>
+<p>Create a NetworkPolicy <code>db-guard</code> in <code>jupiter</code> so that ingress to pods labeled <code>role=db</code> is allowed <em>only</em> from pods labeled <code>role=backend</code> in the same namespace, and only on TCP port 80. All other ingress to the db pods must be disallowed; other pods in the namespace must remain unrestricted.</p>
+<p><em>Grading is on the policy object (as on the real exam). Note your lab's flannel CNI doesn't enforce NetworkPolicies — traffic still flowing is not a sign your policy is wrong; the solutions page shows how to check the spec precisely.</em></p>
+</section>
+
+<div class="note"><b>Timer rang?</b>
+Hands off the keyboard. Count what you attempted and verified, then grade with <a href="solutions-1.html">solutions-1.html</a> — per-task rubric, 66/100 to pass, partial credit exactly as specified. Afterwards: <code>sudo bash setup-exam-1.sh cleanup</code>, and put every dropped point's domain on your 8.2 drill list.</div>
+
+<nav class="pager"><a href="../materials/w8.html">← Week 8 lessons</a><a href="solutions-1.html">Solutions &amp; grading →</a></nav>
+
+<footer>
+Original mock exam authored for this site against Kubernetes v1.35 (current exam version — verified 2026-07-13). Task count, timing, pass line and domain weights mirror the official CKA (~15–20 tasks, 120 min, 66%, v1.35 curriculum weights). IPs assume the week-0 lab (cp 10.211.64.10, node01 .11, node02 .12).
+</footer>
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+<script>
+(function(){
+  var KEY='cka-mock1-deadline', DUR=120*60*1000;
+  var clock=document.getElementById('clock'), bar=document.getElementById('timerbar'),
+      lbl=document.getElementById('tlbl'), tid=null;
+  function fmt(ms){
+    var s=Math.max(0, Math.ceil(ms/1000));
+    var m=Math.floor(s/60); s=s%60;
+    return m+':' + (s<10?'0':'')+s;
+  }
+  function tick(){
+    var end=+localStorage.getItem(KEY);
+    if(!end){ clock.textContent='120:00'; bar.classList.remove('warn','crit'); return; }
+    var left=end-Date.now();
+    clock.textContent=fmt(left);
+    bar.classList.toggle('crit', left<5*60*1000);
+    bar.classList.toggle('warn', left>=5*60*1000 && left<15*60*1000);
+    if(left<=0){
+      clock.textContent="TIME";
+      lbl.textContent='Time is up — hands off, then grade with the solutions page.';
+      clearInterval(tid); tid=null;
+    }
+  }
+  document.getElementById('tstart').addEventListener('click', function(){
+    if(!localStorage.getItem(KEY)){
+      localStorage.setItem(KEY, String(Date.now()+DUR));
+      lbl.textContent='Running. First pass: nothing gets more than 6 minutes.';
+    }
+    if(!tid) tid=setInterval(tick, 500);
+    tick();
+  });
+  document.getElementById('treset').addEventListener('click', function(){
+    if(!confirm('Reset the exam timer?')) return;
+    localStorage.removeItem(KEY);
+    if(tid){ clearInterval(tid); tid=null; }
+    lbl.textContent='The countdown survives page reloads — start it once and work.';
+    tick();
+  });
+  if(localStorage.getItem(KEY)){ tid=setInterval(tick, 500); tick(); }
+})();
+</script>
+</body>
+</html>

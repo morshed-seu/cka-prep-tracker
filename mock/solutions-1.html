@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Solutions and grading rubric for CKA mock exam 1: per-task solution, verification command, point breakdown, 66-point pass line.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>Mock exam 1 · solutions &amp; grading — CKA Prep</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.task{border:1px solid var(--line); border-radius:10px; background:var(--surface);
+  padding:16px 18px; margin:16px 0; box-shadow:var(--shadow)}
+.task h2{display:flex; align-items:center; gap:10px; font-size:16px; margin:0 0 4px}
+.task h2 .tno{color:var(--accent); font-family:ui-monospace,Menlo,Consolas,monospace}
+.task .meta{display:flex; gap:8px; margin:2px 0 10px}
+.task .dom, .task .pts{font-size:10.5px; text-transform:uppercase; letter-spacing:.07em;
+  border:1px solid var(--line); border-radius:20px; padding:2px 9px; color:var(--muted)}
+.task .pts{color:var(--weight); border-color:var(--weight); font-weight:700}
+.task p, .task li{font-size:14px}
+.rubric{border-collapse:collapse; font-size:13px; margin:.6em 0; width:100%}
+.rubric th, .rubric td{border:1px solid var(--line); padding:4px 9px; text-align:left}
+.rubric th{background:var(--code-bg); font-size:11px; text-transform:uppercase; letter-spacing:.05em}
+.rubric td:last-child, .rubric th:last-child{text-align:right; white-space:nowrap}
+.scorecard{border-collapse:collapse; font-size:13.5px; margin:.6em 0}
+.scorecard th, .scorecard td{border:1px solid var(--line); padding:4px 10px; text-align:left}
+.scorecard th{background:var(--code-bg); font-size:11px; text-transform:uppercase; letter-spacing:.05em}
+h5.verify{color:var(--accent); font-size:12px; letter-spacing:.08em; text-transform:uppercase; margin:14px 0 4px}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="exam-1.html">Mock exam · tasks</a></li>
+    <li><a href="../materials/w8.html">W8 · Exam week</a></li>
+    <li><a href="../cheatsheets/triage-template.html">Cheat sheet · triage template</a></li>
+    <li><a href="../cheatsheets/exam-day.html">Cheat sheet · exam day</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="exam-1.html">← Back to the exam</a></p>
+<header class="hero">
+  <h1>Mock exam 1 — solutions &amp; grading</h1>
+  <p>Grade like the real thing grades: by <strong>resulting state</strong>, verified with a command — not by intent. Each task lists the solution, the verification, and a point breakdown; award partial credit exactly as itemized, nothing for "I knew it, I just…". <strong>Pass line: 66/100.</strong> Every dropped point names the domain that goes on your <a href="../materials/w8.html#cp-8-2">8.2 drill list</a>.</p>
+</header>
+
+<div class="note"><b>Scorecard</b>
+Troubleshooting: tasks 2, 6, 9, 12, 14 (30 pts) · Cluster architecture: 1, 7, 13, 15 (25 pts) · Networking: 5, 10, 16 (20 pts) · Workloads &amp; scheduling: 4, 8 (15 pts) · Storage: 3, 11 (10 pts). Solutions show <em>one</em> good path; any route to the same verified end state scores full points.</div>
+
+<section class="task" id="s1">
+<h2><span class="tno">Task 1</span> RBAC for a deployment bot</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl -n neptune create serviceaccount deploy-bot
+kubectl -n neptune create role deployment-manager \
+  --verb=get,list,create --resource=deployments
+kubectl -n neptune create rolebinding deploy-bot-binding \
+  --role=deployment-manager --serviceaccount=neptune:deploy-bot</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl auth can-i create deployments -n neptune \
+  --as=system:serviceaccount:neptune:deploy-bot     # yes
+kubectl auth can-i delete deployments -n neptune \
+  --as=system:serviceaccount:neptune:deploy-bot     # no
+kubectl auth can-i list deployments -n default \
+  --as=system:serviceaccount:neptune:deploy-bot     # no</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>ServiceAccount <code>deploy-bot</code> exists in <code>neptune</code></td><td>1</td></tr>
+<tr><td>Role with exactly get/list/create on deployments (extra verbs = 0 here)</td><td>2</td></tr>
+<tr><td>RoleBinding connects the Role to the SA</td><td>2</td></tr>
+<tr><td>All three <code>can-i</code> checks answer as above</td><td>1</td></tr>
+</table>
+<p>Trap check: a ClusterRoleBinding instead of a RoleBinding grants cluster-wide access — that fails the "no access outside neptune" requirement and caps this task at 3.</p>
+</details>
+</section>
+
+<section class="task" id="s2">
+<h2><span class="tno">Task 2</span> A deployment that won't schedule</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<p>Diagnosis: pods are <code>Pending</code>; <code>describe</code> names the reason.</p>
+<pre class="cmd">kubectl -n mercury get pods
+kubectl -n mercury describe pod -l app=web-frontend | grep -A3 Events:</pre>
+<pre class="out">Warning  FailedScheduling ... <b>0/3 nodes are available: 3 Insufficient cpu</b>.</pre>
+<p>Each replica requests <code>cpu: "4"</code> — more than any lab node has. Lower the request to something real (the exact value doesn't matter; schedulable does):</p>
+<pre class="cmd">kubectl -n mercury edit deployment web-frontend
+  # resources.requests.cpu: "4"  →  100m</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n mercury get deployment web-frontend    # 2/2 READY</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Root cause identified (Insufficient cpu from the request, stated from Events)</td><td>2</td></tr>
+<tr><td>Fixed via the resource request — image, replicas, deployment untouched otherwise</td><td>3</td></tr>
+<tr><td>2/2 Ready verified</td><td>1</td></tr>
+</table>
+<p>Deleting/recreating the deployment or dropping replicas to make it fit violates the task and caps at 2 (diagnosis only).</p>
+</details>
+</section>
+
+<section class="task" id="s3">
+<h2><span class="tno">Task 3</span> Static PV, PVC and a writer pod</h2>
+<div class="meta"><span class="dom">storage</span><span class="pts">5 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: exam-pv
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  hostPath:
+    path: /srv/exam-pv
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: exam-pvc
+  namespace: pluto
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  resources:
+    requests: {storage: 500Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pv-writer
+  namespace: pluto
+spec:
+  containers:
+  - name: main
+    image: busybox:1.36
+    command: ["sh", "-c", "date &gt; /data/out.txt; sleep 1d"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: exam-pvc
+EOF</pre>
+<p><code>type: DirectoryOrCreate</code> makes the kubelet create <code>/srv/exam-pv</code> on whichever node runs the pod — without it, a missing host directory fails the mount.</p>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n pluto get pvc exam-pvc      # STATUS Bound, VOLUME exam-pv
+kubectl -n pluto exec pv-writer -- cat /data/out.txt   # a date</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>PV with exact capacity/mode/class/hostPath</td><td>2</td></tr>
+<tr><td>PVC in <code>pluto</code>, 500Mi, class <code>manual</code>, Bound to exam-pv</td><td>1</td></tr>
+<tr><td>Pod Running with the claim mounted and <code>/data/out.txt</code> written</td><td>2</td></tr>
+</table>
+</details>
+</section>
+
+<section class="task" id="s4">
+<h2><span class="tno">Task 4</span> ConfigMap-driven deployment + rolling update</h2>
+<div class="meta"><span class="dom">workloads &amp; scheduling</span><span class="pts">8 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl -n pluto create configmap app-config \
+  --from-literal=APP_MODE=production --from-literal=APP_COLOR=blue
+kubectl -n pluto create deployment webapp \
+  --image=nginx:1.28-alpine --replicas=3 --dry-run=client -o yaml &gt; webapp.yaml
+vim webapp.yaml     # add under the container:
+#        envFrom:
+#        - configMapRef:
+#            name: app-config
+kubectl apply -f webapp.yaml
+kubectl -n pluto rollout status deployment webapp
+kubectl -n pluto set image deployment/webapp nginx=nginx:1.29-alpine
+kubectl -n pluto rollout status deployment webapp</pre>
+<p>Building the YAML first (instead of <code>create</code> then <code>set env --from=configmap/app-config</code>) keeps the image change as revision 2 — but that's cosmetic: full credit as long as the <em>newest</em> revision is the image update and the end state matches. (<code>set env --from</code> is a fine, faster alternative; it just spends a revision.)</p>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n pluto rollout history deployment webapp        # image change = newest rev
+kubectl -n pluto get deployment webapp \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'  # nginx:1.29-alpine
+kubectl -n pluto exec deploy/webapp -- sh -c 'env | grep APP_'</pre>
+<pre class="out">APP_MODE=<b>production</b>
+APP_COLOR=<b>blue</b></pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>ConfigMap with both exact keys/values</td><td>2</td></tr>
+<tr><td>Deployment: right name/image/replicas, all CM keys in the env (envFrom or per-key)</td><td>3</td></tr>
+<tr><td>Rolling update performed to 1.29-alpine, rollout completed, visible as a new revision</td><td>2</td></tr>
+<tr><td>Env proven in a running pod</td><td>1</td></tr>
+</table>
+</details>
+</section>
+
+<section class="task" id="s5">
+<h2><span class="tno">Task 5</span> NodePort service + its DNS name</h2>
+<div class="meta"><span class="dom">networking</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl -n jupiter expose deployment web-portal --name=web-portal-svc \
+  --port=80 --type=NodePort
+kubectl -n jupiter patch service web-portal-svc --type='json' \
+  -p='[{"op":"replace","path":"/spec/ports/0/nodePort","value":30300}]'
+echo "web-portal-svc.jupiter.svc.cluster.local" &gt; /root/exam/dns.txt</pre>
+<p>(<code>expose</code> can't set a nodePort; patch or edit it after, or write the Service YAML by hand with <code>nodePort: 30300</code> — same points.)</p>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">curl -s http://10.211.64.11:30300 | grep title    # Welcome to nginx!
+cat /root/exam/dns.txt</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Service <code>web-portal-svc</code>: NodePort type, port 80, selects the web-portal pods</td><td>3</td></tr>
+<tr><td>nodePort is exactly 30300 (curl on that port answers)</td><td>1</td></tr>
+<tr><td><code>/root/exam/dns.txt</code> = <code>web-portal-svc.jupiter.svc.cluster.local</code></td><td>1</td></tr>
+<tr><td>curl verification actually run</td><td>1</td></tr>
+</table>
+<p>Common half-credit: DNS name written for the <em>deployment</em> (<code>web-portal.jupiter…</code>) instead of the Service — services own DNS records, not deployments; that line scores 0 of its point.</p>
+</details>
+</section>
+
+<section class="task" id="s6">
+<h2><span class="tno">Task 6</span> A service with no endpoints</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<p>Two planted faults, both inside the Service — the no-endpoints signature (selector) plus a port that would fail even with endpoints:</p>
+<pre class="cmd">kubectl -n venus get endpointslices                     # empty for db-service
+kubectl -n venus get pods --show-labels                 # pods carry app=database
+kubectl -n venus get svc db-service -o yaml | grep -A2 'selector\|targetPort'</pre>
+<pre class="out">selector: {app: <b>db</b>}          ← pods are labeled app=<b>database</b>
+targetPort: <b>8080</b>             ← nginx listens on <b>80</b></pre>
+<pre class="cmd">kubectl -n venus edit service db-service
+  # selector: app: database
+  # targetPort: 80</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n venus get endpointslices        # two endpoints appear
+kubectl -n venus run check --rm -it --restart=Never \
+  --image=busybox:1.36 -- wget -qO- -T2 http://db-service | grep title</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Selector fixed to match the pod labels (endpoints exist)</td><td>2</td></tr>
+<tr><td>targetPort fixed to 80 (traffic actually served)</td><td>2</td></tr>
+<tr><td>Deployment untouched</td><td>1</td></tr>
+<tr><td>wget verification returns the page</td><td>1</td></tr>
+</table>
+<p>Finding only the selector and declaring victory without the consumer-side wget is exactly the trap: endpoints appear, traffic still dies on 8080. Verification from the consumer's side catches it — that's the lesson this task exists for.</p>
+</details>
+</section>
+
+<section class="task" id="s7">
+<h2><span class="tno">Task 7</span> etcd backup, verified</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">7 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">sudo ETCDCTL_API=3 etcdctl snapshot save /root/exam/etcd-backup.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+sudo etcdutl snapshot status /root/exam/etcd-backup.db -w table \
+  | sudo tee /root/exam/etcd-status.txt</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">sudo cat /root/exam/etcd-status.txt     # TOTAL KEYS ≥ ~1000, size a few MB
+kubectl get nodes                        # cluster undisturbed</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Snapshot at the exact path, taken online with the three cert flags + endpoint</td><td>4</td></tr>
+<tr><td>Status verified offline with etcdutl, table saved to the exact path</td><td>2</td></tr>
+<tr><td>Live cluster untouched (no etcd restart, nodes Ready throughout)</td><td>1</td></tr>
+</table>
+<p>Zero-key or few-KB snapshot = wrong endpoint/certs = 0 for the first row; this is why the status check is part of the task. If you reached for the <a href="../cheatsheets/etcd-card.html">etcd card</a> during the exam, note it on your 8.2 list — on the real thing this must come from your fingers.</p>
+</details>
+</section>
+
+<section class="task" id="s8">
+<h2><span class="tno">Task 8</span> Pin a pod to labeled hardware, with limits</h2>
+<div class="meta"><span class="dom">workloads &amp; scheduling</span><span class="pts">7 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl label node node02 disk=fast
+cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fast-worker
+  namespace: pluto
+spec:
+  nodeSelector:
+    disk: fast
+  containers:
+  - name: nginx
+    image: nginx:1.29-alpine
+    resources:
+      requests: {cpu: 200m, memory: 128Mi}
+      limits:   {cpu: 500m, memory: 256Mi}
+EOF</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n pluto get pod fast-worker -o wide     # Running, NODE node02</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>node02 labeled <code>disk=fast</code></td><td>1</td></tr>
+<tr><td>Pod uses a nodeSelector on that label (not a nodeName pin)</td><td>2</td></tr>
+<tr><td>Requests and limits all four values exact</td><td>3</td></tr>
+<tr><td>Running on node02, verified with <code>-o wide</code></td><td>1</td></tr>
+</table>
+<p><code>nodeName: node02</code> "works" but bypasses the scheduler and ignores the label — the task said <em>only onto nodes labeled</em>; it scores 0 on the selector row.</p>
+</details>
+</section>
+
+<section class="task" id="s9">
+<h2><span class="tno">Task 9</span> A crash-looping deployment</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl -n mars get pods                       # CrashLoopBackOff
+kubectl -n mars logs deploy/api</pre>
+<pre class="out">nginx: <b>invalid option: "--with-turbo"</b></pre>
+<p>The pod template overrides the container command with a bogus nginx flag. Remove the flag (or the whole <code>command:</code> override — the image's default is correct):</p>
+<pre class="cmd">kubectl -n mars edit deployment api
+  # delete the line:  - --with-turbo     (or the entire command: block)</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n mars get pods    # 1/1 Running, RESTARTS not climbing</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Cause identified from the pod logs (bad command-line flag)</td><td>2</td></tr>
+<tr><td>Fixed in the deployment's template (not by nursing individual pods), image unchanged</td><td>3</td></tr>
+<tr><td>Running <em>and</em> Ready verified, restarts stable</td><td>1</td></tr>
+</table>
+</details>
+</section>
+
+<section class="task" id="s10">
+<h2><span class="tno">Task 10</span> Route traffic through the Gateway</h2>
+<div class="meta"><span class="dom">networking</span><span class="pts">7 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route
+  namespace: jupiter
+spec:
+  parentRefs:
+  - name: traefik-gateway
+    namespace: traefik
+  hostnames: ["shop.exam.test"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: shop
+      port: 80
+EOF</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n jupiter describe httproute shop-route | grep -A2 Conditions:
+curl -s -H 'Host: shop.exam.test' http://10.211.64.11:30080 | grep title</pre>
+<pre class="out">Type: <b>Accepted</b>      Status: <b>True</b>
+&lt;title&gt;<b>Welcome to nginx!</b>&lt;/title&gt;</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td><code>parentRefs</code> names the Gateway <em>and</em> its namespace <code>traefik</code></td><td>2</td></tr>
+<tr><td>Hostname <code>shop.exam.test</code></td><td>1</td></tr>
+<tr><td>backendRef service <code>shop</code> port 80 (route in <code>jupiter</code>, same ns as backend)</td><td>2</td></tr>
+<tr><td><code>Accepted: True</code> condition checked</td><td>1</td></tr>
+<tr><td>curl through the NodePort returns the page</td><td>1</td></tr>
+</table>
+<p>The classic zero here: omitting <code>namespace: traefik</code> in parentRefs — the route then looks for a Gateway in <code>jupiter</code>, finds none, and sits with <code>Accepted: False</code>. The condition names the problem; reading it is the skill.</p>
+</details>
+</section>
+
+<section class="task" id="s11">
+<h2><span class="tno">Task 11</span> Dynamic provisioning with the default class</h2>
+<div class="meta"><span class="dom">storage</span><span class="pts">5 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-pvc
+  namespace: pluto
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: {storage: 500Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: data-pod
+  namespace: pluto
+spec:
+  containers:
+  - name: main
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 1d"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: data-pvc
+EOF</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n pluto get pvc data-pvc      # Bound (only after the pod scheduled)
+kubectl -n pluto get pod data-pod      # Running</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>PVC: 500Mi, RWO, class <code>local-path</code></td><td>2</td></tr>
+<tr><td>Pod mounts the claim at <code>/data</code></td><td>2</td></tr>
+<tr><td>PVC Bound + pod Running (and you didn't "debug" the WaitForFirstConsumer pause)</td><td>1</td></tr>
+</table>
+<p>The teaching point: <code>local-path</code> binds <code>WaitForFirstConsumer</code> — a Pending PVC with no pod is the storage class working as designed (W5). If you burned minutes investigating it, log that on the drill list.</p>
+</details>
+</section>
+
+<section class="task" id="s12">
+<h2><span class="tno">Task 12</span> Extract the error lines</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl -n saturn logs logger | grep ERROR &gt; /root/exam/errors.txt
+cat /root/exam/errors.txt | head -3</pre>
+<pre class="out">... <b>ERROR payment gateway timeout order=1004</b>
+... <b>ERROR payment gateway timeout order=1008</b></pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>File exists at the exact path, non-empty</td><td>3</td></tr>
+<tr><td>Contains complete ERROR lines and <em>only</em> ERROR lines (no INFO/WARN)</td><td>3</td></tr>
+</table>
+<p>Half the value of tasks like this is re-reading the ask: <em>complete lines</em>, <em>only</em> ERROR, <em>exact path</em>. Each one is a silent zero if missed — <code>cat</code> the file before moving on (8.8).</p>
+</details>
+</section>
+
+<section class="task" id="s13">
+<h2><span class="tno">Task 13</span> Kustomize overlay</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">mkdir -p /root/exam/kustomize/overlays/prod
+cat &gt; /root/exam/kustomize/overlays/prod/kustomization.yaml &lt;&lt;'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: neptune
+namePrefix: prod-
+resources:
+- ../../base
+replicas:
+- name: hello
+  count: 3
+EOF
+kubectl apply -k /root/exam/kustomize/overlays/prod</pre>
+<p>(<code>replicas:</code> is the dedicated transformer; a strategic-merge patch that sets <code>spec.replicas</code> is equally correct. <code>name: hello</code> refers to the <em>base</em> name — transformers run before the prefix lands.)</p>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl -n neptune get deployment prod-hello     # 3/3 READY
+kubectl kustomize /root/exam/kustomize/overlays/prod | head   # renders without errors</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Overlay references the base via <code>resources: ../../base</code> (base files unmodified)</td><td>2</td></tr>
+<tr><td><code>namespace: neptune</code> and <code>namePrefix: prod-</code> in the overlay</td><td>2</td></tr>
+<tr><td>Replicas 3 via transformer or patch</td><td>1</td></tr>
+<tr><td>Applied with <code>-k</code>; prod-hello 3/3 verified</td><td>1</td></tr>
+</table>
+</details>
+</section>
+
+<section class="task" id="s14">
+<h2><span class="tno">Task 14</span> Find the CPU hog</h2>
+<div class="meta"><span class="dom">troubleshooting</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">kubectl top pod -n uranus</pre>
+<pre class="out">NAME         CPU(cores)   MEMORY(bytes)
+cpu-load-1   0m           0Mi
+<b>cpu-load-2   200m</b>         0Mi          ← a busy-loop pinned at its 200m limit
+cpu-load-3   0m           0Mi</pre>
+<pre class="cmd">echo "cpu-load-2" &gt; /root/exam/high-cpu.txt</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>File at the exact path names <code>cpu-load-2</code></td><td>5</td></tr>
+<tr><td>The name and nothing else (no table row, no whitespace art)</td><td>1</td></tr>
+</table>
+<p>If <code>kubectl top</code> errored entirely: metrics-server (installed in 3.19) is the pipeline behind it — <code>kubectl get apiservice v1beta1.metrics.k8s.io</code> is the first triage step, and that rabbit hole is exactly what the 6-minute rule exists for.</p>
+</details>
+</section>
+
+<section class="task" id="s15">
+<h2><span class="tno">Task 15</span> A static pod on node01</h2>
+<div class="meta"><span class="dom">cluster architecture</span><span class="pts">6 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">multipass shell node01     # (real exam: ssh node01)
+sudo grep staticPodPath /var/lib/kubelet/config.yaml   # /etc/kubernetes/manifests
+sudo tee /etc/kubernetes/manifests/static-web.yaml &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: static-web
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.29-alpine
+    ports:
+    - containerPort: 80
+EOF
+exit                       # ← the ritual: leave the node immediately</pre>
+<h5 class="verify">Verify</h5>
+<pre class="cmd">kubectl get pod static-web-node01     # Running — kubelet-owned mirror pod</pre>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td>Manifest in node01's staticPodPath (checked, not guessed)</td><td>3</td></tr>
+<tr><td>Pod spec: name, image, containerPort as asked</td><td>2</td></tr>
+<tr><td><code>static-web-node01</code> Running, verified from cp — and you exited the node shell</td><td>1</td></tr>
+</table>
+<p>No kubectl needed on the node — the kubelet watches the directory. If nothing appears in 30s: manifest YAML typo (kubelet logs name it: <code>sudo journalctl -u kubelet | tail</code>).</p>
+</details>
+</section>
+
+<section class="task" id="s16">
+<h2><span class="tno">Task 16</span> Lock down the database pod</h2>
+<div class="meta"><span class="dom">networking</span><span class="pts">7 pts</span></div>
+<details class="reveal"><summary>Solution &amp; rubric</summary>
+<pre class="cmd">cat &lt;&lt;'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-guard
+  namespace: jupiter
+spec:
+  podSelector:
+    matchLabels:
+      role: db
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: backend
+    ports:
+    - protocol: TCP
+      port: 80
+EOF</pre>
+<h5 class="verify">Verify</h5>
+<p>Spec-check the object (grading basis — flannel doesn't enforce policies, so traffic tests prove nothing here):</p>
+<pre class="cmd">kubectl -n jupiter get networkpolicy db-guard -o yaml</pre>
+<p>Confirm: <code>podSelector</code> targets <code>role: db</code> only; one ingress rule; <code>from</code> is a bare <code>podSelector</code> (same-namespace pods); port TCP/80; <code>policyTypes: [Ingress]</code>. To watch it actually enforce, re-run the <a href="../materials/w4.html#cp-4-24">4.24 Calico swap</a> and wget from <code>frontend</code> (times out) vs <code>backend</code> (answers).</p>
+<table class="rubric">
+<tr><th>Criterion</th><th>Pts</th></tr>
+<tr><td><code>podSelector: role=db</code> (not empty — an empty selector would restrict every pod)</td><td>2</td></tr>
+<tr><td><code>from</code> = podSelector <code>role=backend</code> alone (no namespaceSelector AND-combo, no extra peers)</td><td>2</td></tr>
+<tr><td>Ports limited to TCP 80</td><td>1</td></tr>
+<tr><td><code>policyTypes</code> = Ingress only (egress and other pods untouched)</td><td>1</td></tr>
+<tr><td>Object present in <code>jupiter</code> under the right name</td><td>1</td></tr>
+</table>
+<p>Indentation trap, one last time: <code>- podSelector</code> (one list item under <code>from</code>) means <em>backend pods</em>; adding a second <code>-</code> peer ORs another allowed source, while nesting a namespaceSelector <em>inside the same item</em> ANDs it. One dash decides the meaning (4.25).</p>
+</details>
+</section>
+
+<div class="note"><b>After grading</b>
+Score ≥66: you'd have passed — now look at <em>where</em> the lost points cluster and drill that domain anyway (8.2). Score &lt;66: no drama — this mock is graded harshly on purpose, and every rubric row you missed is a named, fixable gap with a lesson behind it. Either way: <code>sudo bash setup-exam-1.sh cleanup</code>, log the lessons, and remember the mock's real product is the drill list it writes for your final week.</div>
+
+<nav class="pager"><a href="exam-1.html">← The exam</a><a href="../materials/w8.html">Week 8 lessons →</a></nav>
+
+<footer>
+Solutions authored against Kubernetes v1.35 on the week-0 lab (flannel CNI, Traefik gateway, local-path default StorageClass, metrics-server from 3.19). Every solution shown is one valid path — grade end states, not keystrokes.
+</footer>
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>

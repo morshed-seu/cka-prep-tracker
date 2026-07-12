@@ -16,7 +16,9 @@ The full approved plan is in [`docs/PLAN.md`](docs/PLAN.md). Decisions already m
 | P5 | materials/w5.html (storage/CSI) | ✅ done |
 | P6 | materials/w6.html + labs/faults/*.sh + cheatsheets/triage-template.html | ✅ done |
 | P7 | materials/w7.html (RBAC/auth/speed) + cheatsheets/commands.html | ✅ done |
-| P8 | materials/w8.html + mock/ (exam-1, solutions, setup script) + cheatsheets/exam-day.html + final QA + artifact banner update | ⬜ next |
+| P8 | materials/w8.html + mock/ (exam-1, solutions, setup script) + cheatsheets/exam-day.html + final QA + artifact banner update | ✅ done |
+
+All phases complete. Future sessions: maintenance only (re-verify exam version/rules against the LF pages, fix reported issues); a second mock (`mock/exam-2.html`) would follow the exam-1 pattern if ever requested. Note: `shellcheck` was unavailable in the P8 environment — `mock/setup-exam-1.sh` passed `bash -n` and mirrors the (shellchecked) `labs/faults/` patterns, but run shellcheck on it when available.
 
 ## Phase workflow
 
