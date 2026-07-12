@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CKA prep Week 7 lessons: authentication internals, the CSR onboarding flow, ServiceAccount tokens, RBAC in practice, and the speed drills that convert knowledge into exam points.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>W7 · RBAC, auth &amp; speed — CKA Prep Lessons</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>week 7 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="w0.html">W0 · Setup</a></li>
+    <li><a href="w1.html">W1 · Control plane</a></li>
+    <li><a href="w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="w3.html">W3 · Workloads</a></li>
+    <li><a href="w4.html">W4 · Networking</a></li>
+    <li><a href="w5.html">W5 · Storage</a></li>
+    <li><a href="w6.html">W6 · Troubleshooting</a></li>
+    <li><a href="w7.html">W7 · RBAC &amp; speed</a></li>
+    <li><a href="../cheatsheets/etcd-card.html">Cheat sheet · etcd card</a></li>
+    <li><a href="../cheatsheets/triage-template.html">Cheat sheet · triage template</a></li>
+    <li><a href="../cheatsheets/commands.html">Cheat sheet · kubectl commands</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../index.html#w7">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>Week 7 — RBAC, ServiceAccounts &amp; speed drills</h1>
+  <p>Two jobs this week. First, close out the 25% Cluster Architecture domain with the piece weeks 1–2 left open: how the apiserver decides <em>who you are</em> and <em>what you may do</em> — certificates, ServiceAccount tokens, the CSR onboarding flow, and RBAC's four objects. Second, convert everything you know into speed: imperative generators, jsonpath surgery, fast-edit patterns, timed sprints, and your first killer.sh session. Knowledge stopped being the bottleneck around week 4; from here the enemy is the clock. Ticking <em>done</em> here also ticks the tracker.</p>
+  <div class="flow"><span>request + credential</span><em>→</em><span>authentication — who?</span><em>→</em><span class="hot">authorization — may you?</span><em>→</em><span>admission</span><em>→</em><span>etcd</span></div>
+</header>
+
+<!-- ---------------- Authn & authz internals ---------------- -->
+<div class="grp" id="g-authn"><h3>Authentication &amp; authorization internals</h3>
+
+<article class="lesson" id="cp-7-1" data-id="w7-1">
+<div class="lesson-head"><span class="cp-id">7.1</span><h4>Consolidate authentication: three credentials, one rule — there is no User object</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You've already met every credential type this cluster uses — client certs in week 2, the sa.key pair in the PKI map, bootstrap tokens during <code>kubeadm join</code>. This lesson snaps them into one picture, and gives you the 401-vs-403 discriminator that instantly classifies half of all "access denied" exam symptoms.</p>
+<h5>The concept</h5>
+<p>Every request hits the apiserver's <strong>authenticator chain</strong>: each configured authenticator either identifies the request or passes; the first success wins and yields a <em>username + group list</em> — nothing more. Kubernetes stores <strong>no User objects anywhere</strong>: a "user" exists only as whatever name a credential carries. That's why you can't <code>kubectl get users</code>, and why "create a user" tasks always mean "mint a credential" (a cert via the CSR API, or a ServiceAccount).</p>
+<table>
+<tr><th>Credential</th><th>Verified against</th><th>Identity it yields</th><th>You built it in</th></tr>
+<tr><td>x509 client cert</td><td>cluster CA (<code>ca.crt</code>)</td><td>CN = username, O = groups</td><td><a href="w2.html#cp-2-3">2.3</a></td></tr>
+<tr><td>ServiceAccount JWT</td><td><code>sa.pub</code> (signed by <code>sa.key</code>)</td><td><code>system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code>, group <code>system:serviceaccounts</code></td><td><a href="w2.html#cp-2-5">2.5</a></td></tr>
+<tr><td>bootstrap token</td><td>Secret in <code>kube-system</code></td><td><code>system:bootstrap:&lt;id&gt;</code>, group <code>system:bootstrappers</code></td><td>2.x (<code>kubeadm join</code>)</td></tr>
+<tr><td>no credential</td><td>— (anonymous auth on by default)</td><td><code>system:anonymous</code>, group <code>system:unauthenticated</code></td><td>—</td></tr>
+</table>
+<p>The status codes then split cleanly: <strong>401 Unauthorized = authentication failed</strong> (bad/expired credential — the apiserver doesn't know who you are). <strong>403 Forbidden = authentication succeeded, authorization refused</strong> (it knows exactly who you are and the answer is no). A 403 always names the identity it resolved — read it; it tells you which credential you're actually using.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask the API who your kubeconfig makes you (works with any credential type):
+<pre class="cmd">kubectl auth whoami</pre>
+<pre class="out">ATTRIBUTE   VALUE
+Username    <b>kubernetes-admin</b>
+Groups      [<b>kubeadm:cluster-admins</b> system:authenticated]</pre></li>
+<li>On <code>cp</code>, talk to the apiserver with <em>no credential</em>. Health/version endpoints are open to anonymous; real resources are not:
+<pre class="cmd">curl -sk https://127.0.0.1:6443/version | grep gitVersion
+curl -sk https://127.0.0.1:6443/api/v1/pods | grep -A2 message</pre>
+<pre class="out">  "gitVersion": "v1.35.1",
+  "message": "pods is forbidden: User <b>\"system:anonymous\"</b> cannot list resource \"pods\" ...",
+  "reason": "<b>Forbidden</b>",
+  "code": <b>403</b></pre>
+<p>No credential still produced an identity (<code>system:anonymous</code>) — and a <em>403</em>: authn passed, authz said no.</p></li>
+<li>Now a <em>broken</em> credential — a garbage bearer token:
+<pre class="cmd">curl -sk -H 'Authorization: Bearer garbage' https://127.0.0.1:6443/api/v1/pods | grep -E 'message|code'</pre>
+<pre class="out">  "message": "<b>Unauthorized</b>",
+  "code": <b>401</b></pre>
+<p>Bad credential → 401, no identity at all. That's the discriminator: 401 = fix the credential, 403 = fix RBAC.</p></li>
+<li>Crack open a ServiceAccount JWT — it's three base64 chunks joined by dots; the middle one is the claims:
+<pre class="cmd">TOKEN=$(kubectl create token default)
+echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2&gt;/dev/null; echo</pre>
+<pre class="out">{"aud":["https://kubernetes.default.svc.cluster.local"],
+ "exp":1783742533,"iat":1783738933,
+ "iss":"https://kubernetes.default.svc.cluster.local",
+ "sub":"<b>system:serviceaccount:default:default</b>", ...}</pre>
+<p>Audience, issue/expiry times, and the subject line that <em>is</em> the SA's username. The signature (third chunk) is what <code>sa.pub</code> verifies — 7.4 goes deeper.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can state, for each row of the table, where its signing/verification key lives on <code>cp</code> — and you can classify 401 vs 403 without looking anything up.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Because users are just names on certificates, there is <strong>no revocation</strong>: you cannot "delete" a cert user, and Kubernetes checks no CRLs. Locking someone out means removing their RBAC bindings (or re-issuing the CA — a cluster-wide event). Short <code>expirationSeconds</code> on issued certs (7.3) is the mitigation. Also: <code>system:masters</code> in a cert's O field bypasses authorization entirely — no binding needed, no way to restrict it. That's why 2.3's <code>super-admin.conf</code> stays offline.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Authenticating"</strong> (Kubernetes docs — the strategies table) and <strong>"anonymous requests"</strong> on the same page.</p>
+</article>
+
+<article class="lesson" id="cp-7-2" data-id="w7-2">
+<div class="lesson-head"><span class="cp-id">7.2</span><h4>Dissect a kubeconfig — clusters × users, joined by contexts</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every exam task begins with <code>kubectl config use-context …</code> — the one line you must run ~16 times without thinking. And "fix this broken kubeconfig" is a recurring task type: solvable in a minute if you know exactly which field lives where.</p>
+<h5>The concept</h5>
+<p>A kubeconfig is three parallel lists plus a pointer. <code>clusters</code> say <em>where</em> (server URL + the CA to trust it by). <code>users</code> say <em>as whom</em> (client cert+key, or a token). A <code>context</code> is just a named pairing of one cluster + one user, optionally with a default namespace. <code>current-context</code> points at one of them:</p>
+<svg viewBox="0 0 660 290" role="img" aria-label="kubeconfig anatomy: clusters and users lists joined by a context, with current-context pointing at it">
+  <rect x="10" y="40" width="190" height="130" rx="10" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="105" y="62" fill="var(--accent)" font-size="11" text-anchor="middle" letter-spacing="2" font-weight="600">CLUSTERS — WHERE</text>
+  <text x="24" y="88" fill="var(--ink)" font-size="11.5">name: kubernetes</text>
+  <text x="24" y="108" fill="var(--ink)" font-size="11.5">server: https://…:6443</text>
+  <text x="24" y="128" fill="var(--ink)" font-size="11.5">certificate-authority-data:</text>
+  <text x="24" y="144" fill="var(--muted)" font-size="10.5">(CA that must have signed the</text>
+  <text x="24" y="158" fill="var(--muted)" font-size="10.5">server's cert — else x509 error)</text>
+
+  <rect x="460" y="40" width="190" height="130" rx="10" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="555" y="62" fill="var(--accent)" font-size="11" text-anchor="middle" letter-spacing="2" font-weight="600">USERS — AS WHOM</text>
+  <text x="474" y="88" fill="var(--ink)" font-size="11.5">name: kubernetes-admin</text>
+  <text x="474" y="108" fill="var(--ink)" font-size="11.5">client-certificate-data</text>
+  <text x="474" y="126" fill="var(--ink)" font-size="11.5">client-key-data</text>
+  <text x="474" y="146" fill="var(--muted)" font-size="10.5">(or token: … for SAs)</text>
+
+  <rect x="235" y="60" width="190" height="90" rx="10" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="330" y="82" fill="var(--accent)" font-size="11" text-anchor="middle" letter-spacing="2" font-weight="600">CONTEXT</text>
+  <text x="249" y="104" fill="var(--ink)" font-size="11.5">cluster: kubernetes</text>
+  <text x="249" y="122" fill="var(--ink)" font-size="11.5">user: kubernetes-admin</text>
+  <text x="249" y="140" fill="var(--ink)" font-size="11.5">namespace: default</text>
+  <line x1="235" y1="105" x2="200" y2="105" stroke="var(--muted)" stroke-width="1.5"/>
+  <line x1="425" y1="105" x2="460" y2="105" stroke="var(--muted)" stroke-width="1.5"/>
+
+  <rect x="235" y="210" width="190" height="40" rx="10" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="330" y="234" fill="var(--ink)" font-size="11.5" text-anchor="middle">current-context: kubernetes-admin@kubernetes</text>
+  <line x1="330" y1="210" x2="330" y2="152" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="340" y="185" fill="var(--muted)" font-size="10.5">the pointer use-context moves</text>
+</svg>
+<p>Everything kubectl does starts by resolving <code>current-context → (cluster, user, namespace)</code>. The classic broken-kubeconfig faults are one-field edits: wrong <code>server</code> port (timeout/refused), wrong <code>certificate-authority-data</code> ("x509: certificate signed by unknown authority" — you met this in 2.3), a user pointing at a missing key file, or a context naming a user that doesn't exist.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your real one — <code>view</code> redacts secrets, <code>--minify</code> shows only the current context's slice:
+<pre class="cmd">kubectl config view --minify</pre>
+<pre class="out">clusters:
+- cluster:
+    certificate-authority-data: <b>DATA+OMITTED</b>
+    server: <b>https://192.168.64.2:6443</b>
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    <b>user: kubernetes-admin</b>
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: DATA+OMITTED
+    client-key-data: DATA+OMITTED</pre></li>
+<li>The two config commands you'll type all exam. List contexts, and pull one field with jsonpath (a 7.11 preview):
+<pre class="cmd">kubectl config get-contexts
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'</pre>
+<pre class="out">CURRENT   NAME                          CLUSTER      AUTHINFO           NAMESPACE
+<b>*</b>         kubernetes-admin@kubernetes   kubernetes   kubernetes-admin
+https://192.168.64.2:6443</pre></li>
+<li>Drill the namespace switch — this changes what "no <code>-n</code>" means for every later command:
+<pre class="cmd">kubectl config set-context --current --namespace=kube-system
+kubectl get pods | head -3
+kubectl config set-context --current --namespace=default</pre>
+<pre class="out">Context "kubernetes-admin@kubernetes" modified.
+NAME                         READY   STATUS    RESTARTS      AGE
+<b>coredns</b>-7c65d6cfc9-9qhfx     1/1     Running   3 (2d ago)    21d
+coredns-7c65d6cfc9-l7npk     1/1     Running   3 (2d ago)    21d</pre>
+<p><code>kube-system</code> pods with no <code>-n</code> flag — because the <em>context</em> now carries the namespace.</p></li>
+<li>Run each ten times until your fingers know them: <code>kubectl config use-context &lt;name&gt;</code> (switch the pointer) and <code>kubectl config set-context --current --namespace=&lt;ns&gt;</code> (edit the current pairing). Tab completion works on both.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Given any kubeconfig, you can answer in seconds: which server will this talk to, as whom, in which default namespace — and you can switch all three without reading help text.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Exam trap: a task's setup line sets a context whose <em>namespace isn't default</em> — every object you create lands there unless you notice. Make <code>kubectl config get-contexts</code> (the NAMESPACE column) part of your per-task ritual. Also, <code>KUBECONFIG</code> can hold a colon-separated list of files that kubectl <em>merges</em> — if a cluster you can't explain appears in <code>config view</code>, check that variable. And <code>--minify</code> fails if <code>current-context</code> is unset — that itself is a planted-fault signature.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure Access to Multiple Clusters"</strong> — the kubeconfig structure reference; <strong>"kubectl config"</strong> for subcommand syntax.</p>
+</article>
+
+<article class="lesson" id="cp-7-3" data-id="w7-3">
+<div class="lesson-head"><span class="cp-id">7.3</span><h4>Onboard a human user via the CSR API — the full flow, from memory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is a classic exam task, worth real points, and it's pure mechanics: five steps, zero improvisation. It's also 7.1 made concrete — you mint a certificate whose CN/O <em>become</em> a user the moment the cluster CA signs it. Drill it until the whole transcript takes under five minutes.</p>
+<h5>The concept</h5>
+<div class="flow"><span>openssl key + CSR</span><em>→</em><span>CSR object (base64)</span><em>→</em><span class="hot">approve</span><em>→</em><span>extract signed cert</span><em>→</em><span>kubeconfig entry</span></div>
+<p>The CertificateSigningRequest API turns the cluster CA into a service: you submit a PEM CSR wrapped in a CSR object, an admin approves it, and the controller-manager (which holds <code>ca.key</code>) signs and publishes the certificate in the object's status. Three spec fields do all the work: <code>request</code> (your CSR, base64, one line), <code>signerName: kubernetes.io/kube-apiserver-client</code> (the signer for "certs that authenticate humans to the apiserver" — <strong>never auto-approved</strong>, by design), and <code>usages: [client auth]</code>. Optional <code>expirationSeconds</code> requests a lifetime (minimum 600); the signer grants the <em>smaller</em> of your request and its <code>--cluster-signing-duration</code>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Mint the user's key and CSR — CN is the username, O the group (7.1's rule):
+<pre class="cmd">openssl genrsa -out jane.key 2048
+openssl req -new -key jane.key -out jane.csr -subj "/CN=jane/O=devs"</pre></li>
+<li>Wrap it in a CSR object. The base64 must be a single line — <code>-w0</code>:
+<pre class="cmd">cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: jane
+spec:
+  request: $(base64 -w0 &lt; jane.csr)
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 86400
+  usages:
+  - client auth
+EOF
+kubectl get csr</pre>
+<pre class="out">certificatesigningrequest.certificates.k8s.io/jane created
+NAME   AGE   SIGNERNAME                            REQUESTOR          CONDITION
+jane   4s    kubernetes.io/kube-apiserver-client   kubernetes-admin   <b>Pending</b></pre></li>
+<li>Approve — this signer always waits for a human decision:
+<pre class="cmd">kubectl certificate approve jane
+kubectl get csr jane</pre>
+<pre class="out">certificatesigningrequest.certificates.k8s.io/jane approved
+NAME   AGE   SIGNERNAME                            REQUESTOR          CONDITION
+jane   30s   kubernetes.io/kube-apiserver-client   kubernetes-admin   <b>Approved,Issued</b></pre></li>
+<li>The signed cert now sits in <code>.status.certificate</code> — extract and inspect it:
+<pre class="cmd">kubectl get csr jane -o jsonpath='{.status.certificate}' | base64 -d &gt; jane.crt
+openssl x509 -in jane.crt -noout -subject -dates</pre>
+<pre class="out">subject=<b>O = devs, CN = jane</b>
+notBefore=Jul 13 09:00:00 2026 GMT
+notAfter=<b>Jul 14</b> 09:00:00 2026 GMT</pre>
+<p>Exactly one day — the <code>expirationSeconds</code> you asked for, granted because it's below the signer's cap.</p></li>
+<li>Build her kubeconfig entry (in your existing file — same cluster, new user + context):
+<pre class="cmd">kubectl config set-credentials jane --client-certificate=jane.crt --client-key=jane.key --embed-certs
+kubectl config set-context jane --cluster=kubernetes --user=jane</pre>
+<pre class="out">User "jane" set.
+Context "jane" created.</pre></li>
+<li>Prove both halves of the story — she authenticates, and (having no RBAC yet) can do nothing:
+<pre class="cmd">kubectl --context=jane auth whoami
+kubectl --context=jane get pods</pre>
+<pre class="out">Username   <b>jane</b>
+Groups     [<b>devs</b> system:authenticated]
+Error from server (<b>Forbidden</b>): pods is forbidden: User "jane" cannot list resource "pods" ...</pre>
+<p><strong>Forbidden is success here</strong> — 403, not 401: the cert works, the user exists, RBAC just hasn't granted anything. The RBAC group fixes that with this exact jane.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>kubectl --context=jane auth whoami</code> returns <code>jane</code> + <code>devs</code>, and the whole flow — six commands — ran without you opening the docs.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The three spec traps, in order of popularity: <code>request</code> must be the base64 of the <em>CSR</em> (not the key, not the cert) with no line wraps; <code>usages</code> must be exactly <code>client auth</code>; <code>signerName</code> is the exact string <code>kubernetes.io/kube-apiserver-client</code> (the similar <code>kubelet-serving</code> signer rejects CN patterns like this). A CSR that sits Pending forever is <em>normal</em> — nothing auto-approves this signer. And if the issued cert seems to ignore your <code>expirationSeconds</code>, the signer's <code>--cluster-signing-duration</code> cap won — check the controller-manager manifest.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Certificate Signing Requests"</strong> — the "Normal user" section of that page is this lesson's transcript in official form (copy the object skeleton from there during the exam).</p>
+</article>
+
+<article class="lesson" id="cp-7-4" data-id="w7-4">
+<div class="lesson-head"><span class="cp-id">7.4</span><h4>Modern ServiceAccount tokens: TokenRequest, projected volumes, rotation</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Old tutorials (and old muscle memory) say "every ServiceAccount has a token Secret". That world ended in v1.24. Exam tasks and real debugging both require the current model: tokens are minted on demand, time-bound, and rotated under your pods without their knowledge.</p>
+<h5>The concept</h5>
+<p>A ServiceAccount object contains <strong>no credential at all</strong> — it's just a name RBAC can bind to. Tokens come from the <strong>TokenRequest API</strong> (a subresource of the SA): the apiserver signs a JWT with <code>sa.key</code> on the spot, scoped to an <em>audience</em> and a <em>lifetime</em>, and never stores it. Two consumers:</p>
+<ul>
+<li><code>kubectl create token &lt;sa&gt;</code> — the CLI front-end. Default lifetime <strong>1 hour</strong>; <code>--duration</code> to change it.</li>
+<li><strong>Pods</strong> — the admission chain injects a <em>projected volume</em> at <code>/var/run/secrets/kubernetes.io/serviceaccount</code> combining three sources: a <code>serviceAccountToken</code> (the kubelet calls TokenRequest for it), the cluster CA bundle (a ConfigMap), and the namespace (downward API). The <strong>kubelet rotates</strong> the token when it passes 80% of its TTL (or 24h) — it rewrites the file; well-behaved clients re-read it rather than caching.</li>
+</ul>
+<p>Tokens bound to a pod carry that pod's identity in their claims and die with the pod — a stolen token from a deleted pod is useless. Legacy non-expiring Secret tokens aren't auto-created anymore; the only reason to make one today is an explicit task demanding a long-lived token (there's a sanctioned Secret type for it — see Gotchas).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create an SA and look for its token — there isn't one:
+<pre class="cmd">kubectl create serviceaccount probe
+kubectl describe sa probe | grep -A1 Tokens
+kubectl get secrets</pre>
+<pre class="out">serviceaccount/probe created
+Tokens:              <b>&lt;none&gt;</b>
+<b>No resources found</b> in default namespace.</pre></li>
+<li>Mint one on demand and read its claims (the 7.1 trick):
+<pre class="cmd">TOKEN=$(kubectl create token probe --duration=10m)
+echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2&gt;/dev/null; echo</pre>
+<pre class="out">{"aud":["https://kubernetes.default.svc.cluster.local"],
+ "exp":1783739533,"iat":<b>1783738933</b>,          ← exp − iat = 600s: exactly your --duration
+ "sub":"<b>system:serviceaccount:default:probe</b>", ...}</pre></li>
+<li>Now the pod path. Run a pod under this SA and inspect what admission injected:
+<pre class="cmd">kubectl run tokenpod --image=busybox:1.36 \
+  --overrides='{"spec":{"serviceAccountName":"probe"}}' -- sleep 3600
+kubectl get pod tokenpod -o yaml | grep -A12 'projected:'</pre>
+<pre class="out">    - projected:
+        sources:
+        - <b>serviceAccountToken</b>:
+            expirationSeconds: <b>3607</b>
+            path: token
+        - configMap:
+            name: <b>kube-root-ca.crt</b>
+        - downwardAPI:
+            items:
+            - fieldRef: {fieldPath: metadata.namespace}
+              path: namespace</pre>
+<p>You never wrote a volume — the ServiceAccount admission plugin did. 3607s ≈ 1h is the kubelet's requested TTL.</p></li>
+<li>See the rotation machinery from inside — the files are symlinks through a swappable <code>..data</code> dir, so the kubelet can replace all three atomically:
+<pre class="cmd">kubectl exec tokenpod -- ls -l /var/run/secrets/kubernetes.io/serviceaccount/</pre>
+<pre class="out">ca.crt -&gt; <b>..data</b>/ca.crt
+namespace -&gt; ..data/namespace
+token -&gt; ..data/token</pre></li>
+<li>Clean up: <pre class="cmd">kubectl delete pod tokenpod</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can explain where a pod's token comes from (kubelet → TokenRequest → projected file), why <code>kubectl get secrets</code> shows nothing for a new SA, and what happens at 80% of the token's TTL.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If a task really demands a long-lived token (CI systems, external clients), the sanctioned form is a Secret of type <code>kubernetes.io/service-account-token</code> carrying the annotation <code>kubernetes.io/service-account.name: &lt;sa&gt;</code> — the controller fills in a non-expiring token. Don't reach for it otherwise. In-pod clients that read the token <em>once at startup</em> break mysteriously after rotation — "worked for a day, then 401" is that signature. And <code>automountServiceAccountToken: false</code> (on the SA or pod) removes the volume entirely: a pod that can't find <code>/var/run/secrets/…</code> isn't broken, it's hardened.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Managing Service Accounts"</strong> (token mechanics, bound tokens) and <strong>"Configure Service Accounts for Pods"</strong> (the long-lived Secret recipe).</p>
+</article>
+
+<article class="lesson" id="cp-7-5" data-id="w7-5">
+<div class="lesson-head"><span class="cp-id">7.5</span><h4>The authorization lineup: Node,RBAC — order matters, first decision wins</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>RBAC isn't alone in the gate. Knowing what <code>--authorization-mode=Node,RBAC</code> actually means explains one weird Forbidden message you'll meet in kubelet debugging, and answers the direct exam question "which authorization modes does this cluster run?"</p>
+<h5>The concept</h5>
+<p>Authorization is a <strong>chain of authorizers consulted in flag order</strong>. Each returns one of three verdicts: <em>allow</em> (request proceeds, chain stops), <em>deny</em> (request fails, chain stops), or <em>no opinion</em> (next authorizer). If the chain ends with nobody opining — deny. RBAC, notably, <strong>can only allow or abstain</strong> — it has no deny verdict, which is why RBAC rules are purely additive and "revoke" always means "delete a binding".</p>
+<p>kubeadm's lineup is <code>Node,RBAC</code>. The <strong>Node authorizer</strong> runs first and handles exactly one clientele: identities named <code>system:node:&lt;name&gt;</code> in group <code>system:nodes</code> — the kubelets. It grants each kubelet read access only to the objects <em>related to pods bound to that node</em> (its ConfigMaps, Secrets, PVCs…), plus writes to its own Node status and pod statuses. A generic RBAC rule can't express "only secrets your pods mount" — the Node authorizer computes that relationship graph live. Everyone else falls through to RBAC. (Other modes exist — <code>Webhook</code>, <code>ABAC</code>, <code>AlwaysAllow/AlwaysDeny</code> — and newer clusters can define the same chain in a structured <code>--authorization-config</code> file instead of the flag; kubeadm still uses the flag, and the two are mutually exclusive.)</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the lineup off your apiserver:
+<pre class="cmd">sudo grep authorization-mode /etc/kubernetes/manifests/kube-apiserver.yaml</pre>
+<pre class="out">    - --authorization-mode=<b>Node,RBAC</b></pre></li>
+<li>Borrow the kubelet's identity (its kubeconfig from 2.3) and see who the Node authorizer thinks you are:
+<pre class="cmd">sudo kubectl --kubeconfig /etc/kubernetes/kubelet.conf auth whoami</pre>
+<pre class="out">Username   <b>system:node:cp</b>
+Groups     [<b>system:nodes</b> system:authenticated]</pre></li>
+<li>Watch the relationship rule bite. Create a secret no pod on <code>cp</code> mounts, then ask for it as the kubelet:
+<pre class="cmd">kubectl create secret generic topsecret --from-literal=k=v
+sudo kubectl --kubeconfig /etc/kubernetes/kubelet.conf get secret topsecret</pre>
+<pre class="out">Error from server (Forbidden): secrets "topsecret" is forbidden:
+User "system:node:cp" cannot get resource "secrets" ...: <b>no relationship found between node 'cp' and this object</b></pre>
+<p>That phrase is the Node authorizer's signature — you'll never see RBAC say it.</p></li>
+<li>But node-related reads sail through the same credential:
+<pre class="cmd">sudo kubectl --kubeconfig /etc/kubernetes/kubelet.conf get node cp</pre>
+<pre class="out">NAME   STATUS   ROLES           AGE   VERSION
+cp     <b>Ready</b>    control-plane   21d   v1.35.1</pre></li>
+<li>Keep <code>topsecret</code> — 7.11's drills decode it.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can recite the three verdicts and the ordering rule, say which identities the Node authorizer serves, and explain why RBAC has no deny.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Order is meaningful but rarely a fault: with <code>Node,RBAC</code>, non-node requests pass through Node as "no opinion" at zero cost. The trap is conceptual questions: "add a deny rule for user X" is a trick — RBAC can't; you remove/narrow bindings instead. And don't confuse the Node <em>authorizer</em> with the <code>NodeRestriction</code> <em>admission plugin</em> (also on by default in kubeadm): the authorizer limits what kubelets may <em>read</em>, NodeRestriction limits what they may <em>modify</em> (only their own Node and their own pods' status).</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Authorization Overview"</strong> (modes + decision flow) and <strong>"Using Node Authorization"</strong>.</p>
+</article>
+</div>
+
+<!-- ---------------- RBAC in practice ---------------- -->
+<div class="grp" id="g-rbac"><h3>RBAC in practice</h3>
+
+<article class="lesson" id="cp-7-6" data-id="w7-6">
+<div class="lesson-head"><span class="cp-id">7.6</span><h4>The four-object matrix: Role/ClusterRole × RoleBinding/ClusterRoleBinding</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every RBAC exam task is assembled from four object kinds and one question: <em>does a binding connect this subject to a rule allowing this verb on this resource in this scope?</em> Get the matrix straight once and every task becomes fill-in-the-blanks.</p>
+<h5>The concept</h5>
+<p>Two kinds hold <strong>rules</strong> (what can be done), two kinds hold <strong>grants</strong> (who gets the rules, where):</p>
+<table>
+<tr><th></th><th>RoleBinding (grants in ONE namespace)</th><th>ClusterRoleBinding (grants EVERYWHERE)</th></tr>
+<tr><td><strong>Role</strong> (rules live in a ns)</td><td>classic per-ns access — rules and grant both scoped to that ns</td><td>✗ impossible — a ClusterRoleBinding can't reference a Role</td></tr>
+<tr><td><strong>ClusterRole</strong> (rules are global)</td><td><b>the reuse pattern</b>: one shared rule-set, granted per-namespace — the binding's ns is the boundary</td><td>full cluster-wide grant; also the <em>only</em> way to grant cluster-scoped resources (nodes, PVs, namespaces) and non-resource URLs</td></tr>
+</table>
+<p>A rule is <code>apiGroups + resources + verbs</code> (optionally <code>resourceNames</code>). The RBAC authorizer is purely additive: it looks for <em>any</em> binding→rule path that allows the request; finding none means no-opinion (→ deny at chain's end, per 7.5). Two hard scope laws: a namespaced Role can <strong>never</strong> grant cluster-scoped things like <code>nodes</code> — writing one succeeds but grants nothing (favorite trick question); and a RoleBinding to a ClusterRole grants those rules <strong>only inside the binding's namespace</strong>.</p>
+<h5>Lab</h5>
+<p>Uses <code>jane</code> from 7.3 — recreate her if the cert expired.</p>
+<ol class="lab">
+<li>Quadrant 1 — Role + RoleBinding in a fresh namespace:
+<pre class="cmd">kubectl create namespace dev
+kubectl -n dev create role pod-reader --verb=get,list,watch --resource=pods
+kubectl -n dev create rolebinding jane-pods --role=pod-reader --user=jane</pre>
+<pre class="out">namespace/dev created
+role.rbac.authorization.k8s.io/pod-reader created
+rolebinding.rbac.authorization.k8s.io/jane-pods created</pre></li>
+<li>Prove the scope edge from jane's side — allowed in <code>dev</code>, Forbidden one namespace over:
+<pre class="cmd">kubectl --context=jane -n dev get pods
+kubectl --context=jane get pods</pre>
+<pre class="out"><b>No resources found</b> in dev namespace.        ← empty list = the read WORKED
+Error from server (<b>Forbidden</b>): pods is forbidden: User "jane" cannot list resource "pods" in API group "" in the namespace "default"</pre></li>
+<li>Quadrant 3, the reuse pattern — one ClusterRole, granted only in <code>dev</code> by a RoleBinding:
+<pre class="cmd">kubectl create clusterrole cm-reader --verb=get,list --resource=configmaps
+kubectl -n dev create rolebinding jane-cms --clusterrole=cm-reader --user=jane
+kubectl --context=jane -n dev get configmaps
+kubectl --context=jane get configmaps -A</pre>
+<pre class="out">clusterrole.rbac.authorization.k8s.io/cm-reader created
+rolebinding.rbac.authorization.k8s.io/jane-cms created
+NAME               DATA   AGE
+kube-root-ca.crt   1      2m
+Error from server (<b>Forbidden</b>): configmaps is forbidden: User "jane" cannot list resource "configmaps" ... <b>at the cluster scope</b></pre>
+<p>Global rules, namespace-sized grant. This is how the built-in <code>view</code>/<code>edit</code>/<code>admin</code> ClusterRoles are meant to be used.</p></li>
+<li>Read a binding the way the authorizer does — subject, roleRef, namespace:
+<pre class="cmd">kubectl -n dev describe rolebinding jane-cms</pre>
+<pre class="out">Role:
+  Kind:  <b>ClusterRole</b>
+  Name:  cm-reader
+Subjects:
+  Kind  Name  Namespace
+  User  <b>jane</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can fill the 2×2 table from memory, including which quadrant is impossible, and jane's four results (works/Forbidden × pods/configmaps) match your prediction before each command.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A binding's <code>roleRef</code> is <strong>immutable</strong> — pointing an existing binding at a different role means delete + recreate, not edit (kubectl tells you, but only after your edit bounces). Subjects have three kinds — <code>User</code>, <code>Group</code>, <code>ServiceAccount</code> — and only ServiceAccounts have a namespace field; binding to group <code>devs</code> would cover every cert with <code>O=devs</code>, jane included. And before hand-writing any rule, check whether a built-in ClusterRole (<code>view</code>, <code>edit</code>, <code>admin</code>) already says what you mean.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Using RBAC Authorization"</strong> — the one page with every object, the built-in roles table, and copyable examples.</p>
+</article>
+
+<article class="lesson" id="cp-7-7" data-id="w7-7">
+<div class="lesson-head"><span class="cp-id">7.7</span><h4>Imperative RBAC: create role / rolebinding until it's instant</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>RBAC YAML is verbose and easy to typo under pressure; the imperative forms are one line each and generate correct objects every time. This is the difference between a 3-minute task and an 8-minute one.</p>
+<h5>The concept</h5>
+<p>Four commands cover every RBAC task. The grammar to internalize:</p>
+<table>
+<tr><th>Command</th><th>Key flags</th></tr>
+<tr><td><code>kubectl create role</code></td><td><code>--verb=get,list,watch</code> <code>--resource=pods</code> [<code>--resource-name=web</code>] [<code>-n ns</code>]</td></tr>
+<tr><td><code>kubectl create clusterrole</code></td><td>same, plus <code>--resource=nodes</code> etc. works here</td></tr>
+<tr><td><code>kubectl create rolebinding</code></td><td><code>--role=X</code> <em>or</em> <code>--clusterrole=X</code>, then <code>--user=jane</code> / <code>--group=devs</code> / <code>--serviceaccount=ns:name</code></td></tr>
+<tr><td><code>kubectl create clusterrolebinding</code></td><td><code>--clusterrole=X</code> + the same three subject flags</td></tr>
+</table>
+<p>Details that matter: <code>--resource</code> accepts singular, plural, and short names (<code>deploy</code>, <code>cm</code>) and infers the apiGroup; subresources use a slash (<code>--resource=pods/log</code>); <code>--serviceaccount</code> is always <code>namespace:name</code>; <code>--resource-name</code> narrows a rule to named objects (but can never gate <code>create</code> — the name doesn't exist yet at authorization time).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Warm up with <code>$do</code> — see what each one-liner generates before creating anything:
+<pre class="cmd">kubectl create role log-reader --verb=get --resource=pods/log $do</pre>
+<pre class="out">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+rules:
+- apiGroups: [""]
+  resources:
+  - <b>pods/log</b>
+  verbs: ["get"]</pre></li>
+<li>The apiGroup inference — deployments land in <code>apps</code> without you saying so:
+<pre class="cmd">kubectl create clusterrole deploy-admin --verb=create,delete --resource=deploy $do | grep -B1 -A3 apiGroups</pre>
+<pre class="out">rules:
+- apiGroups:
+  - <b>apps</b>
+  resources:
+  - <b>deployments</b></pre></li>
+<li>All three subject flags, dry-run, back to back:
+<pre class="cmd">kubectl create rolebinding b1 --role=pod-reader --user=jane -n dev $do | grep -A4 subjects
+kubectl create rolebinding b2 --clusterrole=view --group=devs -n dev $do | grep -A4 subjects
+kubectl create rolebinding b3 --clusterrole=view --serviceaccount=dev:app-sa -n dev $do | grep -A4 subjects</pre>
+<pre class="out">subjects:
+- kind: <b>User</b>,  name: jane      (apiGroup: rbac.authorization.k8s.io)
+- kind: <b>Group</b>, name: devs      (apiGroup: rbac.authorization.k8s.io)
+- kind: <b>ServiceAccount</b>, name: app-sa, <b>namespace: dev</b></pre>
+<p>(Output condensed — run each to see the full YAML. Note only the SA subject carries a namespace.)</p></li>
+<li>Now the drill: without <code>$do</code>, create and delete each of these five times, racing yourself — <em>role, clusterrole, rolebinding to a role, rolebinding to a clusterrole, clusterrolebinding</em>:
+<pre class="cmd">kubectl -n dev create role r1 --verb=get --resource=pods
+kubectl -n dev create rolebinding rb1 --role=r1 --user=jane
+kubectl -n dev delete rolebinding rb1 ; kubectl -n dev delete role r1</pre>
+<p>Target: any single object in under 15 seconds, from memory.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Each of the four create commands comes out of your fingers correctly on the first try — including <code>--serviceaccount=ns:name</code> ordering — with no <code>--help</code> peeks.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The binding flags are <code>--role</code> <em>or</em> <code>--clusterrole</code> — passing a ClusterRole name to <code>--role</code> creates a binding to a Role that doesn't exist, and RBAC treats a dangling roleRef as "grants nothing" (no error at create time!). <code>--serviceaccount=name</code> without the namespace prefix is rejected — it's always <code>ns:name</code>. And verbs are a fixed vocabulary (<code>get list watch create update patch delete deletecollection</code>) — inventing <code>read</code> fails at create, but a misspelled <em>resource</em> often doesn't: RBAC rules aren't validated against real resource types.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"kubectl create role"</strong> / <strong>"kubectl create rolebinding"</strong> — reference pages with every flag; the RBAC page's "kubectl create" section has the same in context.</p>
+</article>
+
+<article class="lesson" id="cp-7-8" data-id="w7-8">
+<div class="lesson-head"><span class="cp-id">7.8</span><h4>Verify like the exam does: kubectl auth can-i (and impersonation)</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Habit 8.8 — verify every answer — applied to RBAC. <code>auth can-i</code> asks the apiserver's <em>real</em> authorization chain, so it's proof, not opinion. It's also how you debug someone else's permissions without ever holding their credentials.</p>
+<h5>The concept</h5>
+<p><code>kubectl auth can-i VERB RESOURCE</code> creates a <code>SelfSubjectAccessReview</code> — the server runs its authorizer chain (Node, RBAC, everything) for that exact request and answers <code>yes</code> or <code>no</code>. Add <code>--as=user</code> / <code>--as-group=group</code> and kubectl sends <em>impersonation headers</em>: the apiserver evaluates the question as that identity instead. Impersonation is itself RBAC-gated (verb <code>impersonate</code>) — your admin context has it via cluster-admin; jane doesn't. ServiceAccounts impersonate by their full username: <code>--as=system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code>. And <code>--list</code> flips the question from "may I do X?" to "what may I do here?" — the whole permission surface as a table.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Check jane's grants from 7.6 — no context switching, just impersonation:
+<pre class="cmd">kubectl auth can-i list pods --as=jane -n dev
+kubectl auth can-i list pods --as=jane
+kubectl auth can-i create deployments --as=jane -n dev</pre>
+<pre class="out"><b>yes</b>
+no
+no</pre></li>
+<li>The SA form — full username, namespace baked in:
+<pre class="cmd">kubectl auth can-i list pods --as=system:serviceaccount:dev:app-sa -n dev</pre>
+<pre class="out">no        ← app-sa doesn't exist yet; 7.9 creates and binds it, then this flips</pre></li>
+<li>The whole surface at once:
+<pre class="cmd">kubectl auth can-i --list --as=jane -n dev</pre>
+<pre class="out">Resources     Resource Names   Verbs
+<b>configmaps</b>    []               [get list]
+<b>pods</b>          []               [get list watch]
+selfsubjectreviews.authentication.k8s.io  []  [create]
+...                                            ← system:authenticated boilerplate below</pre></li>
+<li>It's a real yes/no exit code — scriptable verification:
+<pre class="cmd">kubectl auth can-i get nodes --as=jane; echo "exit=$?"</pre>
+<pre class="out">no
+exit=<b>1</b></pre></li>
+<li>Group membership counts — jane's cert carries <code>O=devs</code>, so a group grant reaches her. Predict, then test:
+<pre class="cmd">kubectl -n dev create rolebinding devs-view --clusterrole=view --group=devs
+kubectl auth can-i list secrets --as=jane --as-group=devs -n dev
+kubectl -n dev delete rolebinding devs-view</pre>
+<pre class="out">rolebinding.rbac.authorization.k8s.io/devs-view created
+<b>no</b>          ← view excludes secrets, deliberately — good trivia
+rolebinding.rbac.authorization.k8s.io "devs-view" deleted</pre>
+<p>Note the mechanics: <code>--as=jane</code> alone impersonates the bare user <em>without</em> her groups — add <code>--as-group=devs</code> to test group-granted access.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Every RBAC object you created this week has a matching <code>can-i</code> proof: yes where you granted, no where you didn't — and you can write the SA impersonation string without pausing.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The big one: impersonating a <em>user</em> does not impersonate their <em>groups</em> — the apiserver can't know cert groups without seeing the cert, so <code>--as=jane</code> tests bare-jane and you must add <code>--as-group=devs</code> yourself. (Testing with <code>--context=jane</code> uses the real cert, groups included — that's why 7.6 did both.) <code>can-i --list</code> includes rows every authenticated user has — don't read those as your grant working. And in scripts, a "no" answer exits 1: <code>set -e</code> will kill your verification script on a <em>correct</em> negative.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Checking API Access"</strong> (can-i, SelfSubjectAccessReview) and <strong>"user impersonation"</strong> on the Authenticating page.</p>
+</article>
+
+<article class="lesson" id="cp-7-9" data-id="w7-9">
+<div class="lesson-head"><span class="cp-id">7.9</span><h4>Wire a pod to a ServiceAccount end-to-end — and prove it with curl</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the full workload-identity story in one lab: SA → Role → binding → pod → in-pod API call. It's a complete exam task type by itself, and it welds together 7.4 (where the token lives) with 7.6–7.8 (what it may do).</p>
+<h5>The concept</h5>
+<p>A pod runs as exactly one ServiceAccount, set by <code>spec.serviceAccountName</code> (default: the namespace's <code>default</code> SA — every namespace has one). In-pod clients authenticate with the three projected files from 7.4: send the <code>token</code> as a Bearer header, trust the server via <code>ca.crt</code>. The apiserver is always reachable from any pod at the DNS name <code>kubernetes.default.svc</code> (port 443 → the real :6443 via the Service you traced in week 4). So the proof loop is: bind a Role to the SA, curl the API from inside, watch an allowed call return a resource list and a non-granted call return a 403 naming the SA.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Identity and grant (reuses <code>dev</code> and its <code>pod-reader</code> Role from 7.6):
+<pre class="cmd">kubectl -n dev create serviceaccount app-sa
+kubectl -n dev create rolebinding app-sa-pods --role=pod-reader --serviceaccount=dev:app-sa
+kubectl auth can-i list pods --as=system:serviceaccount:dev:app-sa -n dev</pre>
+<pre class="out">serviceaccount/app-sa created
+rolebinding.rbac.authorization.k8s.io/app-sa-pods created
+<b>yes</b>          ← 7.8's "no" just flipped</pre></li>
+<li>A pod that runs as it (curl-equipped image, held open with sleep):
+<pre class="cmd">kubectl -n dev run api-client --image=curlimages/curl:8.8.0 \
+  --overrides='{"spec":{"serviceAccountName":"app-sa"}}' -- sleep 3600
+kubectl -n dev get pod api-client -o jsonpath='{.spec.serviceAccountName}'; echo</pre>
+<pre class="out">pod/api-client created
+<b>app-sa</b></pre></li>
+<li>Inside, assemble the call from the projected files:
+<pre class="cmd">kubectl -n dev exec -it api-client -- sh
+cd /var/run/secrets/kubernetes.io/serviceaccount
+curl -s --cacert ca.crt -H "Authorization: Bearer $(cat token)" \
+  https://kubernetes.default.svc/api/v1/namespaces/dev/pods | head -6</pre>
+<pre class="out">{
+  "kind": "<b>PodList</b>",
+  "apiVersion": "v1",
+  "metadata": {
+    "resourceVersion": "48211"
+  },</pre>
+<p>A PodList, over TLS, authorized purely by the RoleBinding — no kubeconfig anywhere in this pod.</p></li>
+<li>Now a call you did <em>not</em> grant — still inside the pod:
+<pre class="cmd">curl -s --cacert ca.crt -H "Authorization: Bearer $(cat token)" \
+  https://kubernetes.default.svc/api/v1/namespaces/dev/secrets | grep -E 'message|code'
+exit</pre>
+<pre class="out">  "message": "secrets is forbidden: User <b>\"system:serviceaccount:dev:app-sa\"</b> cannot list resource \"secrets\" ...",
+  "code": <b>403</b></pre>
+<p>The 403 names the SA — the token authenticated fine; RBAC drew the line exactly where you put it.</p></li>
+<li>Clean up the pod (SA, Role and bindings stay for the sprint drills):
+<pre class="cmd">kubectl -n dev delete pod api-client $now</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From inside the pod: pods list returns 200/PodList, secrets returns 403 naming <code>system:serviceaccount:dev:app-sa</code> — both matching your <code>can-i</code> predictions from the outside.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>serviceAccountName</code> is <strong>immutable on a running pod</strong> — "make this pod use SA X" means recreate the pod (or edit the Deployment's template and let the rollout do it; that's usually what the task wants). The token in the volume is <em>bound to this pod</em>: copying it elsewhere works only until the pod dies. And if <code>curl</code> gets "certificate signed by unknown authority" in-pod, you forgot <code>--cacert ca.crt</code> — the apiserver's cert isn't in public trust stores.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"Configure Service Accounts for Pods"</strong> — includes the in-pod API access recipe; <strong>"Accessing the API from a Pod"</strong> for the endpoint details.</p>
+</article>
+</div>
+
+<!-- ---------------- Speed drills ---------------- -->
+<div class="grp" id="g-speed"><h3>Speed drills</h3>
+
+<article class="lesson" id="cp-7-10" data-id="w7-10">
+<div class="lesson-head"><span class="cp-id">7.10</span><h4>Imperative generators: scaffold everything, write YAML never</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Nearly every "create X" task starts with a generator plus <code>$do</code> (your <code>--dry-run=client -o yaml</code> variable from 0.9). People who write manifests from scratch run out of exam; people who scaffold-edit-apply finish early. This drill makes the full generator vocabulary reflexive.</p>
+<h5>The concept</h5>
+<p>The complete set worth knowing — each emits correct YAML with <code>$do</code>, or creates directly without it:</p>
+<table>
+<tr><th>Task</th><th>Generator</th></tr>
+<tr><td>bare Pod</td><td><code>k run web --image=nginx:1.27 --port=80 --labels=app=web</code></td></tr>
+<tr><td>Pod running a command</td><td><code>k run tester --image=busybox:1.36 -- sh -c "sleep 3600"</code></td></tr>
+<tr><td>Deployment</td><td><code>k create deploy web --image=nginx:1.27 --replicas=3 --port=80</code></td></tr>
+<tr><td>Service for existing workload</td><td><code>k expose deploy web --port=80 --target-port=80 [--type=NodePort]</code></td></tr>
+<tr><td>Service, no workload yet</td><td><code>k create service clusterip web --tcp=80:8080</code></td></tr>
+<tr><td>Job</td><td><code>k create job once --image=busybox:1.36 -- echo done</code></td></tr>
+<tr><td>CronJob</td><td><code>k create cronjob tick --image=busybox:1.36 --schedule="*/5 * * * *" -- date</code></td></tr>
+<tr><td>ConfigMap</td><td><code>k create cm app-cfg --from-literal=MODE=prod --from-file=app.conf</code></td></tr>
+<tr><td>Secret</td><td><code>k create secret generic app-sec --from-literal=PASS=hunter2</code></td></tr>
+<tr><td>Namespace / SA / quota</td><td><code>k create ns team1</code> · <code>k create sa app-sa</code> · <code>k create quota q1 --hard=pods=10</code></td></tr>
+</table>
+<p>The workflow for anything a generator can't fully express (volumes, probes, affinity): generate the nearest shape with <code>$do &gt; f.yaml</code>, edit the two fields the task adds, <code>apply -f</code>. The generator guarantees valid apiVersion/structure — your editing is confined to the interesting part.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run the whole table once with <code>$do</code>, reading each output — notice what <code>run</code> vs <code>create deploy</code> emit, where labels land, what <code>expose</code> copies the selector from:
+<pre class="cmd">k create deploy web --image=nginx:1.27 --replicas=3 --port=80 $do | head -20</pre>
+<pre class="out">apiVersion: <b>apps/v1</b>
+kind: <b>Deployment</b>
+metadata:
+  labels:
+    <b>app: web</b>
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+...</pre></li>
+<li>The scaffold-edit-apply loop, timed. Task: "an nginx pod with an environment variable and a 100m CPU request" — no generator flag sets requests:
+<pre class="cmd">k run web --image=nginx:1.27 --env=MODE=prod $do &gt; /tmp/web.yaml
+vim /tmp/web.yaml        # add resources: {requests: {cpu: 100m}} under the container
+k apply -f /tmp/web.yaml
+k get pod web</pre>
+<pre class="out">pod/web created
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     <b>Running</b>   0          4s</pre></li>
+<li>Now the drill proper: set a 10-minute timer and produce each of these, delete, repeat until all fit inside the timer — <em>pod with command · deployment ×3 exposed on a NodePort · cronjob every 5 min · cm from two literals · secret · job that echoes</em>. Every one from memory, <code>$do</code> only when you need to edit.</li>
+<li>Clean up: <pre class="cmd">k delete pod web; k delete deploy web; k delete svc web --ignore-not-found</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>All six drill objects inside 10 minutes, zero doc lookups, zero YAML written from a blank buffer.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>k run</code> creates a <strong>Pod</strong>, not a Deployment (that changed years ago; old blogs lie). Everything after <code>--</code> is the container's command — flags after it are swallowed, so <code>--image</code> must come first. <code>create deploy --port</code> sets <code>containerPort</code> only — it does <em>not</em> create a Service; <code>expose</code> does, copying the workload's selector. CronJob schedules want quotes (<code>"*/5 * * * *"</code>) or the shell eats the asterisks. And <code>expose</code> on a Deployment with no <code>--port</code> fails — it can't guess.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"kubectl Quick Reference"</strong> — the generator list lives there; it's also the page worth bookmarking mentally for the exam.</p>
+</article>
+
+<article class="lesson" id="cp-7-11" data-id="w7-11">
+<div class="lesson-head"><span class="cp-id">7.11</span><h4>Output surgery: jsonpath, custom-columns, sort-by — a drill set</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Tasks phrased as "write the X of all Y to /path/file.txt" are pure output surgery — full points for one correct line, zero for a near-miss. And in troubleshooting, extracting exactly one field beats scrolling YAML every time.</p>
+<h5>The concept</h5>
+<p>Four tools, in the order you should reach for them:</p>
+<ul>
+<li><code>-o jsonpath='{...}'</code> — path into any object: <code>{.items[*].metadata.name}</code>. Iterate with <code>{range .items[*]}…{end}</code> to control separators (<code>{"\n"}</code> for one-per-line — files usually want this). Filter lists with <code>[?(@.type=="InternalIP")]</code>.</li>
+<li><code>-o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName</code> — jsonpath per column, table out. Easier than range/end when you want several fields.</li>
+<li><code>--sort-by='{.status.containerStatuses[0].restartCount}'</code> — server gives arbitrary order; sort-by takes a jsonpath.</li>
+<li>The honest fallback: <code>-o yaml | grep -A5 &lt;key&gt;</code> — when the path won't come to you in 30 seconds, stop composing and grep. It's on the sheet because it wins points, not style contests.</li>
+</ul>
+<p>Discovery when you don't know the path: run <code>-o yaml</code> on <em>one</em> object and read the real field names — or <code>kubectl explain pod.status --recursive | less</code>.</p>
+<h5>Lab</h5>
+<p>Eight drills. For each: write the command yourself first, run it, then check against the reveal. Wrong or slow → repeat tomorrow.</p>
+<ol class="lab">
+<li>All pod names in <code>kube-system</code>, one per line.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl -n kube-system get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'</pre></details></li>
+<li>The InternalIP of every node (space-separated is fine).
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'</pre><p>The filter selects which list entry; note double quotes inside single-quoted jsonpath.</p></details></li>
+<li>Every container image running in the cluster, deduplicated.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get pods -A -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | sort -u</pre><p>Nested ranges: pods, then containers within each.</p></details></li>
+<li>A table of pod name + node it runs on, all namespaces.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get pods -A -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName</pre></details></li>
+<li>All pods sorted by restart count — most-restarted last.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get pods -A --sort-by='{.status.containerStatuses[0].restartCount}'</pre></details></li>
+<li>Decode the value of key <code>k</code> in secret <code>topsecret</code> (from 7.5).
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get secret topsecret -o jsonpath='{.data.k}' | base64 -d; echo</pre></details></li>
+<li>The current context's apiserver URL, from the kubeconfig.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'</pre></details></li>
+<li>Each node's name and its taints (key only), one node per line.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.taints[*].key}{"\n"}{end}'</pre><p>Untainted nodes print an empty value after the colon — that's fine.</p></details></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Drills 1, 2 and 6 come out right on the first attempt (they're the three most exam-frequent shapes); the rest within one retry.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Always single-quote the whole jsonpath — <code>$</code>, <code>*</code> and <code>"</code> inside are shell food otherwise. <code>{.items[*]}</code> with a plain <code>*</code> joins values with spaces; only <code>range/end</code> gives you newlines. Filters compare with <code>==</code> (not <code>=</code>) and need <code>@</code> for "current element". When a task says "to a file", redirect the <em>whole</em> command and then <code>cat</code> the file — a jsonpath with no trailing newline can make the file look empty on a lazy glance.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"JSONPath Support"</strong> — the syntax table with examples; <strong>"kubectl Quick Reference"</strong> has the most common one-liners under "Formatting output".</p>
+</article>
+
+<article class="lesson" id="cp-7-12" data-id="w7-12">
+<div class="lesson-head"><span class="cp-id">7.12</span><h4>Fast pod edits: edit where you can, replace --force where you must</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Change this field on this pod" tasks split into two speeds: mutable fields are a 20-second <code>kubectl edit</code>; immutable ones need the dump-edit-replace loop. Knowing <em>which is which before you start</em> is the speed trick — finding out via a rejected edit costs a minute each time.</p>
+<h5>The concept</h5>
+<p>On a live <strong>Pod</strong>, only a short list is mutable: <code>spec.containers[*].image</code> (and initContainers'), <code>spec.activeDeadlineSeconds</code>, <code>spec.tolerations</code> (additions only), and <code>spec.terminationGracePeriodSeconds</code> (limited). Everything else — env, args, volumes, probes, serviceAccountName, nodeSelector, labels-in-spec — is <strong>immutable</strong>: the apiserver rejects the update outright. The escape hatch is recreate-in-place:</p>
+<div class="flow"><span>kubectl get pod X -o yaml &gt; f.yaml</span><em>→</em><span>edit f.yaml</span><em>→</em><span class="hot">kubectl replace --force -f f.yaml</span></div>
+<p><code>replace --force</code> deletes the pod and creates it again from your file in one command — new UID, brief downtime, same name. Critical fork: this is for <em>bare</em> pods. A pod owned by a Deployment/DaemonSet should never be surgically edited — change the controller's <em>template</em> (fully mutable) and let the rollout replace pods properly.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a pod with a wrong env value, then watch <code>edit</code> refuse to fix it:
+<pre class="cmd">kubectl run editme --image=nginx:1.27 --env=MODE=staging
+kubectl edit pod editme        # change MODE's value to "prod", save, quit</pre>
+<pre class="out">error: pods "editme" is invalid
+# * spec: <b>Forbidden: pod updates may not change fields other than</b>
+#   `spec.containers[*].image`, `spec.initContainers[*].image`,
+#   `spec.activeDeadlineSeconds`, `spec.tolerations` (only additions...) ...
+# A copy of your changes has been stored to <b>"/tmp/kubectl-edit-1408.yaml"</b></pre>
+<p>Two gifts in that failure: the canonical mutable-field list, and your rejected buffer saved to /tmp.</p></li>
+<li>The loop that works — under 60 seconds total:
+<pre class="cmd">kubectl get pod editme -o yaml &gt; /tmp/editme.yaml
+vim /tmp/editme.yaml           # fix MODE, ignore the status:/managedFields noise
+kubectl replace --force -f /tmp/editme.yaml</pre>
+<pre class="out">pod "editme" deleted
+pod/editme <b>replaced</b></pre></li>
+<li>Confirm the change landed (and notice the pod is <em>new</em> — AGE reset):
+<pre class="cmd">kubectl get pod editme -o jsonpath='{.spec.containers[0].env}'; echo
+kubectl get pod editme</pre>
+<pre class="out">[{"name":"MODE","value":"<b>prod</b>"}]
+NAME     READY   STATUS    RESTARTS   AGE
+editme   1/1     Running   0          <b>9s</b></pre></li>
+<li>Contrast: the one field you never needed the loop for —
+<pre class="cmd">kubectl set image pod/editme editme=nginx:1.28
+kubectl get pod editme -o jsonpath='{.spec.containers[0].image}'; echo</pre>
+<pre class="out">pod/editme image updated
+<b>nginx:1.28</b></pre></li>
+<li>Clean up: <pre class="cmd">kubectl delete pod editme $now</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can recite the mutable-fields list, and the dump-edit-replace loop runs from your fingers in under a minute.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Run the loop on a Deployment-owned pod and the controller instantly builds a replacement from the <em>old</em> template — your fix evaporates; edit the Deployment instead (<code>kubectl edit deploy X</code> — templates have no immutability problem). <code>replace --force</code> without <code>--force</code> fails on immutable fields exactly like edit did. If your edited YAML has a <code>nodeName</code>, the recreated pod is pinned right back to that node — usually fine, occasionally the bug. And <code>kubectl edit</code>'s editor is <code>$KUBE_EDITOR</code> — you set it to vim in 0.9; on the exam, set it again first thing.</p>
+<h5>Docs</h5>
+<p class="docs-links">Docs search: <strong>"kubectl edit"</strong> / <strong>"kubectl replace"</strong> reference pages; the mutable-fields list also appears under "Pod update" in the Pods concept page.</p>
+</article>
+
+<article class="lesson" id="cp-7-13" data-id="w7-13">
+<div class="lesson-head"><span class="cp-id">7.13</span><h4>Topic sprints: ten timed tasks across weeks 2–6</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Exam tasks average ~6 minutes of budget. This sprint tells you — per topic — whether you're inside that budget, and turns "I know how" into "I know how <em>fast</em>". The lookups that cost you time here are your memorization list for week 8.</p>
+<h5>The drill</h5>
+<p>Rules: one sitting, 60-minute cap for all ten (the targets sum to 42). Docs allowed, but <strong>only kubernetes.io</strong> — search there like it's exam day. After each task, note your time and what you had to look up. Reveal a solution only after finishing or timing out; each is terse on purpose — full explanations live in the week linked.</p>
+<ol class="lab">
+<li><strong>[W2 · 4 min]</strong> Snapshot etcd to <code>/tmp/snap.db</code> and prove the snapshot contains data.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">sudo ETCDCTL_API=3 etcdctl snapshot save /tmp/snap.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+sudo etcdutl snapshot status /tmp/snap.db -w table</pre><p>Flags from the manifest, not memory failing you → <a href="../cheatsheets/etcd-card.html">etcd card</a>.</p></details></li>
+<li><strong>[W3 · 5 min]</strong> Deployment <code>web</code>, nginx:1.27, 3 replicas, exposed as ClusterIP :80; prove it answers from a test pod.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">k create deploy web --image=nginx:1.27 --replicas=3 --port=80
+k expose deploy web --port=80
+k run t --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- web | head -4
+k delete deploy web; k delete svc web</pre></details></li>
+<li><strong>[W3 · 3 min]</strong> Scale a deployment to 5, roll out a bad image, then get back to the working revision.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">k create deploy roll --image=nginx:1.27
+k scale deploy roll --replicas=5
+k set image deploy/roll nginx=nginx:1.99
+k rollout status deploy/roll --timeout=20s   # sticks — ImagePullBackOff
+k rollout undo deploy/roll
+k rollout status deploy/roll                 # back to healthy
+k delete deploy roll</pre></details></li>
+<li><strong>[W3 · 4 min]</strong> A static pod named <code>sentinel</code> (busybox, sleep) on <code>node01</code>.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">ssh node01
+sudo sh -c 'kubectl run sentinel --image=busybox:1.36 \
+  --dry-run=client -o yaml -- sleep 3600 &gt; /etc/kubernetes/manifests/sentinel.yaml'
+exit
+kubectl get pod sentinel-node01     # suffix = node name proves it's static</pre><p>No kubectl on node01? Write the manifest by hand — or generate on cp and scp it.</p></details></li>
+<li><strong>[W4 · 6 min]</strong> In <code>dev</code>: only pods labeled <code>app=frontend</code> may reach pods labeled <code>app=backend</code> on :80; all other ingress to backend blocked.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">cat &lt;&lt;EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: backend-allow, namespace: dev}
+spec:
+  podSelector: {matchLabels: {app: backend}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector: {matchLabels: {app: frontend}}
+    ports:
+    - {protocol: TCP, port: 80}
+EOF</pre><p>Verify with two test pods (one labeled frontend, one not) + wget timeouts — W4's method.</p></details></li>
+<li><strong>[W4/W6 · 4 min]</strong> Service <code>broken</code> selects nothing (create it with a wrong selector first); diagnose and fix so it has endpoints.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">k create deploy target --image=nginx:1.27 --port=80        # labels app=target
+k create service clusterip broken --tcp=80:80              # selector app=broken — wrong
+k get endpointslices | grep broken                         # no endpoints
+k set selector svc broken app=target
+k get endpointslices | grep broken                         # endpoints appear
+k delete svc broken; k delete deploy target</pre></details></li>
+<li><strong>[W5 · 6 min]</strong> hostPath PV (1Gi, RWO) + PVC + a pod mounting it at <code>/data</code>; prove a write lands on the node.
+<details class="reveal"><summary>Solution</summary><p>PV (hostPath /tmp/pvdata, storageClassName manual) → PVC requesting 1Gi same class → pod with volumes/volumeMounts. Then <code>k exec ... -- sh -c 'echo hi &gt; /data/f'</code> and read /tmp/pvdata/f on the pod's node. Full walk: W5's PV/PVC lessons.</p></details></li>
+<li><strong>[W2/W6 · 3 min]</strong> Drain <code>node02</code> for maintenance, verify nothing schedulable remains, bring it back.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">k drain node02 --ignore-daemonsets --delete-emptydir-data
+k get nodes                        # node02 Ready,SchedulingDisabled
+k get pods -A -o wide | grep node02   # only DaemonSet pods remain
+k uncordon node02</pre></details></li>
+<li><strong>[W7 · 5 min]</strong> SA <code>runner</code> in <code>dev</code> that may create jobs there, nothing more; prove both halves with can-i.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">k -n dev create sa runner
+k -n dev create role job-maker --verb=create --resource=jobs
+k -n dev create rolebinding runner-jobs --role=job-maker --serviceaccount=dev:runner
+k auth can-i create jobs --as=system:serviceaccount:dev:runner -n dev    # yes
+k auth can-i list pods   --as=system:serviceaccount:dev:runner -n dev    # no</pre></details></li>
+<li><strong>[W7 · 2 min]</strong> Write every node's InternalIP to <code>/tmp/ips.txt</code>, one per line.
+<details class="reveal"><summary>Solution</summary><pre class="cmd">kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' &gt; /tmp/ips.txt
+cat /tmp/ips.txt</pre></details></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Total inside 60 minutes with at most two tasks over target. Your lookup log exists and has concrete entries ("forgot etcdctl cert flag names", "NetworkPolicy from: indentation") — those go on the memorize list.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Don't skip the verify step inside each task to save time — that habit is worth more than any single task, and unverified answers are where mock-exam points silently die. If a task blows past 2× target, stop, reveal, and redo it from scratch immediately; struggling longer teaches the wrong lesson. Re-run the whole sprint once more before 7.14.</p>
+</article>
+
+<article class="lesson" id="cp-7-14" data-id="w7-14">
+<div class="lesson-head"><span class="cp-id">7.14</span><h4>killer.sh session 1 — full two hours, exam conditions</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>killer.sh is the closest thing to the real exam that exists — same remote-terminal feel, harder tasks. Session 1's job is calibration: your speed, your weak domains, your nerves. The score does not matter. What you do with the solutions (7.15) matters enormously.</p>
+<h5>Steps</h5>
+<ol>
+<li>Your CKA purchase includes two sessions — find them in your Linux Foundation portal (My Portal → the exam entry → simulator link). Don't buy anything.</li>
+<li>Know before you click start: activating a session starts a <strong>36-hour window</strong> in which the environment runs; you can restart the environment within it, but the clock on the window doesn't pause. Pick a day with a clear 2-hour block plus an hour of margin.</li>
+<li>Set up exam conditions for real: one monitor, closed door, water, no phone, no notes, no music. The only extra tab allowed: kubernetes.io docs. Treat every deviation now as a point you'll pay for in three weeks.</li>
+<li>Run the full 120 minutes without pausing. Use the per-task ritual from day one: <code>use-context</code> line first, check the namespace, verify after solving, flag and move on at the 6-minute mark.</li>
+<li>When time's up: write down three numbers before looking at anything — tasks attempted, tasks you verified, tasks flagged-and-skipped. Then stop for the day. Solutions are tomorrow's work (7.15), with fresh eyes.</li>
+</ol>
+<h5 class="gotcha">Gotchas</h5>
+<p>killer.sh is <em>deliberately harder</em> than the CKA — expect ~60–70% feel even when well prepared; don't let the score rattle you. Both of your sessions contain the <strong>same questions</strong> — that's by design (session 2 in week 8 measures your improvement on identical ground), so don't waste session 2 hunting for new content. And don't preview questions casually: an activated session with the answers half-remembered ruins the week-8 measurement.</p>
+<h5>Docs</h5>
+<p class="docs-links">killer.sh's own FAQ (linked from the simulator page) covers environment restarts and the 36-hour window — read it before activating, not after.</p>
+</article>
+
+<article class="lesson" id="cp-7-15" data-id="w7-15">
+<div class="lesson-head"><span class="cp-id">7.15</span><h4>Mine the killer.sh solutions — a half-day that's worth more than the session</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The killer.sh answer explanations are the product; the exam session was just the diagnostic that tells you which explanations to study hard. A missed task studied properly is a guaranteed point converted; a missed task glanced at is a point you'll miss again.</p>
+<h5>Steps</h5>
+<ol>
+<li>Block half a day within the same 36-hour window if you want the environment alive (nice for re-doing tasks in place), or work from the solution text afterwards — both work.</li>
+<li>Triage every task into three piles: <strong>solved &amp; verified</strong> (skim the solution anyway — their method is often faster than yours; steal it), <strong>solved slowly</strong> (find where the time went: lookup? typing? wrong first approach?), <strong>missed</strong> (the real payload).</li>
+<li>For every <em>missed</em> or <em>slow</em> task: redo it from scratch on your own lab cluster — not by reading, by typing. Then classify the failure: knowledge gap (didn't know the mechanism → re-do that week's lesson), speed gap (knew it, too slow → add to sprint rotation), or reading gap (solved the wrong task → slow down on task statements; this one is the most common and the cheapest to fix).</li>
+<li>File every lesson learned where week 8 will find it: failure signatures onto your <a href="../cheatsheets/triage-template.html">triage sheet</a>, command patterns into your notes next to the <a href="../cheatsheets/commands.html">commands card</a>.</li>
+<li>End the half-day by re-running any sprint task (7.13) from the same domain as your worst killer.sh miss — prove to yourself the gap is closed <em>today</em>.</li>
+</ol>
+<h5 class="gotcha">Gotchas</h5>
+<p>Resist the urge to memorize killer.sh answers verbatim — the real exam asks different questions in the same <em>shapes</em>; what transfers is the shape and the verification habit. And don't skip studying the tasks you got right-but-slow: in a 120-minute exam, slow is a failure mode with better PR.</p>
+</article>
+
+<article class="lesson" id="cp-7-16" data-id="w7-16">
+<div class="lesson-head"><span class="cp-id">7.16</span><h4>Close the loop: revisit your week-0 self-assessment, schedule week 8</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Week 8 has no new material by design — it's review slots waiting for a list. That list should come from evidence (sprint times, killer.sh misses), not vibes. Twenty minutes of honest scheduling now decides how much your last week is worth.</p>
+<h5>Steps</h5>
+<ol>
+<li>Pull out three artifacts: your week-0 self-assessment, your 7.13 sprint log, and your killer.sh triage from 7.15.</li>
+<li>Score each exam domain red/yellow/green — a domain is red if it shows up in two of the three artifacts. Weight by exam share: a red in Troubleshooting (30%) outranks a red in Storage (10%).</li>
+<li>Write week 8's plan into the tracker's date slots now, by name: which fault scripts to re-run (W6), which drills to repeat, which lessons to re-read. Checkpoint 8.2 expects this list to exist.</li>
+<li>Compare against week 0's self-assessment for the morale data point: the things that scared you then are mostly green now. The gap list is shorter than it feels.</li>
+</ol>
+<h5 class="gotcha">Gotchas</h5>
+<p>Two scheduling traps: filling week 8 with your <em>favorite</em> topics (they're green precisely because you like them), and scheduling more than ~2 focused hours a day for exam week — week 8's job is consolidation and calm, not cramming. Leave the last two days nearly empty; checkpoints 8.10–8.12 will insist anyway.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>Week 7 recall quiz</h3>
+<p>Answer out loud before revealing. Wrong or hesitant → redo that lesson's lab.</p>
+<ol>
+<li>401 vs 403 — what does each prove about the request, and which one names an identity?
+<details class="reveal"><summary>Answer</summary><p>401 Unauthorized = authentication failed: the apiserver couldn't establish who you are (bad/expired credential). 403 Forbidden = authentication <em>succeeded</em>, authorization refused — and the message names the exact identity it resolved. 401 → fix the credential; 403 → fix RBAC (7.1).</p></details></li>
+<li>Why is there no <code>kubectl get users</code> — and what do "create a user" tasks actually mean?
+<details class="reveal"><summary>Answer</summary><p>Kubernetes stores no User objects; a user is just the name a credential carries (cert CN, token subject). "Create a user" means mint a credential: the CSR flow for humans (7.3) or a ServiceAccount for workloads (7.4/7.9). Corollary: no revocation — locking someone out means removing bindings (7.1).</p></details></li>
+<li>Recite the five CSR onboarding steps and the three spec fields that must be exactly right.
+<details class="reveal"><summary>Answer</summary><p>openssl key+CSR (CN=user/O=group) → CSR object → <code>kubectl certificate approve</code> → extract <code>.status.certificate</code> | base64 -d → <code>config set-credentials</code> + <code>set-context</code>. Fields: <code>request</code> (base64 of the CSR, one line), <code>signerName: kubernetes.io/kube-apiserver-client</code>, <code>usages: [client auth]</code> (7.3).</p></details></li>
+<li>After onboarding, the new user gets <code>Forbidden</code> on everything. Success or failure?
+<details class="reveal"><summary>Answer</summary><p>Success — 403 proves the cert authenticates (the server names the user); it just has no RBAC yet. Failure would be a 401 or an x509 error (7.3).</p></details></li>
+<li>Where does a pod's ServiceAccount token come from, and what happens at 80% of its TTL?
+<details class="reveal"><summary>Answer</summary><p>The kubelet calls the TokenRequest API and projects the result to <code>/var/run/secrets/kubernetes.io/serviceaccount/token</code> (with ca.crt + namespace). Past 80% of TTL (or 24h) the kubelet fetches a fresh one and atomically swaps the file — clients must re-read, not cache (7.4).</p></details></li>
+<li>What exactly does the Node authorizer do that RBAC can't, and what's its signature error phrase?
+<details class="reveal"><summary>Answer</summary><p>It grants each kubelet (<code>system:node:X</code> in <code>system:nodes</code>) access only to objects <em>related to pods bound to that node</em> — a live relationship graph no static RBAC rule can express. Signature: "no relationship found between node 'X' and this object" (7.5).</p></details></li>
+<li>With <code>--authorization-mode=Node,RBAC</code>: the three verdicts an authorizer can return, and the chain rule?
+<details class="reveal"><summary>Answer</summary><p>Allow, deny, or no-opinion; authorizers run in flag order and the first allow-or-deny wins; all-no-opinion → deny. RBAC can only allow or abstain — no deny verdict exists, so revoking access always means deleting/narrowing a binding (7.5/7.6).</p></details></li>
+<li>ClusterRole + RoleBinding — what does it grant, and why is the combination useful?
+<details class="reveal"><summary>Answer</summary><p>The ClusterRole's rules, but <em>only inside the binding's namespace</em>. One shared rule-set (like built-in <code>view</code>/<code>edit</code>), granted per-namespace — no rule duplication. The reverse (ClusterRoleBinding→Role) is impossible (7.6).</p></details></li>
+<li>Which field of a RoleBinding is immutable, and what's the trick about Roles granting <code>nodes</code>?
+<details class="reveal"><summary>Answer</summary><p><code>roleRef</code> — repointing a binding means delete + recreate. And a namespaced Role listing cluster-scoped resources (nodes, PVs) creates fine but grants nothing — cluster-scoped access needs ClusterRole + ClusterRoleBinding (7.6).</p></details></li>
+<li>Exact command: check whether ServiceAccount <code>app-sa</code> in <code>dev</code> may list pods there — without its token.
+<details class="reveal"><summary>Answer</summary><p><code>kubectl auth can-i list pods --as=system:serviceaccount:dev:app-sa -n dev</code>. Impersonation runs the real authorizer chain server-side. Caveat: <code>--as=jane</code> alone drops her cert groups — add <code>--as-group=devs</code> to test group grants (7.8).</p></details></li>
+<li>Name the mutable fields of a running Pod, and the loop for everything else.
+<details class="reveal"><summary>Answer</summary><p>Mutable: container/initContainer <code>image</code>, <code>activeDeadlineSeconds</code>, toleration <em>additions</em>, (limited) <code>terminationGracePeriodSeconds</code>. Everything else: <code>get -o yaml &gt; f.yaml</code> → edit → <code>replace --force -f f.yaml</code> — unless a controller owns the pod, in which case edit the controller's template instead (7.12).</p></details></li>
+<li>jsonpath: all node InternalIPs, one per line — write it.
+<details class="reveal"><summary>Answer</summary><p><code>kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'</code> — range/end for newlines, <code>[?(@.type=="…")]</code> to filter the list, whole expression single-quoted (7.11).</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="w6.html">← Week 6 · Troubleshooting</a><a href="../index.html#w8">Week 8 on the tracker →</a></nav>
+
+<footer>
+Authored against Kubernetes v1.35 (current exam version — re-verified 2026-07-13, LF CKA page) on the post-Feb-2025 CKA curriculum. Token lifetimes (1h default, 80%/24h rotation), CSR minimum <code>expirationSeconds</code> (600) and the Node,RBAC lineup are v1.35 kubeadm defaults. Timestamps, IPs and pod suffixes will differ on your cluster; outputs are abridged.
+</footer>
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>

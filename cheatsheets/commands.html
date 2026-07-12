@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Printable one-page CKA card: imperative kubectl generators, RBAC one-liners, jsonpath patterns, explain recipes and fast-edit loops.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>kubectl commands card — CKA Prep</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.cards{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:6px}
+.card{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:12px 14px; box-shadow:var(--shadow)}
+.card h2{font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--accent); margin:0 0 8px}
+.card p, .card li{font-size:13px; margin:.35em 0}
+.card ul{padding-left:18px; margin:.35em 0}
+.card pre{margin:.5em 0; font-size:11.5px; padding:8px 10px}
+.card table{border-collapse:collapse; font-size:12px; margin:.4em 0; width:100%}
+.card th, .card td{border:1px solid var(--line); padding:3px 7px; text-align:left}
+.card th{background:var(--code-bg); font-size:10.5px; text-transform:uppercase; letter-spacing:.05em}
+.card .warn{color:var(--weight); font-weight:600}
+.span2{grid-column:1 / -1}
+@media (max-width:760px){ .cards{grid-template-columns:1fr} }
+@media print{
+  .hero p{display:none}
+  h1{font-size:17px; margin-bottom:4px}
+  .cards{gap:8px}
+  .card{padding:7px 9px; break-inside:avoid; border-color:#bbb; box-shadow:none}
+  .card h2{font-size:9.5px; margin-bottom:4px}
+  .card p, .card li{font-size:9px}
+  .card pre{font-size:8.2px; padding:5px 6px; line-height:1.45}
+  .card table{font-size:8.5px}
+  .card th, .card td{padding:2px 4px}
+  footer{margin-top:10px; padding-top:6px; font-size:8px}
+}
+</style>
+</head>
+<body class="sheet">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="../materials/w0.html">W0 · Setup</a></li>
+    <li><a href="../materials/w1.html">W1 · Control plane</a></li>
+    <li><a href="../materials/w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="../materials/w3.html">W3 · Workloads</a></li>
+    <li><a href="../materials/w4.html">W4 · Networking</a></li>
+    <li><a href="../materials/w5.html">W5 · Storage</a></li>
+    <li><a href="../materials/w6.html">W6 · Troubleshooting</a></li>
+    <li><a href="../materials/w7.html">W7 · RBAC &amp; speed</a></li>
+    <li><a href="etcd-card.html">Cheat sheet · etcd card</a></li>
+    <li><a href="triage-template.html">Cheat sheet · triage template</a></li>
+    <li><a href="commands.html">Cheat sheet · kubectl commands</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../materials/w7.html#cp-7-10">← Back to the W7 speed drills</a></p>
+<header class="hero">
+  <h1>kubectl commands — one-page card</h1>
+  <p>Print this (it fits one page) and check your drill runs against it. The lessons behind it are <a href="../materials/w7.html#cp-7-10">7.10–7.12</a> (generators, jsonpath, fast edits) and <a href="../materials/w7.html#cp-7-7">7.7–7.8</a> (RBAC). By exam week you shouldn't need it.</p>
+</header>
+
+<div class="cards">
+
+<div class="card">
+<h2>0 · Session setup (first 60 seconds)</h2>
+<pre>alias k=kubectl
+source &lt;(kubectl completion bash)
+complete -o default -F __start_kubectl k
+export do="--dry-run=client -o yaml"
+export now="--force --grace-period 0"
+export KUBE_EDITOR=vim</pre>
+<p>Per-task ritual: run the task's <b>use-context</b> line → <code>k config get-contexts</code> (check the <b>NAMESPACE</b> column) → solve → <b>verify</b> → next.</p>
+</div>
+
+<div class="card">
+<h2>1 · Generators (scaffold, never hand-write)</h2>
+<pre>k run web --image=nginx:1.27 --port=80 --env=A=b $do
+k run t --rm -it --image=busybox --restart=Never -- wget -qO- svc
+k create deploy web --image=nginx:1.27 --replicas=3 --port=80
+k expose deploy web --port=80 --target-port=8080 --type=NodePort
+k create service clusterip web --tcp=80:8080   # no workload yet
+k create job once --image=busybox -- echo done
+k create cronjob tick --schedule="*/5 * * * *" --image=busybox -- date
+k create cm cfg --from-literal=K=V --from-file=app.conf
+k create secret generic sec --from-literal=PASS=x
+k create ns team1 · k create sa app-sa · k create quota q --hard=pods=10</pre>
+<p><span class="warn">--image before <code>--</code></span>; everything after <code>--</code> is the container command. <code>run</code> = Pod, not Deployment.</p>
+</div>
+
+<div class="card">
+<h2>2 · RBAC one-liners + proof</h2>
+<pre>k create role r --verb=get,list,watch --resource=pods -n ns
+k create clusterrole cr --verb=get --resource=nodes,pods/log
+k create rolebinding rb --role=r --user=jane -n ns
+k create rolebinding rb2 --clusterrole=view \
+  --serviceaccount=ns:app-sa -n ns
+k create clusterrolebinding crb --clusterrole=cr --group=devs</pre>
+<pre>k auth can-i list pods --as=jane -n ns
+k auth can-i --list --as=jane -n ns
+k auth can-i get po --as=system:serviceaccount:ns:app-sa -n ns
+k auth whoami</pre>
+<p><span class="warn">--serviceaccount is always ns:name</span> · <code>roleRef</code> immutable → delete + recreate · <code>--as=user</code> drops cert groups: add <code>--as-group=devs</code>.</p>
+</div>
+
+<div class="card">
+<h2>3 · jsonpath / columns / sort</h2>
+<pre># one per line → range/end
+k get po -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+# filter a list
+k get no -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
+# decode a secret key
+k get secret s -o jsonpath='{.data.k}' | base64 -d
+# current server URL
+k config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+# several fields → custom-columns
+k get po -A -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
+k get po -A --sort-by=.status.containerStatuses[0].restartCount
+k get events --sort-by=.metadata.creationTimestamp</pre>
+<p>Single-quote the whole path. Fallback that still scores: <code>-o yaml | grep -A5 key</code>.</p>
+</div>
+
+<div class="card">
+<h2>4 · kubectl explain (offline docs)</h2>
+<pre>k explain pod.spec.containers.livenessProbe
+k explain deploy.spec.strategy --recursive | less
+k explain networkpolicy.spec.ingress
+k explain pv.spec.accessModes
+k api-resources | grep -i &lt;name&gt;   # kind, short name, namespaced?</pre>
+<p>Faster than Firefox for field names/spelling. <code>--recursive</code> shows the whole subtree; grep it for the field you half-remember.</p>
+</div>
+
+<div class="card">
+<h2>5 · Fast edits &amp; rollouts</h2>
+<pre>k edit deploy web                  # templates: fully mutable
+k set image deploy/web nginx=nginx:1.28
+k scale deploy web --replicas=5
+k rollout status/undo/history deploy/web
+# bare pod, immutable field → dump-edit-replace
+k get po X -o yaml &gt; f.yaml ; vim f.yaml
+k replace --force -f f.yaml</pre>
+<p>Pod-mutable: <b>image</b>, activeDeadlineSeconds, toleration <em>additions</em>. Everything else → the loop. <span class="warn">Controller-owned pod? Edit the controller, not the pod.</span></p>
+</div>
+
+<div class="card span2">
+<h2>⚠ Speed traps</h2>
+<ul>
+<li><span class="warn">Wrong namespace</span> — a context may carry one; check get-contexts before creating anything.</li>
+<li><span class="warn">cronjob schedule unquoted</span> — the shell eats <code>*</code>; always <code>--schedule="*/5 * * * *"</code>.</li>
+<li><span class="warn">expose without --port</span> fails; <code>create deploy --port</code> sets containerPort only, creates no Service.</li>
+<li><span class="warn">can-i "no" exits 1</span> — fine interactively, kills <code>set -e</code> scripts on a correct answer.</li>
+<li><span class="warn">kubectl edit rejected</span> — your buffer is saved to /tmp/kubectl-edit-*.yaml; don't retype it.</li>
+<li>Verify everything: <code>k get X</code> after create, <code>rollout status</code> after image change, <code>can-i</code> after RBAC, wget/curl after Service. Partial credit exists; silent typos don't score.</li>
+</ul>
+</div>
+
+</div>
+
+<footer>
+CKA prep · authored against Kubernetes v1.35 · companion to <a href="../materials/w7.html">Week 7 lessons</a>. Aliases assume the 0.9 shell setup; on the exam, paste the setup block first.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>

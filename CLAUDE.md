@@ -15,8 +15,8 @@ The full approved plan is in [`docs/PLAN.md`](docs/PLAN.md). Decisions already m
 | P4 | materials/w4.html (networking; heaviest diagrams) | ✅ done |
 | P5 | materials/w5.html (storage/CSI) | ✅ done |
 | P6 | materials/w6.html + labs/faults/*.sh + cheatsheets/triage-template.html | ✅ done |
-| P7 | materials/w7.html (RBAC/auth/speed) + cheatsheets/commands.html | ⬜ next |
-| P8 | materials/w8.html + mock/ (exam-1, solutions, setup script) + cheatsheets/exam-day.html + final QA + artifact banner update | ⬜ |
+| P7 | materials/w7.html (RBAC/auth/speed) + cheatsheets/commands.html | ✅ done |
+| P8 | materials/w8.html + mock/ (exam-1, solutions, setup script) + cheatsheets/exam-day.html + final QA + artifact banner update | ⬜ next |
 
 ## Phase workflow
 
