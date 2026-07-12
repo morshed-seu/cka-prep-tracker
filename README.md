@@ -39,6 +39,6 @@ python3 -m http.server 8000
 
 2. On GitHub: **Settings → Pages → Build and deployment** — set *Source* to **Deploy from a branch**, choose branch **`main`** and folder **`/ (root)`**, then save.
 
-3. After a minute the site is live at `https://<your-username>.github.io/cka-prep/`.
+3. After a minute the site is live at `https://<your-username>.github.io/cka-prep-tracker/`.
 
 > Note: GitHub Pages sites on the free plan are public. Progress is stored in each browser's localStorage, so your checkmarks stay on your device and are not shared through the site.
