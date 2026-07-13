@@ -141,6 +141,7 @@
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
 <p>You need a cluster you can <strong>break</strong>. Managed clusters (EKS/GKE) and minikube hide the control plane; the exam expects you to SSH into nodes, read <code>journalctl</code>, and edit static pod manifests. Only your own kubeadm cluster gives you that.</p>
+<div class="foundation"><h5>🧱 Foundations</h5><p>These three machines are full <strong>virtual machines</strong> — each boots its own separate Linux kernel, unlike the containers you'll create <em>inside</em> them later on, which instead share one kernel via namespaces and cgroups (see <a href="foundations.html#g-processes">Foundations §1</a>). You need real, separate kernels here because kubeadm and the kubelet expect to own a whole machine — its own systemd, its own network interfaces — not a sandboxed slice of someone else's.</p></div>
 <h5>The concept</h5>
 <p>Three nodes is the minimum interesting cluster: a control plane to break, a worker to drain, and a second worker for pods to reschedule onto. 2 vCPU / 4 GB per node matches kubeadm's preflight minimums for the control plane and is plenty for workers.</p>
 <table>
@@ -182,6 +183,7 @@ EOF</pre></li>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
 <p>Every step below is a node prerequisite the exam can plant as a fault: swap on, missing kernel module, forwarding off, wrong cgroup driver, stopped runtime. Installing manually once means you'll recognize each failure later. Run this whole lab on <strong>all three nodes</strong>.</p>
+<div class="foundation"><h5>🧱 Foundations</h5><p>A <strong>cgroup</strong> is the kernel mechanism that caps how much CPU/memory a process may use — every Kubernetes <code>resources.limits</code> you'll ever write ultimately becomes a cgroup setting on some process, which is why kubelet and containerd must agree on which cgroup "driver" (dialect) they speak. The <strong><abbr title="Container Runtime Interface — the gRPC API the kubelet uses to ask a runtime like containerd to start/stop containers">CRI</abbr></strong> is just the plumbing between them: the kubelet never touches containers directly, it asks containerd to, over a socket. See <a href="foundations.html#g-processes">Foundations §1</a> for the bigger container/process picture this sits on.</p></div>
 <h5>The concept</h5>
 <p>The kubelet doesn't run containers itself — it drives a runtime (<strong>containerd</strong>) over the CRI socket. Two independent programs then manage the same kernel <em>cgroup</em> tree, which is why their <strong>cgroup drivers must match</strong>: on systemd distros both must use the <code>systemd</code> driver. Mismatched drivers is the classic "pods randomly fail on one node" fault. Modern kubeadm defaults the kubelet to <code>systemd</code>, so the containerd side (<code>SystemdCgroup = true</code>) is the one you must set yourself.</p>
 <h5>Lab</h5>
@@ -251,6 +253,7 @@ crictl version v1.35.x</pre>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
 <p>This is the cluster you keep for eight weeks. The init/join flow is also itself exam material (week 2 dissects every phase).</p>
+<div class="foundation"><h5>🧱 Foundations</h5><p>Notice below that <em>"kubeadm starts nothing itself — the kubelet does."</em> That's the static-pod escape hatch: normally the apiserver decides what runs where, but the apiserver has to start somehow <em>first</em>. <a href="foundations.html#g-systemd">Foundations §8</a> walks through why systemd only ever needs to know about one service — the kubelet — and how the kubelet bootstraps the rest of the control plane straight from files on disk.</p></div>
 <h5>The concept</h5>
 <p><code>kubeadm init</code> generates a CA and certificates, writes kubeconfigs, drops static pod manifests for the control plane into <code>/etc/kubernetes/manifests/</code> (the kubelet starts them — kubeadm starts nothing itself), then installs CoreDNS and kube-proxy. Nodes report <strong>NotReady</strong> until a CNI plugin gives pods a network. <code>--pod-network-cidr</code> must match what your CNI expects: Flannel's default is <code>10.244.0.0/16</code>.</p>
 <h5>Lab</h5>
@@ -367,7 +370,7 @@ metadata:
 ...</pre></li>
 </ol>
 <h5>The concept</h5>
-<p><code>$do</code> is the single highest-value habit: <code>--dry-run=client -o yaml</code> makes the API server render a valid manifest <em>without creating anything</em> — you scaffold, redirect to a file, edit the 2 fields the task needs, and apply. Writing YAML from scratch is how people run out of time.</p>
+<p>This is the declarative idea from <a href="foundations.html#g-apis">Foundations §2</a> in miniature: instead of hand-typing YAML from a blank file, you ask the API server to render valid YAML for you and edit only the two or three fields the task actually needs. <code>$do</code> is the single highest-value habit: <code>--dry-run=client -o yaml</code> makes the API server render a valid manifest <em>without creating anything</em> — you scaffold, redirect to a file, edit the 2 fields the task needs, and apply. Writing YAML from scratch is how people run out of time.</p>
 <h5 class="verify">Verify</h5>
 <p><code>k get pod&lt;TAB&gt;</code> completes; <code>k run x --image=nginx $do</code> prints YAML and creates nothing (<code>k get pods</code> stays empty).</p>
 <h5 class="gotcha">Gotchas</h5>
@@ -381,6 +384,7 @@ metadata:
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
 <p>YAML dies on tab characters, and vim inserts tabs by default. Two lines of <code>~/.vimrc</code> prevent an entire class of "my manifest won't apply" disasters.</p>
+<div class="foundation"><h5>🧱 Foundations</h5><p>If YAML's indentation-only structure is new to you, read <a href="foundations.html#g-yaml">Foundations §3</a> first — it's two rules and one page, and from here on almost every lesson hands you a YAML file to edit.</p></div>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Write the config:

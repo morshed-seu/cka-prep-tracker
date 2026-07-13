@@ -59,6 +59,8 @@
 <p>Troubleshooting (30% of the exam) is "which component failed?". You can only answer that fast if the map is in your head, not on a cheat sheet.</p>
 <h5>The concept</h5>
 <p>The one insight that organizes everything: <strong>every component talks only to the apiserver, and only the apiserver talks to etcd</strong>. The scheduler doesn't command kubelets. Controllers don't create containers. Each component runs its own loop against the API: watch desired state, converge, report back. Kubernetes is a set of independent control loops around a shared database — not a pipeline.</p>
+<div class="foundation"><h5>🧱 Foundations</h5><p>If "declarative" and "control loop" are new ideas, <a href="foundations.html#g-apis">Foundations §2</a> has the one-paragraph version: everything below is stating a goal once and letting something else keep nudging reality toward it, forever — nobody is issuing step-by-step commands.</p></div>
+<p class="analogy">The apiserver is the building's front desk — every request from every department passes through it. etcd is the filing cabinet behind the desk that only the front desk may open. The scheduler is the seating host deciding which room a new guest gets. The controller-manager is the building's thermostat system: constantly comparing the posted target (desired state) to the actual reading (status) and adjusting until they match.</p>
 <svg viewBox="0 0 660 320" role="img" aria-label="Kubernetes architecture: scheduler, controller-manager and kubelet all talk only to the apiserver; only the apiserver talks to etcd">
   <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
   <rect x="8" y="6" width="400" height="306" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
@@ -128,6 +130,7 @@ kube-scheduler-cp             1/1     Running   cp</pre>
 <h5>Why it matters</h5>
 <p>"Fix the broken apiserver" means editing a file, not running a systemctl command — but only if you know which components are static pods and which is the one real systemd service.</p>
 <h5>The concept</h5>
+<div class="foundation"><h5>🧱 Foundations</h5><p>New to systemd or Linux services generally? <a href="foundations.html#g-systemd">Foundations §8</a> has the plain-language version — the short of it: systemd is the one program the kernel starts first, and it's responsible for starting (and restarting) every long-running background program, including, on this node, the kubelet.</p></div>
 <p>Chicken-and-egg: the control plane runs as pods, but pods need a control plane. The escape hatch is <strong>static pods</strong>: the kubelet watches a directory (<code>staticPodPath: /etc/kubernetes/manifests</code> in its config) and runs whatever pod YAML appears there — no apiserver involved. It then reports read-only <strong>mirror pods</strong> to the API so you can <em>see</em> them (named <code>&lt;name&gt;-&lt;node&gt;</code>, e.g. <code>kube-apiserver-cp</code>). So the boot order is: systemd starts <strong>kubelet</strong> (the only real service) → kubelet starts etcd + apiserver + scheduler + controller-manager from manifest files → everything else arrives via the API.</p>
 <h5>Lab</h5>
 <ol class="lab">
@@ -172,7 +175,7 @@ sudo mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/</pre></li>
 <li>The <strong>deployment controller</strong> (in controller-manager) sees a Deployment with no ReplicaSet → creates a ReplicaSet.</li>
 <li>The <strong>replicaset controller</strong> sees an RS with 0 of 2 pods → creates 2 Pod objects with <code>spec.nodeName</code> <em>empty</em>. Still nothing running — these are database rows.</li>
 <li>The <strong>scheduler</strong> watches for pods with empty <code>nodeName</code>, filters and scores nodes, then writes a <strong>Binding</strong> — which sets <code>nodeName</code>. Still nothing running.</li>
-<li>The <strong>kubelet</strong> on the chosen node sees "a pod scheduled to me" in its watch → pulls images via CRI, starts containers, posts status back. <em>Now</em> it's running.</li>
+<li>The <strong>kubelet</strong> on the chosen node sees "a pod scheduled to me" in its watch → pulls images via <abbr title="Container Runtime Interface — the API the kubelet uses to ask a runtime like containerd to start/stop containers">CRI</abbr>, starts containers, posts status back. <em>Now</em> it's running.</li>
 </ol>
 <h5>Lab</h5>
 <ol class="lab">
@@ -217,8 +220,9 @@ pod/trace-66cc6c9b8b-x7jwd   1/1     Running   0</pre>
 <p>This one ordered list explains RBAC questions, admission questions, and a whole class of "permission denied vs rejected" confusions. It's the most quotable fact in the exam's 25% architecture domain.</p>
 <h5>The concept</h5>
 <div class="flow"><span>authentication</span><em>→</em><span>authorization</span><em>→</em><span class="hot">mutating admission</span><em>→</em><span>schema validation</span><em>→</em><span class="hot">validating admission</span><em>→</em><span>persist to etcd</span></div>
+<div class="foundation"><h5>🧱 Foundations</h5><p><strong>Authentication</strong> answers "who are you" — proving an identity, the way showing an ID does. <strong>Authorization</strong> is a separate question, asked only once authentication already succeeded: "is this identity allowed to do this specific thing." Conflating the two is the most common source of "permission denied" confusion — a valid ID doesn't put you on every guest list. See <a href="foundations.html#g-pki">Foundations §5</a> if certificates as proof-of-identity are new to you.</p></div>
 <ul>
-<li><strong>Authentication — who are you?</strong> Client certificate, bearer token (ServiceAccount JWT, bootstrap token), or OIDC. Modules are tried in turn; first success wins. Failure → <code>401 Unauthorized</code>.</li>
+<li><strong>Authentication — who are you?</strong> Client certificate, bearer token (ServiceAccount <abbr title="JSON Web Token — a signed, self-contained token that proves an identity without a server round-trip">JWT</abbr>, bootstrap token), or <abbr title="OpenID Connect — delegating authentication to an external identity provider, e.g. your company SSO">OIDC</abbr>. Modules are tried in turn; first success wins. Failure → <code>401 Unauthorized</code>.</li>
 <li><strong>Authorization — may you do this verb on this resource?</strong> The configured authorizers (on kubeadm: <code>Node,RBAC</code>) are consulted in order; first to allow wins; default is deny. Failure → <code>403 Forbidden</code>.</li>
 <li><strong>Mutating admission — webhooks may edit the object.</strong> This is how sidecar injectors and defaulters work.</li>
 <li><strong>Validation + validating admission — the object may be rejected but no longer changed.</strong></li>
@@ -291,6 +295,7 @@ no</pre></li>
 <h5>Why it matters</h5>
 <p>"Watch" is the verb that makes the whole architecture from 1.1 work. Understanding it explains <code>resourceVersion</code>, "object has been modified" errors, and why the control plane scales at all.</p>
 <h5>The concept</h5>
+<div class="foundation"><h5>🧱 Foundations</h5><p>This is the client-server idea from <a href="foundations.html#g-apis">Foundations §2</a> made concrete: instead of every component calling back in to ask "anything new yet?", each one holds one open request and the server pushes changes down it the instant they happen. Nobody has to ask twice, and nobody has to poll.</p></div>
 <p>A watch is just a long-lived HTTP GET with <code>?watch=true&amp;resourceVersion=N</code>: "stream me every change to these objects since revision N". The apiserver keeps a <strong>watch cache</strong> per resource type, fed by a single etcd watch — so 5,000 kubelets watching pods cost etcd almost nothing. <code>resourceVersion</code> is literally etcd's MVCC revision counter (1.10): every write bumps it, and comparing versions is how optimistic concurrency ("the object has been modified; please apply your changes to the latest version") detects conflicting edits.</p>
 <h5>Lab</h5>
 <ol class="lab">
@@ -388,6 +393,7 @@ from "STDIN": no matches for kind "Deployment" in version "apps/v1beta1"</pre>
 <h5>Why it matters</h5>
 <p>You won't implement Raft in the exam — but quorum arithmetic explains etcd's failure behavior, and "what still works when etcd is down" is genuine exam material (6.8).</p>
 <h5>The concept</h5>
+<div class="foundation"><h5>🧱 Foundations</h5><p>New to distributed systems? <a href="foundations.html#g-consensus">Foundations §6</a> has the plain-language, one-committee-vote version of what "quorum" means, before the arithmetic below.</p></div>
 <p>etcd members elect a <strong>leader</strong>; all writes go through it. The leader appends each write to its write-ahead log and replicates it to followers; the write <em>commits</em> once a <strong>quorum</strong> — a strict majority — has persisted it. If the leader dies, followers time out and elect a new one (elections take ~seconds; writes pause, reads from the apiserver's watch cache continue).</p>
 <table>
 <tr><th>Members</th><th>Quorum</th><th>Failures tolerated</th><th>Note</th></tr>
@@ -621,6 +627,7 @@ kubectl delete pod waiting direct</pre></li>
 <h5>Why it matters</h5>
 <p>Every controller — built-in or operator/CRD (which the 2025 curriculum expects you to understand) — is this same shape. Learn it once, recognize it everywhere.</p>
 <h5>The concept</h5>
+<p class="analogy">An informer is mail sorting: it watches for anything new and drops a note about it. A work queue is the to-do list built from those notes — deduplicated, so ten notes about the same thing become one line. Reconcile is a worker actually picking up that line, doing the task, and crossing it off — or putting it back on the list to retry if it's not done yet.</p>
 <p>A controller has three parts: an <strong>informer</strong> (the LIST+WATCH pair from 1.6 plus an in-memory cache) that turns API changes into events; a <strong>work queue</strong> where events land as object keys (<code>namespace/name</code>, deduplicated); and worker loops that pop a key and run <strong>reconcile</strong>: read desired state (the spec), read observed state (the world), do <em>one small step</em> toward convergence, requeue with backoff on error. Crucially this is <strong>level-triggered</strong>, not edge-triggered: reconcile looks at <em>current</em> state, not at the event that woke it — so missed events don't matter, and every informer resyncs periodically anyway. A controller that was down catches up by itself the moment it's back (you watched that happen in 1.15 step 4).</p>
 <h5>Lab</h5>
 <ol class="lab">
@@ -746,7 +753,8 @@ kubectl exec pleg-demo -- kill 1       # kill nginx's PID 1</pre>
 <h5>Why it matters</h5>
 <p><code>crictl</code> talks CRI directly to the runtime — no apiserver needed. It is <em>the</em> debugging tool for control-plane-down scenarios, so the chain it plugs into is worth knowing precisely.</p>
 <h5>The concept</h5>
-<p>The kubelet calls the runtime over gRPC on a Unix socket — two services: <code>RuntimeService</code> (sandboxes/containers) and <code>ImageService</code> (pulls). containerd receives the call and spawns a tiny <strong>shim</strong> process per pod, which invokes <strong>runc</strong>; runc assembles namespaces + cgroups per the OCI spec, starts the container's PID 1, and <em>exits</em>. The shim stays alive holding stdio and the exit code — which is why containerd itself can restart without killing your containers.</p>
+<div class="foundation"><h5>🧱 Foundations</h5><p><code>runc</code> is the program that actually applies the namespaces + cgroups fencing from <a href="foundations.html#g-processes">Foundations §1</a> to create a container — it's the last, most literal link in this chain. Everything above it here (containerd, the shim) is bookkeeping and lifecycle management around that one moment.</p></div>
+<p>The kubelet calls the runtime over <abbr title="a remote-procedure-call protocol — a structured way for two programs to call each other's functions across a socket or network, instead of hand-rolling a wire format">gRPC</abbr> on a Unix socket — two services: <code>RuntimeService</code> (sandboxes/containers) and <code>ImageService</code> (pulls). containerd receives the call and spawns a tiny <strong>shim</strong> process per pod, which invokes <strong>runc</strong>; runc assembles namespaces + cgroups per the <abbr title="Open Container Initiative — the vendor-neutral spec that defines what a 'container' is at the filesystem/process level, so runc, crun, etc. are interchangeable">OCI</abbr> spec, starts the container's PID 1, and <em>exits</em>. The shim stays alive holding stdio and the exit code — which is why containerd itself can restart without killing your containers.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Find the socket the kubelet uses. On modern kubeadm (incl. v1.35) this file is often near-empty — kubelet auto-detects the CRI socket when exactly one exists, so kubeadm no longer needs to write <code>--container-runtime-endpoint</code> as a flag:
