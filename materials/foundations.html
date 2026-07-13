@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CKA prep Foundations: the Linux, networking, cryptography and distributed-systems basics that Kubernetes is built on, explained in plain language before you meet them inside the weekly lessons.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☸</text></svg>">
+<title>Foundations · start here — CKA Prep Lessons</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">CKA · Internals Track</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+    <button class="theme-btn" id="basics" aria-label="Toggle beginner-friendly explanations">basics</button>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../index.html">← Tracker</a></li>
+    <li><a href="foundations.html">Foundations · start here</a></li>
+    <li><a href="w0.html">W0 · Setup</a></li>
+    <li><a href="w1.html">W1 · Control plane</a></li>
+    <li><a href="w2.html">W2 · kubeadm &amp; PKI</a></li>
+    <li><a href="w3.html">W3 · Workloads</a></li>
+    <li><a href="w4.html">W4 · Networking</a></li>
+    <li><a href="w5.html">W5 · Storage</a></li>
+    <li><a href="w6.html">W6 · Troubleshooting</a></li>
+    <li><a href="w7.html">W7 · RBAC &amp; speed</a></li>
+    <li><a href="w8.html">W8 · Exam week</a></li>
+    <li><a href="../mock/exam-1.html">Mock exam · 16 tasks</a></li>
+    <li><a href="../cheatsheets/etcd-card.html">Cheat sheet · etcd card</a></li>
+    <li><a href="../cheatsheets/triage-template.html">Cheat sheet · triage template</a></li>
+    <li><a href="../cheatsheets/commands.html">Cheat sheet · kubectl commands</a></li>
+    <li><a href="../cheatsheets/exam-day.html">Cheat sheet · exam day</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../index.html">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>Foundations — the machinery underneath the machinery</h1>
+  <p>Kubernetes doesn't invent its hard parts from scratch — it bolts together a handful of much older ideas from Linux, networking and cryptography. If you already know what a process, a certificate, or DNS is, skim this page once and skip straight to Week 0. If any of the eight topics below are new to you, read this page <em>first</em>: every week's lessons link back into a section here instead of re-explaining it, so the ten minutes you spend here pays off all eight weeks.</p>
+  <p>Each section is short on purpose: the plain-language idea, one analogy, and exactly where it resurfaces in the lessons. The lessons themselves stay internals-first — this page is the on-ramp, not a replacement for them. Use the <strong>basics</strong> toggle (top left) anywhere on this site to show or hide these kinds of plain-language asides inside the weekly lessons.</p>
+</header>
+
+<!-- ---------------- 1. Processes & containers ---------------- -->
+<div class="grp" id="g-processes"><h3>1. Processes, and why a container isn't a tiny VM</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>What's actually running when you "start a container"</h4></div>
+<p>A <strong>process</strong> is just a program the kernel is running: it has memory, open files, and a process ID. Normally every process on a machine can see every other process, and they all share one filesystem and one network address. A <strong>container</strong> is an ordinary Linux process that the kernel has been told to partially blindfold:</p>
+<ul>
+<li><strong>Namespaces</strong> control what a process can <em>see</em> — its own process list, its own network interfaces, its own hostname, its own root filesystem. Six or seven of these, applied together, are what make a process feel like it's alone on a machine.</li>
+<li><strong>cgroups</strong> (control groups) control what a process can <em>use</em> — a CPU and memory budget the kernel enforces. This is where Kubernetes <code>resources.limits</code> actually gets enforced, several layers down.</li>
+<li><strong>A layered filesystem</strong> (overlayfs) is how a container gets "its own" files cheaply: a read-only image on the bottom, a thin writable layer on top, and only the top layer's changes are unique to that container.</li>
+</ul>
+<p class="analogy">A process is a chef working in a shared restaurant kitchen. A container is that same chef given their own sealed-off cooking station (namespaces — they can't see the other chefs' pots), a strict ingredient ration (cgroups — they can't grab more butter than allotted), and a photocopy of the master recipe book they can scribble on without touching the original (overlayfs). It's still the same kitchen and the same kernel underneath — nothing was virtualized, just fenced off.</p>
+<p>This is also why a container starts in milliseconds and a VM takes seconds-to-minutes: there's no second kernel booting, no virtual hardware — just one kernel drawing more fences around an ordinary process. It's also why "the container" and "the pod" are different things: a <strong>pod</strong> is Kubernetes' idea of one or more containers that <em>share</em> some of those namespaces (network and IPC) on purpose, so they can talk over <code>localhost</code>.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w1.html#cp-1-2">W1.2 — static pods and why the kubelet, not systemd, runs almost everything</a></li>
+<li><a href="w3.html#cp-3-1">W3.1 — phases vs container states, the two status vocabularies that come from this split</a></li>
+<li><a href="w5.html">W5 — storage, where the container's writable layer runs out and a Volume takes over</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 2. APIs, declarative vs imperative ---------------- -->
+<div class="grp" id="g-apis"><h3>2. Talking to a server: APIs, and "declare it, don't do it"</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>REST, and the declarative idea that runs the whole cluster</h4></div>
+<p>Most programs you've used talk to a server over <strong>HTTP</strong> using a small, boring vocabulary: <code>GET</code> a thing, <code>POST</code> a new thing, <code>PUT</code>/<code>PATCH</code> change a thing, <code>DELETE</code> remove a thing. That pattern — resources identified by URLs, manipulated with those verbs — is called <strong>REST</strong>, and it's exactly what <code>kubectl</code> is doing under the hood: every command becomes one HTTP call to the apiserver.</p>
+<p>The more important idea is <strong>declarative vs imperative</strong>. Imperative is a list of instructions: "start a container, then another, then check they're up." Declarative is a statement of a desired end state: "there should be 3 replicas of this, forever" — and something else is responsible for continuously checking reality against that statement and nudging it back into line. Kubernetes is declarative almost everywhere: you write what you want in YAML, and controllers spend their whole lives comparing "what you want" against "what exists" and closing the gap. That loop — read desired state, read actual state, act, repeat — is usually called a <strong>reconcile loop</strong> or <strong>control loop</strong>, and grasping it early makes half of Kubernetes's vocabulary (controller, operator, watch, drift) click into place at once.</p>
+<p class="analogy">Imperative is personally walking to the closet and grabbing a towel whenever the bathroom runs low. Declarative is pinning a note on the closet door — "always keep 3 towels in this bathroom" — and the housekeeping staff walk by periodically, glance at the note, count the towels, and top up if short. You never told them <em>when</em> to check or exactly what to carry; you only told them the rule, and they keep re-applying it forever. If a guest steals a towel, the next walk-by fixes it without you doing anything.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w1.html#cp-1-1">W1.1 — the big architecture picture: every component is its own reconcile loop against the apiserver</a></li>
+<li><a href="w1.html#cp-1-6">W1.6 — watches: the actual long-poll HTTP request behind "the staff walking by"</a></li>
+<li><a href="w3.html#cp-3-7">W3.7 — a rolling update watched live: the Deployment controller reconciling toward a new desired state</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 3. YAML ---------------- -->
+<div class="grp" id="g-yaml"><h3>3. YAML: how indentation becomes structure</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>Reading (and not fearing) the files everything is written in</h4></div>
+<p>Every Kubernetes object — a Pod, a Deployment, a Service — is described as a YAML document: a plain-text way of writing nested <code>key: value</code> data. There is no special punctuation to open or close a section like <code>{ }</code> in JSON; <strong>indentation itself is the structure</strong>. Two rules cover almost everything you'll write:</p>
+<ul>
+<li><code>key: value</code> pairs, one per line; a value that's itself a set of keys is written on the following lines, indented further.</li>
+<li>A list is a set of lines starting with <code>-</code> at the same indent level; each <code>-</code> is one list item, which can itself contain further <code>key: value</code> pairs indented past the dash.</li>
+</ul>
+<pre class="cmd">metadata:
+  name: web        # nested under metadata, 2 spaces in
+  labels:
+    app: web        # nested one level further
+spec:
+  containers:
+  - name: web       # first (and only) item in a list
+    image: nginx</pre>
+<p>Two consequences that explain almost every "my YAML won't apply" moment: indentation must be <strong>spaces, not tab characters</strong> (the parser rejects tabs outright), and sibling keys must line up at <em>exactly</em> the same column. This is why W0's vim setup turns Tab into two spaces before you write a single manifest.</p>
+<p class="analogy">YAML is a hand-written outline in a notebook, the kind with sub-bullets indented under a heading. Nobody needs brackets to know that a sub-bullet belongs to the bullet above it — the indent alone says so. Push it in one column too far or too few, and the reader (or the parser) attaches it to the wrong parent.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w0.html#cp-0-10">W0.10 — the two-line <code>~/.vimrc</code> that makes Tab safe for YAML, plus five editing motions</a></li>
+<li><a href="w0.html#cp-0-9">W0.9 — <code>$do</code>: scaffolding YAML from a command instead of writing it from a blank file</a></li>
+<li><a href="w3.html">W3 — the week where you'll hand-edit the most YAML: workloads and scheduling</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 4. TCP/IP & DNS ---------------- -->
+<div class="grp" id="g-network"><h3>4. TCP/IP, ports and DNS in one page</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>Addresses, doors, and the phone book that resolves names to addresses</h4></div>
+<p>Two machines that want to talk need three things: an <strong>IP address</strong> (which machine), a <strong>port</strong> (which door on that machine — a number 0–65535, with well-known ones like 443 for HTTPS), and a protocol to structure the conversation — almost always <strong>TCP</strong>, which guarantees bytes arrive in order and nothing is silently dropped, at the cost of a short handshake before any data flows.</p>
+<p>Remembering IP addresses doesn't scale, so <strong>DNS</strong> exists to translate names into addresses: your machine asks a resolver "what's the address for <code>example.com</code>?" and gets back an IP to actually connect to. That lookup happens transparently before almost every network request you make, including ones you didn't know were happening. Kubernetes runs its own internal DNS server (CoreDNS) purely so that Service names like <code>my-svc.my-namespace.svc.cluster.local</code> resolve the same way — a Service's whole job is to be a stable name and address for a set of pods whose individual IPs change constantly.</p>
+<div class="flow"><span>app asks: resolve my-svc</span><em>→</em><span>CoreDNS looks it up</span><em>→</em><span>returns a ClusterIP</span><em>→</em><span>app opens a TCP connection to that IP:port</span></div>
+<p class="analogy">An IP address is a street address; a port is the apartment number at that address — same building, different doors, different tenants. DNS is directory assistance: you say a name you remember ("Alex's place"), and it hands you the street address to actually dial into your GPS. Kubernetes Services exist because pods are tenants who move apartments constantly (rescheduled, restarted, new IP every time) — the Service is the one thing with a fixed, memorable address that directory assistance always resolves correctly, no matter who's currently living behind it.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w4.html#cp-4-9">W4.9 — a ClusterIP is a virtual address that only exists as rewrite rules, not a real interface</a></li>
+<li><a href="w4.html#cp-4-15">W4.15 — CoreDNS's Corefile, plugin by plugin</a></li>
+<li><a href="w4.html#cp-4-16">W4.16 — a pod's <code>resolv.conf</code> and the <code>ndots:5</code> search-path ladder</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 5. PKI / TLS ---------------- -->
+<div class="grp" id="g-pki"><h3>5. Public-key crypto: certificates and TLS in plain terms</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>Proving who you are without ever sharing a password</h4></div>
+<p>Public-key cryptography gives every party a matching pair of keys: a <strong>private key</strong> they never share, and a <strong>public key</strong> anyone can have. Anything encrypted with the public key can only be decrypted with the private one (and vice versa for signing) — which means you can prove you hold a private key without ever revealing it, just by signing something and letting others check the signature with your public key.</p>
+<p>A <strong>certificate</strong> is a public key plus identity information (whose key is this, what's it allowed to be used for, when does it expire), <strong>signed by someone else's private key</strong> — a <strong>Certificate Authority (CA)</strong>. If you already trust that CA's public key, and the CA's signature on the certificate checks out, you now trust the identity inside it too, without ever having met the party directly. That's the entire trust model behind <strong>TLS</strong> (what makes HTTPS "secure"): a short handshake where both sides present certificates, verify the signatures, and then derive a shared secret to encrypt everything that follows. Kubernetes runs its own tiny CA for exactly this reason: every component (apiserver, kubelet, etcd, you) gets a certificate signed by the cluster's CA, so any two of them can verify each other without a shared password anywhere.</p>
+<p class="analogy">A certificate is a notarized ID card: it states who you are and is stamped by a notary (the CA). A stranger who has never met you can still trust the card, because they already trust the notary's stamp and can verify it wasn't forged. The TLS handshake is presenting that ID at a door, having the doorman check the stamp against a notary they recognize, and only then being let in and given a private channel to talk through.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w2.html#cp-2-5">W2.5 — mapping <code>/etc/kubernetes/pki</code>: the cluster's actual trust domains</a></li>
+<li><a href="w2.html#cp-2-6">W2.6 — inspecting a real certificate's subject, issuer, SANs and expiry with <code>openssl</code></a></li>
+<li><a href="w7.html#cp-7-3">W7.3 — onboarding a human user through the CSR API, start to finish</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 6. Consensus & quorum ---------------- -->
+<div class="grp" id="g-consensus"><h3>6. Distributed consensus: why etcd wants an odd number of members</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>How several machines agree on one answer without a referee</h4></div>
+<p>If only one machine holds the cluster's data, it's a single point of failure. Running several copies fixes that — but now they must all agree on the exact same sequence of changes, even if messages are delayed or a machine crashes mid-write, or the copies quietly diverge into different "truths". <strong>Consensus algorithms</strong> (etcd uses one called <strong>Raft</strong>) solve this: one member is elected <strong>leader</strong>, all writes go through it, and a write is only considered committed once a <strong>quorum</strong> — a strict majority of members — has confirmed they've stored it.</p>
+<p>That majority rule is exactly why cluster sizes are odd (1, 3, 5): with 3 members, quorum is 2, so the cluster survives losing 1 member and still has a majority to keep deciding. With 4 members, quorum is 3 — you'd tolerate the same single failure as a 3-member cluster but need one more machine to do it, for no extra safety. Odd sizes are simply the cheapest way to buy fault tolerance.</p>
+<p class="analogy">Think of a small committee that must approve every decision unanimously-ish — really, by strict majority. Three members means any two agreeing is enough to act, so the committee keeps functioning even if one member is out sick. Add a fourth member and you now need three to agree — you've spent a whole extra seat without being able to survive any more absences than before. That's why committees (and etcd clusters) are kept at odd numbers.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w1.html#cp-1-9">W1.9 — Raft at the "explain to a colleague" level</a></li>
+<li><a href="w2.html#cp-2-11">W2.11 — the two HA control-plane topologies, and what the load balancer is for</a></li>
+<li><a href="w2.html#cp-2-16">W2.16 — taking an etcd snapshot with the right certs</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 7. Linux networking primitives ---------------- -->
+<div class="grp" id="g-linuxnet"><h3>7. Linux networking primitives: namespaces, veth, bridges, iptables</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>The plumbing every CNI plugin is quietly built from</h4></div>
+<p>Kubernetes networking (Week 4) is heavy precisely because it's four Linux primitives stacked together, and nobody tells you the primitives first:</p>
+<ul>
+<li>A <strong>network namespace (netns)</strong> is a private copy of the networking stack — its own interfaces, routes, and firewall rules, isolated from the host's. Every pod gets one; it's why a pod can have "its own" <code>eth0</code> and IP.</li>
+<li>A <strong>veth pair</strong> is two virtual network interfaces permanently wired together — anything sent in one instantly comes out the other. It's the cable that connects a pod's isolated netns back to the host, one end living in each.</li>
+<li>A <strong>bridge</strong> is a virtual switch: plug several veth "cables" into it and it forwards traffic between whichever ones need to talk, the same way a physical switch connects several computers in an office.</li>
+<li><strong>iptables / netfilter</strong> is the kernel's rule engine for rewriting and filtering packets in flight — it's how a Service's single virtual IP gets silently rewritten into one of several real pod IPs, and how NetworkPolicies actually block traffic.</li>
+</ul>
+<p>A CNI plugin's whole job is wiring these four things together consistently across every node so that pod-to-pod traffic looks like one flat network, even though underneath it's a private room, a cable, and a switch, repeated per node.</p>
+<p class="analogy">A network namespace is a hotel room with its own phone line — sealed off from every other room. A veth pair is the wire running from that room's phone jack out to the building's wiring closet. A bridge is the switchboard in that closet, connecting many rooms' wires so any two can be connected on demand. iptables is the switchboard operator quietly rerouting a call placed to "the front desk" (a Service IP) to whichever actual room (pod) is on duty right now — the caller never knows the room number changed.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w4.html#cp-4-2">W4.2 — building a pod network by hand with <code>ip</code> commands: netns, veth pair, bridge</a></li>
+<li><a href="w4.html#cp-4-3">W4.3 — finding a real pod's veth peer on the node</a></li>
+<li><a href="w4.html#cp-4-10">W4.10 — walking the iptables chains behind one of your Services</a></li>
+</ul>
+</article>
+</div>
+
+<!-- ---------------- 8. systemd & static pods ---------------- -->
+<div class="grp" id="g-systemd"><h3>8. Process supervision: systemd, and the static-pod escape hatch</h3>
+<article class="lesson">
+<div class="lesson-head"><h4>Who starts the thing that starts everything else</h4></div>
+<p>On a modern Linux box, <strong>systemd</strong> is process ID 1 — the first thing the kernel starts, and the thing responsible for starting (and restarting, if they crash) every long-running background program, called a <strong>service</strong> or <strong>unit</strong>. Network daemons, SSH, and — on a Kubernetes node — the <strong>kubelet</strong> are all systemd services, meaning systemd is what keeps the kubelet itself alive.</p>
+<p>But the kubelet is also supposed to run the rest of the control plane (apiserver, etcd, scheduler, controller-manager) — and those are normally started <em>by</em> the apiserver's own scheduling logic, which is a chicken-and-egg problem the very first time a cluster boots: nothing can schedule the apiserver before the apiserver exists. The escape hatch is the <strong>static pod</strong>: the kubelet watches one local directory on disk and directly runs whatever pod YAML it finds there, with no apiserver involved at all. So the real boot order on a control-plane node is: systemd starts the kubelet (the only service systemd needs to know about) → the kubelet reads the static pod manifests off disk and starts etcd, the apiserver, the scheduler, and the controller-manager itself → only after that does the rest of the cluster's usual apiserver-mediated machinery become available.</p>
+<p class="analogy">systemd is a building superintendent who unlocks the building every morning and personally keeps the boiler and the main power switch running — those can't wait for a tenant management office to open, because the tenant office needs power too. Static pods are utility rooms the superintendent watches and restarts directly off a posted maintenance schedule, rather than through the normal tenant work-order system (the apiserver) — because that system's own office is one of the rooms being kept alive this way.</p>
+<h5>Where this shows up in the lessons</h5>
+<ul>
+<li><a href="w1.html#cp-1-2">W1.2 — finding the static pod manifests and confirming kubelet is the only real systemd service</a></li>
+<li><a href="w2.html#cp-2-4">W2.4 — the control-plane taint: another thing decided before the apiserver can enforce policy</a></li>
+<li><a href="w6.html">W6 — troubleshooting: reading <code>journalctl</code> for the one component systemd actually supervises</a></li>
+</ul>
+</article>
+</div>
+
+<nav class="pager"><a href="../index.html">← Tracker</a><a href="w0.html">Week 0 · Lab setup →</a></nav>
+
+<footer>
+This primer stays intentionally general — it doesn't track a Kubernetes version. The weekly lessons it links into were authored against Kubernetes v1.35.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>

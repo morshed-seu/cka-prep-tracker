@@ -17,8 +17,17 @@ The full approved plan is in [`docs/PLAN.md`](docs/PLAN.md). Decisions already m
 | P6 | materials/w6.html + labs/faults/*.sh + cheatsheets/triage-template.html | ✅ done |
 | P7 | materials/w7.html (RBAC/auth/speed) + cheatsheets/commands.html | ✅ done |
 | P8 | materials/w8.html + mock/ (exam-1, solutions, setup script) + cheatsheets/exam-day.html + final QA + artifact banner update | ✅ done |
+| EP0 | Beginner-mode infra: `.foundation`/`.analogy` CSS, `#basics` toggle in lesson.js, `materials/foundations.html`, sidebar/hero links, this convention section | ✅ done |
+| EP1 | Enrich W0 + W1 lessons with `.foundation` callouts (pilot — tone-check before continuing) | ⬜ next |
+| EP2 | Enrich W2 | ⬜ |
+| EP3 | Enrich W3 | ⬜ |
+| EP4 | Enrich W4 (biggest gap: veth/bridge/iptables/DNS internals) | ⬜ |
+| EP5 | Enrich W5 | ⬜ |
+| EP6 | Enrich W6 | ⬜ |
+| EP7 | Enrich W7 | ⬜ |
+| EP8 | Enrich W8 + light pass over cheat sheets/mock + final cross-link QA | ⬜ |
 
-All phases complete. Future sessions: maintenance only (re-verify exam version/rules against the LF pages, fix reported issues); a second mock (`mock/exam-2.html`) would follow the exam-1 pattern if ever requested. Note: `shellcheck` was unavailable in the P8 environment — `mock/setup-exam-1.sh` passed `bash -n` and mirrors the (shellchecked) `labs/faults/` patterns, but run shellcheck on it when available.
+P0–P8 complete; the site is a full self-contained internals-first curriculum. EP0–EP8 (the beginner/intermediate enrichment pass, see "Beginner-friendly conventions" below and `docs/PLAN.md`) are in progress — implement one per session, in week order, same as the original build. Note: `shellcheck` was unavailable in the P8 environment — `mock/setup-exam-1.sh` passed `bash -n` and mirrors the (shellchecked) `labs/faults/` patterns, but run shellcheck on it when available.
 
 ## Phase workflow
 
@@ -39,6 +48,35 @@ All phases complete. Future sessions: maintenance only (re-verify exam version/r
 - Escape `<`, `>`, `&` inside all code blocks (`&lt;` etc.) — the checker catches breakage but not silent text loss; grep for suspicious raw `<word>` patterns after authoring.
 - Labs run against the week-0 lab: 3 Ubuntu 24.04 Multipass VMs named `cp`, `node01`, `node02`, kubeadm + containerd + Flannel (`10.244.0.0/16`).
 - Voice: plain, direct, internals-first ("here's the machinery, here's the failure signature"); every lab ends in something checkable. All ~160 lessons should read as one system.
+
+## Beginner-friendly conventions (EP0–EP8)
+
+The original lessons were written internals-first, for readers who already know Linux/networking/crypto basics. EP0–EP8 add an on-ramp without diluting that depth — see `docs/PLAN.md` for the full rationale.
+
+- **`.foundation` callout**: `<div class="foundation"><h5>🧱 Foundations</h5><p>…</p></div>`, inserted right after "Why it matters" and before "The concept" — only on lessons that lean on an underlying primitive a newcomer likely lacks (skip logistics-only checkpoints). 2–4 plain-language sentences, **one** analogy max (from the registry below), ending with a link to the relevant `materials/foundations.html#section` instead of re-teaching it inline.
+- **`.analogy`**: `<p class="analogy">…</p>` — a single-sentence metaphor; the `::before` CSS prints "Like: " automatically, don't type it. One per concept, reused from the registry — don't stack multiple metaphors for the same idea.
+- **Jargon**: wrap the first occurrence per lesson of dense terms (CRI, gRPC, veth, DNAT, quorum, SAN, admission…) in `<abbr title="short plain definition">term</abbr>`.
+- **The "on-ramp" sentence**: prepend one plain-English framing sentence to an existing "The concept" paragraph when enriching a lesson — an addition, not a rewrite of the internals-first voice.
+- **Toggle**: both are hidden together when a reader clicks **basics** in the sidebar (`body.basics-off` class, localStorage `cka-beginner-v1`, default shown) — `assets/lesson.js` wires this the same way as the theme toggle. Every page needs the `#basics` button next to `#theme` in `brand-row`.
+- **`materials/foundations.html`**: the standalone primer for cross-cutting fundamentals (processes/containers, APIs/declarative, YAML, TCP/IP+DNS, PKI/TLS, consensus/quorum, Linux networking primitives, systemd/static pods). Link into its sections from `.foundation` callouts rather than duplicating the explanation per week.
+
+**Canonical analogy registry** — reuse these exact metaphors everywhere so they don't collide across weeks; add to this table (don't invent a competing metaphor for something already listed):
+
+| Concept | Analogy |
+|---|---|
+| apiserver | the front desk / reception |
+| etcd | the filing cabinet / ledger |
+| controllers / reconcile loop | thermostats, or housekeeping re-checking a posted note |
+| scheduler | the seating host at a restaurant |
+| pod | a shipping container |
+| Service | directory assistance / a phone book entry |
+| Ingress | the building receptionist routing calls to the right room |
+| CNI / cluster network | the road network between buildings |
+| RBAC | a keycard system |
+| certificate / CA | a notarized ID card / the notary everyone already trusts |
+| network namespace + veth + bridge | a hotel room, its phone wire, and the switchboard connecting rooms |
+| systemd + static pods | the building superintendent who keeps the boiler running directly, before the tenant office can open |
+| quorum / consensus | a small committee that only needs a strict majority to act |
 
 ## Other components (specs in docs/PLAN.md)
 

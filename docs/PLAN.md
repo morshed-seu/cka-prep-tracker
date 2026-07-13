@@ -108,3 +108,31 @@ Each phase is one working session ending with a local render check + commit. Con
 - Cheat sheets: browser print preview fits one page.
 - Fault scripts: `shellcheck` clean; dry-read for the wrong-cluster guard; at least one script exercised end-to-end on a lab/kind cluster if available.
 - Mock exam: timer starts/stops; solutions page task numbering matches exam page.
+
+## Addendum: beginner/intermediate enrichment (EP0–EP8)
+
+P0–P8 above shipped a complete internals-first curriculum, but it assumes the
+reader already knows Linux, networking, and distributed-systems basics — e.g.
+`w1.html` opens with "control loops" and static pods with no on-ramp. Feedback:
+only already-experienced people can follow the current lessons. Kubernetes
+concepts sit on top of more fundamental tech (processes/namespaces, TCP/IP &
+DNS, PKI/TLS, consensus, REST/YAML) a beginner may never have met. Goal: teach
+those primitives and add plain-language framing, without diluting the
+internals-first depth for readers who don't need it.
+
+Decisions made:
+- Beginner content lives in **toggle-able panels** (`.foundation` callouts +
+  `.analogy` asides), default **on**, via a site-wide `#basics` button next to
+  the theme toggle — same localStorage-driven pattern as theme
+  (`assets/lesson.js`). Advanced readers hide it once, everywhere; nothing is
+  removed, nothing is hidden from newcomers by default.
+- Cross-cutting fundamentals get **one standalone page**,
+  `materials/foundations.html` ("Week 0.5"), not folded into `w0.html` (which
+  stays compact cluster-build logistics). Lessons link into its sections
+  instead of re-explaining the same primitive in every week that touches it.
+
+Design and rollout (EP0–EP8) are documented in `CLAUDE.md`'s "Beginner-friendly
+conventions" section (the `.foundation`/`.analogy` pattern, jargon-`<abbr>`
+convention, and the canonical analogy registry) and the phase roadmap table.
+EP0 (infra + `foundations.html` + conventions) is done; EP1–EP8 enrich one
+week's lessons per session, in week order, same cadence as the original build.
