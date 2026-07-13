@@ -222,22 +222,24 @@ curl -fsSL https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key \
   | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
   | sudo tee /etc/apt/sources.list.d/kubernetes.list</pre></li>
-<li>Install and pin the three packages:
+<li>Install and pin the three packages, plus <code>cri-tools</code> (the same repo publishes it, matching the v1.35 minor) for <code>crictl</code> — the node-level CRI debugging tool weeks 1 and 6 rely on:
 <pre class="cmd">sudo apt-get update
-sudo apt-get install -y kubelet kubeadm kubectl
-sudo apt-mark hold kubelet kubeadm kubectl</pre>
+sudo apt-get install -y kubelet kubeadm kubectl cri-tools
+sudo apt-mark hold kubelet kubeadm kubectl cri-tools</pre>
 <pre class="out">kubelet set on hold.
 kubeadm set on hold.
-kubectl set on hold.</pre>
+kubectl set on hold.
+cri-tools set on hold.</pre>
 <p><code>apt-mark hold</code> stops <code>apt upgrade</code> from bumping Kubernetes behind your back — cluster upgrades must be deliberate (that's the week-2 <code>kubeadm upgrade</code> dance, and the unhold/hold steps are part of the exam task).</p></li>
 </ol>
 <h5 class="verify">Verify</h5>
-<pre class="cmd">kubeadm version -o short &amp;&amp; systemctl is-active containerd &amp;&amp; lsmod | grep br_netfilter</pre>
+<pre class="cmd">kubeadm version -o short &amp;&amp; systemctl is-active containerd &amp;&amp; lsmod | grep br_netfilter &amp;&amp; crictl --version</pre>
 <pre class="out">v1.35.x
 active
-br_netfilter           32768  0</pre>
+br_netfilter           32768  0
+crictl version v1.35.x</pre>
 <h5 class="gotcha">Gotchas</h5>
-<p>It's normal that <code>kubelet</code> is crash-looping right now (<code>systemctl status kubelet</code> shows restarts) — it has no config until <code>kubeadm init/join</code> writes one. Also note the repo pattern: to <em>upgrade a minor version</em> later you must edit <code>/etc/apt/sources.list.d/kubernetes.list</code> first — pkgs.k8s.io repos only carry their own minor.</p>
+<p>It's normal that <code>kubelet</code> is crash-looping right now (<code>systemctl status kubelet</code> shows restarts) — it has no config until <code>kubeadm init/join</code> writes one. Also note the repo pattern: to <em>upgrade a minor version</em> later you must edit <code>/etc/apt/sources.list.d/kubernetes.list</code> first — pkgs.k8s.io repos only carry their own minor. <code>crictl</code> works with no further config once <code>/run/containerd/containerd.sock</code> exists (1.20 has you point it there explicitly anyway).</p>
 <h5>Docs</h5>
 <p class="docs-links">During the exam, search the docs for <strong>"Installing kubeadm"</strong> and <strong>"Container runtimes"</strong> — the repo commands above are copy-pasteable from there; never type them from memory.</p>
 </article>

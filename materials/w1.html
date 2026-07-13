@@ -747,9 +747,14 @@ kubectl exec pleg-demo -- kill 1       # kill nginx's PID 1</pre>
 <p>The kubelet calls the runtime over gRPC on a Unix socket — two services: <code>RuntimeService</code> (sandboxes/containers) and <code>ImageService</code> (pulls). containerd receives the call and spawns a tiny <strong>shim</strong> process per pod, which invokes <strong>runc</strong>; runc assembles namespaces + cgroups per the OCI spec, starts the container's PID 1, and <em>exits</em>. The shim stays alive holding stdio and the exit code — which is why containerd itself can restart without killing your containers.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Find the socket the kubelet uses:
+<li>Find the socket the kubelet uses. On modern kubeadm (incl. v1.35) this file is often near-empty — kubelet auto-detects the CRI socket when exactly one exists, so kubeadm no longer needs to write <code>--container-runtime-endpoint</code> as a flag:
 <pre class="cmd">cat /var/lib/kubelet/kubeadm-flags.env</pre>
-<pre class="out">KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.10"</pre></li>
+<pre class="out">KUBELET_KUBEADM_ARGS=""</pre>
+<p>An empty value here is <em>expected</em>, not broken — as of v1.35 kubeadm instead writes the socket into a small node-local config patch, <code>instance-config.yaml</code> (the <code>NodeLocalCRISocket</code> feature, beta since v1.34):</p>
+<pre class="cmd">cat /var/lib/kubelet/instance-config.yaml
+ls -la /run/containerd/containerd.sock</pre>
+<pre class="out">containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+srw-rw---- 1 root root 0 ... /run/containerd/containerd.sock</pre></li>
 <li>Point crictl at it permanently (on every node):
 <pre class="cmd">sudo crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock
 sudo crictl ps | head -5</pre>
