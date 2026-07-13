@@ -718,13 +718,19 @@ kubectl get lease kube-controller-manager -n kube-system \
 <li>Find the sources in the live config:
 <pre class="cmd">sudo grep -E 'staticPodPath|syncFrequency' /var/lib/kubelet/config.yaml</pre>
 <pre class="out">staticPodPath: /etc/kubernetes/manifests</pre></li>
-<li>Watch a sync cycle narrate itself — restart a pod's container and follow kubelet's log on that node (find the node with <code>kubectl get pod &lt;pod&gt; -o wide</code>, then on it):
-<pre class="cmd">kubectl run pleg-demo --image=nginx    # then on its node:
-sudo journalctl -u kubelet -f | grep -i pleg-demo &amp;
+<li>Watch a sync cycle narrate itself. <code>kubectl</code> only has credentials on <code>cp</code> (0.7) — run every <code>kubectl</code> command there. The kubelet log you want to watch lives on whichever node the pod lands on, so open a <em>second terminal</em>, ssh to that node (find it with <code>kubectl get pod &lt;pod&gt; -o wide</code>), and tail the log there:
+<pre class="cmd"># terminal A — on cp:
+kubectl run pleg-demo --image=nginx
+kubectl get pod pleg-demo -o wide   # note the NODE column
+
+# terminal B — ssh to that node:
+sudo journalctl -u kubelet -f | grep -i pleg-demo
+
+# terminal A — on cp, once terminal B is tailing:
 kubectl exec pleg-demo -- kill 1       # kill nginx's PID 1</pre>
 <pre class="out">... SyncLoop (PLEG): "pleg-demo_default", event: ContainerDied
 ... Container nginx failed liveness/exited, restarting ...</pre>
-<p>PLEG detected the death from the runtime side; the sync loop restarted the container. <code>kubectl get pod pleg-demo</code> now shows <code>RESTARTS: 1</code>. Clean up: <code>kubectl delete pod pleg-demo</code>.</p></li>
+<p>PLEG detected the death from the runtime side; the sync loop restarted the container. <code>kubectl get pod pleg-demo</code> (from <code>cp</code>) now shows <code>RESTARTS: 1</code>. Clean up: <code>kubectl delete pod pleg-demo</code>.</p></li>
 </ol>
 <h5 class="verify">Verify</h5>
 <p>Name the three pod sources and describe PLEG's job in one sentence.</p>
