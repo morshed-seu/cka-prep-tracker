@@ -18,8 +18,8 @@ The full approved plan is in [`docs/PLAN.md`](docs/PLAN.md). Decisions already m
 | P7 | materials/w7.html (RBAC/auth/speed) + cheatsheets/commands.html | ✅ done |
 | P8 | materials/w8.html + mock/ (exam-1, solutions, setup script) + cheatsheets/exam-day.html + final QA + artifact banner update | ✅ done |
 | EP0 | Beginner-mode infra: `.foundation`/`.analogy` CSS, `#basics` toggle in lesson.js, `materials/foundations.html`, sidebar/hero links, this convention section | ✅ done |
-| EP1 | Enrich W0 + W1 lessons with `.foundation` callouts (pilot — tone-check before continuing) | ⬜ next |
-| EP2 | Enrich W2 | ⬜ |
+| EP1 | Enrich W0 + W1 lessons with `.foundation` callouts (pilot) | ✅ done (`8e049a2`) |
+| EP2 | Enrich W2 | ⬜ next |
 | EP3 | Enrich W3 | ⬜ |
 | EP4 | Enrich W4 (biggest gap: veth/bridge/iptables/DNS internals) | ⬜ |
 | EP5 | Enrich W5 | ⬜ |
