@@ -134,6 +134,10 @@
   /* ---- copy buttons on command blocks ---- */
   [].slice.call(document.querySelectorAll('pre.cmd')).forEach(function(pre){
     var text=pre.textContent.replace(/\s+$/,'');
+    var wrap=document.createElement('div');
+    wrap.className='pre-wrap';
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
     var b=document.createElement('button');
     b.className='copy-btn'; b.type='button'; b.textContent='copy';
     b.addEventListener('click', function(){
@@ -141,7 +145,7 @@
         .then(function(){ b.textContent='copied'; setTimeout(function(){ b.textContent='copy'; },1200); })
         .catch(function(){ b.textContent='select & copy'; });
     });
-    pre.appendChild(b);
+    wrap.appendChild(b);
   });
 
   paint();
