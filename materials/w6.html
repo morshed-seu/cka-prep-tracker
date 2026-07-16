@@ -49,7 +49,7 @@
 <p class="crumb"><a href="../index.html#w6">← Back to the tracker</a></p>
 <header class="hero">
   <h1>Week 6 — Troubleshooting: the 30% week</h1>
-  <p>The highest-weighted domain, and the week where the internals from weeks 1–5 become money. The method is deliberate: for every failure class you <em>break your own cluster</em> (scripts in <code>labs/faults/</code> do the breaking so you can't peek), fix it against the clock, and write down the <strong>signature</strong> — symptom → first command → root cause. By Friday you'll own a one-page triage sheet built from things you've personally repaired, and a 30-minute six-fault gauntlet score to prove it. Ticking <em>done</em> here also ticks the tracker.</p>
+  <p>This week is about fixing things that are broken — reading a symptom, chasing it down to the exact root cause, and applying the smallest fix that solves it, on a clock. It's the highest-weighted domain on the exam blueprint, and the week where all the internals you built up in weeks 1–5 finally become money: you can't troubleshoot a system you don't understand, and every fault below only makes sense in terms of some mechanism from an earlier week. The method here is deliberate: for every failure class you'll <em>break your own cluster</em> yourself (scripts in <code>labs/faults/</code> do the actual breaking, precisely so you can't peek at the answer first), fix it against the clock, and write down the <strong>signature</strong> — the reliable pattern of symptom → first command → root cause that lets you recognize the same fault instantly next time. By Friday you'll own a one-page triage sheet built entirely from failures you personally diagnosed and repaired with your own hands, plus a timed 30-minute six-fault gauntlet score to prove the reflexes actually stuck. Ticking <em>done</em> here also ticks the tracker.</p>
   <div class="flow"><span>symptom</span><em>→</em><span>first command</span><em>→</em><span class="hot">root cause</span><em>→</em><span>fix</span><em>→</em><span>verify</span></div>
 </header>
 
@@ -60,14 +60,14 @@
 <div class="lesson-head"><span class="cp-id">6.1</span><h4>The universal first moves: events, describe, logs, wide</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Every troubleshooting task starts the same way, whatever is broken. Four commands cover the opening move of ~80% of them; making them reflexes buys you the first minute of every exam task for free.</p>
+<p>When something in your cluster is broken, you don't start by reading YAML or guessing — you start by asking the cluster what it already noticed, in the same four moves every time, whatever the failure. Every troubleshooting task starts the same way: four commands cover the opening move of ~80% of them, and making them reflexes buys you the first minute of every exam task for free.</p>
 <h5>The concept</h5>
-<p>Events are real API objects (kind <code>Event</code>, stored like everything else) that components write when something notable happens: scheduler placed a pod, kubelet pulled an image, probe failed, eviction started. Two things about them shape the commands:</p>
+<p>An <strong>event</strong> here isn't a vague notion — it's a real API object, stored the same way a Pod or Deployment is (kind <code>Event</code>), that a component writes the moment something notable happens: the scheduler placed a pod, the kubelet pulled an image, a probe failed, an eviction started. Because they're just objects in the same store as everything else, you can list and read them with the commands you already know. Two things about them shape the commands you actually run:</p>
 <ul>
-<li>They expire — the apiserver keeps them for <strong>1 hour</strong> by default (<code>--event-ttl</code>). "No events" on an old broken pod means the evidence aged out, not that nothing happened. Recreate the pod to regenerate it.</li>
-<li>Default <code>kubectl get events</code> ordering is effectively arbitrary — always sort: <code>--sort-by=.metadata.creationTimestamp</code>.</li>
+<li>They expire — the apiserver keeps them for <strong>1 hour</strong> by default (a setting called <code>--event-ttl</code>). So "no events" on an old broken pod doesn't mean nothing happened; it means the evidence aged out of the 1-hour window. Recreate the pod and the story starts fresh.</li>
+<li>Default <code>kubectl get events</code> ordering is effectively arbitrary — it's not chronological unless you ask. Always sort: <code>--sort-by=.metadata.creationTimestamp</code>.</li>
 </ul>
-<p><code>kubectl describe</code> is an aggregator: object spec + status + <em>the events that reference this object</em>, at the bottom — the single highest-value screen in Kubernetes. <code>-o wide</code> on pods adds the node and pod IP, which is how you spot the pattern "every broken pod is on node02" in one glance.</p>
+<p><code>kubectl describe</code> is best thought of as an aggregator: it pulls together an object's spec (what you asked for), its status (what's actually true), and — at the very bottom — <em>the events that reference this object specifically</em>. That combination makes it the single highest-value screen in Kubernetes: one command, three layers of truth. <code>-o wide</code> on pods adds two extra columns, the node and the pod's IP, which is how you spot a pattern like "every broken pod happens to be on node02" in one glance instead of cross-referencing separately.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Manufacture two different failures to practice on:
@@ -97,7 +97,7 @@ crasher     0/1    CrashLoopBackOff  2 (18s ago) 10.244.2.9  <b>node02</b></pre>
 <h5 class="verify">Verify</h5>
 <p>For each broken pod you can say, from these four commands alone, <em>what</em> is failing and <em>where the message names it</em> — without having read the pod spec.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>kubectl get events</code> without <code>-A</code> only shows the current namespace — troubleshooting tasks love hiding the broken thing in a namespace you're not looking at. And <code>describe</code> on a deleted-and-recreated pod shows only the new pod's events; the old pod's story is gone with it.</p>
+<p><code>kubectl get events</code> without <code>-A</code> only shows the current namespace — a real trap, since troubleshooting tasks love hiding the broken thing in a namespace you weren't even looking in. And <code>describe</code> on a pod that got deleted and recreated only shows the <em>new</em> pod's events, because it's a different object with a different history — the old pod's story is gone the moment it's replaced, not just hidden.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debug Pods"</strong> — the task page mirrors this exact sequence; know where it lives.</p>
 </article>
@@ -106,9 +106,9 @@ crasher     0/1    CrashLoopBackOff  2 (18s ago) 10.244.2.9  <b>node02</b></pre>
 <div class="lesson-head"><span class="cp-id">6.2</span><h4>Where logs physically live — the fallback ladder for when kubectl can't help</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Control-plane-failure questions have a chicken-and-egg problem: the apiserver is down, so <code>kubectl logs</code> is down too. Knowing where logs are as <em>files</em> means nothing about a dead control plane can blind you.</p>
+<p><code>kubectl logs</code> feels like a single, simple command, but it secretly depends on several pieces of the control plane being alive at once — which creates a chicken-and-egg problem exactly when you need logs the most: control-plane-failure questions ask you to diagnose a broken apiserver, but a broken apiserver means <code>kubectl logs</code> is down too. Knowing where logs physically live as <em>files</em>, independent of any of that, means nothing about a dead control plane can leave you blind.</p>
 <h5>The concept</h5>
-<p><code>kubectl logs</code> is served <em>by the kubelet</em>: the apiserver proxies your request to the kubelet on the pod's node, and the kubelet reads the container's log file that the runtime writes under <code>/var/log/pods/</code>. Nothing about container logs requires the control plane. The ladder, from most to least infrastructure required:</p>
+<p><code>kubectl logs</code> is served <em>by the kubelet</em>, not the apiserver directly: the apiserver just proxies your request over to the kubelet running on the pod's node, and that kubelet reads the container's log file — a plain file that the container runtime (the software actually running containers, like containerd) writes under <code>/var/log/pods/</code>. Nothing about that chain requires the control plane at all once you're standing on the node. That gives you a ladder of fallbacks, from most to least infrastructure required — reach for the next rung down only when the one above it isn't available:</p>
 <table>
 <tr><th>Rung</th><th>Works when</th><th>Command</th></tr>
 <tr><td><code>kubectl logs</code></td><td>apiserver + kubelet both up</td><td><code>kubectl logs pod [-c ctr] [--previous]</code></td></tr>
@@ -116,7 +116,7 @@ crasher     0/1    CrashLoopBackOff  2 (18s ago) 10.244.2.9  <b>node02</b></pre>
 <tr><td>raw files on the node</td><td>even the runtime is dead</td><td><code>/var/log/pods/&lt;ns&gt;_&lt;pod&gt;_&lt;uid&gt;/&lt;ctr&gt;/0.log</code></td></tr>
 <tr><td><code>journalctl</code></td><td>always (for system services)</td><td><code>journalctl -u kubelet</code>, <code>-u containerd</code></td></tr>
 </table>
-<p><code>/var/log/containers/*.log</code> is a flat directory of symlinks into <code>/var/log/pods/</code> with pod+container in the filename — the grep-friendly view. The kubelet itself is not a container, so its logs are in the journal, never under /var/log/pods.</p>
+<p><code>/var/log/containers/*.log</code> is a flat directory of symlinks into <code>/var/log/pods/</code>, with the pod name and container name baked into the filename — a grep-friendly shortcut view rather than a separate copy of the data. The kubelet itself is not a container (it's the process that starts and watches containers, so it can't very well be one), so its own logs live in the systemd journal (read with <code>journalctl</code>) and never appear under <code>/var/log/pods</code> — that directory is only ever for the things the kubelet runs, not the kubelet itself.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Find <code>crasher</code>'s (from 6.1) log file on its node. Get the node and UID first:
@@ -143,7 +143,7 @@ sudo crictl logs $(sudo crictl ps -a --name crasher -q | head -1)</pre>
 <h5 class="verify">Verify</h5>
 <p>You produced the same log line three ways: <code>kubectl logs --previous</code>, <code>crictl logs</code>, and <code>tail</code> on the file — and can say which rung survives an apiserver outage (all but the first).</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>crictl</code> needs root and talks to the runtime socket configured in <code>/etc/crictl.yaml</code> — if <code>crictl</code> itself errors with "connection refused" on the socket, that's not a crictl problem, that's <em>containerd being down</em> (a 6.11 fault signature). Also <code>crictl ps</code> without <code>-a</code> hides exited containers — for crash forensics you always want <code>-a</code>.</p>
+<p><code>crictl</code> needs root, and it talks to the container runtime over a Unix socket path configured in <code>/etc/crictl.yaml</code> — so if <code>crictl</code> itself errors with "connection refused" on that socket, don't blame crictl; that error means <em>containerd is down</em> (a signature you'll meet again in 6.11). Also worth remembering: <code>crictl ps</code> without <code>-a</code> hides exited containers by default, the same way <code>docker ps</code> does — for crash forensics you always want <code>-a</code>, or the very container you're hunting for is invisible.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Logging Architecture"</strong> (where files live) and <strong>"crictl"</strong> (Debugging Kubernetes nodes with crictl — has a command translation table).</p>
 </article>
@@ -152,10 +152,10 @@ sudo crictl logs $(sudo crictl ps -a --name crasher -q | head -1)</pre>
 <div class="lesson-head"><span class="cp-id">6.3</span><h4>kubectl debug: ephemeral containers for shell-less pods, node debug for host access</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Production images increasingly ship with no shell, no ps, no curl — <code>kubectl exec</code> just fails. <code>kubectl debug</code> is the sanctioned answer, and it doubles as a way to get a host shell on any node through the API. Both appear in exam tasks and both are unusable if you first meet them under time pressure.</p>
+<p>Production images increasingly ship stripped down to just the application binary — no shell, no <code>ps</code>, no <code>curl</code> — because smaller images are more secure and faster to pull. That's great for security, terrible for debugging: <code>kubectl exec</code> just fails, because there's no shell inside to exec into. <code>kubectl debug</code> is Kubernetes' sanctioned answer to that problem, and as a bonus the same command doubles as a way to get a shell on any node's host, entirely through the API, no ssh key required. Both show up in exam tasks, and both are genuinely confusing the first time you meet them — better that first time isn't under a countdown clock.</p>
 <h5>The concept</h5>
-<p>An <strong>ephemeral container</strong> is a container appended to a <em>running</em> pod's spec (via the pod's <code>ephemeralcontainers</code> subresource — a normal update can't do it). It shares the pod's network namespace automatically; with <code>--target=&lt;container&gt;</code> it also joins that container's <strong>process namespace</strong>, so its tools can see the target's processes and filesystem (via <code>/proc/&lt;pid&gt;/root</code>). It never restarts and can't be removed — it lives until the pod dies. That's the price of debugging in place.</p>
-<p><code>kubectl debug node/&lt;name&gt;</code> instead creates a normal pod pinned to that node with the host filesystem mounted at <code>/host</code> — a host shell obtained purely through the API. Since v1.33 every <code>kubectl debug</code> takes <code>--profile</code> (what privileges the debug container gets); in v1.35 omitting it prints a deprecation warning about the old default, so type it: <code>--profile=general</code> for pod debugging, <code>--profile=sysadmin</code> for privileged node work.</p>
+<p>An <strong>ephemeral container</strong> is a container bolted onto a pod that's already <em>running</em>, added via a special API path (the pod's <code>ephemeralcontainers</code> subresource — a normal edit-the-pod update can't add one; it needs this dedicated mechanism). By default it only shares the pod's network namespace (so it can reach the same addresses the app can) — but add <code>--target=&lt;container&gt;</code> and it also joins that specific container's <strong>process namespace</strong>, the Linux mechanism that controls which processes a program can see and signal. Joining it means your debugging tools can now see the target container's running processes and, via <code>/proc/&lt;pid&gt;/root</code>, even browse its filesystem — without ever needing a shell to already exist inside that container. The price for this convenience: an ephemeral container never restarts and can't be removed once added — it lives until the whole pod dies, a permanent guest.</p>
+<p><code>kubectl debug node/&lt;name&gt;</code> does something different: instead of touching an existing pod, it creates a brand new, ordinary pod pinned to that specific node, with the node's entire host filesystem mounted inside it at <code>/host</code> — effectively a host shell, obtained purely by asking the API for a pod, no ssh key needed. Since v1.33 every <code>kubectl debug</code> invocation takes a <code>--profile</code> flag that controls exactly what privileges the debug container gets; by v1.35, omitting it prints a deprecation warning about the old implicit default, so just type it explicitly: <code>--profile=general</code> for debugging inside a pod, <code>--profile=sysadmin</code> when you need genuinely privileged access to a node.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>A genuinely shell-less pod — the pause image has exactly one binary:
@@ -187,7 +187,7 @@ kubectl delete pod quiet node-debugger-node01-x7k2q</pre></li>
 <h5 class="verify">Verify</h5>
 <p>You got a working shell in a pod where <code>kubectl exec</code> failed, saw the target's PID 1 from it, and ran <code>crictl</code> on node01 without ssh.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Without <code>--target</code>, the ephemeral container shares only the <em>network</em> namespace — <code>ps</code> shows nothing of the app and people conclude "debug is broken". For a pod that crashes too fast to attach to at all, the third mode is <code>kubectl debug &lt;pod&gt; --copy-to=mypod --set-image=... </code> — a mutated <em>copy</em> you can hold open. And remember the node debugger pod after you exit; graders and real clusters both dislike litter.</p>
+<p>Without <code>--target</code>, the ephemeral container only shares the <em>network</em> namespace — so <code>ps</code> inside it shows nothing of the app, and people conclude "debug is broken" when really they just forgot the flag that shares process visibility. For a pod that crashes too fast to even attach a debugger to, there's a third mode: <code>kubectl debug &lt;pod&gt; --copy-to=mypod --set-image=...</code> creates a mutated <em>copy</em> of the pod — same spec, different image or command — that you can hold open and poke at without racing the original's crash loop. And don't forget the node debugger pod after you exit its shell; it's a real pod sitting on that node, and both graders and real production clusters dislike litter left behind.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debug Running Pods"</strong> — covers ephemeral containers, copies, and node sessions in one page.</p>
 </article>
@@ -196,7 +196,7 @@ kubectl delete pod quiet node-debugger-node01-x7k2q</pre></li>
 <div class="lesson-head"><span class="cp-id">6.4</span><h4>Start your one-page triage flowchart (you'll refine it all week)</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Under exam adrenaline you will not <em>reason</em>; you will do whatever is rehearsed. A one-page symptom → first-3-commands sheet, built by your own hands from your own breakage, is the rehearsal artifact. Every fault you fix this week feeds it; week 8 reviews it.</p>
+<p>A <strong>triage sheet</strong> is just a one-page cheat sheet mapping "symptom I see" to "the first few commands that get me to the root cause" — and the point of building your own, rather than reading someone else's, is what it does to you under pressure. Under exam adrenaline you will not <em>reason</em> carefully through a decision tree; you will do whatever is rehearsed and automatic. A one-page symptom → first-3-commands sheet, built by your own hands from faults you personally broke and fixed, is that rehearsal artifact. Every fault you fix this week feeds a row into it; week 8 reviews the finished sheet before the real exam.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Open the <a href="../cheatsheets/triage-template.html">triage template</a> and print it (it fits one page). The top half is pre-filled with signatures you already met in weeks 1–5 — read each row and check you can explain <em>why</em> those are the right first commands.</li>
@@ -215,10 +215,11 @@ kubectl delete pod quiet node-debugger-node01-x7k2q</pre></li>
 <div class="lesson-head"><span class="cp-id">6.5</span><h4>The apiserver-down ladder</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"kubectl doesn't work" is the scariest symptom and the most mechanical fix. The apiserver is a static pod: a file, a kubelet, a container, a listener on :6443. The ladder walks that chain in order, and each rung has a distinct answer.</p>
+<p>The apiserver is the <strong>front desk</strong> of the whole cluster — every <code>kubectl</code> command, every controller, every kubelet talks to Kubernetes exclusively through it, so when it's unreachable, "kubectl doesn't work" is the scariest-feeling symptom you'll see all week. It's also, reassuringly, the most mechanical fix once you know the chain behind it: the apiserver runs as a <strong>static pod</strong> (a pod the kubelet on this one node starts directly from a file on disk, before there's even a cluster to talk to — the pattern from week 1's "building superintendent" analogy) — which means underneath the abstraction it's just a file, read by a kubelet, that starts a container, that opens a listening port at :6443. The ladder below walks that exact chain in order, and each rung has one distinct, unambiguous answer.</p>
 <h5>The concept</h5>
 <div class="flow"><span>kubectl fails</span><em>→</em><span>read the error</span><em>→</em><span>systemctl status kubelet</span><em>→</em><span>manifest present/valid?</span><em>→</em><span class="hot">crictl ps -a | grep apiserver</span><em>→</em><span>crictl logs / journalctl</span></div>
-<p>Rung 0 is reading the <em>error text</em> — it splits the fault space before you touch the node:</p>
+<p><em>Each arrow is a question you answer before moving to the next: is the kubelet even alive? if so, does the manifest file exist and parse? if so, did a container actually start from it? if so, what do its logs say?</em></p>
+<p>Rung 0, before you even touch the node, is reading the <em>error text</em> kubectl itself printed — that text alone splits the fault space into completely different directions:</p>
 <table>
 <tr><th>kubectl says</th><th>Meaning</th><th>Points at</th></tr>
 <tr><td><code>connection refused</code></td><td>Nothing listening on :6443</td><td>apiserver container down — the ladder below</td></tr>
@@ -227,7 +228,7 @@ kubectl delete pod quiet node-debugger-node01-x7k2q</pre></li>
 <tr><td>401/403</td><td>apiserver is <em>fine</em></td><td>your credentials/RBAC — not an outage at all</td></tr>
 <tr><td><code>etcdserver: request timed out</code> / 500s</td><td>apiserver up, storage sick</td><td>etcd (6.8)</td></tr>
 </table>
-<p>Then the chain: is the <strong>kubelet</strong> running (it's what turns manifests into pods)? Is the <strong>manifest</strong> present in <code>/etc/kubernetes/manifests/</code> and parseable (a YAML typo means the pod silently never spawns — the error lands in the kubelet journal, not in any pod log)? Did the <strong>container</strong> start, and if it keeps exiting, what do its logs say?</p>
+<p>Then walk the chain rung by rung. Is the <strong>kubelet</strong> running at all — it's the node agent that turns static-pod manifest files into actual running pods, so nothing downstream matters if it's dead? Is the <strong>manifest</strong> present in <code>/etc/kubernetes/manifests/</code> and does it actually parse as valid YAML (a typo in the file means the pod silently never even gets created — and because no pod ever existed, the error lands only in the kubelet's own journal, not in any pod log you'd normally check)? Did the <strong>container</strong> itself start, and if it keeps exiting, what do its logs actually say about why?</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Break it the honest way — take the manifest away and watch the kubelet kill the pod:
@@ -252,7 +253,7 @@ sleep 30; kubectl get --raw='/readyz?verbose' | tail -3</pre>
 <h5 class="verify">Verify</h5>
 <p><code>kubectl get --raw=/readyz</code> returns <code>ok</code>, and you can recite the ladder rungs with what each one rules out.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>The kubelet rescans the manifest directory continuously but recovery still takes 20–60s — don't stack a second "fix" on top of one that's still booting; watch <code>crictl ps</code> instead of re-editing. And a manifest with broken YAML produces <em>no pod and no pod logs at all</em> — the only witness is <code>journalctl -u kubelet | grep -i apiserver</code>.</p>
+<p>The kubelet does rescan the manifest directory continuously, but recovery still takes 20–60 seconds even so — resist the urge to stack a second "fix" on top of one that's genuinely still booting; watch <code>crictl ps</code> for the container actually appearing instead of re-editing files impatiently. And remember: a manifest with broken YAML produces <em>no pod and therefore no pod logs at all</em> — there's nothing to <code>crictl logs</code> because nothing ever started — so the only witness to that failure is <code>journalctl -u kubelet | grep -i apiserver</code>, the kubelet complaining about the file it couldn't parse.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Troubleshooting kubeadm"</strong> and <strong>"Debug Cluster"</strong> — bookmark-worthy pages for every lesson in this group.</p>
 </article>
@@ -261,9 +262,9 @@ sleep 30; kubectl get --raw='/readyz?verbose' | tail -3</pre>
 <div class="lesson-head"><span class="cp-id">6.6</span><h4>Four planted apiserver faults, four distinct fingerprints</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The exam's control-plane tasks are exactly this: someone broke <code>kube-apiserver.yaml</code>, go fix it. The same file breaks four different ways, and each way has a different fingerprint. Learn to read the fingerprint and the fix takes two minutes.</p>
+<p>The exam's control-plane tasks are exactly this scenario, over and over: someone (a script, or a grader) broke <code>kube-apiserver.yaml</code>, and your job is to fix it. The same one file breaks four genuinely different ways, and each way leaves a distinct, recognizable fingerprint in the evidence — so learning to read the fingerprint turns a potentially long investigation into a two-minute fix.</p>
 <h5>The concept</h5>
-<p>Memorize this table — it's the whole lesson:</p>
+<p>Memorize this table — it's the whole lesson. Each row answers the same question ("what do I see, and where do I look") for a different kind of break:</p>
 <table>
 <tr><th>Fault in the manifest</th><th><code>crictl ps -a</code> shows</th><th>Evidence lives in</th><th>Signature line</th></tr>
 <tr><td>wrong image tag</td><td><b>no new container at all</b></td><td><code>journalctl -u kubelet</code></td><td><code>Failed to pull image … not found</code></td></tr>
@@ -271,7 +272,7 @@ sleep 30; kubectl get --raw='/readyz?verbose' | tail -3</pre>
 <tr><td>wrong etcd endpoint</td><td><b>runs for a while</b>, then dies/restarts</td><td><code>crictl logs</code> (the end)</td><td>storm of <code>connection refused</code> to the bogus address</td></tr>
 <tr><td>bad cert/key path</td><td>exits instantly</td><td><code>crictl logs</code></td><td><code>open /etc/kubernetes/pki/…: no such file</code></td></tr>
 </table>
-<p>The discriminator logic: <em>no container</em> → the kubelet couldn't even create it (image, or manifest YAML) → journal. <em>Instant exit</em> → flag parsing or file loading, named in the first log lines. <em>Lives then dies</em> → it started serving and something downstream (etcd) is unreachable — read the last lines, and note the port it's dialing.</p>
+<p>The discriminator logic, reasoned out rather than just memorized: <em>no container at all</em> means the kubelet never even got as far as creating one — that only happens for an image it can't pull, or a manifest it can't parse — so the evidence has to be in the kubelet's own journal, since no container process ever existed to log anything. <em>Instant exit</em> means a container process did start, ran its very first setup step, and immediately gave up — that's flag parsing or a missing file it needs on startup, and it always names the problem in the first few lines of its own logs, because that's the exact moment it failed. <em>Lives for a while, then dies</em> means it got far enough to start serving, and only <em>afterward</em> hit something it depends on that isn't reachable — etcd, almost always — so read the <em>last</em> lines of the log, not the first, and note carefully what address it was trying to reach when it gave up.</p>
 <h5>Lab</h5>
 <p>Four drills, scripts do the planting so you diagnose blind. Take them one per sitting, and after each one write the fingerprint into your triage sheet before reading the reveal.</p>
 <ol class="lab">
@@ -317,7 +318,7 @@ sleep 30; kubectl get --raw=/readyz</pre>
 <h5 class="verify">Verify</h5>
 <p>All four drills fixed with /readyz <code>ok</code>, and your triage sheet now has four one-line fingerprints in your own words.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Do <em>not</em> "fix" by restoring the backup file — that repairs the cluster but wastes the drill; diagnose to the exact line first. In the exam the equivalent shortcut doesn't exist. Also: after editing a static-pod manifest, changes apply on kubelet's next sync — if nothing happens in 60s, you probably broke the YAML itself (journal, not logs).</p>
+<p>Do <em>not</em> shortcut these drills by just restoring a backup file you happen to have — that repairs the cluster, sure, but it wastes the entire point of the exercise, which is training yourself to diagnose down to the exact broken line. In the real exam that shortcut doesn't exist anyway, since there's no backup to restore from. Also worth internalizing: after you edit a static-pod manifest, the change only takes effect on the kubelet's next sync of that directory — if nothing happens within about 60 seconds, the more likely explanation is that your edit itself broke the YAML syntax, and you should be reading the kubelet's journal (not the container's logs, since no container even started) to find out how.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"kube-apiserver"</strong> (component reference — flag spellings live here) and <strong>"Troubleshooting kubeadm"</strong>.</p>
 </article>
@@ -326,15 +327,15 @@ sleep 30; kubectl get --raw=/readyz</pre>
 <div class="lesson-head"><span class="cp-id">6.7</span><h4>Break the scheduler and controller-manager; learn their failure smell</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>These two fail <em>quietly</em>: kubectl works, nodes are Ready, dashboards are green — and yet nothing new happens in the cluster. Recognizing "healthy-looking cluster that won't act" saves you from debugging the wrong layer entirely.</p>
+<p>Some control-plane components fail loudly — kubectl refuses to connect, and you know instantly something's wrong. The scheduler and controller-manager are the opposite: they fail <em>quietly</em>. kubectl works fine, nodes show Ready, every dashboard looks green — and yet nothing new ever actually happens in the cluster. Learning to recognize "this cluster looks perfectly healthy and yet refuses to act" as its own distinct symptom saves you from wasting time debugging the wrong layer entirely — chasing a workload problem when the real fault is one specific component quietly not doing its job.</p>
 <h5>The concept</h5>
-<p>From week 1: the scheduler's only job is filling in <code>spec.nodeName</code> on pending pods; the controller-manager's loops turn desired state into objects (Deployment → ReplicaSet → Pods, plus node lifecycle, endpoints, SA tokens…). So:</p>
+<p>Recall from week 1: the <strong>scheduler</strong> — the "seating host" that decides which table a new party sits at — has exactly one job, filling in <code>spec.nodeName</code> on pods that don't have a node yet. The <strong>controller-manager</strong> runs the reconcile loops (the "thermostats" that keep re-checking whether reality matches what you asked for) that turn desired state into real objects: a Deployment becomes a ReplicaSet becomes actual Pods, and separately it also handles node lifecycle, Service endpoints, and service-account tokens. Knock out either one, and the cluster keeps looking fine on the surface while a specific category of work silently stops:</p>
 <table>
 <tr><th>Dead component</th><th>Smell</th><th>Instant check</th></tr>
 <tr><td>scheduler</td><td>new pods stay <code>Pending</code> with <b>no events at all</b> (nobody even looked at them)</td><td><code>kubectl -n kube-system get pods</code> → scheduler crashlooping; <code>describe pod</code> → empty event list</td></tr>
 <tr><td>controller-manager</td><td>Deployments accept changes but <b>no ReplicaSets/pods appear</b>; scale does nothing; nodes never go NotReady either (its node-lifecycle loop is dead too)</td><td><code>kubectl get rs</code> after creating a deploy → nothing; CM pod crashlooping</td></tr>
 </table>
-<p>The discriminator vs 6.15: Pending <em>with</em> events ("Insufficient cpu", "untolerated taint") means the scheduler is alive and refusing — a workload problem. Pending with an <em>empty</em> event list means no scheduler ran at all.</p>
+<p>The discriminator you'll need against 6.15's Pending-pod causes: Pending <em>with</em> events attached ("Insufficient cpu", "untolerated taint") means the scheduler is alive, looked at the pod, and is correctly refusing to place it — that's a workload problem, not a scheduler problem. Pending with an <em>empty</em> event list means no scheduler ever looked at the pod at all — that's the scheduler itself being down.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Fetch and run the scheduler drill on cp:
@@ -363,7 +364,7 @@ curl -fsSLO "$BASE/w6-scheduler-01.sh" &amp;&amp; sudo bash w6-scheduler-01.sh</
 <h5 class="verify">Verify</h5>
 <p>Both components back to Running 1/1, smoke workloads created and cleaned up, and two new rows on the triage sheet: <em>Pending + zero events → scheduler</em>; <em>objects don't cascade → controller-manager</em>.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Because the apiserver stays up, these faults are <em>visible from kubectl</em> — resist the urge to ssh and crictl first. The fallback ladder exists for when kubectl is dead; when it isn't, kubectl is faster. Also note both components write leader-election leases — <code>kubectl -n kube-system get leases</code> shows a stale <code>renewTime</code> for the dead one; a nice secondary confirmation.</p>
+<p>Because the apiserver stays up throughout, these faults are <em>fully visible from kubectl</em> — resist the reflex to ssh onto the node and reach for crictl first, out of habit from the apiserver-down drills. The fallback ladder from 6.2 exists specifically for when kubectl itself is dead; when it isn't, plain kubectl is faster and there's no reason to go around it. Also worth knowing: both the scheduler and controller-manager write <strong>leader-election leases</strong> — a mechanism where, if you're running multiple replicas of a component for high availability, they use a lease object to agree on which single one is actually active, since only one should be doing the job at a time. <code>kubectl -n kube-system get leases</code> shows a stale <code>renewTime</code> for whichever one is dead — a nice secondary confirmation that lines up with the crashlooping pod you already found.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"kube-scheduler"</strong> / <strong>"kube-controller-manager"</strong> component pages for flag spellings.</p>
 </article>
@@ -372,9 +373,9 @@ curl -fsSLO "$BASE/w6-scheduler-01.sh" &amp;&amp; sudo bash w6-scheduler-01.sh</
 <div class="lesson-head"><span class="cp-id">6.8</span><h4>Stop etcd and map exactly what still works</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>etcd outages produce the most confusing symptom mix in Kubernetes: some commands answer, some hang, apps keep serving traffic. Having watched it once, calmly, you'll recognize the mix instantly instead of chasing ghosts.</p>
+<p>etcd — the cluster's <strong>filing cabinet</strong>, the one place every object's state actually lives — going down produces the single most confusing symptom mix in all of Kubernetes: some commands still answer, others hang or error, and meanwhile your actual applications keep serving traffic like nothing happened. Having watched that mix once, calmly, with your own eyes, means you'll recognize it instantly on the exam instead of chasing ghosts across three different layers.</p>
 <h5>The concept</h5>
-<p>The apiserver is stateless; etcd holds everything. With etcd down: <strong>every write fails</strong> (create/update/delete — including the scheduler's binding and controllers' status updates, so the control plane is fully paralyzed even where kubectl still answers). <strong>Reads</strong> are a mixed bag — the apiserver keeps an in-memory watch cache and may briefly serve list/get from it, but anything needing a fresh quorum read errors. And crucially, <strong>the data plane doesn't notice</strong>: kubelets keep running pods, kube-proxy keeps forwarding, DNS keeps answering — the cluster coasts on its last known state. That's the headline: etcd down ≠ workloads down.</p>
+<p>The apiserver itself holds no data — it's stateless, a front desk with no filing cabinet of its own — and etcd is where every object's actual state lives. So when etcd goes down: <strong>every write fails</strong>, meaning every create, update, and delete — including things you wouldn't think of as "writes" at all, like the scheduler recording which node it picked, or a controller updating a status field — so the entire control plane is effectively paralyzed even in places where kubectl still technically answers something. <strong>Reads</strong> are a mixed bag: the apiserver keeps an in-memory <strong>watch cache</strong> (a local copy of recently-seen objects it maintains so it doesn't have to ask etcd for every single read), so it may briefly keep answering <code>list</code>/<code>get</code> requests straight from that cache — but anything that needs a guaranteed-fresh answer straight from etcd (a "quorum read", meaning enough etcd members agreeing to guarantee correctness) fails outright. And crucially — this is the headline fact worth remembering above all the rest — <strong>the data plane doesn't notice etcd is gone at all</strong>: kubelets keep running the pods they already know about, kube-proxy keeps forwarding traffic using the rules it already programmed, DNS keeps answering from what it already learned. The whole cluster just coasts along on its last known-good state. etcd down does not mean workloads down.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Put a victim workload up first, then stop etcd by removing its manifest (on cp):
@@ -402,7 +403,7 @@ sleep 40; kubectl get pods; kubectl delete deploy coast; kubectl delete pod prob
 <h5 class="verify">Verify</h5>
 <p>You observed all three tiers with your own commands: writes fail with an etcd-naming error, reads degrade, running pods keep serving. Triage row: <em>kubectl 500s mentioning etcdserver</em> → etcd, not apiserver.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Don't confuse this with 6.6/02: <em>same log signature, opposite fix</em>. Wrong endpoint → fix the apiserver flag; real etcd outage → fix etcd (manifest, data dir, certs — and if data is gone, the 2.16–2.18 restore drill and the <a href="../cheatsheets/etcd-card.html">etcd card</a> are the play). Diagnose which side is lying before editing anything.</p>
+<p>Don't confuse this with fault 02 from 6.6: it's the <em>exact same log signature</em> — "connection refused" dialing :2379 — with an <em>opposite</em> fix. If the endpoint address itself is wrong, you fix the apiserver's flag; if etcd is genuinely down, you fix etcd instead (its manifest, its data directory, its certs — and if the data itself is gone, that's the 2.16–2.18 restore drill and the <a href="../cheatsheets/etcd-card.html">etcd card</a>). The log line alone can't tell you which situation you're in — you have to separately check whether etcd is actually running before you touch anything.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Operating etcd clusters for Kubernetes"</strong>.</p>
 </article>
@@ -411,16 +412,16 @@ sleep 40; kubectl get pods; kubectl delete deploy coast; kubectl delete pod prob
 <div class="lesson-head"><span class="cp-id">6.9</span><h4>The expired-certificate scenario: recognize, renew, restart</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>kubeadm's leaf certificates live one year. Clusters that skip upgrades hit the wall, everything TLS breaks at once, and the errors look apocalyptic. The fix is three commands — if you recognize the signature.</p>
+<p>A <strong>certificate</strong>, recall, is like a notarized ID card — it proves who you are to something else, and it's only trusted because the two of you already agree on who the notary (the Certificate Authority, or CA) is. kubeadm's day-to-day "leaf" certificates (the individual ID cards, as opposed to the CA's own long-lived master certificate) are only valid for one year by default. Clusters that go a year or more without an upgrade eventually hit that wall all at once: every certificate expires within days of each other, every TLS connection in the cluster starts failing simultaneously, and the resulting wall of errors looks like the whole cluster collapsed. It hasn't — the fix is three commands, once you recognize the signature for what it is instead of panicking.</p>
 <h5>The concept</h5>
-<p>The trust map from week 2: every control-plane connection is mTLS with certs under <code>/etc/kubernetes/pki/</code>, client creds embedded in the <code>*.conf</code> kubeconfigs, and the kubelet's client cert at <code>/var/lib/kubelet/pki/</code> (auto-rotating since 2.8). The failure signatures:</p>
+<p>Recall the trust map from week 2: every control-plane connection is <strong>mTLS</strong> (mutual TLS — both sides present a certificate and verify each other, not just the client verifying the server like your browser does), with the certificates themselves stored under <code>/etc/kubernetes/pki/</code>, client credentials embedded inside the <code>*.conf</code> kubeconfig files, and the kubelet's own client certificate kept separately at <code>/var/lib/kubelet/pki/</code> (which has auto-renewed itself since a change covered in 2.8 — the kubelet is actually the one component that doesn't suffer from this whole problem). Here's how that expiry shows up depending on where you're looking:</p>
 <table>
 <tr><th>Where you see it</th><th>Signature</th><th>Meaning</th></tr>
 <tr><td>kubectl</td><td><code>x509: certificate has expired or is not yet valid</code></td><td>a cert in the chain is out of date (client or server side)</td></tr>
 <tr><td>kubelet journal</td><td><code>part of the existing bootstrap client certificate … is expired</code></td><td>kubelet's client cert expired (rotation was off/blocked)</td></tr>
 <tr><td>apiserver log</td><td>TLS handshake errors from peers</td><td>some client (kubelet, CM, scheduler) presenting an expired cert</td></tr>
 </table>
-<p>Recovery is always the same shape: <strong>inventory</strong> (<code>kubeadm certs check-expiration</code>) → <strong>renew</strong> (<code>kubeadm certs renew &lt;name&gt;|all</code> — re-signs with the same CA, which lives 10 years) → <strong>restart</strong> the components that loaded the old certs (static pods don't watch their cert files) → refresh <code>admin.conf</code>-derived kubeconfigs if renewed.</p>
+<p>Recovery is always the same shape, and it's worth understanding <em>why</em> each step exists rather than just memorizing the sequence: <strong>inventory</strong> first (<code>kubeadm certs check-expiration</code> — see what's actually expired or close to it, don't guess) → <strong>renew</strong> (<code>kubeadm certs renew &lt;name&gt;|all</code> — this re-signs the leaf certificate using the same CA, which itself lives ten years and essentially never expires) → <strong>restart</strong> every component that already loaded the old certificate into memory, because a static pod reads its certificate file once at startup and never watches it for changes afterward — renewing the file on disk changes nothing for a process that's already running → and finally refresh any <code>admin.conf</code>-derived kubeconfig you're using yourself, since renewing the server's certificates doesn't touch your local copy of your own client certificate.</p>
 <h5>Lab</h5>
 <p>You can't fast-forward the clock safely, so drill the full recovery motion on healthy certs — identical commands, zero risk:</p>
 <ol class="lab">
@@ -450,7 +451,7 @@ sleep 30; kubectl get --raw=/readyz</pre>
 <h5 class="verify">Verify</h5>
 <p>New serial + new notAfter on apiserver.crt, /readyz <code>ok</code> after the restart, and you can recite the three-step recovery plus the admin.conf refresh.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>When kubectl itself is locked out by an expired <code>admin.conf</code>, <code>kubeadm certs renew</code> still works — it needs only the local CA files, not the API. And <code>kubeadm upgrade</code> renews all certs as a side effect, which is why regularly-upgraded clusters never see this; that fact is also the exam-answer to "how do you avoid this".</p>
+<p>Even when kubectl itself is completely locked out by an expired <code>admin.conf</code>, <code>kubeadm certs renew</code> still works fine — it only ever needs the local CA files sitting on disk, never a working connection to the API, so you're never actually stuck. And <code>kubeadm upgrade</code> quietly renews all certificates as a side effect of upgrading — which is exactly why clusters that get upgraded regularly never run into this problem at all; that fact is also the real exam-answer to "how would you prevent this from happening again".</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Certificate Management with kubeadm"</strong> — the check-expiration and renew sections.</p>
 </article>
@@ -463,10 +464,11 @@ sleep 30; kubectl get --raw=/readyz</pre>
 <div class="lesson-head"><span class="cp-id">6.10</span><h4>The NotReady ladder, end to end</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"A node is NotReady, fix it" is a near-certain exam task, worth real points, and 100% mechanical once the ladder is automatic. This lesson installs the ladder; 6.11 varies the fault behind it.</p>
+<p>"A node is NotReady, fix it" is a near-certain exam task, worth real points, and — like the apiserver ladder — it's 100% mechanical once you've drilled the sequence enough that it's automatic. This lesson installs that ladder; 6.11 then varies what's actually broken behind it, so you get practice applying the same sequence to five different underlying problems.</p>
 <h5>The concept</h5>
 <div class="flow"><span>kubectl get nodes</span><em>→</em><span>describe node (Conditions + taints)</span><em>→</em><span>ssh + sudo -i</span><em>→</em><span class="hot">systemctl status kubelet</span><em>→</em><span>journalctl -u kubelet</span><em>→</em><span>fix</span><em>→</em><span>verify Ready</span></div>
-<p>The mechanics behind the status (1.22): the kubelet renews a Lease every 10s; when renewals stop, the controller-manager flips Ready to <code>Unknown</code> after ~40s and writes the message you'll see in describe: <em>"Kubelet stopped posting node status."</em> That message doesn't say <em>why</em> — the why lives on the node, in systemd and the journal, which is exactly what the ladder goes there to read. Two kinds of answers up there: the kubelet <em>service</em> is unhealthy (stopped, crash-looping on bad config), or the kubelet is fine but its <em>dependencies</em> are sick (runtime down, CNI missing — remember "cni plugin not initialized" from 4.8).</p>
+<p><em>Check the status from the control plane first, only ssh onto the node once describe tells you it's worth it, then read outward from the service to its logs.</em></p>
+<p>The mechanics behind that NotReady status, recall from 1.22: the kubelet on a healthy node renews a <strong>Lease</strong> object (a lightweight "I'm still here" heartbeat, refreshed constantly so nobody has to guess) every 10 seconds. When those renewals stop arriving, the controller-manager waits about 40 seconds and then flips the node's Ready condition to <code>Unknown</code>, writing the exact message you'll see in <code>describe</code>: <em>"Kubelet stopped posting node status."</em> Notice what that message does <em>not</em> tell you — <em>why</em> the kubelet stopped posting. That why only exists on the node itself, inside systemd and the journal, which is precisely what the rest of this ladder exists to go read. Once you get there, there are really only two families of answer: either the kubelet <em>service itself</em> is unhealthy (stopped outright, or crash-looping because of bad configuration), or the kubelet process is running just fine but something it <em>depends on</em> is sick underneath it (the container runtime down, or the CNI plugin missing — remember "cni plugin not initialized" from 4.8).</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Break node01 by hand this once (the scripts take over in 6.11). On node01:
@@ -500,7 +502,7 @@ exit</pre></li>
 <h5 class="verify">Verify</h5>
 <p>node01 Ready, unreachable taints gone (<code>kubectl describe node node01 | grep Taints</code>), and you ran the ladder in order without skipping to ssh first.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Conditions <code>Unknown</code> vs <code>False</code> is diagnostic gold: <code>Unknown</code> = kubelet silent (this ladder); <code>Ready=False</code> with the others healthy = kubelet <em>talking</em> but reporting a problem — read its message, it names the cause (runtime, CNI, disk). Different first move. Also: recovery un-taints the node but does <em>not</em> move rescheduled pods back — don't panic when workloads stay lopsided.</p>
+<p>The distinction between condition value <code>Unknown</code> and <code>False</code> is diagnostic gold, worth internalizing precisely: <code>Unknown</code> means the kubelet has gone silent — nobody's heard from it, which is this whole ladder. <code>Ready=False</code> while other conditions look otherwise healthy means the opposite: the kubelet is still <em>talking</em>, it's just actively reporting a problem — read its message, because it names the cause directly (runtime, CNI, disk pressure), and that's a completely different first move than chasing a silent kubelet. Also worth knowing so you don't panic mid-drill: recovery removes the unreachable taint from the node, but it does <em>not</em> move pods that already got rescheduled elsewhere back to this node — a workload staying lopsided across nodes after recovery is expected, not a sign something's still broken.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Nodes"</strong> (concepts — node conditions table) and <strong>"Troubleshooting kubeadm"</strong>.</p>
 </article>
@@ -509,7 +511,7 @@ exit</pre></li>
 <div class="lesson-head"><span class="cp-id">6.11</span><h4>The kubelet classics: five planted faults, five journal signatures</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Exam NotReady tasks draw from a small pool of planted faults. All five below produce the same top-level symptom (NotReady); the <em>journal line</em> is what differs. This is the signature catalog to burn in.</p>
+<p>Exam NotReady tasks draw from a fairly small, well-known pool of planted faults, not an infinite variety — which means memorizing this specific catalog pays off directly. All five faults below produce the exact same top-level symptom (the node goes NotReady); what differs every time is the one line buried in the <em>journal</em>. This is the signature catalog to burn into memory so you recognize the line the instant you see it.</p>
 <h5>The concept</h5>
 <table>
 <tr><th>Planted fault</th><th><code>systemctl status kubelet</code></th><th>The line that names it</th></tr>
@@ -519,7 +521,7 @@ exit</pre></li>
 <tr><td>bad <code>clientCAFile</code> in config.yaml</td><td><code>activating (auto-restart)</code></td><td><code>unable to load client CA file … no such file</code></td></tr>
 <tr><td>containerd stopped</td><td><b><code>active (running)</code>!</b></td><td>CRI socket errors: <code>… containerd.sock: connect: no such file or directory</code>; <code>crictl</code> fails the same way</td></tr>
 </table>
-<p>Note the pattern from 1.23: kubelet configuration lives in three places — the systemd drop-in (<code>10-kubeadm.conf</code>, wires everything), <code>/var/lib/kubelet/config.yaml</code> (KubeletConfiguration), <code>/etc/kubernetes/kubelet.conf</code> (its kubeconfig). Faults get planted in all three; <code>systemctl cat kubelet</code> shows the drop-in without hunting for its path.</p>
+<p>Notice the pattern this table sets up, echoing 1.23: kubelet configuration is spread across three separate files, not one, which is exactly why there are so many distinct ways for it to break — the systemd drop-in (<code>10-kubeadm.conf</code>, the file that wires together which flags and which config file the kubelet process actually gets started with), <code>/var/lib/kubelet/config.yaml</code> (the KubeletConfiguration itself — thresholds, TLS settings, and so on), and <code>/etc/kubernetes/kubelet.conf</code> (the kubelet's own kubeconfig, its credentials for talking to the apiserver). Faults get planted in all three below; <code>systemctl cat kubelet</code> is worth knowing because it prints the drop-in's contents directly, so you never have to go hunting for its exact path first.</p>
 <h5>Lab</h5>
 <p>Three script drills plus two manual ones. For each: watch NotReady appear from cp, walk the 6.10 ladder, fix, verify Ready, file the signature.</p>
 <ol class="lab">
@@ -568,7 +570,7 @@ journalctl -u kubelet --no-pager | tail -2</pre>
 <h5 class="verify">Verify</h5>
 <p>All five faults fixed with node01 Ready after each, drill 01 verified across a reboot, and the five-line signature table transcribed to your triage sheet from memory.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>activating (auto-restart)</code> in systemctl means "crash-looping" — the CrashLoopBackOff of systemd. Don't wait for it to settle; read the journal. And when the journal is a wall of noise, filter for the fatal line: <code>journalctl -u kubelet | grep -iE 'err|fail' | tail</code> — the kubelet's startup errors always begin <code>failed to run Kubelet:</code>.</p>
+<p><code>activating (auto-restart)</code> in <code>systemctl status</code> is systemd's version of CrashLoopBackOff — it means the service keeps starting, failing, and being automatically restarted, over and over. Don't sit and wait for it to eventually "settle" on its own; it won't, go read the journal instead. And when the journal is a wall of unhelpful noise, filter it down to the line that matters: <code>journalctl -u kubelet | grep -iE 'err|fail' | tail</code> — the kubelet's own fatal startup errors always begin with the exact phrase <code>failed to run Kubelet:</code>, which makes them easy to spot once you know to look for it.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Troubleshooting kubeadm"</strong> and <strong>"kubelet"</strong> (component page). For the swap rule: <strong>"swap memory"</strong> in the kubelet config docs.</p>
 </article>
@@ -577,9 +579,9 @@ journalctl -u kubelet --no-pager | tail -2</pre>
 <div class="lesson-head"><span class="cp-id">6.12</span><h4>Read node Conditions fluently: MemoryPressure, DiskPressure, PIDPressure</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Pressure conditions are the kubelet warning you it's about to start killing pods (3.18's eviction machinery). Exam tasks ask you to identify <em>why</em> pods were evicted or won't schedule onto a node — the conditions plus their matching taints are the answer key.</p>
+<p>A node's <strong>pressure conditions</strong> are the kubelet's own early-warning system — it noticing it's genuinely running low on some resource (memory, disk, process slots) and saying so, right before it starts killing pods to relieve that pressure (the eviction machinery from 3.18). Exam tasks routinely ask you to figure out <em>why</em> pods on a node were evicted, or why new pods refuse to schedule there — and the pressure conditions, together with the matching taints they trigger, are the complete answer key for that question.</p>
 <h5>The concept</h5>
-<p>Each condition maps to an eviction signal, a threshold, and a taint the node-lifecycle controller adds while the condition is True:</p>
+<p>Each pressure condition maps to a specific measurable signal, a threshold that triggers it, and a <strong>taint</strong> (a marker on the node saying "don't schedule new pods here unless they specifically tolerate this") that the node-lifecycle controller adds automatically for as long as the condition stays True:</p>
 <table>
 <tr><th>Condition</th><th>Signal (default hard threshold)</th><th>Taint while True</th><th>Kubelet's reaction</th></tr>
 <tr><td>MemoryPressure</td><td><code>memory.available &lt; 100Mi</code></td><td><code>…/memory-pressure:NoSchedule</code></td><td>evict pods (BestEffort first — the 3.18 QoS ladder)</td></tr>
@@ -587,7 +589,7 @@ journalctl -u kubelet --no-pager | tail -2</pre>
 <tr><td>PIDPressure</td><td><code>pid.available</code> low</td><td><code>…/pid-pressure:NoSchedule</code></td><td>evict; usually means a fork bomb somewhere</td></tr>
 <tr><td>Ready=False/Unknown</td><td>—</td><td><code>not-ready</code>/<code>unreachable:NoExecute</code></td><td>(6.10/6.13 territory)</td></tr>
 </table>
-<p>Connect the dots for the exam narrative: threshold crossed → condition True → taint blocks <em>new</em> pods → kubelet evicts <em>existing</em> pods by QoS class → evicted pods show <code>Reason: Evicted</code> with the signal named in their status.</p>
+<p>Put those dots together and you get the whole exam narrative in one causal chain: a threshold gets crossed → the matching condition flips to True → the taint that appears blocks any <em>new</em> pod from landing here → meanwhile the kubelet starts evicting <em>existing</em> pods, working through them in QoS-class order (the priority ladder from 3.18 — least-guaranteed pods go first) → and any pod evicted this way shows up afterward with <code>Reason: Evicted</code>, with the specific signal that caused it named right there in its status.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Read the current conditions the fluent way:
@@ -623,7 +625,7 @@ kubectl describe node node02 | grep DiskPressure     # back to False in ~1 min</
 <h5 class="verify">Verify</h5>
 <p>You saw a pressure condition flip True with its taint, the kubelet's reclaim attempts in the journal, and the flip back after cleanup — and node02 stayed Ready throughout (pressure ≠ dead).</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Pods evicted by the kubelet stay visible as <code>Failed/Evicted</code> husks — <code>kubectl get pods</code> littered with Evicted entries <em>is itself a signature</em> that a node hit pressure recently; describe one and it names the signal ("The node had condition: [DiskPressure]"). Also remember the asymmetry: the taint stops <em>new</em> scheduling, but DaemonSets tolerate pressure taints by default and stay.</p>
+<p>Pods that the kubelet evicts don't just vanish — they stay visible afterward as <code>Failed</code>/<code>Evicted</code> husks, so a <code>kubectl get pods</code> output littered with Evicted entries <em>is itself a diagnostic signature</em> all on its own, telling you a node hit pressure recently even before you go check conditions; describe one of those husks and it names the exact signal responsible ("The node had condition: [DiskPressure]"). Also worth remembering is a real asymmetry: the pressure taint only stops <em>new</em> pods from scheduling there — but DaemonSet pods (the ones meant to run on every node, like a log agent) tolerate pressure taints by default and simply stay put, which is intentional, not a bug.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Node-pressure Eviction"</strong> — thresholds, signals, and the QoS eviction order in one page.</p>
 </article>
@@ -632,9 +634,9 @@ kubectl describe node node02 | grep DiskPressure     # back to False in ~1 min</
 <div class="lesson-head"><span class="cp-id">6.13</span><h4>Kill a node and narrate the whole death timeline</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>1.22 gave you the numbers (10s / ~40s / 300s); this drill makes you <em>watch</em> them tick by with real workloads, so "node down, where are my pods?" becomes a narration you own rather than trivia you recall.</p>
+<p>1.22 already gave you the raw numbers involved when a node disappears (10s / ~40s / 300s); this drill makes you actually <em>watch</em> those numbers tick by against real running workloads, so "node down, where are my pods now?" becomes a narration you can give confidently in your own words, rather than a fact you're trying to recall under pressure.</p>
 <h5>The concept</h5>
-<p>The rehearsal script you're about to observe: node dies → lease renewals stop → <strong>~40s</strong>: node-lifecycle controller marks Ready=Unknown, taints <code>unreachable:NoExecute</code> → every pod's injected 300-second toleration starts counting → <strong>+300s</strong>: pods get deletion timestamps — but the kubelet that must confirm death is itself dead, so they hang as <code>Terminating</code> ghosts while their <em>controllers</em> (which don't wait) create replacements on healthy nodes. Total: ~5m40s of designed patience. DaemonSet and static pods never move.</p>
+<p>Here's the rehearsal script you're about to watch play out, and why each stage takes as long as it does: the node dies → its lease renewals (the 10-second heartbeats from 6.10) stop arriving → <strong>~40 seconds later</strong>, the node-lifecycle controller gives up waiting and marks the node's Ready condition <code>Unknown</code>, adding a taint of <code>unreachable:NoExecute</code> → every pod on that node was quietly given a <strong>300-second toleration</strong> for exactly this taint back when it was scheduled, so that toleration's countdown now starts → <strong>300 seconds after that</strong>, those pods finally get a deletion timestamp — except the one component that's supposed to confirm they actually stopped, the kubelet on that node, is itself dead and can't confirm anything, so the pods hang forever as <code>Terminating</code> ghosts. Meanwhile their <em>controllers</em> — a ReplicaSet, say — don't wait around for that confirmation at all, and go ahead and create fresh replacement pods on healthy nodes immediately. Total elapsed time before your service is actually healed again: roughly 5 minutes 40 seconds of deliberately designed patience, built in so that a brief network blip doesn't cause needless pod churn. Two categories of pod never get this treatment at all: DaemonSet pods and static pods simply never move, because moving them to a different node would defeat their entire purpose.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Seed victims and a stopwatch. From cp:
@@ -665,7 +667,7 @@ kubectl get pods -l app=timeline -o wide</pre>
 <h5 class="verify">Verify</h5>
 <p>You called each phase <em>before</em> it happened, with times: ~40s to NotReady, +300s to eviction, replacements on healthy nodes, ghost cleared on node return.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>If the node were gone <em>forever</em>, the ghosts would sit Terminating indefinitely — force-delete (<code>kubectl delete pod … --force --grace-period=0</code>) is the sanctioned cleanup for exactly this case and almost nothing else. And notice the trap in phase 2: <code>get pods</code> said Running for five minutes while the node was off — pod status is only as fresh as its kubelet's last report.</p>
+<p>If the node were gone <em>permanently</em> rather than just rebooted, those Terminating ghosts would sit there indefinitely with no kubelet ever coming back to confirm their death — force-delete (<code>kubectl delete pod … --force --grace-period=0</code>) is the sanctioned cleanup for exactly this specific situation, and almost nowhere else (recall from week 3 that skipping the graceful-shutdown negotiation is otherwise risky). And notice the trap baked into phase 2 of this drill: <code>get pods</code> kept confidently reporting Running for a full five minutes while the node was completely powered off — because pod status is only ever as fresh as the last report its own kubelet actually sent; nothing is watching it live.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Taint based Evictions"</strong> (Taints and Tolerations page) — the 300s default and the injected tolerations.</p>
 </article>
@@ -674,7 +676,7 @@ kubectl get pods -l app=timeline -o wide</pre>
 <div class="lesson-head"><span class="cp-id">6.14</span><h4>Exam ssh discipline: in, sudo, fix, out, out</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Running the right command on the wrong host is a notorious exam point-loser — worst case you break a <em>working</em> node while "fixing" a broken one, or edit files on the student jump host that graders never look at. The countermeasure is a drilled ritual, not vigilance.</p>
+<p>Every lesson so far in this week has told you to ssh onto a node and fix something there — but exam tasks give you several nodes and several problems, and running the exact right command on the wrong host is a notorious, entirely self-inflicted point-loser. Worst case, you "fix" a node that was never broken while the actually-broken one stays untouched, or you carefully edit files on the student jump host that graders never even look at. The countermeasure isn't trying to be more careful in the moment — under time pressure that fails anyway — it's a drilled, boring ritual you do identically every single time.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>The ritual, drilled until boring — say each step as you do it on the lab all week:
@@ -704,9 +706,9 @@ hostname          # 6. confirm you're back</pre></li>
 <div class="lesson-head"><span class="cp-id">6.15</span><h4>The Pending-pod checklist: four causes, reproduced once each</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Pending is the scheduler saying "no node passed my filters" — and it always tells you which filter, in the pod's events. Exam Pending tasks are read-the-event, apply-the-matching-fix. You just need to have seen each event phrase once.</p>
+<p>A pod stuck <code>Pending</code> means the scheduler looked at every node and found none of them acceptable — and the useful part is, it always tells you exactly which check each node failed, right there in the pod's events, rather than leaving you to guess. Exam Pending tasks reduce to: read the event message, apply the one fix that matches it. You just need to have personally seen each of these event phrases once so they're recognizable on sight instead of cryptic jargon.</p>
 <h5>The concept</h5>
-<p>The scheduler's event message enumerates every node's rejection reason (week 3's filter phase, verbatim). The four exam-classic causes:</p>
+<p>The scheduler's event message literally enumerates every node it considered and why it rejected each one — the same filter phase from week 3, just reported back to you verbatim instead of happening invisibly. Four causes come up constantly on the exam:</p>
 <table>
 <tr><th>Event phrase</th><th>Cause</th><th>Fix family</th></tr>
 <tr><td><code>Insufficient cpu</code> / <code>Insufficient memory</code></td><td>requests exceed any node's allocatable</td><td>lower requests, or add capacity</td></tr>
@@ -752,7 +754,7 @@ kubectl describe pod p4 | tail -2</pre>
 <h5 class="verify">Verify</h5>
 <p>Four Pending pods, four different event phrases read aloud, and the checklist row on your sheet: <em>Pending → describe → match the phrase → fix that layer</em> (and Pending with <em>no</em> events → 6.7).</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>After fixing the cause, the pod usually schedules on its own — the scheduler retries with backoff (up to ~5 min; be patient before assuming failure, or delete/recreate the pod to skip the wait). And a Pending pod has no node and thus no logs — don't waste a command asking.</p>
+<p>After you fix whatever was causing the rejection, the pod usually schedules on its own without you doing anything further — the scheduler keeps retrying pending pods with a backoff delay (which can stretch up to roughly 5 minutes), so be patient before assuming your fix didn't work, or just delete and recreate the pod if you don't want to wait out the backoff. And a Pending pod, by definition, has never been assigned a node — so it has no logs anywhere to fetch; don't waste a command asking for what can't exist yet.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debug Pods"</strong> — the "My pod stays pending" section is this checklist.</p>
 </article>
@@ -761,9 +763,9 @@ kubectl describe pod p4 | tail -2</pre>
 <div class="lesson-head"><span class="cp-id">6.16</span><h4>CrashLoopBackOff mastery: --previous, lastState, and the exit-code alphabet</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>CrashLoopBackOff is the most common workload state on the exam and in life. The pros' edge is knowing it isn't an error — it's the kubelet <em>pacing restarts</em> — and knowing the two places the actual evidence lives.</p>
+<p><code>CrashLoopBackOff</code> is the single most common workload state you'll see, both on the exam and in real production clusters. The edge experienced people have isn't some secret command — it's simply knowing that <code>CrashLoopBackOff</code> itself is not an error message at all, just the kubelet <em>deliberately pacing itself</em> between restart attempts, and knowing the two exact places where the real evidence of <em>why</em> it's crashing actually lives.</p>
 <h5>The concept</h5>
-<p>The kubelet restarts a dying container with exponential backoff: 10s → 20s → 40s → … capped at 5m (reset after 10 minutes of stable running). "CrashLoopBackOff" is the <em>waiting room</em> between attempts. Evidence lives in: (1) the previous container's logs — <code>kubectl logs --previous</code>; (2) the pod's <code>lastState.terminated</code> — reason and exit code. The exit-code alphabet:</p>
+<p>When a container keeps dying, the kubelet doesn't restart it instantly and repeatedly — it restarts it with <strong>exponential backoff</strong>, waiting a little longer each time: 10s → 20s → 40s → … capped at 5 minutes between attempts (and that backoff resets back to 10s once the container manages to stay up for 10 stable minutes). "CrashLoopBackOff" is just the name for the <em>waiting room</em> between one attempt and the next — it's telling you a schedule is being followed, not that something new broke. The actual evidence of what's wrong lives in exactly two places: (1) the <em>previous</em> attempt's container logs, fetched with <code>kubectl logs --previous</code> since the current container just started and hasn't logged anything relevant yet; (2) the pod's <code>lastState.terminated</code> field, which records the reason and exit code from that last attempt. That exit code is itself a compact vocabulary worth learning cold — an alphabet where each number tells its own story:</p>
 <table>
 <tr><th>Code</th><th>Meaning</th><th>Typical story</th></tr>
 <tr><td>0</td><td>clean exit</td><td>command finished — wrong <code>restartPolicy</code> or a one-shot in a Deployment</td></tr>
@@ -773,7 +775,7 @@ kubectl describe pod p4 | tail -2</pre>
 <tr><td>139</td><td>SIGSEGV</td><td>the app crashed hard</td></tr>
 <tr><td>143</td><td>SIGTERM (128+15)</td><td>graceful shutdown — usually eviction/rollout, not a bug</td></tr>
 </table>
-<p>The 137 disambiguation: <strong>OOMKilled</strong> → <code>lastState.terminated.reason: OOMKilled</code> (the kernel did it — memory limit); <strong>liveness kill</strong> → events say <code>Liveness probe failed … Killing container</code> (the kubelet did it). Same restart, opposite fixes: raise the limit / fix the leak, vs fix the probe or the slow startup.</p>
+<p>Exit code 137 deserves special attention because it has two entirely different causes that look identical at first glance — telling them apart is the actual skill here: <strong>OOMKilled</strong> means the Linux kernel itself killed the process for exceeding its memory limit, and you'll see <code>lastState.terminated.reason: OOMKilled</code> spelling that out directly; a <strong>liveness-probe kill</strong> means the kubelet made the decision instead, and you'll see it in the pod's events as <code>Liveness probe failed … Killing container</code>. Same restart behavior, same exit code, but opposite fixes: raise the memory limit or fix an actual memory leak in one case, versus fix the probe's configuration or the app's slow startup in the other — so always check which one actually happened before changing anything.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>An OOM crasher — 64Mi limit, then deliberately hold ~128M in memory:
@@ -804,7 +806,7 @@ kubectl logs typo --previous</pre>
 <h5 class="verify">Verify</h5>
 <p>You produced 137/OOMKilled, a Killing event from a liveness probe, and a StartError with empty logs — and can state where the evidence for each lives (<code>lastState</code>, events, state message).</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>An OOMKill respects the container's <em>limit</em>, not node capacity — a pod can OOM on an empty node (5.1's tmpfs trap counts against the same limit). And when logs --previous is empty, resist rerunning it five times: empty logs <em>is</em> the datum; go read <code>lastState</code> and events instead.</p>
+<p>An OOM kill is triggered purely by the container's own configured memory <em>limit</em>, never by how much memory the node happens to have free — so a pod can get OOM-killed on a completely empty, otherwise idle node, which surprises people who assume OOM only happens under real resource contention (and recall 5.1's tmpfs trap: an emptyDir volume backed by tmpfs counts against that same memory limit too, another surprise source). And when <code>logs --previous</code> comes back empty, resist the urge to rerun it five times hoping for different output — empty logs <em>is itself the data point</em>, telling you the process likely never got far enough to log anything; go read <code>lastState</code> and the pod's events instead of retrying the same command.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debug Running Pods"</strong> and <strong>"Configure Liveness, Readiness and Startup Probes"</strong>.</p>
 </article>
@@ -813,9 +815,9 @@ kubectl logs typo --previous</pre>
 <div class="lesson-head"><span class="cp-id">6.17</span><h4>Image failures: ErrImagePull, ImagePullBackOff, and the three root causes</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Image faults are the most-planted workload fault because they're easy to inject and have a satisfyingly exact fix. Knowing the three sub-causes by their describe-text means never guessing.</p>
+<p>Image faults are the most commonly planted workload fault on any exam or drill, for a simple practical reason: they're trivially easy to inject (just typo one string) and have a precise, unambiguous fix once diagnosed. Knowing the three distinct sub-causes by their exact describe-text means you never have to guess which one you're looking at.</p>
 <h5>The concept</h5>
-<p>First, the two statuses are one fault: <strong>ErrImagePull</strong> is the moment of failure, <strong>ImagePullBackOff</strong> is the kubelet waiting (same backoff idea as 6.16) before retrying — you'll see them alternate. The three root causes, distinguished by the registry's answer in the events:</p>
+<p>First, a clarification that removes some confusion: the two statuses you'll see are really just one fault at two different moments, not two different problems. <strong>ErrImagePull</strong> is the instant of the pull actually failing; <strong>ImagePullBackOff</strong> is the kubelet waiting out a backoff delay (the exact same idea as 6.16's crash backoff) before it tries the pull again — so you'll see the pod's status alternate between the two as it keeps retrying. Underneath either status, there are three genuinely different root causes, and the registry itself tells you which one via what it says back in the pod's events:</p>
 <table>
 <tr><th>Describe says</th><th>Root cause</th><th>Fix</th></tr>
 <tr><td><code>manifest … not found: manifest unknown</code></td><td>tag/name typo — registry answered "no such thing"</td><td>correct the image reference</td></tr>
@@ -854,7 +856,7 @@ sleep 20; kubectl describe pod imgauth | grep -iE 'denied|unauthor|forbidden' | 
 <h5 class="verify">Verify</h5>
 <p>Three different registry answers seen in describe output, and the imgfix deployment repaired via <code>kubectl set image</code> + <code>rollout status</code> — the two-command fix motion.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>For a <em>bare pod</em>, <code>image</code> is one of the few mutable fields — <code>kubectl set image pod/imghost imghost=nginx</code> fixes it in place, no delete needed; the kubelet retries immediately with the new reference. Also: a node that pulled the image before may run it from cache while other nodes fail — "works on node01, ImagePullBackOff on node02" often means credentials/network, not the tag.</p>
+<p>Most fields on a running pod can't be changed in place — you'd have to delete and recreate it. Image is a rare exception: for a <em>bare pod</em> (one you created directly, not through a Deployment), <code>image</code> is actually one of the few mutable fields, so <code>kubectl set image pod/imghost imghost=nginx</code> fixes it right where it stands, no delete needed — the kubelet notices the change and retries the pull immediately with the corrected reference. Also worth knowing: a node that already pulled an image successfully in the past may keep running it from its local cache even while other nodes fail to pull it fresh — so "works fine on node01, ImagePullBackOff on node02" is a real pattern, and it usually points to credentials or network reachability being different between nodes, not a bad tag (since the tag would fail identically everywhere).</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Pull an Image from a Private Registry"</strong> — contains the exact secret + imagePullSecrets snippets.</p>
 </article>
@@ -863,7 +865,7 @@ sleep 20; kubectl describe pod imgauth | grep -iE 'denied|unauthor|forbidden' | 
 <div class="lesson-head"><span class="cp-id">6.18</span><h4>The quiet failures: not-Ready pods, stuck Terminating, init crashes</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>These three don't announce themselves with red statuses — the pod looks <em>almost</em> fine. They're favorite exam material precisely because the signal is one column or one field deep.</p>
+<p>Everything so far in this week has announced itself with a loud, obvious status — CrashLoopBackOff, ImagePullBackOff, Pending. These three don't: the pod looks <em>almost</em> fine at a glance, and you have to look one column, or one field, deeper to notice anything's wrong at all. That's exactly why they're favorite exam material — the failure hides in plain sight rather than shouting for attention.</p>
 <h5>The concept</h5>
 <table>
 <tr><th>Quiet symptom</th><th>What it means</th><th>Where to look</th></tr>
@@ -871,7 +873,7 @@ sleep 20; kubectl describe pod imgauth | grep -iE 'denied|unauthor|forbidden' | 
 <tr><td>stuck <code>Terminating</code></td><td>deletion blocked: a finalizer nobody clears, or a dead kubelet (6.13)</td><td><code>metadata.finalizers</code> and <code>deletionTimestamp</code></td></tr>
 <tr><td><code>Init:CrashLoopBackOff</code> / <code>Init:Error</code></td><td>an <em>init</em> container fails; app containers never start</td><td><code>logs &lt;pod&gt; -c &lt;init-name&gt;</code> — logs need the container name</td></tr>
 </table>
-<p>On finalizers: they're a pre-delete contract — the API holds the object in Terminating until every listed controller removes its entry. When the responsible controller is gone (uninstalled operator, planted fault), the object hangs forever; clearing <code>metadata.finalizers</code> by hand is the break-glass move.</p>
+<p>A word on <strong>finalizers</strong>, since they're the least familiar concept in this table: think of a finalizer as a pre-delete contract — a note attached to an object saying "before you actually remove this, some specific controller needs to do its own cleanup first." The API server honors that note by holding the object in <code>Terminating</code> limbo, refusing to fully delete it, until every listed controller has removed its own entry from the list to signal "I'm done." The trap is when the controller responsible for clearing its entry no longer exists — an operator got uninstalled, or a fault was deliberately planted — because then nothing will ever clear that entry, and the object hangs in Terminating forever. Clearing <code>metadata.finalizers</code> by hand is the break-glass move for exactly that dead end.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Quiet failure 1 — Running-but-not-Ready, with the service consequence on display:
@@ -914,7 +916,7 @@ kubectl logs quiet3 -c init-db</pre>
 <h5 class="verify">Verify</h5>
 <p>All three quiet failures produced, diagnosed from their one-deep signal, and resolved — including one finalizer patch you can now type from memory.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Clearing finalizers on <em>real</em> infrastructure objects (PVs, namespaces) can orphan external resources — in production it's the last resort after asking why the controller isn't doing its job; in the exam it's usually exactly what the task wants. And on init containers: they run <em>serially</em>, so only the first failing one matters; <code>Init:1/2</code> in the STATUS column tells you how far it got.</p>
+<p>Clearing finalizers by hand on <em>real</em> infrastructure objects — a PersistentVolume backed by real cloud storage, a namespace with cloud resources tied to it — can leave those external resources orphaned and still costing money or sitting around unmanaged, since the cleanup that finalizer was protecting never actually ran. In production, that makes it a genuine last resort you reach for only after asking why the responsible controller isn't doing its job; on the exam, in a lab environment with nothing real behind it, it's usually exactly what the task wants. And on init containers specifically: they run <em>serially</em>, one at a time in order, so only the first one that fails actually matters — the STATUS column's <code>Init:1/2</code> notation tells you precisely how far the pod got before something stopped it.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debug Init Containers"</strong> and <strong>"Finalizers"</strong> (concepts).</p>
 </article>
@@ -923,9 +925,9 @@ kubectl logs quiet3 -c init-db</pre>
 <div class="lesson-head"><span class="cp-id">6.19</span><h4>The gauntlet: six broken workloads, 30 minutes, notes closed</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Troubleshooting weight on the exam ≈ 6–7 tasks. This drill is that block, compressed: six faults, one clock. It converts this week's signatures from "known" to "instant" — and gives you a number to beat before exam day.</p>
+<p>The troubleshooting domain is worth roughly 6–7 tasks' worth of weight on the real exam. This drill compresses that entire block into one sitting: six faults, one clock, no looking at your notes. Doing it under real time pressure is what actually converts this week's signatures from merely "known" — recognizable if you think about it — to "instant" — recognized before you've consciously finished reading the symptom. It also gives you a concrete number to beat before exam day, instead of a vague feeling of readiness.</p>
 <h5>The concept</h5>
-<p>Rules of engagement: triage sheet and notes <em>closed</em>; kubernetes.io docs allowed (exam conditions); fix to the stated goal, run the verify, move on. Budget ~5 minutes per fault. If one resists past 7 minutes, skip and return — the same second-pass discipline as 8.7. Everything you need is in 6.15–6.18 and 6.20.</p>
+<p>Rules of engagement, matching real exam conditions as closely as a home lab can: your triage sheet and any other notes stay <em>closed</em>; the official kubernetes.io docs are allowed, since they're allowed on the real exam too; fix each workload to its stated goal, run its verify step, then move on immediately rather than polishing. Budget roughly 5 minutes per fault. If one resists you past 7 minutes, skip it and come back at the end — the identical second-pass discipline you'll practice again in 8.7. Everything you need to solve every fault below was already covered in 6.15–6.18 and 6.20; nothing here is new material.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Plant (from cp — the script guards against non-lab clusters):
@@ -983,7 +985,7 @@ curl -fsSLO "$BASE/w6-gauntlet.sh" &amp;&amp; bash w6-gauntlet.sh</pre></li>
 <h5 class="verify">Verify</h5>
 <p>All six goals green inside the clock (or an honest score + a scheduled re-run), namespace deleted afterwards.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>The verify commands are part of the drill — a fix you didn't verify is a fix you don't get points for (8.8's rule). And don't fix by deleting/recreating whole deployments from scratch: the exam's broken objects often carry other required fields you'd lose; <em>edit the broken thing</em> is the transferable habit.</p>
+<p>The verify commands aren't optional extra credit — they're part of the drill itself: a fix you never actually verified is, on the real exam, a fix you get zero points for (the rule 8.8 spells out in full). And resist the temptation to fix things by deleting a whole broken deployment and recreating it from a fresh guess: the exam's broken objects often carry other required fields — specific labels, annotations, resource settings — that you'd silently lose by starting over; <em>edit the broken thing in place</em> is the habit that actually transfers to exam day.</p>
 <h5>Docs</h5>
 <p class="docs-links">Closed-notes drill — the only doc allowed is kubernetes.io, same as exam day.</p>
 </article>
@@ -996,10 +998,11 @@ curl -fsSLO "$BASE/w6-gauntlet.sh" &amp;&amp; bash w6-gauntlet.sh</pre></li>
 <div class="lesson-head"><span class="cp-id">6.20</span><h4>The service-unreachable checklist, in strict order</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"App A can't reach service B" is guaranteed exam material. The checklist works because it follows the 4.10–4.11 machinery in order — each step isolates one component, so you never debug two layers at once.</p>
+<p>A Service, recall, is like a phone book entry — it gives you one stable name/address to dial, and something behind the scenes routes your call to whichever real pod should answer. "App A can't reach Service B" is guaranteed exam material, precisely because there are several genuinely different things that can go wrong between dialing that number and a pod actually answering. This checklist works because it walks the 4.10–4.11 machinery in the same order packets actually flow — each step isolates exactly one component, so you're never trying to debug two layers of the stack at once and confusing yourself about which one is actually at fault.</p>
 <h5>The concept</h5>
 <div class="flow"><span>1 endpointslices non-empty?</span><em>→</em><span>2 selector = pod labels?</span><em>→</em><span>3 targetPort = containerPort?</span><em>→</em><span>4 pod Ready?</span><em>→</em><span>5 NetworkPolicy?</span><em>→</em><span class="hot">6 curl the ClusterIP</span></div>
-<p>Why this order: empty EndpointSlices mean kube-proxy programmed <em>no</em> DNAT targets — the fault is upstream of networking entirely (selector or readiness). Populated slices but connection refused means DNAT lands on a port nobody listens on (targetPort). Only when the control-plane view is clean do you spend time on packets. The observation table:</p>
+<p><em>Steps 1–4 are all questions you can answer without sending a single packet, just by reading API objects — only steps 5–6 involve real traffic, which is why they come last.</em></p>
+<p>Here's why this exact order matters, not just an arbitrary checklist: an empty EndpointSlice (the object recording which pod IPs currently back a Service) means kube-proxy — the component that actually programs the routing rules on every node — was told there is <em>nobody</em> to send traffic to, so it never even set up a path; that fault sits entirely upstream of networking, in the selector or the pod's readiness, and no amount of network debugging will find it. A populated EndpointSlice but a connection that's still refused means the routing rule fired correctly and delivered the packet — just to a port nobody's listening on there (a targetPort mismatch). Only once that whole control-plane picture checks out clean is it worth spending time chasing actual packets on the wire. The observation table below turns each of those distinct outcomes into a lookup:</p>
 <table>
 <tr><th>Observation</th><th>Meaning</th><th>Component at fault</th></tr>
 <tr><td>slice empty + curl <em>refused</em> instantly</td><td>kube-proxy's REJECT rule for endpoint-less services</td><td>selector mismatch, or no Ready pods (steps 2/4)</td></tr>
@@ -1043,7 +1046,7 @@ svcdrill-7wkfq   IPv4   <b>8080</b>   10.244.1.22,10.244.2.31   ← step 1 PASSE
 <h5 class="verify">Verify</h5>
 <p>Same symptom ("refused") twice, two different root causes, found at two different checklist steps — because you checked endpoints <em>before</em> curling. That's the whole lesson.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Named targetPorts (<code>targetPort: http</code>) must match a <code>name:</code> in the container's ports list — a planted rename there produces the fault-2 signature with a correct-looking number nowhere in sight. And remember step 4: a service can be "broken" purely because readiness probes fail (6.18) — endpoints gate on Ready, so fix the pod, not the service.</p>
+<p>A <strong>named</strong> targetPort (written as <code>targetPort: http</code> instead of a plain number) must match a <code>name:</code> field declared in the container's own ports list — a planted rename of that name produces exactly the fault-2 signature above, except there's no wrong-looking number anywhere to spot; the mismatch is in a string, not a digit, so you have to compare the names character by character. And don't forget step 4's implication: a Service can look entirely "broken" purely because its pods' readiness probes are failing (6.18) — EndpointSlices only ever include pods that are Ready, so the actual fix is on the pod, never on the Service object itself.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debug Services"</strong> — the official page is this checklist in long form; know its section order.</p>
 </article>
@@ -1052,9 +1055,9 @@ svcdrill-7wkfq   IPv4   <b>8080</b>   10.244.1.22,10.244.2.31   ← step 1 PASSE
 <div class="lesson-head"><span class="cp-id">6.21</span><h4>The DNS ladder as reflex: four commands from memory</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>You built and broke the full DNS ladder in 4.18. This week's job is compression: the ladder must come out of your fingers in under two minutes, because on the exam DNS is never the whole task — it's the obstacle in front of the task.</p>
+<p>DNS inside a cluster is what turns a Service's name into the address the network actually needs — you built and deliberately broke the full DNS ladder back in 4.18 to understand each layer of it. This week's job is different: pure compression. The same ladder now has to come out of your fingers in under two minutes flat, because on the real exam DNS is essentially never the whole task by itself — it's the obstacle sitting in front of some other task, something you need working before you can even attempt what was actually asked.</p>
 <h5>The concept</h5>
-<p>The four commands, memorized as a block (they walk 4.18's rungs bottom-up):</p>
+<p>The same four commands as 4.18, but now memorized as a single block you can type without thinking, walking those rungs bottom-up:</p>
 <pre class="cmd"># 1 — is resolution broken, and what does the pod's resolv.conf say?
 kubectl run tmp --rm -it --restart=Never --image=busybox:1.36 -- \
   sh -c 'nslookup kubernetes.default; cat /etc/resolv.conf'
@@ -1081,7 +1084,7 @@ Address: 10.101.44.7</pre></li>
 <h5 class="verify">Verify</h5>
 <p>Three timed cold runs under two minutes, and you can recite what "healthy" looks like at each rung without running anything.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>busybox ≥1.36 has a trustworthy nslookup; some older busybox tags are famously broken resolvers — pin the tag. If you need dig/host, that's the jessie-dnsutils image from 4.17, but busybox is faster to type and always pullable. And <code>--rm -it --restart=Never</code> matters: forgetting <code>--restart=Never</code> makes a deployment-backed pod that survives your exit and litters the cluster.</p>
+<p>busybox ≥1.36 ships a trustworthy <code>nslookup</code>; some older busybox tags are famously broken resolvers that give wrong or flaky answers — always pin the exact tag rather than trusting <code>latest</code>. If you need the fuller <code>dig</code>/<code>host</code> tools, that's the jessie-dnsutils image from 4.17, but plain busybox is faster to type and always pullable, so default to it. And <code>--rm -it --restart=Never</code> together matter more than they look: forget <code>--restart=Never</code> specifically and <code>kubectl run</code> quietly creates a Deployment-backed pod instead of a one-shot pod, which survives long after you exit and litters the cluster with something you'll have to clean up later.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Debugging DNS Resolution"</strong> — same page as 4.18; on exam day you only need its command spellings.</p>
 </article>
@@ -1090,9 +1093,9 @@ Address: 10.101.44.7</pre></li>
 <div class="lesson-head"><span class="cp-id">6.22</span><h4>Planted NetworkPolicy fault: app can't reach db — fix it minimally</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Policy faults are pure reading comprehension under pressure: nothing is crashed, nothing logs an error, packets just vanish. The exam version hands you a namespace with a policy set and a broken flow; the winning motion is compare-selectors-to-labels, then the smallest possible edit.</p>
+<p>A <strong>NetworkPolicy</strong> is a firewall rule scoped to Kubernetes labels instead of IP addresses — it says which pods are allowed to talk to which other pods. Policy faults are pure reading comprehension under time pressure: nothing crashes, nothing logs an error anywhere, packets simply vanish silently because a rule quietly didn't match what you expected. The exam version of this hands you a namespace with some policies already in place and one broken flow; the winning motion is methodically comparing selectors to actual labels, then making the smallest possible edit that fixes only what's asked.</p>
 <h5>The concept</h5>
-<p>The debugging chain for "X can't reach Y, and I suspect policy": symptom is a <strong>timeout</strong> (never "refused" — 4.24's signature); confirm the service chain is otherwise healthy (6.20 steps 1–4 pass); then <code>kubectl get netpol -A</code> and read every policy that <em>selects the destination</em> against the 4.25 rules — is the traffic's source matched by any <code>from</code> element (AND within an element, OR across elements)? The classic planted faults: a label typo in <code>from.podSelector</code>, a missing port, the AND/OR dash, or a policy in the wrong namespace (policies only ever select pods in <em>their own</em> namespace).</p>
+<p>The debugging chain for "X can't reach Y, and I suspect a policy is the cause" runs like this: the symptom itself is a <strong>timeout</strong> — never "connection refused", which is 4.24's signature for a completely different kind of problem, packets dropped silently rather than actively rejected; first confirm the ordinary service chain is otherwise entirely healthy (6.20's steps 1–4 all pass, so this genuinely isn't a Service problem); then run <code>kubectl get netpol -A</code> and read every single policy that <em>selects the destination</em> pod against the AND/OR rules from 4.25 — is the traffic's actual source matched by at least one <code>from</code> element (remembering that conditions <em>within</em> one element are ANDed together, while separate elements in the list are ORed)? The classic planted faults, in order of how often they show up: a label typo inside <code>from.podSelector</code>, a missing port in the rule, a misplaced list dash that silently changes AND into OR (or vice versa), or a policy sitting in the wrong namespace entirely — worth remembering explicitly that a NetworkPolicy can only ever select pods living in <em>its own</em> namespace, never reach across into another one.</p>
 <p><strong>Lab prerequisite:</strong> policies need an enforcing CNI — redo 4.24's swap first (snapshot → flannel out → Calico in). The script below refuses to run without Calico present. When you're done with this lesson, restore the flannel snapshot as in 4.24 step 8.</p>
 <h5>Lab</h5>
 <ol class="lab">
@@ -1121,7 +1124,7 @@ wget: <b>download timed out</b>              ← default-deny still holds</pre><
 <h5 class="verify">Verify</h5>
 <p>Allowed flow open, everything else still denied, one-word diff to the policy — and you never touched the pods.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>"Fix minimally" is exam wording with teeth: deleting <code>default-deny-ingress</code> also "fixes" the symptom and would score zero (the requirement was <em>this flow and nothing else</em>). Always re-test the negative case after a policy edit — an over-broad fix looks identical on the happy path.</p>
+<p>"Fix minimally" is exam wording with real teeth, not a style suggestion: deleting <code>default-deny-ingress</code> entirely would also technically make the symptom go away, and would still score zero, because the actual requirement was <em>this one flow working, and everything else still blocked</em> — a fix that's too broad fails the task just as surely as one that's wrong. Always re-test the negative case after any policy edit, not just the flow you were asked to fix: an over-broad fix looks completely identical to a correct one on the happy path, and only the negative test exposes the difference.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Network Policies"</strong> — the AND/OR examples you'll compare against are on that one page.</p>
 </article>
@@ -1130,7 +1133,7 @@ wget: <b>download timed out</b>              ← default-deny still holds</pre><
 <div class="lesson-head"><span class="cp-id">6.23</span><h4>Deliverable: your finished one-page triage sheet</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>This sheet is the week's compiled output — every fault you fixed, reduced to symptom → first three commands → likely causes. Week 8's review (8.4, 8.10) runs off it; more importantly, writing it <em>is</em> the final rep that locks the patterns in.</p>
+<p>This sheet is the week's compiled output, distilled into something you could scan in seconds — every fault you personally fixed this week, reduced down to symptom → first three commands → likely causes. Week 8's review sessions (8.4, 8.10) run directly off it; but more importantly than any future reuse, the act of writing it yourself, in your own words, <em>is</em> the final repetition that actually locks these patterns into reflex rather than reference material.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Take your working copy from 6.4 (or reprint the <a href="../cheatsheets/triage-template.html">template</a>) and finish every blank row from this week's experience: DNS (6.21), Running-not-Ready and stuck Terminating (6.18), scheduler/CM silence (6.7), NetworkPolicy (6.22), plus anything the gauntlet taught you about your own blind spots.</li>
