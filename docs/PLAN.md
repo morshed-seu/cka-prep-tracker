@@ -131,8 +131,24 @@ Decisions made:
   stays compact cluster-build logistics). Lessons link into its sections
   instead of re-explaining the same primitive in every week that touches it.
 
-Design and rollout (EP0–EP8) are documented in `CLAUDE.md`'s "Beginner-friendly
+Design and rollout (EP0–EP8) were documented in `CLAUDE.md`'s "Beginner-friendly
 conventions" section (the `.foundation`/`.analogy` pattern, jargon-`<abbr>`
 convention, and the canonical analogy registry) and the phase roadmap table.
-EP0 (infra + `foundations.html` + conventions) is done; EP1–EP8 enrich one
-week's lessons per session, in week order, same cadence as the original build.
+EP0 (infra + `foundations.html` + conventions) shipped; EP1 (W0+W1 pilot,
+`8e049a2`) shipped and was reviewed as a tone check before continuing.
+
+### Superseded by R0–R8 (2026-07-16)
+
+After the EP1 pilot, the user's read was that toggleable `.foundation` panels
+bolted onto otherwise-unchanged jargon-dense prose weren't enough: a beginner
+still hit dense expert-shorthand sentences in "The concept" and "Lab" before
+ever reaching a callout, so fully-detailed lessons still read as terse hints.
+**EP0–EP8 is retired** (not deleted from history — W0/W1's EP1 content gets
+folded into their prose during R1, and the toggle infra was removed in R0:
+`#basics` button, `body.basics-off` CSS rule, `cka-beginner-v1` localStorage
+key, all gone). The replacement is **R0–R8**: rewrite each week's lesson
+prose itself in a unified plain-English-first voice, full technical depth
+kept and unabridged, nothing to toggle — every reader gets the same page.
+The `.foundation`/`.analogy` box *styles* stay (useful for setting off an
+aside) but are always visible now, not conditionally hidden. Recipe and
+phase table live in `CLAUDE.md`'s "Plain-English lesson voice" section.

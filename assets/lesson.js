@@ -19,15 +19,6 @@
     localStorage.setItem(TKEY, next);
   });
 
-  /* ---- beginner-mode toggle (foundations/analogy panels) ---- */
-  var BKEY='cka-beginner-v1';
-  if(localStorage.getItem(BKEY)==='off') document.body.classList.add('basics-off');
-  var bbtn=document.getElementById('basics');
-  if(bbtn) bbtn.addEventListener('click', function(){
-    var off=document.body.classList.toggle('basics-off');
-    localStorage.setItem(BKEY, off? 'off':'on');
-  });
-
   /* ---- mark-done sync ---- */
   var lessons=[].slice.call(document.querySelectorAll('.lesson[data-id]'));
 
