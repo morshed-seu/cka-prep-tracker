@@ -45,7 +45,7 @@
 <p class="crumb"><a href="../index.html#w2">← Back to the tracker</a></p>
 <header class="hero">
   <h1>Week 2 — Installation, PKI &amp; cluster lifecycle</h1>
-  <p>Last week you learned what the control plane <em>is</em>; this week you learn how it gets built, trusted, upgraded, and recovered. Every lesson here maps to a guaranteed exam-task family: init/join, certificate surgery, the upgrade dance, and the etcd backup/restore drill. By the weekend, each should run without notes.</p>
+  <p>Last week you learned what the control plane <em>is</em>; this week you learn how it gets built, trusted, upgraded, and recovered. A lot of this week is certificates — files that prove "I am who I say I am" to another program — which sounds abstract until you've unwrapped a few by hand and realized they're just text. Every lesson here maps to a guaranteed exam-task family: init/join, certificate surgery, the upgrade dance, and the etcd backup/restore drill. By the weekend, each should run without notes.</p>
 </header>
 
 <!-- ---------------- kubeadm init, dissected ---------------- -->
@@ -55,20 +55,20 @@
 <div class="lesson-head"><span class="cp-id">2.1</span><h4>List the kubeadm init phases from memory</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Exam tasks say things like "regenerate the apiserver certificate" or "the join is failing at preflight". If you know init as a pipeline of named phases, every such task becomes "re-run one phase" instead of "rebuild the cluster".</p>
+<p><strong>kubeadm</strong> is the command-line tool that actually builds a Kubernetes control plane on a bare machine — instead of hand-writing certificates and config files yourself, you run one command and it works through a fixed, named checklist for you. Exam tasks say things like "regenerate the apiserver certificate" or "the join is failing at preflight". If you know init as a pipeline of named phases, every such task becomes "re-run one line of the checklist" instead of "rebuild the cluster".</p>
 <h5>The concept</h5>
-<p><code>kubeadm init</code> is not one monolithic action — it's a fixed pipeline, and every stage is independently re-runnable via <code>kubeadm init phase &lt;name&gt;</code>:</p>
+<p><code>kubeadm init</code> looks like one big opaque action from the outside, but it isn't — it's a fixed sequence of named steps, and the genuinely useful part is that every single step can also be re-run on its own later, without redoing anything above it, via <code>kubeadm init phase &lt;name&gt;</code>:</p>
 <div class="flow"><span>preflight</span><em>→</em><span>certs</span><em>→</em><span>kubeconfig</span><em>→</em><span>etcd</span><em>→</em><span>control-plane</span><em>→</em><span>kubelet-start</span><em>→</em><span>wait-control-plane</span><em>→</em><span>upload-config</span><em>→</em><span>mark-control-plane</span><em>→</em><span>bootstrap-token</span><em>→</em><span>kubelet-finalize</span><em>→</em><span class="hot">addon (CoreDNS, kube-proxy)</span></div>
-<p>The load-bearing details:</p>
+<p>Four details here are worth holding onto, because each one is the reason behind a real command you'll type later:</p>
 <ul>
-<li><strong>certs</strong> and <strong>kubeconfig</strong> only write files under <code>/etc/kubernetes</code>. Nothing runs yet.</li>
-<li><strong>etcd</strong> and <strong>control-plane</strong> just drop static pod YAML into <code>/etc/kubernetes/manifests</code> — kubeadm never starts a process itself; the kubelet notices the files and starts the pods (week 1.2 machinery).</li>
-<li><strong>upload-config</strong> stores the cluster configuration as the <code>kubeadm-config</code> ConfigMap in kube-system. Later <code>kubeadm join</code> and <code>kubeadm upgrade</code> read <em>that</em>, not your original command line — it's the cluster's memory of how it was built.</li>
-<li><strong>bootstrap-token</strong> mints the join token; <strong>kubelet-finalize</strong> switches the kubelet onto its own rotated client cert (lesson 2.8).</li>
+<li><strong>certs</strong> and <strong>kubeconfig</strong> only write files to disk, under <code>/etc/kubernetes</code>. Nothing is actually running yet — these two phases are pure paperwork.</li>
+<li><strong>etcd</strong> and <strong>control-plane</strong> drop <strong>static pod</strong> YAML files into <code>/etc/kubernetes/manifests</code> — a static pod is one the kubelet starts straight from a file on disk, with no apiserver involved (the full mechanics are week 1's lesson 1.2). kubeadm itself never launches a process; it just leaves the file there for the kubelet to notice and act on moments later.</li>
+<li><strong>upload-config</strong> saves the settings you gave <code>kubeadm init</code> — pod CIDR, version, and so on — as the <code>kubeadm-config</code> ConfigMap in kube-system. Later, <code>kubeadm join</code> and <code>kubeadm upgrade</code> read <em>that</em> stored copy, not your original command line — it's the cluster's own memory of how it was built, so you never have to retype the flags.</li>
+<li><strong>bootstrap-token</strong> mints the credential a new node uses to join (lesson 2.9); <strong>kubelet-finalize</strong> switches this node's own kubelet onto its rotated client certificate (lesson 2.8).</li>
 </ul>
 <h5>Lab</h5>
 <ol class="lab">
-<li>On <code>cp</code>, list the pipeline straight from the binary:
+<li>See the pipeline for yourself, straight from the binary's own help text — this is the same list as the diagram above, in kubeadm's own words:
 <pre class="cmd">kubeadm init --help | sed -n '/preflight/,/show-join-command/p'</pre>
 <pre class="out">preflight                    Run pre-flight checks
 certs                        Certificate generation
@@ -79,7 +79,7 @@ control-plane                Generate all static Pod manifest files ...
 kubelet-start                Write kubelet settings and (re)start the kubelet
 ...
 addon                        Install required addons for passing conformance tests</pre></li>
-<li>Re-run a single phase against the live cluster — regenerate just the apiserver serving cert:
+<li>Now prove phases are independently re-runnable — regenerate just the apiserver's serving certificate (the cert it presents to prove its identity to clients) without touching anything else in the cluster:
 <pre class="cmd">sudo ls -l --time-style=+%H:%M /etc/kubernetes/pki/apiserver.crt
 sudo kubeadm init phase certs apiserver
 sudo ls -l --time-style=+%H:%M /etc/kubernetes/pki/apiserver.crt</pre>
@@ -104,7 +104,7 @@ data:
 <h5 class="verify">Verify</h5>
 <p>Close the page and recite the pipeline. Minimum bar: certs → kubeconfig → etcd/control-plane manifests → kubelet starts them → upload-config → token → addons, and <em>why</em> each early phase is "just files".</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>After regenerating a cert that a running component already loaded, the component keeps using the old one until restarted — certs are read at process start. That's why cert tasks pair with "restart the control-plane pods" (2.7). Also: older kubeadm ran <code>kubelet-start</code> earlier; don't be surprised by ordering differences in old blog posts — trust <code>kubeadm init --help</code> on the box.</p>
+<p>Here's the trap: a component reads its certificate files once, at process start, and then keeps that copy in memory — it never notices the file on disk changed underneath it. So regenerating a cert that a running component already loaded changes nothing until you restart that component. That's why cert tasks almost always pair with "restart the control-plane pods" (2.7) — regenerating alone silently does nothing. Also: older kubeadm versions ran <code>kubelet-start</code> at a different point in the sequence; don't be thrown by ordering differences in old blog posts — trust <code>kubeadm init --help</code> on the actual box you're working on.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"kubeadm init phase"</strong> (every phase, independently documented) and <strong>"Creating a cluster with kubeadm"</strong>.</p>
 </article>
@@ -113,35 +113,35 @@ data:
 <div class="lesson-head"><span class="cp-id">2.2</span><h4>Tear down and rebuild — and leave the rebuild one minor version old</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Rebuilding from scratch once turns init from magic into a checklist. And there's a trick: rebuild the cluster <strong>one minor version behind</strong> (v1.34) on purpose — that gives you a real upgrade to perform in lessons 2.13–2.14 instead of a pretend one.</p>
+<p>Reading about <code>kubeadm init</code> is one thing; watching your own cluster disappear and come back under your own hands is what actually makes it stick. Rebuilding from scratch once turns init from magic into a checklist you've personally run. And there's a trick: rebuild the cluster <strong>one minor version behind</strong> (v1.34) on purpose — that gives you a real upgrade to perform in lessons 2.13–2.14 instead of a pretend one.</p>
 <h5>The concept</h5>
-<p><code>kubeadm reset</code> undoes what kubeadm did: stops running control-plane containers, wipes <code>/etc/kubernetes</code> (manifests, PKI, kubeconfigs) and <code>/var/lib/etcd</code>. It deliberately does <em>not</em> undo what others did: CNI config in <code>/etc/cni/net.d</code>, iptables/IPVS rules, and your <code>$HOME/.kube/config</code> all survive — each a source of weird behavior on re-init if you forget.</p>
+<p><code>kubeadm reset</code> is the undo button, but only for what kubeadm itself did: it stops the running control-plane containers and wipes <code>/etc/kubernetes</code> (manifests, PKI certificates, kubeconfigs) plus <code>/var/lib/etcd</code>, etcd's on-disk database. What it deliberately leaves alone is everything <em>other</em> tools set up on the node: the CNI (container network interface — the plugin that wires up pod networking) config in <code>/etc/cni/net.d</code>, the iptables/IPVS packet-forwarding rules that plugin installed, and your own <code>$HOME/.kube/config</code> credentials file all survive the reset untouched. Each one is a source of confusing, half-broken behavior on a fresh re-init if you forget it's still there.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Practice the small version first — remove one worker. On <code>node02</code>:
+<li>Practice the small version first — remove just one worker and watch what reset actually says it's leaving behind. On <code>node02</code>:
 <pre class="cmd">sudo kubeadm reset -f
 sudo rm -rf /etc/cni/net.d</pre>
 <pre class="out">[reset] Stopping the kubelet service
 [reset] Deleting contents of directories: [/etc/kubernetes/manifests /var/lib/kubelet /etc/kubernetes/pki]
 <b>The reset process does not clean CNI configuration. To do so, you must remove /etc/cni/net.d</b>
 The reset process does not reset or clean up iptables rules or IPVS tables.</pre>
-<p>Read that output — reset itself tells you what it leaves behind. Then on <code>cp</code>, remove the node object (reset can't reach the API to do it for you):</p>
+<p>Read that output — reset itself tells you exactly what it leaves behind, in plain text, every time you run it. Then on <code>cp</code>, remove the node object (reset ran locally on node02, so it has no way to reach the apiserver and delete the node's entry for you):</p>
 <pre class="cmd">kubectl delete node node02
 kubectl get nodes</pre>
 <pre class="out">node "node02" deleted
 NAME     STATUS   ROLES           AGE   VERSION
 cp       Ready    control-plane   7d    v1.35.x
 node01   Ready    &lt;none&gt;          7d    v1.35.x</pre></li>
-<li>Rejoin it (fresh token — the week-0 one expired long ago; details in 2.9):
+<li>Rejoin it with a fresh token (the week-0 token expired long ago — the full lifecycle is 2.9's lesson):
 <pre class="cmd">kubeadm token create --print-join-command      # on cp; paste result on node02 with sudo</pre></li>
-<li>Now the full rebuild, downgraded. Reset <em>all three</em> nodes as in step 1. Then on every node, repoint the package repo one minor back and downgrade the binaries (this is lesson 0.6's repo pattern in reverse):
+<li>Now the real exercise: a full rebuild, deliberately downgraded. Reset <em>all three</em> nodes as in step 1. Then on every node, point the package repo one minor version back and install the older binaries over the newer ones (this is lesson 0.6's repo pattern, run in reverse):
 <pre class="cmd">sudo sed -i 's/v1\.35/v1.34/' /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update
 sudo apt-mark unhold kubelet kubeadm kubectl
 apt-cache madison kubeadm | head -3            # pick the newest 1.34 patch
 sudo apt-get install -y --allow-downgrades kubeadm=1.34.x-1.1 kubelet=1.34.x-1.1 kubectl=1.34.x-1.1
 sudo apt-mark hold kubelet kubeadm kubectl</pre></li>
-<li>Re-init on <code>cp</code> exactly as in week 0 — but this time <strong>read every phase line</strong> as it scrolls and tie it to the 2.1 pipeline:
+<li>Re-init on <code>cp</code> exactly as in week 0 — but this time <strong>read every phase line</strong> as it scrolls past and tie each one back to the 2.1 pipeline you just memorized:
 <pre class="cmd">sudo kubeadm init --pod-network-cidr=10.244.0.0/16
 mkdir -p $HOME/.kube &amp;&amp; sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config &amp;&amp; sudo chown $(id -u):$(id -g) $HOME/.kube/config
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml</pre></li>
@@ -156,7 +156,7 @@ node02   Ready    &lt;none&gt;          1m    <b>v1.34.x</b></pre></li>
 <h5 class="verify">Verify</h5>
 <p>All three nodes <code>Ready</code> at v1.34, and a <code>pre-upgrade</code> snapshot exists for each VM.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>If a re-init fails preflight with "port 6443 in use" or "manifests already exist", the previous reset didn't finish — run it again. If pods later can't reach each other on a rebuilt cluster, stale CNI state is the usual suspect: you skipped <code>rm -rf /etc/cni/net.d</code> or old flannel iptables rules linger (a reboot clears them).</p>
+<p>If a re-init fails preflight with "port 6443 in use" or "manifests already exist", read it literally: the previous reset didn't actually finish cleaning up, so just run it again. If pods on a freshly rebuilt cluster can't reach each other, stale CNI state is almost always the cause — either you skipped <code>rm -rf /etc/cni/net.d</code>, or old flannel iptables rules are still installed from before (a reboot clears those out if nothing else does).</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"kubeadm reset"</strong>.</p>
 </article>
@@ -165,9 +165,9 @@ node02   Ready    &lt;none&gt;          1m    <b>v1.34.x</b></pre></li>
 <div class="lesson-head"><span class="cp-id">2.3</span><h4>Know the kubeconfigs kubeadm writes — and whose identity is inside each</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Fix the broken kubeconfig" and "why is this component unauthorized?" tasks are solved by knowing that each file in <code>/etc/kubernetes/*.conf</code> is a wrapped client certificate — and by being able to unwrap one in ten seconds.</p>
+<p>A <strong>kubeconfig</strong> is just a file that bundles "which cluster to talk to" with "who I am when I talk to it" — <code>kubectl</code> reads one to know both. "Fix the broken kubeconfig" and "why is this component unauthorized?" tasks are solved by knowing that each file in <code>/etc/kubernetes/*.conf</code> is really a wrapped client certificate — a small proof-of-identity document — and by being able to unwrap one in ten seconds to see exactly whose identity it holds.</p>
 <h5>The concept</h5>
-<p>Kubernetes has <strong>no User objects</strong>. A "user" is whatever identity a request carries; for certificates the rule is: <strong>CN = username, O = group</strong> (Subject CommonName / Organization). kubeadm applies the pattern five times:</p>
+<p>Here's the fact that makes the rest of this lesson make sense: Kubernetes has <strong>no User objects</strong> anywhere in its database. There's no table of accounts to look up. Instead, a "user" is simply whatever identity a request happens to carry proof of — and for a certificate, that proof follows one fixed rule: <strong>CN = username, O = group</strong> (the certificate's Subject field has a CommonName and an Organization, and Kubernetes reads those two as "who" and "which group they belong to"). Think of a client certificate as a notarized ID card: a trusted notary (the <abbr title="Certificate Authority — the trusted party whose signature on a certificate everyone agrees to honor">CA</abbr>) has signed it, so anyone who trusts that notary trusts the name printed on the card without re-checking it themselves. kubeadm prints five of these ID cards when it builds the cluster, one per component:</p>
 <table>
 <tr><th>File</th><th>CN (user)</th><th>O (group)</th><th>Power</th></tr>
 <tr><td><code>admin.conf</code></td><td>kubernetes-admin</td><td>kubeadm:cluster-admins</td><td>cluster-admin <em>via an RBAC binding</em> — revocable</td></tr>
@@ -176,35 +176,35 @@ node02   Ready    &lt;none&gt;          1m    <b>v1.34.x</b></pre></li>
 <tr><td><code>scheduler.conf</code></td><td>system:kube-scheduler</td><td>—</td><td>ditto, scheduler-sized</td></tr>
 <tr><td><code>kubelet.conf</code></td><td>system:node:&lt;name&gt;</td><td>system:nodes</td><td>gated by the Node authorizer</td></tr>
 </table>
-<p>The admin/super-admin split exists because <code>system:masters</code> is hardwired into the apiserver — no RBAC change can lock it out. So day-to-day admin credentials live in a group you <em>can</em> govern, and the ungovernable one stays in a separate file you keep offline.</p>
+<p>The admin/super-admin split exists for a specific reason: <code>system:masters</code> is hardwired into the apiserver's authorization logic itself, not granted through the normal permissions system (<abbr title="Role-Based Access Control — Kubernetes' permissions system: who may do what">RBAC</abbr>, the keycard-style system week 7 covers in depth) — so no RBAC change can ever lock that group out, not even by an administrator trying to tighten security. That's a feature for a break-glass emergency credential and a liability for day-to-day use. So kubeadm splits it: day-to-day admin credentials live in a group you <em>can</em> govern through ordinary RBAC bindings, and the ungovernable one stays in a separate file meant to be kept offline, not used casually.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Unwrap the identity inside admin.conf — this two-step is worth memorizing:
+<li>Unwrap the identity sitting inside admin.conf — the certificate data is base64-encoded text inside a YAML file, so this two-step decode-and-read is worth memorizing:
 <pre class="cmd">sudo grep client-certificate-data /etc/kubernetes/admin.conf \
   | awk '{print $2}' | base64 -d | openssl x509 -noout -subject -issuer</pre>
 <pre class="out">subject=<b>O = kubeadm:cluster-admins, CN = kubernetes-admin</b>
 issuer=CN = kubernetes</pre></li>
-<li>Compare with super-admin.conf and the scheduler:
+<li>Now compare it against super-admin.conf and the scheduler's kubeconfig — same decode, different files, to see the CN/O pattern repeat:
 <pre class="cmd">sudo grep client-certificate-data /etc/kubernetes/super-admin.conf \
   | awk '{print $2}' | base64 -d | openssl x509 -noout -subject
 sudo grep client-certificate-data /etc/kubernetes/scheduler.conf \
   | awk '{print $2}' | base64 -d | openssl x509 -noout -subject</pre>
 <pre class="out">subject=<b>O = system:masters</b>, CN = kubernetes-super-admin
 subject=CN = <b>system:kube-scheduler</b></pre></li>
-<li>Prove the admin binding is real RBAC, not magic:
+<li>Prove the admin binding is ordinary, revocable RBAC and not some special hardcoded magic:
 <pre class="cmd">kubectl get clusterrolebinding kubeadm:cluster-admins -o wide</pre>
 <pre class="out">NAME                     ROLE                        SUBJECTS
 kubeadm:cluster-admins   ClusterRole/cluster-admin   Group/<b>kubeadm:cluster-admins</b></pre></li>
-<li>Ask the API who you are — works with any credential:
+<li>Finally, ask the API to tell you who it thinks you are — this works with any credential, and is the fastest sanity check when identity is in doubt:
 <pre class="cmd">kubectl auth whoami</pre>
 <pre class="out">ATTRIBUTE   VALUE
 Username    kubernetes-admin
 Groups      [kubeadm:cluster-admins system:authenticated]</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p>For each of the five files you can state the CN, whether it carries a group, and what would happen if you deleted the <code>kubeadm:cluster-admins</code> binding while holding each file.</p>
+<p>For each of the five files you can state the CN, whether it carries a group, and — the part that actually tests understanding, not memory — what would happen to each one's power if you deleted the <code>kubeadm:cluster-admins</code> binding while holding it.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>The kubeconfigs embed the CA certificate too (<code>certificate-authority-data</code>) — a corrupted or wrong CA there gives <em>"x509: certificate signed by unknown authority"</em> from kubectl even though the server is fine. That's a favorite planted fault: diff the embedded CA against <code>/etc/kubernetes/pki/ca.crt</code>.</p>
+<p>Each kubeconfig also embeds a copy of the CA certificate itself (<code>certificate-authority-data</code>) — that's how kubectl knows which notary to trust when verifying the apiserver's own certificate. A corrupted or swapped-out CA there produces <em>"x509: certificate signed by unknown authority"</em> from kubectl even though the server is perfectly healthy — the client simply no longer trusts the notary that signed the server's cert. That's a favorite planted exam fault: diff the embedded CA against <code>/etc/kubernetes/pki/ca.crt</code> to catch it.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"PKI certificates and requirements"</strong> — its table of certs and kubeconfigs is this lesson in official form.</p>
 </article>
@@ -213,12 +213,12 @@ Groups      [kubeadm:cluster-admins system:authenticated]</pre></li>
 <div class="lesson-head"><span class="cp-id">2.4</span><h4>The control-plane taint: why it exists, how to lift it</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Exam clusters are often single-node — where this taint is <em>already removed</em>. Knowing the taint by exact name tells you instantly why a pod won't schedule on a control-plane node, and taint add/remove syntax is week-3 material you get to rehearse early.</p>
+<p>A <strong>taint</strong> is a marker on a node that says "don't schedule ordinary pods here unless they explicitly say they're okay with this" — it's a repel-by-default mechanism, the opposite of an attractive label. Exam clusters are often single-node, and on those the control-plane taint has usually already been removed so the one node can actually run workloads. Knowing this taint by its exact name tells you instantly why a pod refuses to schedule onto a control-plane node, and the add/remove syntax you'll use here is week-3 material you get to rehearse early, for free.</p>
 <h5>The concept</h5>
-<p><code>kubeadm init</code>'s <em>mark-control-plane</em> phase (see 2.1) labels the node and taints it <code>node-role.kubernetes.io/control-plane:NoSchedule</code>. Taints repel pods that don't tolerate them — so ordinary workloads stay off the node that runs etcd and the apiserver, protecting them from noisy neighbors. Control-plane static pods don't care (they bypass the scheduler entirely), and DaemonSets like kube-proxy/Flannel carry a blanket toleration — which is why the node isn't empty.</p>
+<p>During <code>kubeadm init</code>'s <em>mark-control-plane</em> phase (see 2.1), kubeadm labels the node and applies the taint <code>node-role.kubernetes.io/control-plane:NoSchedule</code>. A taint like this repels any pod that doesn't carry a matching <strong>toleration</strong> — a pod's explicit statement of "I'm fine running on a node with this taint." The point is to keep ordinary application workloads off the node running etcd and the apiserver, so a noisy pod can't starve the control plane of CPU or memory. Control-plane static pods aren't affected at all, because static pods bypass the scheduler entirely — nothing ever "schedules" them in the first place (1.2's mechanics). And DaemonSets like kube-proxy and Flannel carry a blanket toleration built in, which is why the control-plane node isn't actually empty even with the taint in place.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>See the taint, then watch it repel a pod:
+<li>See the taint on the node, then watch it actually repel a pod in real time:
 <pre class="cmd">kubectl describe node cp | grep -i taint
 kubectl run probe --image=nginx --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"cp"}}}'
 kubectl get pod probe</pre>
@@ -229,7 +229,7 @@ probe   0/1     <b>Pending</b>   0          20s</pre>
 <pre class="cmd">kubectl describe pod probe | tail -3</pre>
 <pre class="out">Warning  FailedScheduling  ... 0/3 nodes are available: 1 node(s) had <b>untolerated taint {node-role.kubernetes.io/control-plane: }</b>,
 2 node(s) didn't match Pod's node affinity/selector.</pre></li>
-<li>Lift the taint — note the trailing <code>-</code> means <em>remove</em>:
+<li>Now lift the taint and watch the same pod finally schedule — note the trailing <code>-</code> on the command, which is <code>kubectl</code>'s syntax for "remove this taint":
 <pre class="cmd">kubectl taint node cp node-role.kubernetes.io/control-plane:NoSchedule-
 kubectl get pod probe -o wide</pre>
 <pre class="out">node/cp untainted
@@ -242,9 +242,9 @@ kubectl delete pod probe --force --grace-period 0</pre>
 pod "probe" force deleted</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p><code>kubectl describe node cp | grep -i taint</code> shows the taint back in place, and the pending→running→gone story matches what you predicted at each step.</p>
+<p><code>kubectl describe node cp | grep -i taint</code> shows the taint back in place, and the pending→running→gone story matches what you predicted before running each step.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Removing a taint doesn't move anything: already-running pods stay put, and re-adding the taint doesn't evict pods either — <code>NoSchedule</code> only gates <em>new</em> scheduling decisions (<code>NoExecute</code> is the one that evicts; week 3). Also, the old taint name <code>node-role.kubernetes.io/master</code> is gone — muscle-memory from old tutorials will "succeed" at removing a taint that isn't there.</p>
+<p>Taints only ever affect <em>new</em> scheduling decisions, never pods that are already running — so removing a taint doesn't move anything onto the node, and re-adding it doesn't evict anything already there either. That's specific to this taint's effect, <code>NoSchedule</code>; there's a different effect, <code>NoExecute</code>, that does actively evict running pods, covered in week 3. Also worth knowing: the old taint name <code>node-role.kubernetes.io/master</code> no longer exists on current clusters — muscle-memory from old tutorials will "successfully" run a command that removes a taint that was never there, and quietly do nothing.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Taints and Tolerations"</strong>.</p>
 </article>
@@ -257,9 +257,10 @@ pod "probe" force deleted</pre></li>
 <div class="lesson-head"><span class="cp-id">2.5</span><h4>Map /etc/kubernetes/pki: three trust domains and one odd couple</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Certificate faults are only confusing if the directory is a blur. Once you see it as three independent CAs plus one signing key, every filename explains itself — and week 6's cert faults become filename lookups.</p>
+<p><code>/etc/kubernetes/pki</code> is where every certificate kubeadm generated actually lives on disk — and it looks like a wall of similarly-named files until you know the organizing idea behind it. Certificate faults are only confusing if that directory is a blur. Once you see it as three independent notary offices (trust domains) plus one signing key that isn't a certificate at all, every filename explains itself — and week 6's cert faults become simple filename lookups instead of guesswork.</p>
 <h5>The concept</h5>
-<p>kubeadm builds <strong>three separate trust domains</strong>. A client cert signed by one CA means nothing to a server trusting another — that isolation is the design, not an accident:</p>
+<p>kubeadm sets up <strong>three separate trust domains</strong> — three independent notaries, each with its own signature, that don't recognize each other's signatures at all. A client certificate signed by one CA (Certificate Authority — the notary whose signature a trust domain honors) means nothing to a server that only trusts a different CA. That isolation between the three is deliberate design, not an accident: it means a leak or compromise in one domain doesn't automatically hand over the others.</p>
+<p>The diagram below sorts every certificate under <code>pki/</code> into which of the three notaries signed it — plus a fourth box for the one file pair that isn't a certificate at all.</p>
 <svg viewBox="0 0 660 340" role="img" aria-label="The three kubeadm trust domains: cluster CA, etcd CA and front-proxy CA, plus the service-account signing key pair">
   <rect x="8" y="6" width="392" height="192" rx="10" fill="none" stroke="var(--accent)" stroke-dasharray="5 4"/>
   <text x="20" y="28" fill="var(--accent)" font-size="11" letter-spacing="2" font-weight="600">CLUSTER CA — ca.crt / ca.key</text>
@@ -303,7 +304,7 @@ pod "probe" force deleted</pre></li>
 </svg>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Walk the directory and sort every file into a domain:
+<li>Walk the actual directory on disk and sort every file into one of the four boxes above:
 <pre class="cmd">sudo find /etc/kubernetes/pki -type f | sort</pre>
 <pre class="out">/etc/kubernetes/pki/apiserver-etcd-client.crt      ← etcd domain (client)
 /etc/kubernetes/pki/apiserver-etcd-client.key
@@ -323,7 +324,7 @@ pod "probe" force deleted</pre></li>
 /etc/kubernetes/pki/sa.key                         ← JWT signing pair
 /etc/kubernetes/pki/sa.pub</pre>
 <p>(<code>.key</code> siblings abridged.)</p></li>
-<li>Prove the domains connect where the diagram says. Check issuers:
+<li>Now prove the domains really are wired up the way the diagram claims. Check each file's <strong>issuer</strong> field — the name of the notary who signed it:
 <pre class="cmd">for c in apiserver apiserver-etcd-client etcd/server front-proxy-client; do
   echo -n "$c → "; sudo openssl x509 -in /etc/kubernetes/pki/$c.crt -noout -issuer
 done</pre>
@@ -331,7 +332,7 @@ done</pre>
 apiserver-etcd-client → issuer=CN = <b>etcd-ca</b>
 etcd/server → issuer=CN = <b>etcd-ca</b>
 front-proxy-client → issuer=CN = <b>front-proxy-ca</b></pre></li>
-<li>Find where each file is consumed — the apiserver manifest is the map:
+<li>Finally, find out where each file is actually <em>used</em> — the apiserver's own static pod manifest names every cert file it reads, so it doubles as the map:
 <pre class="cmd">sudo grep -E 'client-ca|tls-cert|etcd-c|service-account-key' /etc/kubernetes/manifests/kube-apiserver.yaml</pre>
 <pre class="out">- --client-ca-file=/etc/kubernetes/pki/ca.crt          ← "trust client certs signed by this"
 - --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt
@@ -340,9 +341,9 @@ front-proxy-client → issuer=CN = <b>front-proxy-ca</b></pre></li>
 - --tls-cert-file=/etc/kubernetes/pki/apiserver.crt    ← "serve with this"</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p>Cover the diagram and sort these from memory into their domains: <code>apiserver-etcd-client</code>, <code>front-proxy-client</code>, <code>sa.key</code>, <code>etcd/peer</code>, <code>apiserver-kubelet-client</code>. (Two are trick entries that live in the pki root but belong elsewhere.)</p>
+<p>Cover the diagram and sort these from memory into their domains: <code>apiserver-etcd-client</code>, <code>front-proxy-client</code>, <code>sa.key</code>, <code>etcd/peer</code>, <code>apiserver-kubelet-client</code>. (Two are trick entries — they live in the pki root folder alongside cluster-CA files, but the notary that actually signed them is a different one.)</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>sa.key/sa.pub</code> is the pair people mislabel in study groups: it never expires, has no CA, and <code>openssl x509</code> chokes on it (it's a bare RSA key — inspect with <code>openssl rsa -in sa.key -noout -text</code>). If the apiserver and controller-manager somehow use different <code>sa</code> keys, every ServiceAccount token in the cluster is rejected — an outage signature worth filing away.</p>
+<p><code>sa.key</code>/<code>sa.pub</code> is the pair people mislabel in study groups, because it doesn't behave like the others: it never expires, has no CA, and <code>openssl x509</code> simply refuses to read it — because it's not a certificate at all, just a bare RSA key pair (inspect it with <code>openssl rsa -in sa.key -noout -text</code> instead). If the apiserver and controller-manager somehow end up pointed at different <code>sa</code> keys, every ServiceAccount token in the entire cluster gets rejected at once — an outage signature specific enough to be worth filing away for week 6.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"PKI certificates and requirements"</strong> — keep it open for 2.6 and 2.7 too.</p>
 </article>
@@ -351,10 +352,10 @@ front-proxy-client → issuer=CN = <b>front-proxy-ca</b></pre></li>
 <div class="lesson-head"><span class="cp-id">2.6</span><h4>Inspect a certificate by hand: subject, issuer, SANs, expiry</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>One openssl invocation answers four exam-relevant questions about any cert: who is this (Subject), who vouches for it (Issuer), which names is it valid for (SANs), and until when (Validity). Faults live in all four fields.</p>
+<p>A certificate is really just a small text document with four questions answered inside it, and <strong>openssl</strong> (the command-line tool for reading and manipulating certificates and keys) can print all four in one shot: who is this (Subject), who vouches for it (Issuer), which names is it allowed to be presented for (SANs — Subject Alternative Names), and until when is it valid (Validity). Every certificate fault you'll meet lives in one of those four fields, so being fluent in reading them is the actual skill here — memorizing specific error messages is not.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>The one command to memorize:
+<li>Here's the one command worth memorizing outright — it pulls all four fields at once:
 <pre class="cmd">sudo openssl x509 -in /etc/kubernetes/pki/apiserver.crt -text -noout | \
   grep -A1 -E 'Issuer|Subject:|Not After|Alternative'</pre>
 <pre class="out">        Issuer: CN = <b>kubernetes</b>
@@ -365,19 +366,19 @@ front-proxy-client → issuer=CN = <b>front-proxy-ca</b></pre></li>
             X509v3 Subject Alternative Name:
                 DNS:cp, DNS:kubernetes, DNS:kubernetes.default, DNS:kubernetes.default.svc,
                 DNS:kubernetes.default.svc.cluster.local, <b>IP Address:10.96.0.1, IP Address:10.211.64.10</b></pre></li>
-<li>Decode the SAN list — every entry is a name some client dials:
+<li>Decode the SAN list — this is the part people skim past, but every single entry in it is a name some real client actually dials to reach this server:
 <table>
 <tr><th>SAN</th><th>Who uses it</th></tr>
 <tr><td><code>kubernetes.default.svc[.cluster.local]</code></td><td>in-cluster clients via the <code>kubernetes</code> Service</td></tr>
 <tr><td><code>10.96.0.1</code></td><td>same Service's ClusterIP — always the <em>first</em> IP of the service CIDR</td></tr>
 <tr><td><code>10.211.64.10</code> / <code>cp</code></td><td>kubelets and your kubectl hitting the node directly</td></tr>
 </table>
-<p>Add a load balancer or a second hostname without regenerating this cert, and every client using that name gets a TLS failure.</p></li>
-<li>Simulate the diagnosis without breaking anything — ask for a name that isn't in the SANs:
+<p>The consequence follows directly: add a load balancer or a second hostname later without regenerating this cert to include it, and every client that tries to use that new name gets a TLS failure — the server's identity document simply doesn't cover that name.</p></li>
+<li>See that failure happen on purpose, without breaking anything real — dial a name that deliberately isn't in the SAN list:
 <pre class="cmd">curl --cacert /etc/kubernetes/pki/ca.crt --resolve fake-lb:6443:127.0.0.1 https://fake-lb:6443/version 2&gt;&amp;1 | tail -2</pre>
 <pre class="out">curl: (60) SSL: <b>certificate subject name does not match target host name 'fake-lb'</b></pre>
-<p>kubectl phrases the same failure as <em>"x509: certificate is valid for cp, kubernetes, ... not fake-lb"</em>. Either wording means: SAN list vs dialed name mismatch. Fix: regenerate with the extra SAN (<code>kubeadm init phase certs apiserver --apiserver-cert-extra-sans fake-lb</code> after deleting the old pair) — or dial a name that's on the list.</p></li>
-<li>Sweep expiry across the whole directory in one go:
+<p>kubectl phrases the exact same failure differently — as <em>"x509: certificate is valid for cp, kubernetes, ... not fake-lb"</em> — but it's the identical underlying problem either way: the SAN list and the name you dialed don't match. The fix follows directly from the diagnosis: either regenerate the cert with the extra name added (<code>kubeadm init phase certs apiserver --apiserver-cert-extra-sans fake-lb</code>, after deleting the old cert/key pair so kubeadm knows to make a new one), or simply dial a name that's already on the list.</p></li>
+<li>One more sweep worth doing: check expiry across the whole directory in one go, so you know at a glance which certs are close to their deadline:
 <pre class="cmd">sudo find /etc/kubernetes/pki -name '*.crt' \
   -exec sh -c 'echo -n "{} → "; openssl x509 -in {} -noout -enddate' \;</pre>
 <pre class="out">/etc/kubernetes/pki/apiserver.crt → notAfter=Jul 10 09:19:02 <b>2027</b> GMT
@@ -387,7 +388,7 @@ front-proxy-client → issuer=CN = <b>front-proxy-ca</b></pre></li>
 <h5 class="verify">Verify</h5>
 <p>Without notes: which four openssl output fields answer "who / vouched by whom / for which names / until when", and what error signature a SAN mismatch produces in kubectl.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>"Certificate is valid for X, not Y" is a <em>name</em> problem, not an expiry problem — don't reflexively renew (renewal keeps the same SANs and fixes nothing). Conversely an expired cert says <em>"certificate has expired or is not yet valid"</em> — that one 2.7 fixes. Read the error before choosing the tool.</p>
+<p>The single most useful habit this lesson builds: read the error message before reaching for a tool. <em>"Certificate is valid for X, not Y"</em> is a <em>name</em> problem, not an expiry problem — renewing it reflexively fixes nothing, because renewal keeps the exact same SAN list. An expired cert, by contrast, says something completely different: <em>"certificate has expired or is not yet valid"</em> — and that one actually is fixed by renewal, which is 2.7's lesson. Two different sentences, two different root causes, two different fixes.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"PKI certificates and requirements"</strong>. openssl itself isn't in the k8s docs — the invocation above has to live in your fingers.</p>
 </article>
@@ -396,12 +397,12 @@ front-proxy-client → issuer=CN = <b>front-proxy-ca</b></pre></li>
 <div class="lesson-head"><span class="cp-id">2.7</span><h4>Check expiry and renew everything with kubeadm certs</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"The cluster's certificates expire soon — renew them" is about as literal as exam tasks get. The trap is the second half everyone forgets: renewed files on disk change nothing until the control-plane processes restart.</p>
+<p>"The cluster's certificates expire soon — renew them" is about as literal as exam tasks get. The trap is the half everyone forgets: renewed files sitting on disk change absolutely nothing on their own, because — as you saw in 2.1's gotcha — a running process keeps using the certificate it loaded at start-up, not whatever's currently on disk. Renewal without a restart is renewal that does nothing.</p>
 <h5>The concept</h5>
-<p>kubeadm leaf certificates last <strong>1 year</strong>; the CAs last <strong>10 years</strong> (both tunable via <code>certificateValidityPeriod</code> / <code>caCertificateValidityPeriod</code> in the kubeadm config). <code>kubeadm certs renew</code> re-signs leaf certs with the existing CA — including the client certs <em>embedded inside</em> admin.conf, scheduler.conf and controller-manager.conf. Two facts explain the whole workflow: certs are loaded at process start (so: restart after renewing), and <code>kubeadm upgrade apply</code> renews everything as a side effect (so: clusters that upgrade regularly never hit the 1-year wall).</p>
+<p>kubeadm's day-to-day <strong>leaf certificates</strong> (the individual certs like <code>apiserver.crt</code>, as opposed to the CA certs that sign them) last <strong>1 year</strong> by default; the <strong>CAs</strong> themselves last <strong>10 years</strong> (both are tunable via <code>certificateValidityPeriod</code> / <code>caCertificateValidityPeriod</code> in the kubeadm config, if you ever need to change them). <code>kubeadm certs renew</code> re-signs every leaf cert using the existing CA — no new notary, just a fresh signature and a fresh expiry date — including the client certs that are <em>embedded inside</em> admin.conf, scheduler.conf, and controller-manager.conf, not just the standalone files under <code>pki/</code>. Two facts explain the entire workflow you're about to run: certificates are loaded once, at process start (so renewing always has to be followed by a restart), and <code>kubeadm upgrade apply</code> renews everything automatically as a side effect (so a cluster that gets upgraded regularly never actually hits the 1-year wall in practice).</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Read the expiry dashboard:
+<li>Start by reading the expiry dashboard — one command lists every certificate kubeadm manages and how long each has left:
 <pre class="cmd">sudo kubeadm certs check-expiration</pre>
 <pre class="out">CERTIFICATE                EXPIRES                  RESIDUAL TIME   CERTIFICATE AUTHORITY   EXTERNALLY MANAGED
 admin.conf                 Jul 10, 2027 09:19 UTC   364d            ca                      no
@@ -411,28 +412,28 @@ apiserver-etcd-client      Jul 10, 2027 09:19 UTC   364d            <b>etcd-ca</
 CERTIFICATE AUTHORITY   EXPIRES                  RESIDUAL TIME
 ca                      Jul 08, 2036 09:14 UTC   <b>9y</b>
 etcd-ca                 Jul 08, 2036 09:14 UTC   9y</pre>
-<p>Notice what's <em>missing</em>: <code>kubelet.conf</code>. The kubelet renews its own client cert automatically (2.8), so kubeadm doesn't track it.</p></li>
-<li>Renew everything:
+<p>Notice what's <em>missing</em> from that list: <code>kubelet.conf</code>. That's not an oversight — the kubelet manages and renews its own client cert automatically (2.8 covers exactly how), so there's nothing here for kubeadm to track or renew on its behalf.</p></li>
+<li>Now renew everything in one command:
 <pre class="cmd">sudo kubeadm certs renew all</pre>
 <pre class="out">certificate embedded in the kubeconfig file for the admin to use ... <b>renewed</b>
 certificate for serving the Kubernetes API <b>renewed</b>
 ...
 <b>You must restart the kube-apiserver, kube-controller-manager, kube-scheduler and etcd, so that they can use the new certificates.</b></pre></li>
-<li>Do what it says — bounce all four static pods at once by moving their manifests out for ~30s:
+<li>The output just told you exactly what to do next — do it. Bounce all four static pods at once by moving their manifests out of the watched directory for ~30 seconds and back in: the kubelet notices the directory go empty, stops the pods, then notices the files return and starts fresh ones that load the newly-renewed certs:
 <pre class="cmd">sudo mkdir -p /tmp/mk &amp;&amp; sudo mv /etc/kubernetes/manifests/*.yaml /tmp/mk/
 sleep 30 &amp;&amp; sudo mv /tmp/mk/*.yaml /etc/kubernetes/manifests/
 kubectl get nodes    # give it ~30s more; expect a refused connection first, then success</pre>
 <pre class="out">The connection to the server 10.211.64.10:6443 was refused ...   ← normal mid-restart
 NAME   STATUS   ROLES           AGE   VERSION
 cp     Ready    control-plane   2h    v1.34.x</pre></li>
-<li>Refresh your own credentials (your <code>~/.kube/config</code> is a <em>copy</em> of the old admin.conf — renewal didn't touch it):
+<li>One more thing renewal doesn't reach: refresh your own credentials. Your <code>~/.kube/config</code> is a <em>copy</em> you made of the old admin.conf back at setup time — renewal touched the original file, not your copy, so your copy is now stale:
 <pre class="cmd">sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config &amp;&amp; sudo chown $(id -u):$(id -g) $HOME/.kube/config</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
 <pre class="cmd">sudo kubeadm certs check-expiration | grep apiserver | head -1</pre>
 <pre class="out">apiserver    Jul 10, 2027 10:41 UTC   <b>364d</b>   ca   no      ← timestamp moved to just now</pre>
 <h5 class="gotcha">Gotchas</h5>
-<p>Renewal renews <em>leaf</em> certs only — an expiring <strong>CA</strong> is a different, much heavier procedure (docs: "Manual Rotation of CA Certificates"; know it exists, don't memorize it). And if kubectl starts failing with <em>"certificate signed by unknown authority"</em> right after your renew+restart, that's your stale <code>~/.kube/config</code> copy — step 4, not a broken cluster.</p>
+<p><code>kubeadm certs renew</code> only ever touches <em>leaf</em> certificates — an expiring <strong>CA</strong> itself is a different, much heavier procedure that involves re-signing everything downstream of it (docs: "Manual Rotation of CA Certificates"; know that it exists and where to find it, don't try to memorize the steps). And if kubectl starts failing with <em>"certificate signed by unknown authority"</em> right after you renew and restart, don't assume the cluster is broken — check step 4 first. That error is exactly what a stale <code>~/.kube/config</code> copy produces.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Certificate Management with kubeadm"</strong> — contains the check/renew commands and the restart warning verbatim.</p>
 </article>
@@ -441,24 +442,24 @@ cp     Ready    control-plane   2h    v1.34.x</pre></li>
 <div class="lesson-head"><span class="cp-id">2.8</span><h4>Find the kubelet's own client cert and confirm rotation is on</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The kubelet is the one client that manages its own certificate lifecycle. Knowing where that cert lives — and that <code>kubelet.conf</code> merely points at it — demystifies both the check-expiration gap from 2.7 and a class of node-auth failures.</p>
+<p>Every other component in the cluster gets its certificate handed to it once by kubeadm and just keeps using that same file. The kubelet is the one exception — it's the single client that manages its own certificate lifecycle, quietly requesting itself a new one before the old one runs out. Knowing where that self-managed cert actually lives, and that <code>kubelet.conf</code> merely points at it rather than containing it, demystifies both the gap you noticed in 2.7's expiry dashboard and a whole class of node-authentication failures.</p>
 <h5>The concept</h5>
-<p>At join time the kubelet gets a short-lived cert via TLS bootstrap (2.10). From then on it re-requests a fresh client cert via the CSR API <em>before</em> expiry — that's <code>rotateCertificates: true</code> in its config. Each new cert lands in <code>/var/lib/kubelet/pki/</code>, and a symlink <code>kubelet-client-current.pem</code> always names the newest one. <code>kubelet.conf</code> doesn't embed cert data like the other kubeconfigs — it references the symlink path, so rotation never has to rewrite it.</p>
+<p>At join time the kubelet gets a short-lived starter certificate through the TLS bootstrap flow (2.10 walks through this step by step). From then on, before that certificate is due to expire, the kubelet requests itself a fresh one through the CSR (CertificateSigningRequest) API — that automatic behavior is what <code>rotateCertificates: true</code> in its config turns on. Each new certificate lands as a new file in <code>/var/lib/kubelet/pki/</code>, and a symlink named <code>kubelet-client-current.pem</code> always points at whichever one is newest. Here's the detail that makes rotation seamless: unlike the other kubeconfigs, <code>kubelet.conf</code> doesn't embed the certificate's actual bytes inline — it just references that symlink's path. So each time rotation happens and the symlink target changes, <code>kubelet.conf</code> itself never has to be rewritten at all.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Look at the rotation trail on any node:
+<li>Look at the rotation trail on any node — the directory holds every certificate the kubelet has ever issued itself, not just the current one:
 <pre class="cmd">sudo ls -l /var/lib/kubelet/pki/</pre>
 <pre class="out">-rw------- 1 root root 1113 Jul 10 09:20 kubelet-client-2026-07-10-09-20-15.pem
 lrwxrwxrwx 1 root root   59 Jul 10 09:20 <b>kubelet-client-current.pem -&gt; /var/lib/kubelet/pki/kubelet-client-2026-07-10-09-20-15.pem</b>
 -rw-r--r-- 1 root root 2258 Jul 10 09:14 kubelet.crt      ← self-signed serving cert (unrelated)
 -rw------- 1 root root 1675 Jul 10 09:14 kubelet.key</pre></li>
-<li>Confirm kubelet.conf points at the symlink instead of embedding data:
+<li>Confirm kubelet.conf really does just point at the symlink, rather than embedding certificate data the way admin.conf and the others do:
 <pre class="cmd">sudo grep client-cert /etc/kubernetes/kubelet.conf</pre>
 <pre class="out">    client-certificate: <b>/var/lib/kubelet/pki/kubelet-client-current.pem</b></pre></li>
-<li>Check rotation is enabled in the kubelet's config file:
+<li>Confirm rotation is actually switched on in the kubelet's own config file:
 <pre class="cmd">sudo grep -i rotate /var/lib/kubelet/config.yaml</pre>
 <pre class="out"><b>rotateCertificates: true</b></pre></li>
-<li>Read the identity inside — it's the CN=user / O=group pattern again, node-flavored:
+<li>Finally, read the identity baked into that certificate — it's the same CN=user / O=group pattern from 2.3, just node-flavored this time:
 <pre class="cmd">sudo openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -subject -enddate</pre>
 <pre class="out">subject=<b>O = system:nodes, CN = system:node:cp</b>
 notAfter=Jul 10 09:15:00 2027 GMT</pre></li>
@@ -466,7 +467,7 @@ notAfter=Jul 10 09:15:00 2027 GMT</pre></li>
 <h5 class="verify">Verify</h5>
 <p>You can answer: where does the kubelet's client cert live, what keeps it fresh, and why doesn't <code>kubeadm certs check-expiration</code> list kubelet.conf?</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Rotation needs a <em>working apiserver</em> to file the CSR — a node that was powered off past its cert expiry can't rejoin by itself; its kubelet logs show <em>"part of the existing bootstrap client certificate is expired"</em>. The repair is a manual re-bootstrap (docs: "kubelet client certificate rotation fails"). Also don't confuse the pair in that directory: <code>kubelet-client-*</code> is the rotated <em>client</em> identity; <code>kubelet.crt/key</code> is a self-signed <em>serving</em> cert for the kubelet's own :10250 API.</p>
+<p>Rotation isn't magic — it still needs a <em>working apiserver</em> to actually file the CSR against. So a node that was powered off long enough for its certificate to expire past that point can't just quietly rejoin on its own; its kubelet logs show <em>"part of the existing bootstrap client certificate is expired"</em>, and the fix is a manual re-bootstrap (docs: "kubelet client certificate rotation fails"). Also don't confuse the two similarly-named files in that directory: <code>kubelet-client-*</code> is the rotated <em>client</em> identity used when the kubelet talks to the apiserver, while <code>kubelet.crt</code>/<code>kubelet.key</code> is an unrelated, self-signed <em>serving</em> certificate the kubelet presents on its own <code>:10250</code> API when something else (like the apiserver, for logs/exec) connects to it.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Configure Certificate Rotation for the Kubelet"</strong> and (troubleshooting) <strong>"Troubleshooting kubeadm"</strong>.</p>
 </article>
@@ -479,16 +480,16 @@ notAfter=Jul 10 09:15:00 2027 GMT</pre></li>
 <div class="lesson-head"><span class="cp-id">2.9</span><h4>Mint a fresh join command and understand token lifecycle</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Join this node to the cluster" is a staple task, and the token from init is long gone — the exam expects you to mint one. Tokens are also just Secrets, which makes their whole lifecycle inspectable.</p>
+<p>A brand-new node has no certificate yet, so it can't authenticate the normal way — it needs a one-time, low-privilege credential just to get in the door and request its own certificate. That's a <strong>bootstrap token</strong>. "Join this node to the cluster" is a staple exam task, and the token minted back at init time is long gone by the time you sit the exam — you're expected to mint a fresh one from scratch. The reassuring part: a token is nothing exotic, it's stored as an ordinary Kubernetes Secret, which means its entire lifecycle — creation, inspection, expiry, deletion — is visible with plain <code>kubectl</code>.</p>
 <h5>The concept</h5>
-<p>A bootstrap token is a credential of the form <code>id.secret</code> (e.g. <code>abcdef.0123456789abcdef</code>), stored as a Secret of type <code>bootstrap.kubernetes.io/token</code> in kube-system, valid for <strong>24 hours by default</strong>. It authenticates a joining kubelet as a member of <code>system:bootstrappers</code> — a group whose powers are deliberately tiny (next lesson). Deleting the Secret revokes the token instantly.</p>
+<p>A bootstrap token is a credential string shaped like <code>id.secret</code> (for example <code>abcdef.0123456789abcdef</code>), stored as a Secret of type <code>bootstrap.kubernetes.io/token</code> in the kube-system namespace, valid for <strong>24 hours by default</strong>. Presenting it authenticates a joining kubelet as a member of the group <code>system:bootstrappers</code> — a group whose powers are deliberately kept tiny, as the next lesson shows in detail. Because it's just a Secret, deleting that Secret revokes the token instantly, with no separate revocation mechanism to learn.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>On <code>cp</code>, mint a token with the full join line in one shot:
+<li>On <code>cp</code>, mint a token and get the full ready-to-paste join command in one shot:
 <pre class="cmd">kubeadm token create --print-join-command</pre>
 <pre class="out"><b>kubeadm join 10.211.64.10:6443 --token dz54cd.n2akm3fq07k5vfy8 \
   --discovery-token-ca-cert-hash sha256:9a3c1e...d47f</b></pre></li>
-<li>See it in both views — the kubeadm view and the raw Secret underneath:
+<li>See the same token from both angles — kubeadm's friendly summary, and the raw Secret it's actually backed by:
 <pre class="cmd">kubeadm token list
 kubectl -n kube-system get secret bootstrap-token-dz54cd -o yaml | head -12</pre>
 <pre class="out">TOKEN                     TTL   EXPIRES                USAGES                   DESCRIPTION   EXTRA GROUPS
@@ -500,12 +501,12 @@ data:
   token-secret: ...
 kind: Secret
 type: <b>bootstrap.kubernetes.io/token</b></pre></li>
-<li>Use it: reset node02 (as in 2.2 step 1, including <code>kubectl delete node node02</code> on cp), then paste the join line on node02 with sudo. Watch it come back:
+<li>Put it to use: reset node02 (as in 2.2 step 1, including <code>kubectl delete node node02</code> on cp), then paste the join line on node02 with sudo. Watch it come back online:
 <pre class="cmd">kubectl get nodes -w</pre>
 <pre class="out">NAME     STATUS     ROLES    AGE   VERSION
 node02   NotReady   &lt;none&gt;   5s    v1.34.x
 node02   <b>Ready</b>      &lt;none&gt;   40s   v1.34.x</pre></li>
-<li>Practice revocation — mint a second token and kill it:
+<li>Now practice the other direction — revocation. Mint a second token, then kill it before it's ever used:
 <pre class="cmd">kubeadm token create
 kubeadm token delete &lt;the-new-token-id&gt;</pre>
 <pre class="out">bootstrap token "&lt;id&gt;" deleted</pre></li>
@@ -513,7 +514,7 @@ kubeadm token delete &lt;the-new-token-id&gt;</pre>
 <h5 class="verify">Verify</h5>
 <p>node02 is Ready again, and <code>kubeadm token list</code> shows exactly the tokens you expect (the used one still valid, the revoked one gone).</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>kubeadm token create --ttl 0</code> makes a token that never expires — handy in a throwaway lab, an audit finding anywhere real. And if a join fails with <em>"token is invalid or has expired"</em>, don't debug the network for twenty minutes: minting a fresh token is a 5-second test that rules out the most common cause.</p>
+<p><code>kubeadm token create --ttl 0</code> makes a token that never expires — convenient for a throwaway lab where you're joining nodes on and off all day, but an audit finding waiting to happen on anything real, since it means a permanently valid way for a new node to talk its way into the cluster. And if a join fails with <em>"token is invalid or has expired"</em>, don't lose twenty minutes debugging the network first: minting a fresh token and retrying is a five-second test that rules out the single most common cause immediately.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"kubeadm token"</strong> and <strong>"kubeadm join"</strong>.</p>
 </article>
@@ -522,30 +523,30 @@ kubeadm token delete &lt;the-new-token-id&gt;</pre>
 <div class="lesson-head"><span class="cp-id">2.10</span><h4>Watch the TLS bootstrap flow a join actually performs</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Understanding the four-step handshake under <code>kubeadm join</code> turns node-onboarding failures from voodoo into a pipeline you can bisect — and it's the same CSR machinery week 7 uses to onboard <em>humans</em>.</p>
+<p>2.9 showed you the token; this lesson shows what actually happens with it, step by step, in the seconds between pasting the join command and the node turning <code>Ready</code>. Understanding this four-step handshake turns node-onboarding failures from voodoo into a pipeline you can bisect — check which step happened and which didn't. It's also the exact same CSR (CertificateSigningRequest) machinery week 7 reuses to onboard <em>human</em> users, so learning it once pays out twice.</p>
 <h5>The concept</h5>
 <div class="flow"><span>token auth</span><em>→</em><span>group system:bootstrappers</span><em>→</em><span>kubelet creates CSR</span><em>→</em><span class="hot">csrapprover auto-approves</span><em>→</em><span>signed client cert</span><em>→</em><span>kubelet.conf written</span></div>
 <ol>
-<li>The kubelet connects with the <strong>bootstrap token</strong> — authenticating as group <code>system:bootstrappers</code>, whose RBAC grants exactly one meaningful power: <em>create CertificateSigningRequests</em>.</li>
-<li>It submits a CSR for identity <code>CN=system:node:&lt;name&gt;, O=system:nodes</code> with signer <code>kubernetes.io/kube-apiserver-client-kubelet</code>.</li>
-<li>The <strong>csrapproving</strong> controller in kube-controller-manager auto-approves CSRs that match the node-client pattern from a bootstrapper. (Only this signer is auto-approved — that's why human CSRs in week 7 need manual approval.)</li>
-<li>The kubelet downloads the signed cert into <code>/var/lib/kubelet/pki/</code> and writes <code>kubelet.conf</code> pointing at it. The token's job is done; from here, 2.8's rotation takes over.</li>
+<li>The joining kubelet connects and presents the <strong>bootstrap token</strong> — the apiserver authenticates it as a member of the group <code>system:bootstrappers</code>, a group whose RBAC grants exactly one meaningful power: <em>create CertificateSigningRequests</em>. Nothing more.</li>
+<li>Using that one power, it submits a CSR asking to be recognized as <code>CN=system:node:&lt;name&gt;, O=system:nodes</code> — the real node identity it wants — tagged with signer <code>kubernetes.io/kube-apiserver-client-kubelet</code>, which tells the apiserver what kind of certificate is being requested.</li>
+<li>The <strong>csrapproving</strong> controller, running inside kube-controller-manager, watches for exactly this pattern — a node-client CSR submitted by an identity that came in via a bootstrap token — and auto-approves it without a human involved. This narrow auto-approval is specific to that one signer and that one pattern; it's precisely why the human-onboarding CSRs in week 7 need someone to manually click approve instead.</li>
+<li>The kubelet downloads its newly-signed certificate into <code>/var/lib/kubelet/pki/</code> and writes <code>kubelet.conf</code> to point at it. At this point the token's entire job is finished — from here on, 2.8's automatic rotation takes over maintaining this certificate for the rest of the node's life.</li>
 </ol>
-<p>And the flag mirror-image: the token proves the <em>node</em> to the cluster, while <code>--discovery-token-ca-cert-hash</code> proves the <em>cluster</em> to the node — it pins the CA public key, so a spoofed apiserver can't trick your kubelet into joining and shipping it credentials.</p>
+<p>One more piece worth noticing: the join command actually carries two credentials working in opposite directions. The token proves the <em>node</em> is legitimate to the cluster (steps 1–3 above); the <code>--discovery-token-ca-cert-hash</code> flag proves the <em>cluster</em> is legitimate to the node — it pins a fingerprint of the CA's public key, so a spoofed apiserver sitting on the network can't trick your kubelet into joining it and handing over credentials to an attacker.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Redo the 2.9 join, but this time keep a watch running on <code>cp</code> <em>before</em> you paste the join command on node02:
+<li>Redo the 2.9 join, but this time keep a live watch running on <code>cp</code> <em>before</em> you paste the join command on node02, so you can see the CSR appear and get approved in real time:
 <pre class="cmd">kubectl get csr -w</pre>
 <pre class="out">NAME        AGE   SIGNERNAME                                      REQUESTOR                  CONDITION
 csr-x7k2p   0s    <b>kubernetes.io/kube-apiserver-client-kubelet</b>     <b>system:bootstrap:dz54cd</b>   Pending
 csr-x7k2p   1s    kubernetes.io/kube-apiserver-client-kubelet     system:bootstrap:dz54cd    <b>Approved,Issued</b></pre>
-<p>Pending→Approved in about a second — that's step 3 happening live. The REQUESTOR column shows the token identity (<code>system:bootstrap:&lt;id&gt;</code>), not a node name: the node identity doesn't exist yet, it's what's being requested.</p></li>
-<li>Inspect what was requested and what was granted:
+<p>Pending→Approved in about a second — that's step 3 from the concept above, happening live in front of you. Notice the REQUESTOR column shows the token's own identity (<code>system:bootstrap:&lt;id&gt;</code>), not a node name — that's not a display quirk, it's because the node identity doesn't exist yet at the moment of asking; it's literally the thing being requested.</p></li>
+<li>Inspect exactly what was requested versus what was actually granted:
 <pre class="cmd">kubectl get csr csr-x7k2p -o jsonpath='{.spec.username}{"  →  "}{.status.conditions[0].type}{"\n"}'
 kubectl get csr csr-x7k2p -o jsonpath='{.status.certificate}' | base64 -d | openssl x509 -noout -subject</pre>
 <pre class="out">system:bootstrap:dz54cd  →  Approved
 subject=<b>O = system:nodes, CN = system:node:node02</b></pre></li>
-<li>Verify the bootstrapper group's power is really that narrow:
+<li>Confirm the bootstrapper group's power really is as narrow as claimed — one power granted, everything else denied:
 <pre class="cmd">kubectl auth can-i create certificatesigningrequests --as system:bootstrap:dz54cd
 kubectl auth can-i create pods --as system:bootstrap:dz54cd</pre>
 <pre class="out"><b>yes</b>
@@ -554,7 +555,7 @@ kubectl auth can-i create pods --as system:bootstrap:dz54cd</pre>
 <h5 class="verify">Verify</h5>
 <p>Narrate the four steps and name which component acts in each (kubelet, apiserver authn, csrapproving controller, kubelet again) — plus what each of the two join-command credentials protects against.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>A join that hangs at <em>"waiting for the kubelet to perform the TLS Bootstrap"</em> means the CSR round-trip stalled: check <code>kubectl get csr</code> — a forever-<code>Pending</code> CSR points at the controller-manager (down, or its csrapprover misconfigured), while <em>no CSR at all</em> points earlier: token/connectivity/preflight on the node itself.</p>
+<p>A join that hangs at <em>"waiting for the kubelet to perform the TLS Bootstrap"</em> means the CSR round-trip stalled somewhere — and <code>kubectl get csr</code> tells you roughly where. A CSR that's stuck forever in <code>Pending</code> points at a problem later in the chain: the controller-manager is down, or its csrapprover isn't approving as expected. <em>No CSR at all</em> ever showing up points earlier: the token, network connectivity, or a preflight check failing on the node itself, before it ever got far enough to submit a request.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"TLS bootstrapping"</strong> and <strong>"Certificate Signing Requests"</strong>.</p>
 </article>
@@ -563,9 +564,9 @@ kubectl auth can-i create pods --as system:bootstrap:dz54cd</pre>
 <div class="lesson-head"><span class="cp-id">2.11</span><h4>Know the two HA topologies and what the load balancer is for</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>You won't build an HA cluster in the exam, but topology questions hide inside other tasks ("why does the kubeconfig point at a name that isn't a node?"), and the concepts — quorum, controlPlaneEndpoint — explain flags you'll meet everywhere.</p>
+<p><strong>HA</strong> (high availability) here means running <em>multiple</em> control-plane nodes instead of one, so the cluster survives losing any single machine. You won't build an HA cluster from scratch in the exam, but HA topology questions hide inside other tasks — "why does the kubeconfig point at a name that isn't any actual node?" — and the two ideas underneath it, quorum and <code>controlPlaneEndpoint</code>, explain flags and behaviors you'll run into throughout the exam even on a single-control-plane cluster.</p>
 <h5>The concept</h5>
-<p>Two blessed layouts:</p>
+<p>kubeadm supports two blessed layouts, which differ in exactly one thing — where etcd runs relative to the apiservers:</p>
 <table>
 <tr><th></th><th>Stacked etcd</th><th>External etcd</th></tr>
 <tr><td>Where etcd runs</td><td>on each control-plane node, beside the apiserver</td><td>its own dedicated hosts</td></tr>
@@ -573,22 +574,22 @@ kubectl auth can-i create pods --as system:bootstrap:dz54cd</pre>
 <tr><td>Failure coupling</td><td>losing a CP node loses an etcd member too</td><td>decoupled — pricier, more machines</td></tr>
 <tr><td>How kubeadm builds it</td><td><code>init --control-plane-endpoint lb:6443 --upload-certs</code>, then <code>join --control-plane</code></td><td>same, plus an etcd cluster you built separately</td></tr>
 </table>
-<p>Why <strong>3</strong>: etcd needs a Raft quorum (majority). 1 node → quorum 1; 2 nodes → quorum 2, so <em>either</em> failure halts writes (worse than 1!); 3 nodes → quorum 2, one node can die. That's week 1.9's math driving a purchasing decision.</p>
-<p>The <strong>load balancer</strong> is for the apiservers, not etcd: apiservers are stateless and hot-hot, so clients just need one stable name that spreads across them. That name — the <code>controlPlaneEndpoint</code> — gets baked into every kubeconfig <em>and into the apiserver cert's SANs</em> (2.6), which is why you must decide it at init time: retrofitting HA onto a cluster inited without it means cert and kubeconfig surgery everywhere. etcd needs no LB — its clients (the apiservers) know all member addresses natively.</p>
+<p>Why the minimum sensible size is specifically <strong>3</strong>, not 2: etcd needs a Raft <strong>quorum</strong> — a strict majority of members — to accept any write, the same consensus mechanics from week 1.9's "small committee" analogy. With 1 node, quorum is 1 (fine for learning, zero tolerance for failure). With 2 nodes, quorum is 2 — meaning <em>either</em> node failing halts every write, which is actually worse than running just 1. With 3 nodes, quorum is 2 — any single node can die and the cluster keeps accepting writes. That's week 1.9's arithmetic turning directly into a real purchasing and architecture decision here.</p>
+<p>The <strong>load balancer</strong> in the table exists for the apiservers, not for etcd. apiservers are stateless and can all serve the same request equally (often described as "hot-hot") — so clients just need one stable name that gets spread across whichever apiservers are healthy. That name is the <code>controlPlaneEndpoint</code>, and it gets baked into every kubeconfig <em>and into the apiserver certificate's SAN list</em> (the name-matching mechanism from 2.6) — which is exactly why you have to decide on it at init time: retrofitting HA onto a cluster that was inited without one means going back and doing certificate and kubeconfig surgery on every file, everywhere. etcd, by contrast, needs no load balancer at all — its only clients are the apiservers themselves, and they're configured with every member's address directly, so there's no "which one do I ask" ambiguity to solve.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Your lab cluster is the degenerate case — see what's <em>absent</em>:
+<li>Your lab cluster is the degenerate, non-HA case — single control-plane node, no load balancer — so look at what's simply <em>absent</em> compared to the HA picture above:
 <pre class="cmd">kubectl -n kube-system get cm kubeadm-config -o yaml | grep -i -A1 controlplane
 kubectl config view --minify | grep server</pre>
 <pre class="out">controlPlaneEndpoint: ""        ← empty: no HA was planned
     server: https://<b>10.211.64.10</b>:6443   ← clients pinned to one node's IP</pre>
-<p>On an HA cluster both would show the LB name. This empty string is the fork in the road.</p></li>
-<li>Thought-drill (write the answers down): (a) With 3 stacked CP nodes, how many can you lose and keep scheduling pods? (b) With 2? (c) Your kubeconfig points at <code>lb.example.com</code> but TLS fails with a SAN error — what was forgotten at init time?</li>
+<p>On an HA cluster, both of those lines would show the load balancer's name instead. This one empty string is the fork in the road that decides which of the two topologies you actually have.</p></li>
+<li>A short thought-drill to cement the quorum math — write the answers down before checking Verify: (a) With 3 stacked control-plane nodes, how many can you lose and still keep scheduling pods? (b) With 2? (c) Your kubeconfig points at <code>lb.example.com</code>, but TLS fails with a SAN mismatch error — what step was forgotten at init time?</li>
 </ol>
 <h5 class="verify">Verify</h5>
 <p>Answers: (a) one — quorum 2 of 3 survives; (b) none — quorum 2 of 2 means any loss halts etcd writes; (c) <code>lb.example.com</code> wasn't in <code>--apiserver-cert-extra-sans</code>/controlPlaneEndpoint, so it's missing from the apiserver cert's SANs.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>--upload-certs</code> stashes the control-plane certs as an encrypted Secret so joining CP nodes can fetch them — it expires after <strong>2 hours</strong> (re-run <code>kubeadm init phase upload-certs --upload-certs</code> to refresh). Don't confuse the two join flavors: plain <code>join</code> = worker, <code>join --control-plane --certificate-key ...</code> = another control-plane node.</p>
+<p><code>--upload-certs</code> stashes the control-plane certificates as an encrypted Secret so that additional joining control-plane nodes can fetch them without you copying files by hand — but that Secret expires after <strong>2 hours</strong> (re-run <code>kubeadm init phase upload-certs --upload-certs</code> to refresh it if the window closes). Don't confuse the two flavors of join: plain <code>join</code> brings up a worker, while <code>join --control-plane --certificate-key ...</code> brings up another control-plane node — same command, one extra flag, very different result.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Options for Highly Available Topology"</strong> and <strong>"Creating Highly Available Clusters with kubeadm"</strong>.</p>
 </article>
@@ -601,9 +602,9 @@ kubectl config view --minify | grep server</pre>
 <div class="lesson-head"><span class="cp-id">2.12</span><h4>Memorize the version skew rules</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The skew rules dictate the <em>order</em> of every upgrade you'll ever run — control plane first, kubelets after, one minor at a time. Get the rules into memory and the procedure in 2.13/2.14 stops being a recipe and starts being obvious.</p>
+<p><strong>Version skew</strong> is the set of rules for how far out of sync different Kubernetes components are allowed to be with each other at the same time — because during any rolling upgrade, old and new versions of different components necessarily coexist for a while, and only certain combinations have actually been tested. These rules dictate the <em>order</em> of every upgrade you'll ever run: control plane first, kubelets after, one minor version at a time, never the reverse. Get the rules into memory now and the procedure in 2.13/2.14 stops feeling like a recipe to follow and starts feeling obvious.</p>
 <h5>The concept</h5>
-<p>Everything is stated relative to <strong>kube-apiserver</strong>, the component nothing may be newer than:</p>
+<p>Every rule below is stated relative to one anchor point: <strong>kube-apiserver</strong>, the one component nothing else in the cluster is ever allowed to be newer than:</p>
 <table>
 <tr><th>Component</th><th>Allowed vs apiserver</th><th>With apiserver at 1.35</th></tr>
 <tr><td>kubelet</td><td>up to <b>3 minors older</b>, never newer</td><td>1.32 – 1.35</td></tr>
@@ -612,10 +613,10 @@ kubectl config view --minify | grep server</pre>
 <tr><td>kubectl</td><td><b>±1 minor</b> (the only one allowed newer)</td><td>1.34 – 1.36</td></tr>
 <tr><td>kubeadm (during upgrade)</td><td>upgrade to kubeadm's own minor; cluster may be 1 behind it</td><td>kubeadm 1.35 upgrades a 1.34 cluster</td></tr>
 </table>
-<p>And the iron rule: <strong>the apiserver moves one minor at a time</strong> — 1.33→1.35 means two full upgrade cycles, never one jump. All of this derives from one design constraint: during a rolling upgrade, old and new components coexist, so each pairing must be tested — and only adjacent (or near-adjacent) pairings are.</p>
+<p>And the one iron rule that ties everything together: <strong>the apiserver itself only ever moves one minor version at a time</strong> — going from 1.33 to 1.35 always means two separate, full upgrade cycles run back to back, never one jump straight across. All of this ultimately comes from a single design constraint mentioned above: during a rolling upgrade old and new components genuinely run side by side for a while, so every pairing that can occur has to have been tested by the Kubernetes project in advance — and only adjacent, or near-adjacent, version pairings ever are.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Audit your (deliberately old, if you did 2.2) lab against the table:
+<li>Audit your own lab cluster against the table above (it should be deliberately one minor behind, if you did the downgrade in 2.2):
 <pre class="cmd">kubectl version | grep Server
 kubectl get nodes -o custom-columns=NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion
 kubeadm version -o short</pre>
@@ -625,12 +626,12 @@ cp       v1.34.x
 node01   v1.34.x
 node02   v1.34.x
 v1.34.x</pre></li>
-<li>Skew quiz — answer from the table, then check: (a) apiserver 1.35, kubelet 1.31: legal? (b) apiserver 1.34, kubectl 1.35: legal? (c) apiserver 1.33 upgrading to 1.35 directly: legal? (d) During 2.13's upgrade, cp's apiserver will be 1.35 while node01's kubelet is 1.34 — legal?</li>
+<li>A short skew quiz — answer each from the table above before checking Verify: (a) apiserver 1.35, kubelet 1.31: legal? (b) apiserver 1.34, kubectl 1.35: legal? (c) apiserver 1.33 upgrading straight to 1.35 in one step: legal? (d) During 2.13's upgrade, cp's apiserver will briefly be 1.35 while node01's kubelet is still 1.34 — legal?</li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p>(a) no — 4 minors behind; (b) yes — kubectl may be 1 ahead; (c) no — one minor per hop; (d) yes — that window is exactly what the 3-minor kubelet allowance exists for.</p>
+<p>(a) no — 4 minors behind is one past the allowed 3; (b) yes — kubectl is the one component allowed to be a minor <em>ahead</em>; (c) no — the apiserver moves one minor per hop, so this needs two cycles; (d) yes — that in-between window is exactly the situation the 3-minor kubelet allowance exists to cover safely.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>The 3-minor kubelet allowance is a <em>ceiling for emergencies</em>, not a lifestyle: a kubelet 3 minors back can't use features its API objects may reference. In practice (and in the exam) you upgrade kubelets in the same session as the control plane. Also remember the kubelet is <em>never</em> allowed newer than the apiserver — upgrading node packages before the control plane is the classic ordering mistake.</p>
+<p>Don't mistake the 3-minor kubelet allowance for permission to leave kubelets behind indefinitely — it's a <em>ceiling for emergencies and rolling-upgrade windows</em>, not a lifestyle. A kubelet running 3 minors behind can't make use of features that newer API objects in the cluster might reference. In practice, and in the exam, you upgrade kubelets in the same session as the control plane, not weeks later. Also worth repeating because it's the classic ordering mistake: the kubelet is <em>never</em> allowed to be newer than the apiserver, so upgrading node packages before the control plane is the wrong order every time.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Version Skew Policy"</strong> (it's under kubernetes.io/releases — the docs search finds it).</p>
 </article>
@@ -639,14 +640,14 @@ v1.34.x</pre></li>
 <div class="lesson-head"><span class="cp-id">2.13</span><h4>Upgrade the control plane for real: v1.34 → v1.35</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The upgrade task appears on nearly every CKA. It's long, it's mechanical, and it's worth a lot of points to whoever has the sequence in muscle memory. You built the v1.34 fixture in 2.2 — now spend it.</p>
+<p>The upgrade task appears on nearly every CKA exam. It's long, it's mechanical, and it's worth a lot of points specifically to whoever already has the sequence in muscle memory rather than reconstructing it under time pressure. You deliberately built a one-minor-behind fixture back in 2.2 — this is where you spend it on a real upgrade.</p>
 <h5>The concept</h5>
-<p>The sequence, and why each step is where it is:</p>
+<p>Here's the full sequence, and the reasoning for why each step has to be where it is:</p>
 <div class="flow"><span>repo file → new minor</span><em>→</em><span>upgrade kubeadm pkg</span><em>→</em><span>kubeadm upgrade plan</span><em>→</em><span class="hot">kubeadm upgrade apply v1.35.x</span><em>→</em><span>drain cp</span><em>→</em><span>upgrade kubelet+kubectl pkgs</span><em>→</em><span>restart kubelet</span><em>→</em><span>uncordon cp</span></div>
-<p><code>upgrade apply</code> is mostly a <strong>manifest rewrite</strong>: it pulls new images, then replaces each static pod manifest in <code>/etc/kubernetes/manifests</code> one at a time, waiting for each new pod to go healthy before the next, rolling back automatically on failure. It also renews all certificates (2.7's side effect). What it <em>never</em> touches is the kubelet binary — that's yours, via apt, which is why the task has a second half at all. And the repo edit comes first because pkgs.k8s.io repos carry <em>only their own minor</em> (the 0.6 gotcha, now load-bearing).</p>
+<p>At its core, <code>upgrade apply</code> is mostly a <strong>manifest rewrite</strong>: it pulls the new container images, then replaces each static pod manifest in <code>/etc/kubernetes/manifests</code> one at a time — waiting for each freshly-restarted pod to report healthy before moving to the next, and rolling everything back automatically if one fails. As a side effect it also renews every certificate, the same operation from 2.7. What it deliberately <em>never</em> touches is the kubelet binary itself on disk — that stays entirely your responsibility via apt, which is exactly why this task has a whole second half. And the repo edit has to come first, before anything else, because the pkgs.k8s.io package repositories only ever carry packages for <em>one</em> minor version each — the same fact from 0.6's setup lesson, now load-bearing in a real upgrade.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>On <code>cp</code> — repoint the repo and upgrade <strong>kubeadm only</strong>:
+<li>On <code>cp</code> — first repoint the package repo at the new minor version, then upgrade <strong>kubeadm only</strong> (not kubelet yet — that comes later, deliberately):
 <pre class="cmd">sudo sed -i 's/v1\.34/v1.35/' /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update
 sudo apt-mark unhold kubeadm
@@ -655,7 +656,7 @@ sudo apt-get install -y kubeadm=1.35.x-1.1
 sudo apt-mark hold kubeadm
 kubeadm version -o short</pre>
 <pre class="out">v1.35.x</pre></li>
-<li>Ask kubeadm what it would do:
+<li>Before touching anything live, ask kubeadm what it's actually going to do — this is a dry-run, nothing is changed yet:
 <pre class="cmd">sudo kubeadm upgrade plan</pre>
 <pre class="out">[upgrade/versions] Cluster version: v1.34.x
 [upgrade/versions] kubeadm version: v1.35.x
@@ -666,8 +667,8 @@ kubelet     node01   v1.34.x    v1.35.x
 ...
 You can now apply the upgrade by executing the following command:
         <b>kubeadm upgrade apply v1.35.x</b></pre>
-<p>Read the "manually" table — kubeadm is telling you, in writing, that the kubelet half is your job.</p></li>
-<li>Apply. Watch the one-manifest-at-a-time choreography in the output:
+<p>Read the "manually" table carefully — kubeadm is telling you, in its own output, in writing, that the kubelet half of this job is entirely on you.</p></li>
+<li>Now actually apply the upgrade. Watch the output closely — it walks through each static pod one at a time, exactly as described in the concept above:
 <pre class="cmd">sudo kubeadm upgrade apply v1.35.x</pre>
 <pre class="out">[upgrade/staticpods] Preparing for "kube-apiserver" upgrade
 [upgrade/staticpods] Moved new manifest to "/etc/kubernetes/manifests/kube-apiserver.yaml" ...
@@ -676,7 +677,7 @@ You can now apply the upgrade by executing the following command:
 ... (controller-manager, scheduler follow one by one) ...
 [upgrade/successful] SUCCESS! Your cluster was upgraded to "v1.35.x". Enjoy!
 <b>[upgrade] Now you must upgrade kubelet and kubectl on each node</b></pre></li>
-<li>Now the node half. Drain, upgrade packages, restart, uncordon:
+<li>The control plane binaries are upgraded; now for the node half kubeadm just told you about — drain this node so no pods are running on it during the kubelet restart, upgrade the packages, restart, and bring it back into service:
 <pre class="cmd">kubectl drain cp --ignore-daemonsets
 sudo apt-mark unhold kubelet kubectl
 sudo apt-get install -y kubelet=1.35.x-1.1 kubectl=1.35.x-1.1
@@ -693,9 +694,9 @@ node/cp uncordoned</pre></li>
 cp       Ready    control-plane   3h    <b>v1.35.x</b>   ← upgraded
 node01   Ready    &lt;none&gt;          3h    v1.34.x   ← 2.14's job
 node02   Ready    &lt;none&gt;          3h    v1.34.x</pre>
-<p>The VERSION column shows <em>kubelet</em> versions — mixed right now, legally (2.12 d).</p>
+<p>That VERSION column is showing <em>kubelet</em> versions specifically, and right now they're mixed across the cluster — which is fine, that's exactly the legal in-between state 2.12(d) predicted.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Three classic stumbles: forgetting the <strong>repo edit</strong> (apt then insists 1.34.x is the newest kubeadm — nothing to upgrade to); forgetting <strong>unhold</strong> (install silently keeps the held version); and running <code>upgrade apply</code> with the old kubeadm binary. If <code>upgrade plan</code> shows kubeadm version = cluster version, your package didn't actually upgrade — check those two causes before anything else.</p>
+<p>Three classic stumbles, all worth checking for by name if something feels stuck: forgetting the <strong>repo edit</strong> (apt then insists the old minor is still the newest kubeadm available — there's nothing for it to upgrade to); forgetting <strong>unhold</strong> (the install command runs but silently keeps the previously-held version, since <code>apt-mark hold</code> is designed to resist exactly this); and running <code>upgrade apply</code> with the old kubeadm binary because the package upgrade in step 1 didn't actually take. If <code>upgrade plan</code> shows the kubeadm version equal to the cluster version, that's your signal — the package didn't upgrade, so check those two causes before anything else.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Upgrading kubeadm clusters"</strong> — during the exam, keep this page open and copy each command; it includes the repo-edit step people forget.</p>
 </article>
@@ -704,17 +705,17 @@ node02   Ready    &lt;none&gt;          3h    v1.34.x</pre>
 <div class="lesson-head"><span class="cp-id">2.14</span><h4>Upgrade a worker — and time yourself</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The worker procedure is the control-plane one minus the apply drama — but with a twist that trips people: <em>where</em> each command runs. Drain and uncordon talk to the API (run on cp); everything else changes the node itself (run on the worker).</p>
+<p>The worker upgrade procedure is essentially the control-plane one with the dramatic <code>upgrade apply</code> step removed — but it has its own twist that trips people up: <em>where</em> each command has to run. Drain and uncordon are API calls, so they only work from a machine with cluster credentials (<code>cp</code>); everything else changes files and packages on the node itself, so it has to run on the worker.</p>
 <h5>The concept</h5>
-<p><code>kubeadm upgrade node</code> on a worker is small but not skippable: it downloads the new cluster-wide kubelet configuration (from the <code>kubelet-config</code> ConfigMap the control-plane upgrade published) and rewrites the local config the kubelet will read on restart. No manifests to rotate here — workers have no control-plane static pods.</p>
+<p><code>kubeadm upgrade node</code> on a worker looks small, but it isn't skippable: it downloads the new cluster-wide kubelet configuration (published by the control-plane upgrade as the <code>kubelet-config</code> ConfigMap) and rewrites the local config file the kubelet will read the next time it restarts. There are no static pod manifests to rotate here at all, because workers don't run any control-plane components — that's the one piece of the control-plane procedure that simply doesn't apply.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Start a timer. From <code>cp</code>, drain the worker:
+<li>Start a timer — the whole point of this lesson is speed, not just correctness. From <code>cp</code>, drain the worker so its pods move off before the kubelet restarts:
 <pre class="cmd">kubectl drain node01 --ignore-daemonsets</pre>
 <pre class="out">node/node01 cordoned
 evicting pod kube-system/coredns-...
 <b>node/node01 drained</b></pre></li>
-<li>On <code>node01</code> — repo, kubeadm, upgrade node:
+<li>Switch to <code>node01</code> itself for the rest of this — repoint the repo, upgrade kubeadm, then run the worker-specific upgrade step:
 <pre class="cmd">sudo sed -i 's/v1\.34/v1.35/' /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update &amp;&amp; sudo apt-mark unhold kubeadm
 sudo apt-get install -y kubeadm=1.35.x-1.1 &amp;&amp; sudo apt-mark hold kubeadm
@@ -723,12 +724,12 @@ sudo kubeadm upgrade node</pre>
 [upgrade] Backing up kubelet config file to /etc/kubernetes/tmp/...
 <b>[upgrade] The configuration for this node was successfully updated!</b>
 [upgrade] Now you should go ahead and upgrade the kubelet package</pre></li>
-<li>Still on <code>node01</code> — kubelet + kubectl, restart:
+<li>Still on <code>node01</code> — now the kubelet and kubectl packages themselves, then restart the kubelet so it picks up both the new binary and the config <code>upgrade node</code> just rewrote:
 <pre class="cmd">sudo apt-mark unhold kubelet kubectl
 sudo apt-get install -y kubelet=1.35.x-1.1 kubectl=1.35.x-1.1
 sudo apt-mark hold kubelet kubectl
 sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart kubelet</pre></li>
-<li>Back on <code>cp</code> — return the node to service and stop the timer:
+<li>Back on <code>cp</code> — return the node to service by uncordoning it, and stop your timer:
 <pre class="cmd">kubectl uncordon node01
 kubectl get nodes</pre>
 <pre class="out">node/node01 uncordoned
@@ -736,12 +737,12 @@ NAME     STATUS   ROLES           AGE   VERSION
 cp       Ready    control-plane   3h    v1.35.x
 <b>node01   Ready    &lt;none&gt;          3h    v1.35.x</b>
 node02   Ready    &lt;none&gt;          3h    v1.34.x</pre></li>
-<li>Repeat for node02 <em>without looking at this page</em> — docs open, notes closed. Target: <strong>under 10 minutes</strong> per worker. Log both times in your notes.</li>
+<li>Now repeat the entire thing for node02 <em>without looking at this page</em> — docs open if you need them, your notes closed. Target: <strong>under 10 minutes</strong> per worker. Log both times so you can see yourself improve.</li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p>All three nodes report v1.35.x, every pod in kube-system is Running, and your second worker was faster than your first.</p>
+<p>All three nodes report v1.35.x, every pod in kube-system is Running, and your second worker was faster than your first — that improvement is the actual point of repeating this drill.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Wrong-terminal errors are the time sink: <code>drain</code> on the worker fails (no kubeconfig there), <code>kubeadm upgrade node</code> on cp does the wrong thing (it would act as a control-plane node upgrade). Say it out loud each time: <em>API verbs from cp, node surgery on the node.</em> Forgetting <code>uncordon</code> costs silent points — the task is graded on the node being schedulable again.</p>
+<p>Wrong-terminal errors are the real time sink here, not the commands themselves: running <code>drain</code> on the worker fails outright (it has no kubeconfig with cluster credentials), while running <code>kubeadm upgrade node</code> on <code>cp</code> does something you didn't intend — it acts as a control-plane node upgrade instead. Say the rule out loud each time until it's automatic: <em>API verbs run from cp, node surgery runs on the node itself.</em> And forgetting <code>uncordon</code> at the end costs silent points on the real exam — grading checks whether the node is schedulable again, not just whether the version bumped.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Upgrading kubeadm clusters"</strong> — the worker section is at the bottom of the same page.</p>
 </article>
@@ -750,9 +751,9 @@ node02   Ready    &lt;none&gt;          3h    v1.34.x</pre></li>
 <div class="lesson-head"><span class="cp-id">2.15</span><h4>What drain really does — and when it refuses</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>You've now typed <code>drain</code> four times on faith. It's also a standalone exam task ("make the node unschedulable and move workloads off it") — and its refusal messages are a mini-exam in themselves: each names its own fix.</p>
+<p>You've now typed <code>drain</code> four times on faith, trusting it to safely empty a node before an upgrade. It's also a standalone exam task in its own right ("make the node unschedulable and move workloads off it") — and its refusal messages are a mini-exam in themselves: each one names its own fix directly in the error text, if you read it.</p>
 <h5>The concept</h5>
-<p><code>drain</code> = <strong>cordon</strong> (mark unschedulable — a taint-like flag on the node object) + <strong>evict</strong> every pod, via the Eviction API. Eviction is polite deletion: it <em>respects PodDisruptionBudgets</em>, retrying while a PDB says "not now". Three pod categories make drain balk, each with a flag that means "I understand the consequence":</p>
+<p><code>drain</code> is really two operations glued together: <strong>cordon</strong> (mark the node unschedulable — a flag on the node object, similar in spirit to a taint) plus <strong>evict</strong> every pod currently on it, through the Eviction API. Eviction is best understood as <em>polite</em> deletion — it respects any <strong>PodDisruptionBudget</strong> (a rule an application owner sets saying "never take down more than N of my pods at once"), retrying patiently while a PDB says "not right now" rather than forcing the issue. Three categories of pod make drain refuse outright rather than just wait, each with its own override flag that essentially means "yes, I understand the consequence, do it anyway":</p>
 <table>
 <tr><th>Pod type</th><th>Why drain refuses</th><th>Override</th><th>Consequence</th></tr>
 <tr><td>DaemonSet pods</td><td>the DS controller would instantly recreate them (they tolerate the cordon)</td><td><code>--ignore-daemonsets</code></td><td>they simply stay — fine, they're per-node by design</td></tr>
@@ -761,41 +762,41 @@ node02   Ready    &lt;none&gt;          3h    v1.34.x</pre></li>
 </table>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Stage all three refusals on node02 (check placement with <code>-o wide</code>; if something landed on node01, drain that instead):
+<li>Stage all three refusal conditions on node02 at once, so you can see every error message in one drain attempt (check placement with <code>-o wide</code>; if something landed on node01 instead, drain that one):
 <pre class="cmd">kubectl run barepod --image=nginx --overrides='{"spec":{"nodeName":"node02"}}'
 kubectl create deployment scratch --image=nginx -- sleep 1d
 kubectl patch deployment scratch --patch '{"spec":{"template":{"spec":{
   "nodeSelector":{"kubernetes.io/hostname":"node02"},
   "volumes":[{"name":"scratch","emptyDir":{}}],
   "containers":[{"name":"nginx","image":"nginx","volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]}]}}}}'</pre></li>
-<li>Drain naked and collect the refusals:
+<li>Now drain with no flags at all, and read every refusal it hands back:
 <pre class="cmd">kubectl drain node02</pre>
 <pre class="out">node/node02 cordoned
 error: unable to drain node "node02" due to error: [<b>cannot delete DaemonSet-managed Pods</b> (use --ignore-daemonsets to ignore): kube-system/kube-flannel-ds-..., kube-system/kube-proxy-...,
 <b>cannot delete cannot delete Pods that declare no controller</b> (use --force to override): default/barepod,
 <b>cannot delete Pods with local storage</b> (use --delete-emptydir-data to override): default/scratch-...]</pre>
-<p>Note: it already cordoned! A failed drain leaves the node <code>SchedulingDisabled</code> — check <code>kubectl get nodes</code>.</p></li>
-<li>Acknowledge everything and drain for real:
+<p>Notice something important buried in that output: the node is already cordoned, even though the drain as a whole failed. Cordon and evict are separate steps run in sequence, and cordon succeeded before eviction hit its refusals — so a failed drain still leaves the node <code>SchedulingDisabled</code> behind. Always confirm with <code>kubectl get nodes</code> rather than assuming a failed drain changed nothing.</p></li>
+<li>Now acknowledge every consequence explicitly and drain for real:
 <pre class="cmd">kubectl drain node02 --ignore-daemonsets --delete-emptydir-data --force
 kubectl get pods -o wide</pre>
 <pre class="out">node/node02 drained
 NAME             READY   STATUS    NODE
 scratch-...      1/1     <b>Pending</b>   &lt;none&gt;    ← nodeSelector pins it to the cordoned node
 </pre>
-<p>barepod is gone forever (that's what <code>--force</code> meant); the deployment pod was recreated by its controller but can't schedule until node02 returns — remove the nodeSelector or uncordon to release it.</p></li>
-<li>Watch a PDB stall a drain — the polite machinery visible:
+<p>barepod is gone permanently — that's exactly what agreeing to <code>--force</code> meant, since nothing was going to recreate it. The deployment's pod, on the other hand, was immediately recreated by its controller (deployments always maintain their replica count), but it can't actually schedule anywhere until node02 comes back, because its nodeSelector pins it there specifically — remove the nodeSelector or uncordon the node to release it.</p></li>
+<li>One more thing worth seeing directly: watch a PDB actually stall a drain in progress, so the "polite" retry behavior described above becomes something you've watched happen rather than just read about:
 <pre class="cmd">kubectl uncordon node02
 kubectl create deployment pdbdemo --image=nginx --replicas=2
 kubectl create poddisruptionbudget pdbdemo --selector app=pdbdemo --min-available=2
 kubectl drain node02 --ignore-daemonsets --delete-emptydir-data</pre>
 <pre class="out">evicting pod default/pdbdemo-...
 <b>error when evicting pods/"pdbdemo-..." (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.</b></pre>
-<p>minAvailable=2 with replicas=2 allows zero disruptions — drain retries forever. Ctrl-C, then fix it like an operator: <code>kubectl scale deployment pdbdemo --replicas=3</code> and watch the drain (rerun it) proceed. Clean up: delete deployment, PDB, and uncordon.</p></li>
+<p>Setting <code>minAvailable=2</code> on a deployment that only has 2 replicas means zero disruptions are ever permitted — so drain simply retries forever, exactly as the PDB instructs it to. Ctrl-C out of it, then fix the situation the way an operator actually would: give the PDB some slack by scaling up first (<code>kubectl scale deployment pdbdemo --replicas=3</code>), then re-run the drain and watch it proceed cleanly. Clean up afterward: delete the deployment and the PDB, and uncordon the node.</p></li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p>You can quote the three refusal categories with their flags from memory, and explain why a "stuck" drain with PDB retries isn't a bug.</p>
+<p>You can quote the three refusal categories with their override flags from memory, and explain in your own words why a "stuck" drain that's retrying against a PDB isn't a bug — it's the eviction API working exactly as designed.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p><code>uncordon</code> does <em>not</em> move pods back — nothing does; rebalancing only happens as new scheduling decisions. And since a failed drain still cordons, an exam task that errored halfway leaves the node unschedulable — always end with a <code>kubectl get nodes</code> sanity check before moving on.</p>
+<p><code>uncordon</code> does <em>not</em> move any pods back onto the node — nothing in Kubernetes actively rebalances existing workloads; a node only fills back up as new scheduling decisions happen to land there. And because a failed drain has already cordoned the node (as you saw above), an exam task that errors out halfway through still leaves that node unschedulable behind it — always finish with a <code>kubectl get nodes</code> sanity check before moving on to the next task.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Safely Drain a Node"</strong> and <strong>"Disruptions"</strong> (PDB concepts).</p>
 </article>
@@ -808,12 +809,12 @@ kubectl drain node02 --ignore-daemonsets --delete-emptydir-data</pre>
 <div class="lesson-head"><span class="cp-id">2.16</span><h4>Take an etcd snapshot with the right certs, verify it</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The etcd backup task is near-certain on the exam and pure mechanics: four flags, one endpoint, one file. All four flag values are readable off the etcd manifest, so there's nothing to memorize except <em>where to look</em>.</p>
+<p>Recall etcd from week 1: it's the cluster's filing cabinet, the one place every object you've ever created actually lives. A <strong>snapshot</strong> is simply a photocopy of the entire cabinet's contents at one moment in time, saved to a single file. The etcd backup task is near-certain on the exam and is pure mechanics once you know it: four flags, one endpoint, one output file. All four flag values are readable directly off the etcd manifest already on disk, so there's genuinely nothing to memorize here except <em>where to look</em>.</p>
 <h5>The concept</h5>
-<p>Two tools split the work: <strong><code>etcdctl</code></strong> talks to a <em>live</em> etcd over the network (that's why it needs endpoint + TLS client flags) and takes snapshots; <strong><code>etcdutl</code></strong> operates on <em>files on disk</em> (status, restore) and needs no certs at all. A snapshot is a point-in-time copy of etcd's bbolt keyspace — every API object in one file. etcd serves clients on <strong>:2379</strong> over TLS from 2.5's etcd trust domain; its own <code>server.crt/key</code> pair doubles as a perfectly good <em>client</em> credential for our purposes, which is the standard exam trick.</p>
+<p>Two different tools split this work between them: <strong><code>etcdctl</code></strong> talks to a <em>live, running</em> etcd over the network — which is exactly why it needs an endpoint address and TLS client credentials — and it's the tool that actually takes snapshots. <strong><code>etcdutl</code></strong>, by contrast, operates purely on <em>files already sitting on disk</em> (checking a snapshot's status, restoring one) and needs no network connection or certificates at all, because it never talks to anything running. A snapshot itself is a point-in-time copy of etcd's internal bbolt keyspace (bbolt being the on-disk B+tree structure etcd stores data in) — every API object in the whole cluster, frozen into one file. etcd serves its clients on port <strong>:2379</strong> over TLS, using the separate etcd trust domain from 2.5's diagram; conveniently, its own <code>server.crt</code>/<code>server.key</code> pair also works as a valid <em>client</em> credential for talking to itself, which is the standard shortcut used both here and on the exam.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Get matching tools. Check what your cluster runs, then pull that release's binaries (the etcd image tag tells you the version):
+<li>First, get matching tool versions. Check what version your cluster's etcd actually runs, then pull that exact release's binaries — the etcd container's image tag tells you the version to match:
 <pre class="cmd">kubectl -n kube-system get pod etcd-cp -o jsonpath='{.spec.containers[0].image}{"\n"}'
 ETCD_VER=v3.6.x    # ← match the tag you just saw
 curl -L https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz \
@@ -822,14 +823,14 @@ sudo mv /tmp/etcdctl /tmp/etcdutl /usr/local/bin/ &amp;&amp; etcdctl version | h
 <pre class="out">registry.k8s.io/etcd:3.6.x-0
 etcdctl version: 3.6.x</pre>
 <p>(On the exam the tools are pre-installed — this step is lab-only.)</p></li>
-<li>Read the four flag values off the manifest — this is the reflex to build:
+<li>Now read the four flag values you'll need straight off the manifest — building the reflex of looking here, instead of trying to remember values, is the actual skill this lesson teaches:
 <pre class="cmd">sudo grep -E 'listen-client|trusted-ca|cert-file|key-file' /etc/kubernetes/manifests/etcd.yaml | grep -v peer</pre>
 <pre class="out">- --cert-file=<b>/etc/kubernetes/pki/etcd/server.crt</b>
 - --key-file=<b>/etc/kubernetes/pki/etcd/server.key</b>
 - --listen-client-urls=https://127.0.0.1:2379,https://<b>10.211.64.10:2379</b>
 - --trusted-ca-file=<b>/etc/kubernetes/pki/etcd/ca.crt</b></pre>
-<p>Mapping: <code>--trusted-ca-file</code> → your <code>--cacert</code>, <code>--cert-file/--key-file</code> → your <code>--cert/--key</code>, <code>listen-client-urls</code> → your <code>--endpoints</code>.</p></li>
-<li>Snapshot:
+<p>The mapping in one line: <code>--trusted-ca-file</code> becomes your <code>--cacert</code>, <code>--cert-file</code>/<code>--key-file</code> become your <code>--cert</code>/<code>--key</code>, and <code>listen-client-urls</code> becomes your <code>--endpoints</code>. Same values, different flag names because they're two different tools.</p></li>
+<li>Take the snapshot:
 <pre class="cmd">sudo mkdir -p /backup
 sudo ETCDCTL_API=3 etcdctl snapshot save /backup/snap.db \
   --endpoints=https://127.0.0.1:2379 \
@@ -839,7 +840,7 @@ sudo ETCDCTL_API=3 etcdctl snapshot save /backup/snap.db \
 <pre class="out">{"level":"info","msg":"created temporary db file","path":"/backup/snap.db.part"}
 {"level":"info","msg":"fetching snapshot","endpoint":"https://127.0.0.1:2379"}
 <b>Snapshot saved at /backup/snap.db</b></pre></li>
-<li>Verify with the <em>offline</em> tool — no certs needed, it's just a file now:
+<li>Now verify the snapshot actually contains something real, using the <em>offline</em> tool — no certs needed here, because it's just a file on disk now, not a live connection:
 <pre class="cmd">sudo etcdutl snapshot status /backup/snap.db -w table</pre>
 <pre class="out">+----------+----------+------------+------------+
 |   HASH   | REVISION | TOTAL KEYS | TOTAL SIZE |
@@ -851,7 +852,7 @@ sudo ETCDCTL_API=3 etcdctl snapshot save /backup/snap.db \
 <h5 class="verify">Verify</h5>
 <p><code>snapshot status</code> shows a plausible key count — and you can name, without looking, where each of the four flag values comes from in the manifest.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Missing/wrong cert flags fail unhelpfully (<em>"context deadline exceeded"</em> — looks like a network problem, is an auth problem). Snapshot against exactly <strong>one</strong> endpoint — never a list. And note <code>etcdctl snapshot status</code> is deprecated in favor of <code>etcdutl</code>: using the offline tool for offline jobs is the habit the etcd project wants, and the one this site teaches.</p>
+<p>Missing or wrong certificate flags fail unhelpfully — you'll see <em>"context deadline exceeded"</em>, which reads like a network timeout but is actually a TLS/auth failure in disguise (the connection is being silently rejected, not lost). Snapshot against exactly <strong>one</strong> endpoint, never a list of several — snapshotting more than one at once isn't meaningfully defined. And note that <code>etcdctl snapshot status</code> still technically works but is deprecated in favor of <code>etcdutl</code>: using the offline tool for offline jobs is the habit the etcd project wants you to build, and the one this lesson teaches.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Operating etcd clusters for Kubernetes"</strong> — the backup section has these exact flags; it's your copy-paste source in the exam.</p>
 </article>
@@ -860,12 +861,12 @@ sudo ETCDCTL_API=3 etcdctl snapshot save /backup/snap.db \
 <div class="lesson-head"><span class="cp-id">2.17</span><h4>Restore the snapshot and prove deleted objects come back</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Restore is the half of the drill people fumble, because it's <em>not</em> the reverse of backup: no etcdctl, no endpoints, no certs — a file operation plus one manifest edit. Understanding that shape is what makes it fast.</p>
+<p>Restore is the half of the drill people fumble, precisely because it feels like it should be the reverse of backup and isn't. There's no etcdctl, no endpoint, no certs involved at all — it's a plain file operation followed by one manifest edit. Understanding that shape up front, before you touch a command, is what makes it fast instead of a guessing exercise.</p>
 <h5>The concept</h5>
-<p><strong>Restore never touches the running etcd.</strong> <code>etcdutl snapshot restore</code> materializes a brand-new data directory on disk (with a fresh member identity) from the snapshot file. The running cluster only changes when you repoint the etcd static pod's <strong>hostPath volume</strong> at that new directory — then the kubelet restarts etcd on the restored data, the apiserver reconnects, and every controller reconciles the world back to the snapshot's state. Objects created <em>after</em> the snapshot vanish (their records don't exist in the restored keyspace); objects deleted after it return.</p>
+<p>The single fact that makes this whole lesson click: <strong>restore never touches the running etcd at all.</strong> <code>etcdutl snapshot restore</code> reads the snapshot file and materializes a brand-new data directory on disk from it — a fresh copy of the filing cabinet's contents, with a fresh internal member identity, sitting inert next to the live one. Nothing about the running cluster changes yet. The switch only happens when you repoint the etcd static pod's <strong>hostPath volume</strong> — the setting that says "which directory on this host's disk does the etcd container actually mount" — at that new directory. Once you do, the kubelet restarts etcd against the restored data, the apiserver reconnects to it, and every controller in the cluster reconciles the world back into line with whatever the snapshot said it should look like. The practical consequence: any object created <em>after</em> the snapshot was taken simply vanishes, because no record of it exists in the restored keyspace; any object deleted after the snapshot comes back, because the snapshot still remembers it.</p>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Plant evidence, snapshot, then diverge from it:
+<li>Plant evidence first, take a snapshot, then deliberately diverge from it — this gives you something concrete to check restore against afterward:
 <pre class="cmd">kubectl create deployment keepme --image=nginx
 # take a fresh snapshot exactly as in 2.16, to /backup/snap.db
 kubectl delete deployment keepme          # deleted AFTER the snapshot → restore brings it back
@@ -873,28 +874,28 @@ kubectl create deployment loseme --image=nginx   # created AFTER → restore era
 kubectl get deploy</pre>
 <pre class="out">NAME     READY   UP-TO-DATE   AVAILABLE
 loseme   1/1     1            1</pre></li>
-<li>Restore to a <em>new</em> directory (offline op — mind that it's <code>etcdutl</code>):
+<li>Restore into a <em>new</em>, empty directory — this is a pure offline file operation, so mind that the tool is <code>etcdutl</code>, not <code>etcdctl</code>:
 <pre class="cmd">sudo etcdutl snapshot restore /backup/snap.db --data-dir /var/lib/etcd-restore</pre>
 <pre class="out">... "msg":"membership changed","added":[{"clusterID":"...","localMember":...}]
 <b>... snapshot restored at /var/lib/etcd-restore</b></pre></li>
-<li>The one edit: repoint the <strong>hostPath volume</strong> in the etcd manifest. Find the block first:
+<li>Now the one edit that actually flips the switch: repoint the <strong>hostPath volume</strong> in the etcd manifest at the restored directory. Find the right block first, then edit it:
 <pre class="cmd">sudo grep -B1 -A3 'hostPath' /etc/kubernetes/manifests/etcd.yaml | grep -A3 etcd-data
 sudo vim /etc/kubernetes/manifests/etcd.yaml</pre>
 <pre class="out">  - hostPath:
       path: <b>/var/lib/etcd</b>        ← change this line to /var/lib/etcd-restore
       type: DirectoryOrCreate
     name: etcd-data</pre>
-<p>Leave <code>--data-dir=/var/lib/etcd</code> and the volumeMount alone — inside the container nothing changes; only which host directory is mounted there.</p></li>
-<li>Wait out the restart (~60–90s; kubectl will refuse connections while etcd and then the apiserver bounce), then check the verdict:
+<p>Leave <code>--data-dir=/var/lib/etcd</code> and the volumeMount itself alone — inside the container, nothing changes at all; only <em>which directory on the host</em> gets mounted into that same in-container path changes.</p></li>
+<li>Wait out the restart — expect roughly 60–90 seconds where kubectl refuses connections while etcd, and then the apiserver, both bounce — then check the verdict:
 <pre class="cmd">kubectl get deploy</pre>
 <pre class="out">NAME     READY   UP-TO-DATE   AVAILABLE
 <b>keepme   1/1     1            1</b>          ← back from the dead
 (loseme is gone)</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p><code>keepme</code> exists, <code>loseme</code> doesn't, and all kube-system pods are Running. That asymmetry is the proof the cluster is running on the restored keyspace.</p>
+<p><code>keepme</code> exists again, <code>loseme</code> doesn't, and every kube-system pod is Running. That exact asymmetry — one back, one gone — is the proof the cluster is now genuinely running on the restored keyspace, not just that etcd restarted.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>The two classic fumbles: editing <code>--data-dir</code> instead of the hostPath (etcd then starts on an <em>empty</em> DirectoryOrCreate mount — cluster amnesia), and restoring <em>into</em> <code>/var/lib/etcd</code> over live data (etcdutl refuses if the dir exists; don't "fix" that with rm). If kubectl stays dead &gt;2 minutes, kick the apiserver (move its manifest out/in per 2.7) — its etcd watches can wedge across a restore. Diagnosis for all of it: <code>sudo crictl ps -a | grep etcd</code> and <code>journalctl -u kubelet</code>.</p>
+<p>Two classic fumbles account for most restore failures: editing <code>--data-dir</code> instead of the hostPath (etcd then starts against an <em>empty</em> <code>DirectoryOrCreate</code> mount, since nothing actually points at your restored data — the cluster effectively forgets everything), and trying to restore <em>directly into</em> <code>/var/lib/etcd</code> on top of the live data (etcdutl refuses outright if the target directory already exists — resist the urge to "fix" that by deleting the live directory first). If kubectl stays unreachable for more than about 2 minutes, try kicking the apiserver by moving its manifest out and back in, the same trick from 2.7 — its watches against etcd can occasionally wedge across a restore. For diagnosing any of this: <code>sudo crictl ps -a | grep etcd</code> and <code>journalctl -u kubelet</code>.</p>
 <h5>Docs</h5>
 <p class="docs-links">Docs search: <strong>"Operating etcd clusters for Kubernetes"</strong> → "Restoring an etcd cluster". The manifest edit isn't spelled out there — that part is yours to own.</p>
 </article>
@@ -903,18 +904,18 @@ sudo vim /etc/kubernetes/manifests/etcd.yaml</pre>
 <div class="lesson-head"><span class="cp-id">2.18</span><h4>The full cycle from memory, twice more, under 10 minutes</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Backup/restore is worth points only at speed and from memory — under exam adrenaline you'll have neither this page nor time to re-derive the flags. Spaced repetition is the entire lesson.</p>
+<p>Everything in 2.16 and 2.17 was explained once, carefully, with reasons attached. On exam day, none of that matters if you can't reproduce it fast and from memory — under real time pressure you'll have neither this page open nor the spare minutes to re-derive which flag goes where. This lesson has one purpose: turn understanding into a reflex through plain repetition.</p>
 <h5>Steps</h5>
 <ol>
-<li>Print or save the <a href="../cheatsheets/etcd-card.html">etcd backup &amp; restore card</a> — but use it only to <em>check</em> your work, not to type from.</li>
-<li>Today, run the full cycle against a timer: plant a marker object → snapshot → delete marker + create decoy → restore → verify marker back, decoy gone (the 2.17 sequence). Everything from memory except the docs page you'd have in the exam. Log your time.</li>
-<li>Repeat once in ~3 days, and once more next week (put both in your calendar now). Same drill, cold start. Target: <strong>under 10 minutes</strong> end-to-end by the third run.</li>
-<li>Each run, also answer aloud: which tool for save vs restore? where do the cert flag values come from? which line in etcd.yaml changes? why does the decoy object vanish?</li>
+<li>Print or save the <a href="../cheatsheets/etcd-card.html">etcd backup &amp; restore card</a> — but use it only to <em>check</em> your work afterward, never to type commands from as you go.</li>
+<li>Today, run the full cycle against a timer: plant a marker object → snapshot → delete the marker and create a decoy → restore → verify the marker is back and the decoy is gone (the exact sequence from 2.17). Do it all from memory, except for whatever docs page you'd realistically have open during the real exam. Log your time.</li>
+<li>Repeat once in about 3 days, and once more the week after that — put both dates in your calendar right now, since "I'll remember" is exactly what spaced repetition doesn't rely on. Same drill, cold start each time, no peeking at your notes from the prior run. Target: <strong>under 10 minutes</strong> end-to-end by the third attempt.</li>
+<li>On each run, also answer out loud: which tool handles save, and which handles restore? Where do the four certificate flag values come from? Which single line in etcd.yaml actually changes? And why does the decoy object disappear when the marker comes back?</li>
 </ol>
 <h5 class="verify">Verify</h5>
-<p>Three dated times in your notes, the last one under 10:00, with a marker-back/decoy-gone check passing each run.</p>
+<p>Three dated times logged in your notes, the last one under 10:00, with the marker-back/decoy-gone check passing cleanly on every run.</p>
 <h5 class="gotcha">Gotchas</h5>
-<p>Don't drill on a cluster state you care about — do it right after a snapshot of the VMs (0.8), or make the marker/decoy objects trivial. And vary the marker object type across runs (deployment, then configmap, then secret) so your verification habit doesn't overfit to one resource.</p>
+<p>Don't drill against cluster state you actually care about keeping — do this right after taking a VM snapshot (0.8), or just keep the marker/decoy objects deliberately trivial and disposable. And vary the marker object's type across the three runs (a deployment, then a configmap, then a secret) so your verification habit generalizes instead of quietly overfitting to one specific resource type.</p>
 <h5>Docs</h5>
 <p class="docs-links">Same page as 2.16/2.17 — by run three you should know its <em>title</em> and section layout cold: <strong>"Operating etcd clusters for Kubernetes"</strong>.</p>
 </article>
