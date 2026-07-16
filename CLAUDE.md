@@ -42,13 +42,13 @@ There is no build step, package manager, linter, or test framework beyond the tw
 | R1 | Rewrite materials/w0.html + w1.html: plain-English-first voice, full depth kept | ✅ done |
 | R2 | Rewrite materials/w2.html (kubeadm/PKI/lifecycle) | ✅ done |
 | R3 | Rewrite materials/w3.html (workloads/scheduling/Helm/Kustomize) | ✅ done |
-| R4 | Rewrite materials/w4.html (networking; heaviest diagrams) | ⬜ next |
+| R4 | Rewrite materials/w4.html (networking; heaviest diagrams) | ✅ done |
 | R5 | Rewrite materials/w5.html (storage/CSI) | ✅ done |
-| R6 | Rewrite materials/w6.html (troubleshooting) | ⬜ |
-| R7 | Rewrite materials/w7.html (RBAC/auth/speed) | ⬜ |
+| R6 | Rewrite materials/w6.html (troubleshooting) | ✅ done |
+| R7 | Rewrite materials/w7.html (RBAC/auth/speed) | ⬜ next |
 | R8 | Rewrite materials/w8.html + final cross-link/voice-consistency QA over all 9 files | ⬜ |
 
-P0–P8 complete; the site is a full self-contained internals-first curriculum. EP0–EP8 (the toggleable beginner-enrichment pass) is **superseded** — feedback was that bolting optional panels onto otherwise jargon-dense prose wasn't enough; the plan pivoted to rewriting every lesson's core prose in plain English with full depth kept, one unified voice, nothing to toggle (R0–R8, see "Plain-English lesson voice" below and `docs/PLAN.md`'s addendum for the pivot history). R0–R3 and R5 are done (R1 also dissolved every `.foundation` callout box in w0/w1 into the main "The concept" prose — those boxes are retired per-week as each gets rewritten, not site-wide; w2/w3/w5 never had any (EP1's pilot only touched w0/w1), and w4/w6–w8 still have them until their own R-phase); R4, R6–R8 rewrite one week's lesson file per session, in order (not strictly sequential — R5 shipped ahead of R4 when they ran in parallel sessions). Note: `shellcheck` was unavailable in the P8 environment — `mock/setup-exam-1.sh` passed `bash -n` and mirrors the (shellchecked) `labs/faults/` patterns, but run shellcheck on it when available.
+P0–P8 complete; the site is a full self-contained internals-first curriculum. EP0–EP8 (the toggleable beginner-enrichment pass) is **superseded** — feedback was that bolting optional panels onto otherwise jargon-dense prose wasn't enough; the plan pivoted to rewriting every lesson's core prose in plain English with full depth kept, one unified voice, nothing to toggle (R0–R8, see "Plain-English lesson voice" below and `docs/PLAN.md`'s addendum for the pivot history). R0–R6 are done (R1 dissolved every `.foundation` callout box in w0/w1 into the main "The concept" prose — EP1's pilot only ever touched w0/w1, so w2–w8 never had any `.foundation`/`.analogy` boxes to begin with); R7–R8 rewrite one week's lesson file per session, in order (phases haven't always landed strictly in order when sessions ran in parallel — check each week's own status above rather than assuming). Note: `shellcheck` was unavailable in the P8 environment — `mock/setup-exam-1.sh` passed `bash -n` and mirrors the (shellchecked) `labs/faults/` patterns, but run shellcheck on it when available.
 
 ## Phase workflow
 
