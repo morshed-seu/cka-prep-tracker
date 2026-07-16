@@ -56,13 +56,13 @@
 <div class="lesson-head"><span class="cp-id">5.1</span><h4>The ephemeral volumes, cold: emptyDir, hostPath, and the config projections</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Most exam volume work isn't persistent at all — it's "add a scratch volume", "mount this ConfigMap at /etc/app", "share a dir between two containers". These are two-minute tasks if the shapes are memorized, and one of them (<code>medium: Memory</code>) hides a genuine trap.</p>
+<p>A <strong>volume</strong>, in Kubernetes terms, is just a directory that gets handed to a container's filesystem from somewhere outside it — sometimes disposable scratch space, sometimes a live copy of a config file, sometimes a peek at the node's own disk. Most exam volume work isn't persistent at all — it's "add a scratch volume", "mount this ConfigMap at /etc/app", "share a dir between two containers". These are two-minute tasks if the shapes are memorized, and one of them (<code>medium: Memory</code>) hides a genuine trap.</p>
 <h5>The concept</h5>
-<p>An ephemeral volume lives and dies with its <em>pod</em> — which is longer than a <em>container</em>: containers restart in place, and the volume survives every restart. Only deleting or rescheduling the pod loses the data.</p>
+<p>The word <em>ephemeral</em> just means "temporary, gone when its owner goes away" — and the owner here is specific: an ephemeral volume lives and dies with its <em>pod</em>, not its <em>container</em>. That distinction matters because a pod usually outlives several containers: when a container crashes and the kubelet restarts it, that's a brand-new container process, but it's still the same pod, so the volume is still there waiting for it. Only deleting or rescheduling the whole pod loses the data. Five shapes cover almost every exam volume task:</p>
 <table>
 <tr><th>Type</th><th>What it is</th><th>The thing to remember</th></tr>
 <tr><td><code>emptyDir</code></td><td>Fresh empty dir on the node, created when the pod starts</td><td>Survives container restarts, dies with the pod. Shared by all containers that mount it — the standard sidecar handoff.</td></tr>
-<tr><td><code>emptyDir</code> + <code>medium: Memory</code></td><td>tmpfs (RAM-backed)</td><td>Every byte written <strong>counts against the container's memory limit</strong> — a full tmpfs can OOM-kill the pod.</td></tr>
+<tr><td><code>emptyDir</code> + <code>medium: Memory</code></td><td><abbr title="a filesystem backed by RAM instead of disk — everything written to it disappears on unmount and consumes memory while it exists">tmpfs</abbr> (RAM-backed)</td><td>Every byte written <strong>counts against the container's memory limit</strong> — a full tmpfs can OOM-kill the pod.</td></tr>
 <tr><td><code>hostPath</code></td><td>A directory that already exists on whatever node the pod lands on</td><td>Data does <em>not</em> follow the pod: reschedule to another node and the path is empty (or different). It's a node inspection tool, not storage.</td></tr>
 <tr><td><code>configMap</code> / <code>secret</code></td><td>Keys projected as read-only files</td><td>Updates propagate to the mounted files (kubelet sync, up to ~a minute) — <em>except</em> through a <code>subPath</code> mount, which never updates.</td></tr>
 <tr><td><code>downwardAPI</code></td><td>Pod metadata (labels, annotations, resources) as files</td><td>How an app learns its own labels without calling the API.</td></tr>
@@ -118,9 +118,9 @@ scratch   0/1     <b>OOMKilled</b>   1          3m</pre>
 <div class="lesson-head"><span class="cp-id">5.2</span><h4>Where volumes actually live: /var/lib/kubelet/pods/&lt;uid&gt;/volumes</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Every volume a pod mounts is a real directory on the node, at a predictable path. Once you've found one by hand, "storage" stops being abstract — and in week 6 this path is how you rescue data from a pod that won't start and decode kubelet mount errors.</p>
+<p>A pod's volume isn't magic — it's a plain directory sitting on the node's disk (or in the node's RAM, for tmpfs), at a path you can walk to and read yourself with <code>ls</code> and <code>cat</code>. Once you've found one by hand, "storage" stops being abstract — and in week 6 this path is how you rescue data from a pod that won't start and decode kubelet mount errors.</p>
 <h5>The concept</h5>
-<p>The kubelet's volume manager prepares each pod's volumes under a fixed layout, then the runtime bind-mounts them into containers:</p>
+<p>The kubelet's volume manager prepares each pod's volumes under a fixed layout, then <strong>bind-mounts</strong> them into containers — a bind mount is the kernel making one directory visible at a second path, both paths pointing at the very same files, so a write through either path shows up instantly through the other:</p>
 <pre class="out">/var/lib/kubelet/pods/<b>&lt;pod-uid&gt;</b>/volumes/<b>kubernetes.io~&lt;plugin&gt;</b>/<b>&lt;volume-name&gt;</b>/
                                       kubernetes.io~empty-dir/cache/      ← plain dir
                                       kubernetes.io~secret/token/         ← tmpfs (never touches disk)
@@ -175,15 +175,16 @@ sudo cat /var/lib/kubelet/pods/$UID/volumes/kubernetes.io~empty-dir/cache/msg</p
 <div class="lesson-head"><span class="cp-id">5.3</span><h4>The object model: PV is cluster infrastructure, PVC is a namespaced request</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Every storage exam task is some slice of one chain: <strong>PV ← bound to ← PVC ← mounted by ← Pod</strong>. Get the scoping straight now and the YAML writes itself; get it wrong and you'll hunt for a namespace flag that doesn't exist.</p>
+<p>"Persistent storage in Kubernetes" always comes down to two objects handed to each other in a fixed order — learn what each one is for and every storage task becomes filling in a template, not reasoning from scratch. Every storage exam task is some slice of one chain: <strong>PV ← bound to ← PVC ← mounted by ← Pod</strong>. Get the scoping straight now and the YAML writes itself; get it wrong and you'll hunt for a namespace flag that doesn't exist.</p>
 <h5>The concept</h5>
-<p>The split mirrors nodes and pods:</p>
+<p>Think of it as a self-storage facility. A <strong>PersistentVolume (PV)</strong> is a physical storage unit already sitting on the lot — some real storage (an NFS export, a cloud disk, a directory) wrapped in an API object, created by an admin or minted automatically by a provisioner (5.10). A <strong>PersistentVolumeClaim (PVC)</strong> is a reservation ticket an application fills out: "I need 1Gi, ReadWriteOnce, of this class of unit" — it doesn't name a specific unit, just the requirements. The facility (the binding controller, 5.4) is what matches tickets to units.</p>
+<p>The scoping follows the same split as nodes and pods:</p>
 <ul>
-<li>A <strong>PersistentVolume</strong> is <em>cluster-scoped</em> — a piece of real storage (an NFS export, a cloud disk, a directory) represented as an API object, created by an admin or minted by a provisioner. Like a Node, it has no namespace.</li>
-<li>A <strong>PersistentVolumeClaim</strong> is <em>namespaced</em> — an application's request: "I need 1Gi, ReadWriteOnce, of class X". Like a Pod, it lives with the workload.</li>
-<li>Pods mount <strong>claims, never PVs</strong>: <code>volumes: [{persistentVolumeClaim: {claimName: …}}]</code>. There is no way to reference a PV from a pod spec.</li>
+<li>A PV is <em>cluster-scoped</em> — like a Node, it belongs to the whole cluster and has no namespace of its own.</li>
+<li>A PVC is <em>namespaced</em> — like a Pod, it lives inside the namespace of the application that needs it.</li>
+<li>Pods mount <strong>claims, never PVs directly</strong>: <code>volumes: [{persistentVolumeClaim: {claimName: …}}]</code>. There is no field anywhere in a pod spec for naming a PV.</li>
 </ul>
-<p>The indirection is the point: the app author asks for storage by size and behavior; <em>which</em> disk satisfies it is the cluster's problem. The PVC is the boundary between those two worlds, and the pod+PVC pair is portable across clusters whose PVs look completely different.</p>
+<p>The indirection is the whole point: the app author asks for storage by size and behavior (fill out a ticket), and <em>which</em> physical unit satisfies it is the facility's problem, not theirs. The PVC is the boundary between those two worlds — write a pod that mounts a PVC once, and it runs unmodified against completely different PVs on a different cluster, because the ticket format never changes even when the storage behind it does.</p>
 <div class="flow"><span>Pod (ns)</span><em>→</em><span>claimName</span><em>→</em><span>PVC (ns)</span><em>→</em><span>bound 1:1</span><em>→</em><span>PV (cluster)</span><em>→</em><span>real storage</span></div>
 <h5>Lab</h5>
 <ol class="lab">
@@ -217,9 +218,9 @@ sudo cat /var/lib/kubelet/pods/$UID/volumes/kubernetes.io~empty-dir/cache/msg</p
 <div class="lesson-head"><span class="cp-id">5.4</span><h4>The binding control loop: match, then an exclusive 1:1 claim</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Every Pending PVC you will ever debug is this loop failing to find a match. Know the four matching rules and the failure stops being mysterious — you just check them in order.</p>
+<p>A PVC that just sits there instead of turning into usable storage is, underneath, always the same thing: nobody at the storage facility could find a unit that matched the ticket. Every Pending PVC you will ever debug is this loop failing to find a match. Know the four matching rules and the failure stops being mysterious — you just check them in order.</p>
 <h5>The concept</h5>
-<p>The PV controller (inside kube-controller-manager) runs the standard reconcile pattern: watch unbound PVCs, and for each one scan the Available PVs for candidates. A PV is a candidate only if <em>all four</em> hold:</p>
+<p>The <strong>PV controller</strong> lives inside kube-controller-manager and runs the same pattern every controller in this curriculum runs: watch for something that needs attention, compare it against the current state, act, repeat — like a thermostat that keeps checking the room temperature against its setting rather than heating the room once and walking away. Here, what it watches is unbound PVCs; for each one, it scans every <code>Available</code> PV looking for candidates. A PV only counts as a candidate — a unit the ticket is even allowed to match — if <em>all four</em> conditions hold:</p>
 <ul>
 <li><strong>Capacity</strong>: PV capacity ≥ PVC request.</li>
 <li><strong>Access modes</strong>: the PV offers every mode the PVC asks for (PV modes ⊇ PVC modes).</li>
@@ -344,9 +345,9 @@ kubectl describe pvc claim-b | tail -3</pre>
 <div class="lesson-head"><span class="cp-id">5.5</span><h4>The static chain from memory: PV + PVC + pod</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>This trio <em>is</em> the canonical storage exam task, nearly verbatim. It's worth over-practicing: three objects, zero thinking, under five minutes — that's points banked for the hard troubleshooting tasks.</p>
+<p>This lesson is a rehearsal: write the exact same three objects — a PV, a PVC, a pod — enough times that your hands know the shapes before your brain has to think about them. This trio <em>is</em> the canonical storage exam task, nearly verbatim. It's worth over-practicing: three objects, zero thinking, under five minutes — that's points banked for the hard troubleshooting tasks.</p>
 <h5>The concept</h5>
-<p>Nothing new — this is 5.3's chain plus 5.4's matching rules, typed out. The fields that must agree, and where each lives:</p>
+<p>Nothing new here conceptually — this is 5.3's chain plus 5.4's matching rules, typed out as YAML. What's useful is seeing exactly which fields on which object have to agree with which, side by side:</p>
 <pre class="out">PV:   capacity ≥ ─────────┐   accessModes ⊇ ─┐   storageClassName = ─┐
 PVC:  resources.requests ──┘   accessModes ───┘   storageClassName ───┘
 Pod:  volumes[].persistentVolumeClaim.claimName = PVC name  (+ same namespace)
@@ -439,7 +440,7 @@ app-data   <b>Bound    app-pv</b>   2Gi        RWO            manual</pre>
 <div class="lesson-head"><span class="cp-id">5.6</span><h4>Access modes are node-level guarantees — RWO does not mean one pod</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Can two pods share a ReadWriteOnce volume?" is a classic trick question (yes — if they're on the same node), and choosing an impossible mode is a classic planted fault (the PVC just never binds, as you saw in 5.5).</p>
+<p>An <strong>access mode</strong> is just a rule about how many places at once are allowed to mount a volume for writing — and the most common name, ReadWriteOnce, is also the most commonly misread. "Can two pods share a ReadWriteOnce volume?" is a classic trick question (yes — if they're on the same node), and choosing an impossible mode is a classic planted fault (the PVC just never binds, as you saw in 5.5).</p>
 <h5>The concept</h5>
 <table>
 <tr><th>Mode</th><th>Short</th><th>Guarantee unit</th><th>Meaning</th></tr>
@@ -519,9 +520,9 @@ kubectl delete pv pv-big pv-small pv-solo</pre></li>
 <div class="lesson-head"><span class="cp-id">5.7</span><h4>Reclaim policies by doing: Released is not Available</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Make sure the data survives PVC deletion" and "why won't this PV re-bind?" are both exam material, and both are answered by one field: <code>persistentVolumeReclaimPolicy</code>.</p>
+<p>Deleting a PVC doesn't automatically mean deleting the data behind it — Kubernetes leaves that decision to one field on the PV, and reading that field tells you exactly what happens next. "Make sure the data survives PVC deletion" and "why won't this PV re-bind?" are both exam material, and both are answered by that one field: <code>persistentVolumeReclaimPolicy</code>.</p>
 <h5>The concept</h5>
-<p>The policy answers: <em>when the bound PVC is deleted, what happens to the PV and the data?</em></p>
+<p>The policy answers a single question: <em>when the bound PVC is deleted, what happens to the PV and the data sitting behind it?</em></p>
 <table>
 <tr><th>Policy</th><th>On PVC delete</th><th>Data</th><th>Default for</th></tr>
 <tr><td><code>Retain</code></td><td>PV goes <strong>Released</strong> and stays</td><td>Kept — admin recovers or wipes manually</td><td>statically created PVs</td></tr>
@@ -591,9 +592,9 @@ kubectl get pv pv-retain -o jsonpath='{.spec.persistentVolumeReclaimPolicy}{"\n"
 <div class="lesson-head"><span class="cp-id">5.8</span><h4>StorageClass, field by field — and what "default class" really does</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The exam cluster provisions storage dynamically — you'll be handed a StorageClass and expected to read it at a glance: does it expand? does it bind immediately? what happens to my PVC if I name no class at all?</p>
+<p>So far every PV in this week's labs has been created by hand — an admin builds a storage unit, then a PVC claims it. A StorageClass automates the "build the unit" half. The exam cluster provisions storage dynamically — you'll be handed a StorageClass and expected to read it at a glance: does it expand? does it bind immediately? what happens to my PVC if I name no class at all?</p>
 <h5>The concept</h5>
-<p>A StorageClass is a named <em>recipe for minting PVs</em>. When a PVC references one (and no static PV matches first), a provisioner creates real storage plus a PV object to represent it, pre-bound to that claim.</p>
+<p>Keep the self-storage analogy from 5.3: a StorageClass is a <em>standing order</em> the facility keeps on file — "whenever a ticket comes in for a unit like this and nothing on the lot matches, build a new one to this spec." When a PVC references a class (and no static PV matches first — 5.4's rules run first, always), the class's <strong>provisioner</strong> creates real storage plus a PV object to represent it, pre-bound to that claim, with no human touching either.</p>
 <table>
 <tr><th>Field</th><th>What it controls</th></tr>
 <tr><td><code>provisioner</code></td><td>Who gets called — a CSI driver name (<code>ebs.csi.aws.com</code>) or an external provisioner (<code>rancher.io/local-path</code>). The class is inert if nothing in the cluster answers to this name.</td></tr>
@@ -603,7 +604,7 @@ kubectl get pv pv-retain -o jsonpath='{.spec.persistentVolumeReclaimPolicy}{"\n"
 <tr><td><code>allowVolumeExpansion</code></td><td>Whether PVCs of this class may be resized upward (5.13). One of the few mutable SC fields.</td></tr>
 <tr><td><code>mountOptions</code>, <code>allowedTopologies</code></td><td>Mount flags for minted PVs; zone/node restrictions for where volumes may be created.</td></tr>
 </table>
-<p>The <strong>default class</strong> is marked by the annotation <code>storageclass.kubernetes.io/is-default-class: "true"</code>. Its effect happens at <em>admission</em>: a PVC created with <strong>no <code>storageClassName</code> field at all</strong> gets the default's name written into its spec permanently. A PVC with explicit <code>storageClassName: ""</code> opts out — "static PVs only, never provision". Unset vs empty-string are different requests; that distinction is exam-grade. (If several classes are marked default, the newest wins — but treat that as a misconfiguration to fix.)</p>
+<p>The <strong>default class</strong> is marked by the annotation <code>storageclass.kubernetes.io/is-default-class: "true"</code>. Its effect happens at <abbr title="the moment the apiserver accepts a create/update request and may modify or validate it before it's ever written to etcd">admission</abbr> — the brief window, on every write, where the apiserver is allowed to fill in or check fields before the object becomes real: a PVC created with <strong>no <code>storageClassName</code> field at all</strong> gets the default's name written into its spec permanently, right then. A PVC with explicit <code>storageClassName: ""</code> opts out — "static PVs only, never provision". Unset vs empty-string are different requests; that distinction is exam-grade. (If several classes are marked default, the newest wins — but treat that as a misconfiguration to fix.)</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Your kubeadm cluster ships with no classes at all — which is <em>why</em> everything so far needed hand-made PVs:
@@ -650,9 +651,9 @@ ghost   example.com/does-not-exist   <b>Delete          Immediate           fals
 <div class="lesson-head"><span class="cp-id">5.9</span><h4>WaitForFirstConsumer: the Pending that isn't a bug</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>A WFFC PVC sits Pending by design, and the exam (and real dashboards) love to show you one next to a genuinely broken one. Knowing the one event message that separates them saves you from "fixing" healthy clusters.</p>
+<p>Not every Pending PVC is broken — some are Pending on purpose, deliberately waiting for information that doesn't exist yet. A WFFC (short for the setting name below) PVC sits Pending by design, and the exam (and real dashboards) love to show you one next to a genuinely broken one. Knowing the one event message that separates them saves you from "fixing" healthy clusters.</p>
 <h5>The concept</h5>
-<p>With <code>volumeBindingMode: Immediate</code>, provisioning happens the moment the PVC is created — before any pod exists, before anyone knows where that pod will run. For topology-constrained storage (a disk in zone A, a directory on node01) that's a gamble: the volume lands somewhere, and the scheduler is then forced to put the pod next to it, even if that node/zone can't fit the pod's CPU, affinity, or taints.</p>
+<p>This is about <em>when</em> the standing order from 5.8 actually fires. With <code>volumeBindingMode: Immediate</code>, provisioning happens the moment the PVC is created — before any pod exists, before anyone knows where that pod will run. For topology-constrained storage (a disk in zone A, a directory on node01) that's a gamble: the volume lands somewhere, and the scheduler is then forced to put the pod next to it, even if that node/zone can't fit the pod's CPU, affinity, or taints.</p>
 <p><code>WaitForFirstConsumer</code> inverts the order:</p>
 <ol>
 <li>PVC created → nothing happens; it sits Pending with event <code>WaitForFirstConsumer</code>.</li>
@@ -717,9 +718,9 @@ kubectl get pod consumer -o wide --no-headers | awk '{print $7}'</pre>
 <div class="lesson-head"><span class="cp-id">5.10</span><h4>Install two real provisioners: local-path, then NFS for true RWX</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Watching a provisioner mint a PV closes the loop on everything above — and it upgrades your lab: from here on (week 6 faults, the mock exam) the cluster provisions storage like the exam's does. The NFS half also gives you the only honest way to see ReadWriteMany work.</p>
+<p>Everything since 5.8 has described dynamic provisioning in the abstract; this lesson installs a real one and watches it work, which is worth more than another paragraph of theory. Watching a provisioner mint a PV closes the loop on everything above — and it upgrades your lab: from here on (week 6 faults, the mock exam) the cluster provisions storage like the exam's does. The NFS half also gives you the only honest way to see ReadWriteMany work.</p>
 <h5>The concept</h5>
-<p>A dynamic provisioner is just a controller running the watch-and-reconcile loop you know from week 1: watch PVCs whose class names <em>me</em>, create the backing storage, then create a PV object with <code>claimRef</code> already stamped so it binds instantly.</p>
+<p>A dynamic provisioner is just a controller — the same watch-something/react-to-it shape as every other controller in this curriculum, running on its own instead of built into kube-controller-manager: watch PVCs whose class names <em>me</em>, create the backing storage, then create a PV object with <code>claimRef</code> already stamped so it binds instantly, with no separate binding step for the PV controller to do.</p>
 <ul>
 <li><strong>local-path-provisioner</strong> (Rancher): on the selected node, a short-lived helper pod runs <code>mkdir</code> under <code>/opt/local-path-provisioner</code>, and the PV it mints is a hostPath pointing there. WFFC, RWO-only (it's one node's disk), reclaim Delete.</li>
 <li><strong>nfs-subdir-external-provisioner</strong>: one NFS export, one subdirectory per PVC. Because NFS is a shared filesystem, its PVs honestly support RWX. Immediate binding (any node can mount NFS — no topology to wait for).</li>
@@ -802,12 +803,12 @@ written-on-node02</b></pre>
 <div class="lesson-head"><span class="cp-id">5.11</span><h4>CSI architecture: sidecars translate API objects into four gRPC calls</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>When a real cluster's volume won't mount, the fix starts with knowing <em>which of four steps</em> died — because each step logs in a different place. Provision→Attach→Stage→Publish is the storage equivalent of week 4's packet path.</p>
+<p>Everything from 5.8 onward has been "and then a provisioner creates the volume" — this lesson opens that box. When a real cluster's volume won't mount, the fix starts with knowing <em>which of four steps</em> died — because each step logs in a different place. Provision→Attach→Stage→Publish is the storage equivalent of week 4's packet path.</p>
 <h5>The concept</h5>
-<p>Kubernetes core contains no vendor storage code — it was all extracted ("CSI migration") into drivers that speak one gRPC interface, the Container Storage Interface. A driver ships two halves, and stock Kubernetes <strong>sidecar</strong> containers do all the Kubernetes-facing work, so the vendor only implements storage verbs:</p>
+<p><abbr title="Container Storage Interface — the standard API that lets any storage vendor plug into Kubernetes without Kubernetes needing to know that vendor's code">CSI</abbr> exists because Kubernetes core used to ship a hand-written chunk of code for every storage backend it supported (AWS, Azure, vSphere, …), and that didn't scale — every new backend meant patching Kubernetes itself. So all of that vendor code was pulled out ("CSI migration") into separate driver programs, each speaking one shared interface over <abbr title="a fast, structured way for two programs to call functions on each other over the network — the interface style CSI drivers speak">gRPC</abbr> (a remote-procedure-call protocol; think of it as a menu of function calls a driver promises to answer, rather than a REST API you'd curl). A driver ships two halves, and stock Kubernetes <strong>sidecar</strong> containers — helper containers that run alongside the vendor's own container in the same pod, handling the Kubernetes-facing plumbing — do all of the watching-the-API-and-calling-the-driver work, so the vendor only has to implement the storage verbs themselves:</p>
 <ul>
-<li><strong>Controller plugin</strong> — a Deployment/StatefulSet, anywhere in the cluster. Sidecars watch API objects and call the driver: <em>external-provisioner</em> (sees PVC → <code>CreateVolume</code>), <em>external-attacher</em> (sees VolumeAttachment → <code>ControllerPublishVolume</code>, i.e. "attach disk to that node"), <em>external-resizer</em> (sees PVC size edit → <code>ControllerExpandVolume</code>).</li>
-<li><strong>Node plugin</strong> — a DaemonSet on every node. The <em>node-driver-registrar</em> sidecar registers the driver's socket with the kubelet; from then on the <strong>kubelet calls the driver directly</strong>: <code>NodeStageVolume</code> (format if needed + mount once per node into a global staging dir), then <code>NodePublishVolume</code> (bind-mount the staged volume into each pod's volumes dir — the paths from 5.2).</li>
+<li><strong>Controller plugin</strong> — a Deployment (or StatefulSet), running once, anywhere in the cluster, not tied to any particular node. Its sidecars watch API objects and call the driver on what they see: <em>external-provisioner</em> watches for new PVCs and calls <code>CreateVolume</code>, <em>external-attacher</em> watches for VolumeAttachment objects and calls <code>ControllerPublishVolume</code> ("attach this disk to that node"), <em>external-resizer</em> watches for PVC size edits and calls <code>ControllerExpandVolume</code>.</li>
+<li><strong>Node plugin</strong> — a <strong>DaemonSet</strong> (one copy on every node, the same pattern kube-proxy uses). Its <em>node-driver-registrar</em> sidecar registers the driver's local socket with the kubelet on that node; from then on, for anything node-local, the <strong>kubelet skips the sidecars entirely and calls the driver directly</strong>: <code>NodeStageVolume</code> (format the disk if it needs it, then mount it once into a shared staging directory on that node), then <code>NodePublishVolume</code> (bind-mount that staged volume into each individual pod's volumes directory — the same paths you walked by hand in 5.2).</li>
 </ul>
 <svg viewBox="0 0 660 388" role="img" aria-label="CSI call flow: sidecars in the controller plugin call CreateVolume and ControllerPublishVolume; on the node, the kubelet calls NodeStageVolume then NodePublishVolume on the node plugin">
   <rect x="8" y="6" width="644" height="180" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
@@ -855,7 +856,7 @@ written-on-node02</b></pre>
 
   <text x="22" y="376" fill="var(--muted)" font-size="10.5">① provision → ② attach → ③ stage → ④ publish — mount hangs? name the step, then read that step's log (5.12)</text>
 </svg>
-<p>The staging step exists so a volume mounted by several pods on one node is formatted and fsck'd <em>once</em>; each pod then gets a cheap bind mount. Bookkeeping objects you can inspect: <code>CSIDriver</code> (driver's capabilities — e.g. whether it needs the attach step at all), <code>CSINode</code> (which drivers are registered on each node), <code>VolumeAttachment</code> (one per attached disk-node pair — the attacher's to-do list).</p>
+<p>Back in the self-storage picture (5.3/5.8): if the StorageClass is the standing order, the CSI driver is the actual locksmith the facility calls to go build and service that specific kind of unit — Kubernetes never touches the lock itself, it just tells the locksmith what's needed and waits for confirmation. The staging step exists so a volume mounted by several pods on one node is formatted and fsck'd <em>once</em>, not once per pod; each pod after that gets a cheap bind mount instead of its own format/mount cycle. Three bookkeeping objects record what CSI knows, and you can read all of them with plain <code>kubectl get</code>: <code>CSIDriver</code> (the driver's declared capabilities — e.g. whether it needs the attach step at all), <code>CSINode</code> (which drivers are registered on each node), <code>VolumeAttachment</code> (one object per attached disk-node pair — literally the attacher's to-do list, one row per pending or completed attach).</p>
 <h5>Lab</h5>
 <p>Your lab runs no full CSI driver (local-path and NFS are external provisioners — provision-only, no attach/stage machinery), so this is an inspection lab; you'll meet real driver pods on the exam-adjacent clusters (killer.sh) in week 7.</p>
 <ol class="lab">
@@ -892,7 +893,7 @@ csistoragecapacities storage.k8s.io/v1  true    CSIStorageCapacity
 <div class="lesson-head"><span class="cp-id">5.12</span><h4>Trace one mount end to end on the node</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>This is 5.2 applied to persistent storage: prove to yourself that a Bound PVC is, in the end, one line in <code>mount</code> output on one node. When mounts fail in week 6, you'll be reading exactly this plumbing — knowing what healthy looks like is the prerequisite.</p>
+<p>A "Bound" PVC is a promise made of API objects; this lesson checks that the promise is actually kept, in bytes, on a real disk. This is 5.2 applied to persistent storage: prove to yourself that a Bound PVC is, in the end, one line in <code>mount</code> output on one node. When mounts fail in week 6, you'll be reading exactly this plumbing — knowing what healthy looks like is the prerequisite.</p>
 <h5>The concept</h5>
 <p>For the NFS-backed pod from 5.10, the chain on disk is:</p>
 <pre class="out">on cp:      /srv/nfs/k8s/default-data-nfs-pvc-3e9f…/          ← the actual files
@@ -941,7 +942,7 @@ trace-me</b></pre></li>
 <div class="lesson-head"><span class="cp-id">5.13</span><h4>Volume expansion: up only, class permitting — and three failure signatures</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Increase the PVC to 5Gi" is a plausible exam one-liner. It's ten seconds when allowed — and when it's not, the error messages tell you exactly why, <em>if</em> you've seen them before. This lab manufactures all three.</p>
+<p>Growing a volume in place — without deleting anything or losing data — sounds risky but is a completely ordinary, supported operation, as long as a few conditions line up. "Increase the PVC to 5Gi" is a plausible exam one-liner. It's ten seconds when allowed — and when it's not, the error messages tell you exactly why, <em>if</em> you've seen them before. This lab manufactures all three.</p>
 <h5>The concept</h5>
 <p>Rules of the resize game:</p>
 <ul>
@@ -995,7 +996,7 @@ data-nfs   <b>Bound    pvc-3e9f…   1Gi</b>        RWX            nfs-client</p
 <div class="lesson-head"><span class="cp-id">5.14</span><h4>Timed drill: SC → PVC → pod → proof, under 7 minutes</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Storage tasks are the exam's most formulaic points. The drill converts this week from knowledge into a reflex with a clock on it — the same way week 7 will drill everything else.</p>
+<p>You now know every piece of this chain individually; this drill is about stringing them together fast enough, under a clock, that the exam's storage task stops costing you time you need elsewhere. Storage tasks are the exam's most formulaic points. The drill converts this week from knowledge into a reflex with a clock on it — the same way week 7 will drill everything else.</p>
 <h5>The concept</h5>
 <p>One wrinkle to internalize before the clock starts: there is <strong>no imperative generator for PVCs</strong> — no <code>kubectl create pvc</code>. Your two fast paths are (a) type the ~10-line YAML from memory, or (b) pull the skeleton from the docs task page ("Configure a Pod to Use a PersistentVolume for Storage") and edit three fields. Practice both; (a) is faster once it's automatic. For the pod, scaffold with the generator and splice the volume in:</p>
 <pre class="cmd">kubectl run app --image=busybox:1.36 --dry-run=client -o yaml --command -- sleep 1d &gt; pod.yaml
