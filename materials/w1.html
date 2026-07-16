@@ -55,11 +55,10 @@
 <div class="lesson-head"><span class="cp-id">1.1</span><h4>Draw the full architecture from memory</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Troubleshooting (30% of the exam) is "which component failed?". You can only answer that fast if the map is in your head, not on a cheat sheet.</p>
+<p>Kubernetes isn't one program — it's a handful of small, separate programs that only ever talk to each other in one very restricted pattern, and that pattern <em>is</em> "the architecture" this lesson is about. Troubleshooting, 30% of the exam, is fundamentally the question "which of those separate programs failed?" — you can only answer that fast if the map is in your head, not on a cheat sheet.</p>
 <h5>The concept</h5>
-<p>The one insight that organizes everything: <strong>every component talks only to the apiserver, and only the apiserver talks to etcd</strong>. The scheduler doesn't command kubelets. Controllers don't create containers. Each component runs its own loop against the API: watch desired state, converge, report back. Kubernetes is a set of independent control loops around a shared database — not a pipeline.</p>
-<div class="foundation"><h5>🧱 Foundations</h5><p>If "declarative" and "control loop" are new ideas, <a href="foundations.html#g-apis">Foundations §2</a> has the one-paragraph version: everything below is stating a goal once and letting something else keep nudging reality toward it, forever — nobody is issuing step-by-step commands.</p></div>
-<p class="analogy">The apiserver is the building's front desk — every request from every department passes through it. etcd is the filing cabinet behind the desk that only the front desk may open. The scheduler is the seating host deciding which room a new guest gets. The controller-manager is the building's thermostat system: constantly comparing the posted target (desired state) to the actual reading (status) and adjusting until they match.</p>
+<p>The one insight that organizes everything: <strong>every component talks only to the apiserver, and only the apiserver talks to etcd</strong> (etcd being the cluster's database, covered in depth later this week). The scheduler doesn't command kubelets directly. Controllers don't create containers directly. Instead, each component runs its own independent loop against the API: watch for the state it cares about, take one small step toward the desired outcome, report back what happened, then repeat forever. That watch-act-repeat pattern is called a <strong>reconcile loop</strong> (or control loop), and it's the same declarative idea from <a href="foundations.html#g-apis">Foundations §2</a> in miniature: state a goal once and let something else keep nudging reality toward it, rather than issuing step-by-step commands. Kubernetes as a whole is a set of independent control loops arranged around one shared database — not a pipeline where work hands off stage to stage.</p>
+<p class="analogy">The apiserver is the building's front desk — every request from every department passes through it, and nobody skips the desk to reach another department directly. etcd is the filing cabinet behind the desk that only the front desk may open. The scheduler is the seating host deciding which room a new guest gets. The controller-manager is the building's thermostat system: constantly comparing the posted target (desired state) to the actual reading (status) and adjusting until they match.</p>
 <svg viewBox="0 0 660 320" role="img" aria-label="Kubernetes architecture: scheduler, controller-manager and kubelet all talk only to the apiserver; only the apiserver talks to etcd">
   <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
   <rect x="8" y="6" width="400" height="306" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
@@ -98,6 +97,7 @@
   <line x1="540" y1="128" x2="540" y2="224" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
   <text x="548" y="200" fill="var(--muted)" font-size="10.5">CRI (gRPC)</text>
 </svg>
+<p>In plain terms: every arrow above either starts or ends at the apiserver box in the middle, and only the apiserver has an arrow to etcd — no component ever skips it to reach another component, or the database, directly.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Close this page. On paper, draw every box and arrow above from memory, including <em>who initiates</em> each connection.</li>
@@ -127,10 +127,10 @@ kube-scheduler-cp             1/1     Running   cp</pre>
 <div class="lesson-head"><span class="cp-id">1.2</span><h4>Find out how each component actually runs on the node</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Fix the broken apiserver" means editing a file, not running a systemctl command — but only if you know which components are static pods and which is the one real systemd service.</p>
+<p>"Fix the broken apiserver" means editing a YAML file on disk, not running a <code>systemctl restart</code> command — but only if you know which components are static pods and which one is the single real systemd service on this node.</p>
 <h5>The concept</h5>
-<div class="foundation"><h5>🧱 Foundations</h5><p>New to systemd or Linux services generally? <a href="foundations.html#g-systemd">Foundations §8</a> has the plain-language version — the short of it: systemd is the one program the kernel starts first, and it's responsible for starting (and restarting) every long-running background program, including, on this node, the kubelet.</p></div>
-<p>Chicken-and-egg: the control plane runs as pods, but pods need a control plane. The escape hatch is <strong>static pods</strong>: the kubelet watches a directory (<code>staticPodPath: /etc/kubernetes/manifests</code> in its config) and runs whatever pod YAML appears there — no apiserver involved. It then reports read-only <strong>mirror pods</strong> to the API so you can <em>see</em> them (named <code>&lt;name&gt;-&lt;node&gt;</code>, e.g. <code>kube-apiserver-cp</code>). So the boot order is: systemd starts <strong>kubelet</strong> (the only real service) → kubelet starts etcd + apiserver + scheduler + controller-manager from manifest files → everything else arrives via the API.</p>
+<p><strong>systemd</strong> is the first program the Linux kernel starts on boot, and its job is starting — and restarting, if they crash — every other long-running background program on the machine, each one called a <strong>service</strong> or <strong>unit</strong> (the plain-language version, if Linux services generally are new to you, is in <a href="foundations.html#g-systemd">Foundations §8</a>). On a Kubernetes control-plane node, the kubelet is one such systemd service — but the rest of the control plane (etcd, the apiserver, the scheduler, the controller-manager) deliberately is not.</p>
+<p>Here's the chicken-and-egg problem that explains why: normally, what runs where is decided by the apiserver's own scheduling machinery — but the apiserver itself has to start somehow first, before it exists to schedule anything, including itself. The escape hatch is the <strong>static pod</strong>: the kubelet watches one directory on disk (<code>staticPodPath: /etc/kubernetes/manifests</code> in its config) and runs whatever pod YAML it finds there directly, with no apiserver involved at all. It then reports a read-only <strong>mirror pod</strong> to the API purely so you can <em>see</em> it in <code>kubectl get pods</code> (named <code>&lt;name&gt;-&lt;node&gt;</code>, e.g. <code>kube-apiserver-cp</code>) — but that API object is only a mirror, not the real thing, so deleting it doesn't stop anything, as you're about to prove. So the real boot order on this node is: systemd starts <strong>kubelet</strong>, the only service it needs to know about → the kubelet reads the static pod manifests off disk and starts etcd, the apiserver, the scheduler, and the controller-manager itself → only after that does the rest of the cluster's usual apiserver-mediated machinery become available.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>On <code>cp</code>, look at the static pod manifests:
@@ -166,7 +166,7 @@ sudo mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/</pre></li>
 <div class="lesson-head"><span class="cp-id">1.3</span><h4>Trace one kubectl create deployment end-to-end</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Every "why isn't my pod running?" question is answered by knowing which of the five actors in this chain stopped. This trace <em>is</em> the troubleshooting flowchart.</p>
+<p>Creating a Deployment looks like one action from the outside — you run a single <code>kubectl</code> command — but underneath it's five separate, independent programs each doing one small step in a chain, with no component skipping ahead of another. Every "why isn't my pod running?" question is answered by knowing which of those five actors stopped. This trace <em>is</em> the troubleshooting flowchart.</p>
 <h5>The concept</h5>
 <p>Five independent loops, no direct calls between them:</p>
 <ol>
@@ -216,18 +216,18 @@ pod/trace-66cc6c9b8b-x7jwd   1/1     Running   0</pre>
 <div class="lesson-head"><span class="cp-id">1.4</span><h4>Learn the request pipeline in order</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>This one ordered list explains RBAC questions, admission questions, and a whole class of "permission denied vs rejected" confusions. It's the most quotable fact in the exam's 25% architecture domain.</p>
+<p>Every single thing you or any component does to the cluster — create a pod, read a Secret, delete a node — is one HTTP request that walks through this same fixed sequence of checks before it's allowed to change anything. This one ordered list explains RBAC questions, admission questions, and a whole class of "permission denied vs rejected" confusions. It's the most quotable fact in the exam's 25% architecture domain.</p>
 <h5>The concept</h5>
 <div class="flow"><span>authentication</span><em>→</em><span>authorization</span><em>→</em><span class="hot">mutating admission</span><em>→</em><span>schema validation</span><em>→</em><span class="hot">validating admission</span><em>→</em><span>persist to etcd</span></div>
-<div class="foundation"><h5>🧱 Foundations</h5><p><strong>Authentication</strong> answers "who are you" — proving an identity, the way showing an ID does. <strong>Authorization</strong> is a separate question, asked only once authentication already succeeded: "is this identity allowed to do this specific thing." Conflating the two is the most common source of "permission denied" confusion — a valid ID doesn't put you on every guest list. See <a href="foundations.html#g-pki">Foundations §5</a> if certificates as proof-of-identity are new to you.</p></div>
+<p>Read that chain as two different questions asked one after another, plus two chances for the object to be touched. <strong>Authentication</strong> answers "who are you" — proving an identity, the way showing an ID does. <strong>Authorization</strong> is a separate question, asked only once authentication has already succeeded: "is this identity allowed to do this specific thing." Conflating the two is the single most common source of "permission denied" confusion — a valid ID doesn't put you on every guest list, it just gets you past the door where your name is checked against one. (See <a href="foundations.html#g-pki">Foundations §5</a> if certificates as proof-of-identity are new to you.)</p>
 <ul>
-<li><strong>Authentication — who are you?</strong> Client certificate, bearer token (ServiceAccount <abbr title="JSON Web Token — a signed, self-contained token that proves an identity without a server round-trip">JWT</abbr>, bootstrap token), or <abbr title="OpenID Connect — delegating authentication to an external identity provider, e.g. your company SSO">OIDC</abbr>. Modules are tried in turn; first success wins. Failure → <code>401 Unauthorized</code>.</li>
-<li><strong>Authorization — may you do this verb on this resource?</strong> The configured authorizers (on kubeadm: <code>Node,RBAC</code>) are consulted in order; first to allow wins; default is deny. Failure → <code>403 Forbidden</code>.</li>
-<li><strong>Mutating admission — webhooks may edit the object.</strong> This is how sidecar injectors and defaulters work.</li>
-<li><strong>Validation + validating admission — the object may be rejected but no longer changed.</strong></li>
-<li>Only then is it serialized into etcd. A watch event then fans out to whoever is watching.</li>
+<li><strong>Authentication — who are you?</strong> Client certificate, bearer token (ServiceAccount <abbr title="JSON Web Token — a signed, self-contained token that proves an identity without a server round-trip">JWT</abbr>, bootstrap token), or <abbr title="OpenID Connect — delegating authentication to an external identity provider, e.g. your company SSO">OIDC</abbr> — a way of outsourcing "who is this" to an external identity provider. Modules are tried in turn; first success wins. Failure → <code>401 Unauthorized</code>.</li>
+<li><strong>Authorization — may you do this verb on this resource?</strong> The configured authorizers (on kubeadm: <code>Node,RBAC</code>) are consulted in order; first to allow wins; if none allow, the default is deny. Failure → <code>403 Forbidden</code>.</li>
+<li><strong>Mutating admission — webhooks may edit the object before it's stored.</strong> This is how sidecar injectors and defaulters work: they don't ask permission, they quietly add or change fields in flight.</li>
+<li><strong>Validation + validating admission — the object may still be rejected here, but it's no longer changed.</strong> This stage only gets to say yes or no.</li>
+<li>Only then is the object actually serialized into etcd. A watch event then fans out to whoever is watching for it — which is how every controller in 1.1's diagram finds out something happened.</li>
 </ul>
-<p>Reading errors backwards: <code>401</code> = authn (bad cert/token), <code>403</code> = authz (RBAC), <code>admission webhook denied</code> = admission. Three different fixes, and the status code tells you which lesson to apply.</p>
+<p>Reading errors backwards is the practical payoff: <code>401</code> means authentication failed (bad cert/token), <code>403</code> means authorization failed (RBAC said no), <code>admission webhook denied</code> means it got further but an admission plugin rejected it. Three different problems, three different fixes, and the status code alone tells you which one you're looking at.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>See defaulting/mutation happen. Compare what you <em>send</em> with what gets <em>stored</em>:
@@ -260,7 +260,7 @@ no</pre></li>
 <div class="lesson-head"><span class="cp-id">1.5</span><h4>Read your live kube-apiserver.yaml and explain 10 flags</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Week-6 exam tasks plant faults <em>in this exact file</em>. Reading it fluently now means later you'll spot the wrong line in seconds.</p>
+<p>The apiserver's entire configuration is one YAML file listing command-line flags — no separate config format to learn. Week-6 exam tasks plant faults <em>in this exact file</em>, so reading it fluently now means later you'll spot the wrong line in seconds instead of rereading the whole thing.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Open it read-only (get in the habit — accidental edits restart the apiserver):
@@ -292,10 +292,10 @@ no</pre></li>
 <div class="lesson-head"><span class="cp-id">1.6</span><h4>Understand watches — see the HTTP request kubectl actually makes</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Watch" is the verb that makes the whole architecture from 1.1 work. Understanding it explains <code>resourceVersion</code>, "object has been modified" errors, and why the control plane scales at all.</p>
+<p>"Watch" is the verb that makes the whole architecture from 1.1 actually work in practice, not just in theory. Understanding it explains <code>resourceVersion</code>, "object has been modified" errors, and why the control plane scales to thousands of nodes without falling over.</p>
 <h5>The concept</h5>
-<div class="foundation"><h5>🧱 Foundations</h5><p>This is the client-server idea from <a href="foundations.html#g-apis">Foundations §2</a> made concrete: instead of every component calling back in to ask "anything new yet?", each one holds one open request and the server pushes changes down it the instant they happen. Nobody has to ask twice, and nobody has to poll.</p></div>
-<p>A watch is just a long-lived HTTP GET with <code>?watch=true&amp;resourceVersion=N</code>: "stream me every change to these objects since revision N". The apiserver keeps a <strong>watch cache</strong> per resource type, fed by a single etcd watch — so 5,000 kubelets watching pods cost etcd almost nothing. <code>resourceVersion</code> is literally etcd's MVCC revision counter (1.10): every write bumps it, and comparing versions is how optimistic concurrency ("the object has been modified; please apply your changes to the latest version") detects conflicting edits.</p>
+<p>The obvious way for a component to find out about changes would be to keep asking "anything new yet?" over and over — polling. Kubernetes does the opposite: a <strong>watch</strong> is just a long-lived HTTP GET request with <code>?watch=true&amp;resourceVersion=N</code> tacked on, meaning "stream me every change to these objects from now on, starting right after revision N" — the connection stays open, and the server pushes each change down it the instant it happens instead of waiting to be asked again. Nobody has to ask twice, and nobody has to poll. (This is the same client-server idea from <a href="foundations.html#g-apis">Foundations §2</a> made concrete.)</p>
+<p>The apiserver keeps a <strong>watch cache</strong> per resource type, fed by a single underlying etcd watch — so 5,000 kubelets all watching pods costs etcd almost nothing, since they're really all just reading from that one shared cache. <code>resourceVersion</code> is literally etcd's MVCC revision counter (covered in more depth in 1.10): every write to anything bumps it, and comparing versions is how <strong>optimistic concurrency</strong> works — the strategy of letting two writers both attempt a change rather than locking first, and only catching the conflict at write time. That's exactly what produces the "the object has been modified; please apply your changes to the latest version" error: the server detecting that your copy's version number is stale.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Watch kubectl's own HTTP calls with verbosity 6:
@@ -323,7 +323,7 @@ modified; please apply your changes to the latest version and try again</pre>
 <div class="lesson-head"><span class="cp-id">1.7</span><h4>Talk to the API without kubectl once</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Demystification with a practical payoff: in week 7 you'll prove ServiceAccount permissions by curling the API from inside a pod. Learn the shape of the REST API now.</p>
+<p><code>kubectl</code> isn't a special protocol — it's a thin wrapper that turns each command into a plain HTTP request against a REST API, the same kind of API you'd call with <code>curl</code> or any HTTP client. Seeing that directly is demystification with a practical payoff: in week 7 you'll prove ServiceAccount permissions by curling the API from inside a pod, with no <code>kubectl</code> involved at all. Learn the shape of the REST API now, while it's low-stakes.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Start an authenticated local proxy (it borrows your kubeconfig credentials):
@@ -352,7 +352,7 @@ curl -s localhost:8001/apis/apps/v1/namespaces/default/deployments | grep '"kind
 <div class="lesson-head"><span class="cp-id">1.8</span><h4>Know API groups &amp; versions — and where objects live in etcd</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>A typo'd <code>apiVersion</code> is one of the cheapest planted exam bugs, and <code>kubectl api-resources</code> is the tool that answers "what group is this thing in" in five seconds.</p>
+<p>Every object's YAML starts with an <code>apiVersion</code> line, and Kubernetes organizes its resource types into named <strong>API groups</strong> so the API can grow over time without breaking everything at once — get that line wrong and the object is rejected before anything else even looks at it. A typo'd <code>apiVersion</code> is one of the cheapest planted exam bugs, and <code>kubectl api-resources</code> is the tool that answers "what group is this thing actually in" in five seconds.</p>
 <h5>The concept</h5>
 <p>Resources are organized into groups: the original <strong>core</strong> group has no name (<code>apiVersion: v1</code> — Pods, Services, ConfigMaps, PVCs, Namespaces); later resources live in named groups (<code>apps/v1</code>: Deployments, ReplicaSets, StatefulSets, DaemonSets; <code>batch/v1</code>: Jobs, CronJobs; <code>networking.k8s.io/v1</code>: Ingress, NetworkPolicy; <code>rbac.authorization.k8s.io/v1</code>: Roles, Bindings; <code>storage.k8s.io/v1</code>: StorageClasses). In etcd, every object is stored <em>once</em>, at a path like <code>/registry/deployments/&lt;namespace&gt;/&lt;name&gt;</code>, in one canonical <em>storage version</em> — the apiserver converts between served versions on the fly, which is why version skew mostly "just works".</p>
 <h5>Lab</h5>
@@ -390,10 +390,10 @@ from "STDIN": no matches for kind "Deployment" in version "apps/v1beta1"</pre>
 <div class="lesson-head"><span class="cp-id">1.9</span><h4>Learn Raft at the "explain to a colleague" level</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>You won't implement Raft in the exam — but quorum arithmetic explains etcd's failure behavior, and "what still works when etcd is down" is genuine exam material (6.8).</p>
+<p>etcd is the cluster's database, and it doesn't run as one copy — it runs as several, specifically so that losing one machine doesn't lose the cluster's state. Getting several copies to agree on the exact same sequence of writes, even when a machine crashes mid-write, is what <strong>Raft</strong> (etcd's consensus algorithm) solves. You won't implement Raft in the exam — but the arithmetic it produces, <strong>quorum</strong>, explains etcd's failure behavior directly, and "what still works when etcd is down" is genuine exam material (6.8).</p>
 <h5>The concept</h5>
-<div class="foundation"><h5>🧱 Foundations</h5><p>New to distributed systems? <a href="foundations.html#g-consensus">Foundations §6</a> has the plain-language, one-committee-vote version of what "quorum" means, before the arithmetic below.</p></div>
-<p>etcd members elect a <strong>leader</strong>; all writes go through it. The leader appends each write to its write-ahead log and replicates it to followers; the write <em>commits</em> once a <strong>quorum</strong> — a strict majority — has persisted it. If the leader dies, followers time out and elect a new one (elections take ~seconds; writes pause, reads from the apiserver's watch cache continue).</p>
+<p class="analogy">Think of etcd's members as a small committee that only needs a strict majority to act, not unanimous agreement. Three members means any two agreeing is enough, so the committee keeps functioning even if one member is out sick — but a two-member committee needs both members every time, so losing either one stops everything. (The general version of this idea, for any distributed system, is in <a href="foundations.html#g-consensus">Foundations §6</a>.)</p>
+<p>etcd members elect one <strong>leader</strong>; all writes go through it. The leader appends each write to its write-ahead log — a durable, ordered record of every change, written before anything counts as final — and replicates it to the other members, called followers. A write only <em>commits</em>, meaning it's now safe and permanent, once a <strong>quorum</strong> — a strict majority of members — has persisted a copy of it. If the leader dies, the followers notice it's gone quiet, time out, and elect a new leader among themselves (elections take roughly seconds; writes pause during that gap, while reads keep being served from the apiserver's own watch cache).</p>
 <table>
 <tr><th>Members</th><th>Quorum</th><th>Failures tolerated</th><th>Note</th></tr>
 <tr><td>1</td><td>1</td><td>0</td><td>your lab; fine for learning</td></tr>
@@ -426,9 +426,10 @@ from "STDIN": no matches for kind "Deployment" in version "apps/v1beta1"</pre>
 <div class="lesson-head"><span class="cp-id">1.10</span><h4>Understand etcd's MVCC model: revisions, compaction, defrag</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>This is where <code>resourceVersion</code> (1.6) physically comes from, and compaction/defrag show up both in real operations and in etcd's own log messages you'll read during troubleshooting.</p>
+<p>This lesson is where <code>resourceVersion</code> (1.6) physically comes from — the same number, not a coincidence — and compaction/defrag show up both in real cluster operations and in etcd's own log messages you'll read during troubleshooting.</p>
 <h5>The concept</h5>
-<p>etcd never updates a key in place: every write creates a new <strong>revision</strong> of the key in a bbolt B+tree, and the global revision counter ticks up on every write to anything. Watches are literally "replay every event since revision N" — that's why a watch can reconnect and miss nothing. Old revisions pile up until <strong>compaction</strong> discards history below some revision (Kubernetes' apiserver requests compaction every 5 minutes). Compaction frees <em>logical</em> space only; <strong>defragmentation</strong> (<code>etcdctl defrag</code>) rewrites the DB file to return space to the OS. A neglected etcd hits its space quota and goes into a read-only <code>alarm:NOSPACE</code> state — the pathological version of "writes hang".</p>
+<p><abbr title="Multi-Version Concurrency Control — keeping old versions of data around instead of overwriting in place">MVCC</abbr> is the design etcd uses instead of updating data in place: every write creates a brand-new <strong>revision</strong> of the key, stored alongside the old ones in a bbolt B+tree (etcd's on-disk data structure), and one global revision counter ticks up on <em>every</em> write to anything in the whole database. That's what makes watches reliable: a watch is literally "replay every event since revision N", so reconnecting after a network blip just resumes the replay from the last revision you saw — nothing is missed, because nothing was thrown away yet.</p>
+<p>"Yet" is the key word: old revisions pile up forever unless something clears them out, which is <strong>compaction</strong> — discarding history below some revision number (Kubernetes' own apiserver requests a compaction every 5 minutes, so this happens automatically on a normal cluster). But compaction only frees <em>logical</em> space — it marks that space reusable inside etcd's own file, without shrinking the file on disk. <strong>Defragmentation</strong> (<code>etcdctl defrag</code>) is the separate step that actually rewrites the database file to hand that freed space back to the OS. A neglected etcd that's never defragmented can hit its configured space quota and flip into a read-only <code>alarm:NOSPACE</code> state — the pathological, cluster-wide version of "writes hang".</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Watch the revision counter move. Create anything and check an object's resourceVersion before/after:
@@ -453,7 +454,7 @@ kubectl get cm mvcc-demo -o jsonpath='{.metadata.resourceVersion}'; echo</pre>
 <div class="lesson-head"><span class="cp-id">1.11</span><h4>Extract the four etcdctl connection values from the manifest</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The etcd backup/restore exam task is guaranteed points <em>if</em> you can assemble the etcdctl command quickly. All four values you need are sitting in one file — knowing where beats memorizing them.</p>
+<p><code>etcdctl</code> is etcd's own command-line client, and every command it runs needs four connection values — where etcd is listening, and three TLS files proving you're allowed to talk to it. The etcd backup/restore exam task is guaranteed points <em>if</em> you can assemble that etcdctl command quickly. All four values you need are sitting in one file already; knowing where to look beats memorizing them.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Read the etcd static pod manifest and pull out the TLS/endpoint flags:
@@ -494,7 +495,7 @@ API version: 3.5</pre></li>
 <div class="lesson-head"><span class="cp-id">1.12</span><h4>Browse the raw data in etcd once</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Seeing objects at their real storage paths makes "the apiserver is a database frontend" concrete — and it permanently demystifies what an etcd backup actually contains.</p>
+<p>Every Kubernetes object you've ever created is, underneath, just a key and a value in etcd's key-value store — a Pod named <code>web</code> is stored at a specific path, the way a file lives at a filesystem path. Seeing that directly makes "the apiserver is a database frontend" concrete instead of abstract, and it permanently demystifies what an etcd backup actually contains: a copy of exactly this.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>List some keys (using the same flags as 1.11 — make a shell alias if you're tired of typing them):
@@ -526,7 +527,7 @@ v1	ConfigMap�...   ← binary protobuf, not JSON</pre>
 <div class="lesson-head"><span class="cp-id">1.13</span><h4>Check etcd health the way the exam expects</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Two commands cover every "is etcd okay?" moment in troubleshooting tasks and in the backup/restore drill.</p>
+<p>"Is etcd okay" is really two separate questions — is it reachable and actually accepting writes, and which machines currently think they're members of this cluster — and etcd has one purpose-built command for each. Two commands cover every "is etcd okay?" moment in troubleshooting tasks and in the backup/restore drill.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Health of the endpoint(s):
@@ -559,15 +560,15 @@ v1	ConfigMap�...   ← binary protobuf, not JSON</pre>
 <div class="lesson-head"><span class="cp-id">1.14</span><h4>Learn the scheduler's two-phase cycle</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Week 3's scheduling controls (taints, affinity, resources) all plug into this machinery, and "0/3 nodes are available" messages become readable once you know which phase produced them.</p>
+<p>The scheduler — the "seating host" from 1.1's analogy, deciding which room a new guest gets — doesn't just pick any free node; it runs every pending pod through a fixed two-phase process, and week 3's scheduling controls (taints, affinity, resources) all plug into this exact machinery. "0/3 nodes are available" messages become readable once you know which phase produced them.</p>
 <h5>The concept</h5>
-<p>The scheduler watches for pods with empty <code>spec.nodeName</code> and runs each through two phases:</p>
+<p>The scheduler watches for pods with an empty <code>spec.nodeName</code> — meaning nobody has decided where they go yet — and runs each one through two phases:</p>
 <div class="flow"><span>PreFilter</span><em>→</em><span class="hot">Filter</span><em>→</em><span>PostFilter (preemption)</span><em>→</em><span class="hot">Score</span><em>→</em><span>Reserve</span><em>→</em><span>bind (async)</span></div>
 <ul>
-<li><strong>Filter</strong> drops nodes that <em>can't</em> host the pod: not enough free <em>requests</em> (not actual usage!), untolerated taints, failed nodeSelector/affinity, port conflicts, volume topology. Survivors are "feasible".</li>
-<li><strong>PostFilter</strong> only runs when <em>zero</em> nodes survive — this is where <strong>preemption</strong> lives: evict lower-priority pods to make room, if the pod has higher priority.</li>
-<li><strong>Score</strong> ranks feasible nodes: least-allocated resources, topology spreading, image already present, affinity preferences. Highest total wins.</li>
-<li>The <strong>binding cycle</strong> then writes a Binding subresource asynchronously — the API write that sets <code>nodeName</code>. The scheduler never contacts any node.</li>
+<li><strong>Filter</strong> throws out nodes that flatly <em>can't</em> host the pod: not enough free <em>requests</em> (the CPU/memory a pod has reserved, not what it's actually using right now), an untolerated taint, a failed nodeSelector/affinity rule, a port conflict, or a volume unreachable from that node. Whatever nodes survive this pass are called "feasible".</li>
+<li><strong>PostFilter</strong> only runs when <em>zero</em> nodes survive Filter — this is where <strong>preemption</strong> lives: if the pending pod has higher priority than something already running, the scheduler can evict that lower-priority pod to free up room.</li>
+<li><strong>Score</strong> ranks the feasible nodes against each other: least-allocated resources, spreading pods across failure domains, whether a node already has the image cached, affinity preferences. Highest total score wins.</li>
+<li>The <strong>binding cycle</strong> then writes a Binding subresource asynchronously — the one API write that actually sets <code>nodeName</code> on the pod. Notice the scheduler never contacts any node directly to do this; like everything else in Kubernetes, it just writes to the API and lets the kubelet notice.</li>
 </ul>
 <h5>Lab</h5>
 <ol class="lab">
@@ -593,7 +594,7 @@ kubectl describe pod greedy | tail -4</pre>
 <div class="lesson-head"><span class="cp-id">1.15</span><h4>Prove it: bypass the scheduler with a preset nodeName</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Ten minutes that permanently separates "the scheduler assigns pods" from "the kubelet runs pods". It also hands you a real repair tool: manual scheduling works even with the scheduler dead.</p>
+<p>It's easy to blur "the scheduler assigns pods" and "the kubelet runs pods" into one vague idea; this ten-minute lab permanently separates them by proving pods can run with the scheduler completely dead. It also hands you a real repair tool: manual scheduling still works when the scheduler doesn't.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Stop the scheduler (static pod trick from 1.2):
@@ -624,7 +625,7 @@ kubectl delete pod waiting direct</pre></li>
 <div class="lesson-head"><span class="cp-id">1.16</span><h4>Understand the controller pattern: informer → queue → reconcile</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Every controller — built-in or operator/CRD (which the 2025 curriculum expects you to understand) — is this same shape. Learn it once, recognize it everywhere.</p>
+<p>A <strong>controller</strong> is just a program that watches the API and keeps nudging reality toward whatever's declared — 1.1's "thermostat" idea, but this lesson is the actual mechanism running inside every single one of them, from the built-in Deployment controller to a custom operator watching a CRD (which the 2025 curriculum expects you to understand). Learn this one shape once, recognize it everywhere.</p>
 <h5>The concept</h5>
 <p class="analogy">An informer is mail sorting: it watches for anything new and drops a note about it. A work queue is the to-do list built from those notes — deduplicated, so ten notes about the same thing become one line. Reconcile is a worker actually picking up that line, doing the task, and crossing it off — or putting it back on the list to retry if it's not done yet.</p>
 <p>A controller has three parts: an <strong>informer</strong> (the LIST+WATCH pair from 1.6 plus an in-memory cache) that turns API changes into events; a <strong>work queue</strong> where events land as object keys (<code>namespace/name</code>, deduplicated); and worker loops that pop a key and run <strong>reconcile</strong>: read desired state (the spec), read observed state (the world), do <em>one small step</em> toward convergence, requeue with backoff on error. Crucially this is <strong>level-triggered</strong>, not edge-triggered: reconcile looks at <em>current</em> state, not at the event that woke it — so missed events don't matter, and every informer resyncs periodically anyway. A controller that was down catches up by itself the moment it's back (you watched that happen in 1.15 step 4).</p>
@@ -654,9 +655,9 @@ recon-5b8f6d9c44-jw6ns   0/1     <b>ContainerCreating</b>   0          1s
 <div class="lesson-head"><span class="cp-id">1.17</span><h4>Follow an ownership chain live; understand cascade deletion</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Explains what actually happens on <code>kubectl delete deployment</code>, why deleting an RS pod "doesn't work", and gives you the <code>--cascade=orphan</code> trick.</p>
+<p>"Cascade deletion" — delete a Deployment and watch its ReplicaSet and Pods vanish too — looks like one automatic operation, but nothing in Kubernetes actually cascades imperatively; it's reconciliation doing it one controller at a time. This lesson explains what actually happens on <code>kubectl delete deployment</code>, why deleting an RS's pod "doesn't work", and gives you the <code>--cascade=orphan</code> trick.</p>
 <h5>The concept</h5>
-<p>Child objects carry an <code>ownerReferences</code> entry pointing at their parent. Nothing "cascades" imperatively: deleting a Deployment just deletes the Deployment row. The <strong>garbage collector controller</strong> then notices ReplicaSets whose owner no longer exists and deletes them; the same wave then takes the pods. It's reconciliation all the way down.</p>
+<p>Every child object carries an <code>ownerReferences</code> field pointing back at whatever created it — a ReplicaSet points at its Deployment, a Pod points at its ReplicaSet. Nothing "cascades" imperatively: deleting a Deployment just deletes that one Deployment row from etcd, nothing more. It's the <strong>garbage collector controller</strong> — yet another reconcile loop, this one watching for orphaned objects — that notices a ReplicaSet whose owner no longer exists and deletes it; that deletion is itself watched, so the same wave of noticing-and-deleting then takes the pods too. It's reconciliation all the way down, not a single cascading operation.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Inspect the chain:
@@ -686,7 +687,7 @@ pod/owners-66d9c8b444-tv84q   1/1     Running</pre>
 <div class="lesson-head"><span class="cp-id">1.18</span><h4>Know leader election: why two controller-managers don't double-reconcile</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Explains HA control planes (relevant to multi-control-plane questions) and introduces Lease objects, which reappear in node heartbeats (1.22).</p>
+<p>Running more than one copy of controller-manager sounds like it should double the work done — instead, exactly one copy is ever active at a time, and this lesson is why. It explains HA (highly-available, meaning more than one control-plane node) control planes, relevant to multi-control-plane exam questions, and introduces <strong>Lease</strong> objects, which reappear in node heartbeats (1.22).</p>
 <h5>The concept</h5>
 <p>Controller-manager and scheduler replicas would conflict if all were active — imagine three replicaset controllers each creating 3 pods. So all replicas run, but only the one holding a <strong>Lease</strong> object acts; the rest hot-standby. The holder renews the lease every few seconds; if it dies, another replica acquires the lease when it expires and takes over. Same watch-and-write machinery as everything else — coordination through the API, no direct communication.</p>
 <h5>Lab</h5>
@@ -718,9 +719,10 @@ kubectl get lease kube-controller-manager -n kube-system \
 <div class="lesson-head"><span class="cp-id">1.19</span><h4>Learn the kubelet's syncLoop and its three pod sources</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The kubelet is the component that turns database rows into running processes. Knowing its inputs and its health signals ("PLEG is not healthy") turns several week-6 log messages into instant diagnoses.</p>
+<p>Everything upstream of this point — the apiserver, the scheduler, the controllers — only ever writes rows into a database. The kubelet is the component that turns those rows into actual running processes on a real machine; it's the one place in the whole architecture where "declared" finally becomes "real". Knowing its inputs and its health signals (like "PLEG is not healthy") turns several week-6 log messages into instant diagnoses.</p>
 <h5>The concept</h5>
-<p>The kubelet merges pod specs from <strong>three sources</strong> into one desired set: (1) the apiserver watch — normal pods bound to this node; (2) the <strong>static pod directory</strong> (<code>staticPodPath</code>) — how the control plane bootstraps (1.2); (3) an HTTP endpoint (rarely used). Per-pod workers then converge reality: create the sandbox, pull images, start containers, run probes. Coming back the other way, the <strong>PLEG</strong> (Pod Lifecycle Event Generator) polls the runtime for container state changes and feeds them into the sync loop — that's how the kubelet notices "container died" and restarts it per <code>restartPolicy</code>.</p>
+<p>The kubelet merges pod specs from <strong>three sources</strong> into one desired set: (1) the apiserver watch — ordinary pods bound to this node, the normal case; (2) the <strong>static pod directory</strong> (<code>staticPodPath</code>) — how the control plane bootstraps itself, as you saw in 1.2; (3) an HTTP endpoint, rarely used. Per-pod worker routines then converge reality toward that desired set: create the sandbox, pull images, start containers, run probes.</p>
+<p>Information also flows the other way, from the runtime back up: the <strong>PLEG</strong> (Pod Lifecycle Event Generator) continuously polls the container runtime for state changes and feeds them into the kubelet's sync loop — that's the mechanism by which the kubelet notices "this container just died" and restarts it according to <code>restartPolicy</code>.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Find the sources in the live config:
@@ -751,10 +753,9 @@ kubectl exec pleg-demo -- sh -c "kill 1"   # kill nginx's PID 1</pre>
 <div class="lesson-head"><span class="cp-id">1.20</span><h4>Understand CRI: kubelet → containerd → shim → runc</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p><code>crictl</code> talks CRI directly to the runtime — no apiserver needed. It is <em>the</em> debugging tool for control-plane-down scenarios, so the chain it plugs into is worth knowing precisely.</p>
+<p><code>crictl</code> talks CRI directly to the container runtime, with no apiserver involved at all — which makes it <em>the</em> debugging tool for control-plane-down scenarios, when <code>kubectl</code> itself might not even be reachable. The chain it plugs into is worth knowing precisely.</p>
 <h5>The concept</h5>
-<div class="foundation"><h5>🧱 Foundations</h5><p><code>runc</code> is the program that actually applies the namespaces + cgroups fencing from <a href="foundations.html#g-processes">Foundations §1</a> to create a container — it's the last, most literal link in this chain. Everything above it here (containerd, the shim) is bookkeeping and lifecycle management around that one moment.</p></div>
-<p>The kubelet calls the runtime over <abbr title="a remote-procedure-call protocol — a structured way for two programs to call each other's functions across a socket or network, instead of hand-rolling a wire format">gRPC</abbr> on a Unix socket — two services: <code>RuntimeService</code> (sandboxes/containers) and <code>ImageService</code> (pulls). containerd receives the call and spawns a tiny <strong>shim</strong> process per pod, which invokes <strong>runc</strong>; runc assembles namespaces + cgroups per the <abbr title="Open Container Initiative — the vendor-neutral spec that defines what a 'container' is at the filesystem/process level, so runc, crun, etc. are interchangeable">OCI</abbr> spec, starts the container's PID 1, and <em>exits</em>. The shim stays alive holding stdio and the exit code — which is why containerd itself can restart without killing your containers.</p>
+<p>The kubelet calls the runtime over <abbr title="a remote-procedure-call protocol — a structured way for two programs to call each other's functions across a socket or network, instead of hand-rolling a wire format">gRPC</abbr> — a way for two programs to call each other's functions across a socket, instead of hand-rolling a network protocol — on a Unix socket, using two services: <code>RuntimeService</code> for sandboxes/containers and <code>ImageService</code> for pulls. containerd receives that call and spawns a tiny <strong>shim</strong> process per pod, which in turn invokes <strong>runc</strong> — the program that actually applies the namespaces-plus-cgroups fencing from <a href="foundations.html#g-processes">Foundations §1</a> to create a container. runc assembles the namespaces and cgroups per the <abbr title="Open Container Initiative — the vendor-neutral spec that defines what a 'container' is at the filesystem/process level, so runc, crun, etc. are interchangeable">OCI</abbr> spec, starts the container's PID 1, and then <em>exits immediately</em> — it isn't a long-running process. The shim is what stays alive afterward, holding the container's stdio and eventual exit code, which is exactly why containerd itself can be restarted without killing any of your running containers.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Find the socket the kubelet uses. On modern kubeadm (incl. v1.35) this file is often near-empty — kubelet auto-detects the CRI socket when exactly one exists, so kubeadm no longer needs to write <code>--container-runtime-endpoint</code> as a flag:
@@ -789,9 +790,9 @@ sudo crictl ps | head -5</pre>
 <div class="lesson-head"><span class="cp-id">1.21</span><h4>Meet the pause container</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>The pause container is the physical answer to "why do containers in a pod share an IP?" — and it explains a whole family of crictl output you'll read in week 6.</p>
+<p>A <strong>pod</strong> is Kubernetes' unit of one or more containers that share certain resources — think of it as a shipping container holding one or more crates, traveling together (the pod-as-shipping-container idea reappears throughout this site). The pause container is the literal, physical answer to "why do containers in the same pod share an IP address?" — and it explains a whole family of crictl output you'll read in week 6.</p>
 <h5>The concept</h5>
-<p>Every pod starts with an invisible <strong>pause</strong> container (the "sandbox") whose only job is to sleep while <em>owning the pod's namespaces</em> — most importantly the network namespace. App containers <em>join</em> its namespaces. That's the whole mechanism behind "containers in a pod share an IP and localhost": they're in one netns, and the netns belongs to pause. When an app container crashes and restarts, the pod IP survives because pause never died. Only sandbox death (or pod deletion) releases the IP.</p>
+<p>Every pod starts with an invisible <strong>pause</strong> container, also called the "sandbox", whose only job is to sit there idle while <em>owning the pod's namespaces</em> — most importantly its network namespace: the private copy of the networking stack (its own interfaces, routes, firewall rules) a namespace represents (see <a href="foundations.html#g-linuxnet">Foundations §7</a> if that's new — it compares a network namespace to a hotel room with its own phone line). The pod's actual app containers then <em>join</em> that same namespace rather than getting one of their own. That's the entire mechanism behind "containers in a pod share an IP and can reach each other over localhost": they're all living in one network namespace, and that namespace belongs to pause, not to any of them. When an app container crashes and restarts, the pod's IP survives, because pause — the namespace's owner — never died. Only the sandbox itself dying, or the whole pod being deleted, releases the IP.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>On any worker, compare the two views:
@@ -817,7 +818,7 @@ CONTAINER      STATE     NAME      POD ID
 <div class="lesson-head"><span class="cp-id">1.22</span><h4>Understand node heartbeats and the death timeline</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>"Node died — why isn't my pod moving?" has a precise, numeric answer. Exam troubleshooting tasks and real life both hinge on these four numbers.</p>
+<p>Kubernetes doesn't notice a dead node instantly — it waits, deliberately, because a node that's merely slow to respond looks identical at first to one that's actually gone, and reacting too fast would mean needlessly rescheduling pods off nodes that were fine all along. "Node died — why isn't my pod moving?" has a precise, numeric answer as a result. Exam troubleshooting tasks and real life both hinge on these four numbers.</p>
 <h5>The concept</h5>
 <p>Two heartbeat channels: the kubelet renews a <strong>Lease</strong> in namespace <code>kube-node-lease</code> every <strong>10s</strong> (cheap), and patches <strong>NodeStatus</strong> every <strong>5m</strong> (or on change — expensive, full conditions report). When leases stop, the node-lifecycle controller (in controller-manager) marks the node <code>Unknown/NotReady</code> after <strong>~40s</strong> (<code>node-monitor-grace-period</code>) and adds the <code>node.kubernetes.io/unreachable:NoExecute</code> taint. Pods carry a default toleration for that taint of <strong>300s</strong> — after which they're evicted and their controllers create replacements elsewhere. Timeline: <em>death → ~40s NotReady → +300s pods evicted → replacements scheduled</em>. Roughly five and a half minutes of "nothing seems to happen" — by design.</p>
 <h5>Lab</h5>
@@ -849,7 +850,7 @@ kubectl get pod tol-demo -o yaml | grep -A4 tolerations</pre>
 <div class="lesson-head"><span class="cp-id">1.23</span><h4>Explore /var/lib/kubelet — the kubelet's home directory</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>Week-6 kubelet faults hide in these files. Knowing the two config sources and what lives where makes "kubelet won't start" a two-minute fix.</p>
+<p><code>/var/lib/kubelet</code> is the kubelet's own working directory on disk — its configuration, its certificates, and the actual files backing every volume mounted into a pod on this node. Week-6 kubelet faults hide in these files. Knowing the two config sources and what lives where makes "kubelet won't start" a two-minute fix instead of a guessing game.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li>Tour the directory on any node:
@@ -881,7 +882,7 @@ sudo find /var/lib/kubelet/pods -maxdepth 3 -name volumes | head -2</pre>
 <div class="lesson-head"><span class="cp-id">1.24</span><h4>Weekend drill: stop the scheduler, then the controller-manager — narrate everything</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
 <h5>Why it matters</h5>
-<p>This drill converts the week from knowledge into <em>signatures</em>. After it, "Pending, no events" and "deployment exists, no pods" are instant diagnoses — each worth minutes in the exam.</p>
+<p>Knowing how the scheduler and controller-manager work in theory is different from recognizing their absence at a glance. This drill converts the week's knowledge into <em>signatures</em> — after it, "Pending, no events" and "deployment exists, no pods" are instant diagnoses, each worth minutes saved in the exam.</p>
 <h5>Lab</h5>
 <ol class="lab">
 <li><strong>Scheduler outage.</strong> Stop it, create work, observe, restore:
