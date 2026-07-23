@@ -61,15 +61,15 @@ P0–P8 complete; the site is a full self-contained internals-first curriculum. 
 
 ## Beginner-track roadmap (update this table at the end of each session)
 
-Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0–B14), **225 checkpoints**, ~75 hours, self-paced. (225, not the spec's original ~200: each module's mini project and debugging drill are their own tickable checkpoint in a trailing "Project & drill" group, because the module anatomy makes each its own lesson article and `check-links.sh` demands one tracker checkpoint per anchor. So a module's total = its spec group counts + 2; B0 has no drill, +1; B14's groups already are its capstone/gauntlet, +0. `docs/BEGINNER-TRACK.md`'s per-module tables carry the corrected totals.) **Every phase below is sized to one session, start to finish**: it ends with green checkers, a commit, and a site that renders with nothing half-written. No session depends on another session's in-memory context.
+Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0–B14), **225 checkpoints**, ~74 hours, self-paced. (225, not the spec's original ~200: each module's mini project and debugging drill are their own tickable checkpoint in a trailing "Project & drill" group, because the module anatomy makes each its own lesson article and `check-links.sh` demands one tracker checkpoint per anchor. So a module's total = its spec group counts + 2; B0 has no drill, +1; B14's groups already are its capstone/gauntlet, +0. `docs/BEGINNER-TRACK.md`'s per-module tables carry the corrected totals.) **Every phase below is sized to one session, start to finish**: it ends with green checkers, a commit, and a site that renders with nothing half-written. No session depends on another session's in-memory context.
 
 | Phase | Scope | Status |
 |---|---|---|
 | B-S1 | `docs/BEGINNER-TRACK.md` — curriculum spec (docs-only commit) | ✅ done |
 | B-S2 | Wiring, no content: `site.css` additions; generalize `check-links.sh`/`check-html.py`; track switcher into every sidebar; `index.html` hero + prefix-scoped reset; `foundations.html` banner + go-deep links; stub `beginner.html` (`PUBLISHED=[]`) | ✅ done |
 | B-S3 | `beginner.html` sections B0–B7 (119 checkpoints) | ✅ done |
-| B-S4 | `beginner.html` sections B8–B14 (106 checkpoints) + resume link + hours panel | ⬜ next |
-| B-S5 | `materials/b0.html` — **pattern-setter** (lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks); review before continuing | ⬜ |
+| B-S4 | `beginner.html` sections B8–B14 (106 checkpoints) + hours panel | ✅ done |
+| B-S5 | `materials/b0.html` — **pattern-setter** (lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks); review before continuing | ⬜ next |
 | B-S6…B-S18 | `materials/b1.html` … `materials/b13.html`, one module per session | ⬜ |
 | B-S19 | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA | ⬜ |
 

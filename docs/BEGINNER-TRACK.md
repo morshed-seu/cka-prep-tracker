@@ -31,7 +31,7 @@ journey rather than three courses in a trench coat.
 
 ## Shape of the track
 
-15 modules · 225 checkpoints · ~75 hours · self-paced. There is deliberately **no calendar**: the
+15 modules · 225 checkpoints · ~74 hours · self-paced. There is deliberately **no calendar**: the
 8-week clock belongs to the advanced track. Ordering is strictly dependency-driven:
 
 ```
@@ -586,7 +586,9 @@ idempotent and every failure detector must guess.
 - *State and agreement* (5) — stateless vs stateful services; leader/follower replication; strong vs
   eventual consistency in plain terms; CAP as a practical trade-off; **quorum arithmetic** (majority
   of N, why 3 and 5, why even numbers buy nothing); **consensus/Raft**: leader election, log
-  replication, commit; split brain and fencing.
+  replication, commit; split brain and fencing. *(As built in B-S4: the group's count is 5, and the
+  bullet lists more topics than that — split brain and fencing ride along with the Raft checkpoint
+  they motivate, rather than taking a sixth slot.)*
 - *Patterns* (4) — leases and leader election; idempotency and at-least-once delivery; retries with
   backoff and jitter; **the reconciliation loop** (desired vs observed vs act) and watch-vs-poll;
   heartbeats, timeouts, and why a tight timeout invents failures that didn't happen.
@@ -670,6 +672,15 @@ One `cka-prep-v1` localStorage key for both tracks — beginner ids are namespac
 so they cannot collide and cross-track sync is free. Each tracker's reset button filters to its own
 prefix so resetting one track never wipes the other.
 
+### Hours panel
+
+Where `index.html` has the days-until-exam panel, `beginner.html` has an hours-left panel — this
+track has no calendar, so the honest unit of "how much is left" is lab time. Each
+`<section class="wk" id="bN">` carries `data-hours="N"` (the module's budget from the table above,
+74 in total); the tracker's `refresh()` sums each module's budget scaled by the share of its
+checkpoints still unticked, and prints that plus the number of modules still open. Adding or
+re-budgeting a module means updating that attribute, the module table above, and the hero counter.
+
 ### Track switcher
 
 A three-pill `.tracks` block in every sidebar (Beginner / Intermediate · soon / Advanced · CKA). The
@@ -693,7 +704,7 @@ tick the `CLAUDE.md` row and update the `cka-materials-plan` memory.
 | **B-S1** | This document. Docs-only commit |
 | **B-S2** | Wiring, no content: `site.css` additions; generalize `tools/check-links.sh` and `tools/check-html.py`; track switcher into all existing sidebars; `index.html` hero + prefix-scoped reset; `foundations.html` banner and go-deep links; stub `beginner.html` with `PUBLISHED=[]` |
 | **B-S3** | `beginner.html` sections **B0–B7** (119 checkpoints) — ✅ done |
-| **B-S4** | `beginner.html` sections **B8–B14** (106 checkpoints), resume link, hours panel |
+| **B-S4** | `beginner.html` sections **B8–B14** (106 checkpoints), hours panel — ✅ done |
 | **B-S5** | `materials/b0.html` — **the pattern-setter**: establishes lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks. Review before continuing |
 | **B-S6 … B-S18** | `materials/b1.html` … `materials/b13.html`, one module per session |
 | **B-S19** | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA |
