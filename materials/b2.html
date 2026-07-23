@@ -691,6 +691,202 @@ wait; rm -f /tmp/dtest</pre>
 <p class="docs-links"><code>man 1 ps</code> under <em>PROCESS STATE CODES</em> lists every letter and modifier — worth reading once end to end, it is half a page. <code>man 5 proc</code> under <code>/proc/[pid]/stat</code> for the raw state field, and <code>/proc/[pid]/wchan</code> for the sleeping-in function. <code>man 1 uptime</code> is thin on this, so read <code>man 5 proc</code> under <code>/proc/loadavg</code> for what load average actually counts.</p>
 </article>
 
+<article class="lesson" id="cp-b2-8" data-id="b2-8">
+<div class="lesson-head"><span class="cp-id">B2.8</span><h4>Read an exit code as a message — including 128 + signal</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>An exit code is the only thing a process says on its way out, and it is one small integer. Learning to read it is the difference between "the container crashed" and "the container was killed from outside, so stop reading its application logs for a cause". This is the lesson that makes <code>Exit Code: 137</code> immediately meaningful, months before you meet it in a pod status.</p>
+<h5>The concept</h5>
+<p>When a process ends, the kernel keeps one byte of information — a number from 0 to 255 — and hands it to the parent's <code>wait()</code>. In the shell, <code>$?</code> holds the code from the last command. The conventions:</p>
+<table>
+<tr><th>Code</th><th>Means</th></tr>
+<tr><td><code>0</code></td><td>success — and it is the <em>only</em> success value</td></tr>
+<tr><td><code>1</code>–<code>125</code></td><td>the program's own failure codes, meaning whatever its author decided</td></tr>
+<tr><td><code>126</code></td><td>found, but not executable — usually a missing execute bit</td></tr>
+<tr><td><code>127</code></td><td>command not found — the shell could not find it on <code>PATH</code></td></tr>
+<tr><td><code>128 + N</code></td><td>killed by signal <em>N</em> — the process did not choose to exit</td></tr>
+</table>
+<p>The 128 + N convention is the important one, and it exists because a single byte has to carry two different kinds of news: "the program decided to exit with this code" and "something killed the program with this signal". Reserving the top range for the second kind keeps them apart. So:</p>
+<ul>
+<li><strong>137</strong> = 128 + 9 = <code>SIGKILL</code>. Something outside decided this process should stop existing, and gave it no chance to object. On a node, this is nearly always a memory limit and the kernel's OOM killer.</li>
+<li><strong>143</strong> = 128 + 15 = <code>SIGTERM</code>. Something asked it to stop, and it either agreed or was not listening. This is the ordinary shutdown path.</li>
+<li><strong>139</strong> = 128 + 11 = <code>SIGSEGV</code>. It touched memory it does not own — a genuine bug in the program.</li>
+<li><strong>130</strong> = 128 + 2 = <code>SIGINT</code>. Somebody pressed Ctrl-C.</li>
+</ul>
+<p>The practical value is in what each rules out. A code in the 1–125 range means the program ran, made a decision, and reported it — so its logs will contain the reason. A code above 128 means the program was interrupted, so its logs contain nothing about why, and the cause is in the environment: the OOM killer, an orchestrator, a supervisor, a person. Looking in the wrong place is the most common wasted hour in incident response, and this arithmetic tells you which place is right.</p>
+<p>One subtlety worth carrying: the "128 + N" encoding is the <em>shell's</em> presentation. At the C level, <code>wait()</code> gives the parent a status word from which <code>WIFEXITED</code>/<code>WEXITSTATUS</code> and <code>WIFSIGNALED</code>/<code>WTERMSIG</code> extract the two cases separately and unambiguously — which is what your supervisor in B2.17 will use, and what Kubernetes uses to fill in both <code>exitCode</code> and <code>reason: OOMKilled</code>.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Check the two ends of the ordinary range. <code>$?</code> is set by every command, so read it immediately — the next command overwrites it.
+<pre class="cmd">true;  echo "true  -&gt; $?"
+false; echo "false -&gt; $?"
+grep -q root /etc/passwd; echo "match    -&gt; $?"
+grep -q zzzz /etc/passwd; echo "no match -&gt; $?"</pre>
+<pre class="out">true  -&gt; <b>0</b>
+false -&gt; <b>1</b>
+match    -&gt; 0
+no match -&gt; <b>1</b></pre></li>
+<li>Produce 126 and 127 deliberately, so you recognise them instantly later. They are different failures and the distinction saves time: one means "wrong path", the other means "wrong permissions".
+<pre class="cmd">printf '#!/bin/bash\necho hi\n' &gt; /tmp/noexec.sh
+/tmp/noexec.sh; echo "not executable -&gt; $?"
+chmod +x /tmp/noexec.sh
+/tmp/noexec.sh; echo "now            -&gt; $?"
+/tmp/definitely-not-here; echo "not found      -&gt; $?"</pre>
+<pre class="out">bash: /tmp/noexec.sh: Permission denied
+not executable -&gt; <b>126</b>
+hi
+now            -&gt; 0
+bash: /tmp/definitely-not-here: No such file or directory
+not found      -&gt; <b>127</b></pre></li>
+<li>Now produce 137 with your own hands — this is the moment the number stops being trivia.
+<pre class="cmd">sleep 100 &amp;
+kill -9 %1
+wait %1; echo "SIGKILL -&gt; $?"</pre>
+<pre class="out">[1]+  Killed                  sleep 100
+SIGKILL -&gt; <b>137</b></pre></li>
+<li>And 143, the polite version.
+<pre class="cmd">sleep 100 &amp;
+kill -TERM %1
+wait %1; echo "SIGTERM -&gt; $?"</pre>
+<pre class="out">SIGTERM -&gt; <b>143</b></pre></li>
+<li>Do the arithmetic in the other direction, which is the skill you actually need: given a code, name the signal. <code>kill -l</code> takes a number and prints the signal name, and it already understands the 128 offset.
+<pre class="cmd">for c in 130 137 139 143; do
+  echo "$c -&gt; SIG$(kill -l $((c - 128)))"
+done</pre>
+<pre class="out">130 -&gt; SIGINT
+137 -&gt; SIGKILL
+139 -&gt; SIGSEGV
+143 -&gt; SIGTERM</pre></li>
+<li>See a real 139 rather than a synthetic one, because a segfault is a different kind of news from a kill: it is the program's own bug.
+<pre class="cmd">printf 'int main(void){ int *p = 0; *p = 1; return 0; }\n' &gt; /tmp/segv.c
+gcc -w -o /tmp/segv /tmp/segv.c
+/tmp/segv; echo "segfault -&gt; $?"</pre>
+<pre class="out">Segmentation fault (core dumped)
+segfault -&gt; <b>139</b></pre></li>
+<li>Finally, make your own script report honestly, because a script that always exits 0 is a script nobody can automate around.
+<pre class="cmd">cat &gt; /tmp/check.sh &lt;&lt;'EOF'
+#!/bin/bash
+if [ -f "$1" ]; then echo "found: $1"; exit 0
+else echo "missing: $1" &gt;&amp;2; exit 3; fi
+EOF
+chmod +x /tmp/check.sh
+/tmp/check.sh /etc/hostname; echo "-&gt; $?"
+/tmp/check.sh /etc/nope;     echo "-&gt; $?"
+rm -f /tmp/check.sh /tmp/noexec.sh /tmp/segv /tmp/segv.c</pre>
+<pre class="out">found: /etc/hostname
+-&gt; <b>0</b>
+missing: /etc/nope
+-&gt; <b>3</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without notes: what are 137, 143, 139 and 130, and which of the four means "look in the application's logs"? (Only 139 — a segfault is the program's own bug. The other three were done to it from outside.) Then reproduce 126 and 127 and state the difference in one sentence each.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>$?</code> is the exit code of the <em>immediately</em> preceding command, and <code>echo</code> resets it. <code>cmd; echo "failed"; echo $?</code> always prints 0 — the code of the <code>echo</code>. Capture first: <code>cmd; rc=$?</code>.</p>
+<p>In a pipeline, <code>$?</code> is the exit code of the <em>last</em> stage only, so <code>false | true</code> reports success. This is why <code>set -o pipefail</code> exists (you met it in <a href="b0.html#cp-b0-9">B0.9</a>), and it is the reason a broken step in the middle of a pipeline can go unnoticed indefinitely.</p>
+<p>Exit codes are one byte, so they wrap: <code>exit 256</code> reports 0 and <code>exit -1</code> reports 255. A script that exits with a computed number can accidentally report success. Keep your own codes small and deliberate — 1 to 125.</p>
+<p>The 128 + N convention is a convention, not a kernel-enforced rule. A program is free to <code>exit(137)</code> of its own accord, and then the code is genuinely ambiguous. It is rare, but it is why <code>wait()</code>'s two separate macros exist and why Kubernetes reports both <code>exitCode</code> and a <code>reason</code> — the reason field is what disambiguates.</p>
+<div class="k8s-link">
+<p>This lesson is the direct explanation of a pod's <code>lastState.terminated</code> block. <code>exitCode: 137</code> with <code>reason: OOMKilled</code> is the kernel's OOM killer sending SIGKILL because the container exceeded its memory limit — the cgroup mechanism you will build by hand in B7. <code>exitCode: 143</code> is a normal shutdown. Anything from 1 to 125 is your application choosing to fail, and only that case makes the application's logs the right place to look.</p>
+<p>Follow this into <a href="w6.html#cp-6-16">W6.16 — CrashLoopBackOff mastery: --previous, lastState, and the exit-code alphabet</a>, which is the same arithmetic applied to a restarting container, and <a href="w3.html#cp-3-17">W3.17 — QoS classes</a> for who gets the 137 first when a node runs out of memory.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code> under <em>EXIT STATUS</em> for the shell's conventions including 126/127, and <em>The Set Builtin</em> for <code>pipefail</code>. <code>man 2 wait</code> for <code>WIFEXITED</code>, <code>WEXITSTATUS</code>, <code>WIFSIGNALED</code>, <code>WTERMSIG</code> — the unambiguous version. <code>man 7 signal</code> for the signal numbers you will be adding to 128. <code>man 1 kill</code> for <code>kill -l</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b2-9" data-id="b2-9">
+<div class="lesson-head"><span class="cp-id">B2.9</span><h4>Orphans, zombies, reaping — and what PID 1 owes its children</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the lesson behind one of the most-hit and least-understood container problems: a container whose PID 1 was never designed to be an init, quietly accumulating dead processes until the node runs out of PIDs. It is also where the phrase "the PID 1 problem" comes from, and once you have built a zombie by hand the whole thing stops being folklore.</p>
+<h5>The concept</h5>
+<p>Two things can go wrong with a parent-child pair, and they are opposites.</p>
+<p><strong>The parent dies first.</strong> The child is not killed — it keeps running, now with no parent. The kernel immediately re-parents it to PID 1, so the tree stays a tree. That child is an <strong>orphan</strong>, and it is a completely normal, harmless situation: this is exactly how daemons used to be created on purpose.</p>
+<p><strong>The child dies first, and the parent never asks how it went.</strong> The child's memory is freed, its descriptors closed, its threads gone — but the kernel must keep the exit status somewhere until the parent collects it, because the parent still has the right to know. So a small record survives, holding a PID and a status and nothing else. That is a <strong>zombie</strong>, and the act of collecting it with <code>wait()</code> is called <strong>reaping</strong>.</p>
+<p>Think of a zombie as a receipt left on the front desk. The guest has checked out and the room is cleaned and re-let; only the paperwork remains, waiting for whoever booked them to come and collect it. One receipt is nothing. Ten thousand uncollected receipts fill the desk, and now nobody can check in — because the "desk" here is the system's fixed table of PIDs.</p>
+<p>Which brings us to the obligation. When a process is re-parented to PID 1, PID 1 inherits the duty to reap it. A proper init — <code>systemd</code>, or the classic <code>init</code> — does this in a loop forever: it calls <code>wait()</code>, discards the status, and calls <code>wait()</code> again. That is one of the two jobs PID 1 exists to do, and it is why orphans are harmless on a normal machine.</p>
+<p>Now put a program that is not an init at PID 1, which is exactly what a container does. Your application starts as PID 1 inside the container's PID namespace (B6). It spawns a helper, the helper spawns something, that grandchild's parent exits, and the grandchild is re-parented to... your application, which has no <code>wait()</code> loop, because nobody writing a web server expects to be an init system. The zombies accumulate with nothing to collect them. This is <strong>the PID 1 problem</strong>, and it has exactly three fixes: write the reap loop yourself, use a tiny init as your entrypoint (<code>tini</code>, <code>dumb-init</code>), or ask the platform to provide one.</p>
+<p>PID 1 owes its children a second duty as well, and it is the one people forget: <strong>signal handling</strong>. The kernel gives PID 1 special treatment — signals with a default action of "terminate" are <em>not</em> delivered to PID 1 unless it has explicitly installed a handler for them. This is a safety measure so a stray signal cannot kill init and panic the machine. Inside a container it produces a notorious surprise: your application, running as PID 1 with no SIGTERM handler, simply <em>ignores</em> SIGTERM. Every shutdown then takes the full grace period and ends in SIGKILL. B2.16 is where you fix that properly.</p>
+<div class="flow"><span>child exits</span><em>→</em><span class="hot">zombie holds exit status</span><em>→</em><span>parent calls wait()</span><em>→</em><span>record freed, PID reusable</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make an orphan and watch the re-parenting happen. The parent shell exits immediately; the child carries on and lands on PID 1.
+<pre class="cmd">bash -c 'sleep 60 &amp; echo "child: $!"; echo "parent: $$"'
+sleep 1
+ps -eo pid,ppid,comm | grep -E '^\s*[0-9]+\s+1\s+sleep'</pre>
+<pre class="out">child: 3402
+parent: 3401
+   3402     <b>1</b> sleep</pre></li>
+<li>Now make a zombie, and be precise about the setup: a parent that lives on but never reaps. The child exits after one second; the parent sleeps for sixty without ever calling <code>wait</code>.
+<pre class="cmd">bash -c 'sleep 1 &amp; exec sleep 60' &amp;
+parent=$!
+sleep 3
+ps --ppid $parent -o pid,ppid,stat,args</pre>
+<pre class="out">  PID  PPID STAT COMMAND
+ 3428  3427 <b>Z</b>    [sleep] &lt;defunct&gt;</pre></li>
+<li>Confirm the two facts that make zombies odd: it holds no memory, and it cannot be killed.
+<pre class="cmd">z=$(pgrep -P $parent)
+ps -o pid,stat,rss,vsz,args -p $z
+kill -9 $z; sleep 1
+ps -o pid,stat,args -p $z</pre>
+<pre class="out">  PID STAT   RSS   VSZ COMMAND
+ 3428 Z        <b>0</b>     <b>0</b> [sleep] &lt;defunct&gt;
+  PID STAT COMMAND
+ 3428 <b>Z</b>    [sleep] &lt;defunct&gt;</pre></li>
+<li>Resolve it the only way that works: deal with the <em>parent</em>. When the parent exits, the zombie is re-parented to PID 1, which reaps it instantly.
+<pre class="cmd">kill $parent; sleep 1
+ps -o pid= -p $z 2&gt;/dev/null || echo "reaped by PID 1"</pre>
+<pre class="out">reaped by PID 1</pre></li>
+<li>Build a zombie army, so the scale of the real problem is visible rather than theoretical. This is Python rather than shell for a reason worth noticing: bash reaps its own background children automatically, so it is constitutionally incapable of producing this bug. A program that forks directly and never waits is what a leaking application looks like.
+<pre class="cmd">python3 -c '
+import os, time
+for _ in range(200):
+    if os.fork() == 0:
+        os._exit(0)
+time.sleep(120)' &amp;
+army=$!
+sleep 3
+ps -eo stat= | grep -c '^Z'</pre>
+<pre class="out"><b>200</b></pre></li>
+<li>Note what is and is not consumed. Memory is untouched; the count of live PIDs is what moved, and that is the resource that eventually runs out. Then find the culprit the way you would in an incident — by grouping the zombies by their parent.
+<pre class="cmd">free -m | head -2
+echo "pid_max: $(cat /proc/sys/kernel/pid_max)"
+ps -eo ppid=,stat= | awk '$2 ~ /^Z/ {print $1}' | sort | uniq -c | sort -rn | head -3</pre>
+<pre class="out">               total        used        free  ...
+Mem:            3826         418        2612  ...
+pid_max: <b>4194304</b>
+    <b>200 3502</b></pre></li>
+<li>One number, one PID, and that PID is your answer — it is the parent that stopped reaping. Kill it and every zombie beneath it is inherited by PID 1 and collected at once.
+<pre class="cmd">kill $army; sleep 1; ps -eo stat= | grep -c '^Z'</pre>
+<pre class="out">0</pre></li>
+<li>Finally, write the reap loop — the thing PID 1 does and your application does not. This is the core of B2.17's supervisor, in six lines.
+<pre class="cmd">cat &gt; /tmp/reaper.sh &lt;&lt;'EOF'
+#!/bin/bash
+for i in 1 2 3; do ( sleep $i; exit $i ) &amp; done
+while wait -n; rc=$?; [ $rc -ne 127 ]; do
+  echo "reaped a child, status $rc"
+done
+echo "all children reaped"
+EOF
+chmod +x /tmp/reaper.sh; /tmp/reaper.sh; rm -f /tmp/reaper.sh</pre>
+<pre class="out">reaped a child, status <b>1</b>
+reaped a child, status <b>2</b>
+reaped a child, status <b>3</b>
+all children reaped</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, in two sentences each, what an orphan is and what a zombie is, and say which one is a problem. Then answer: you find 8,000 zombies on a machine. Which process do you investigate, and what do you <em>not</em> bother doing? (Investigate the common parent — <code>ps -eo ppid=,stat= | awk '$2 ~ /^Z/ {print $1}' | sort | uniq -c | sort -rn</code> names it. Do not bother killing the zombies; they are already dead.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Kill the zombies" is the instinct and it accomplishes nothing — <code>ps</code> will show exactly the same list afterwards. There is no process there to receive a signal. The only two resolutions are the parent reaping them or the parent exiting so PID 1 reaps them.</p>
+<p>A <code>&lt;defunct&gt;</code> entry that appears and vanishes within a second is not a leak — it is the normal, brief window between a child exiting and its parent's <code>wait()</code> returning. Every process passes through Z. Only persistence and volume are evidence of a problem.</p>
+<p>The special PID 1 signal rule catches people every time: a shell script as an entrypoint that ends with <code>exec myapp</code> makes <code>myapp</code> PID 1, and if <code>myapp</code> has no SIGTERM handler, SIGTERM is silently discarded. The same binary run anywhere else would die on SIGTERM immediately. Nothing changed about the program; only its PID did.</p>
+<p><code>wait -n</code> in bash returns 127 when there are no children left to wait for, which is what terminates the loop in step 7. Confusingly, 127 is also "command not found" — they are unrelated meanings of the same number, and this is a good example of why exit codes should be read in context.</p>
+<div class="k8s-link">
+<p>This is the whole background to two pod-spec features. <code>shareProcessNamespace: true</code> puts an infrastructure "pause" container at PID 1 for the whole pod — a program whose entire source code is a signal handler and a <code>wait()</code> loop, existing purely to be a correct init. And runtimes offer to inject a tiny init (Docker's <code>--init</code>, containerd's equivalents) for exactly the case where your image's entrypoint is not one.</p>
+<p>The failure mode surfaces as node <code>PIDPressure</code> in <a href="w6.html#cp-6-12">W6.12 — read node Conditions fluently</a>, and the ignored-SIGTERM half of the problem is the direct cause of the full-grace-period shutdowns described in <a href="w3.html#cp-3-5">W3.5 — graceful termination: SIGTERM, the grace period, and SIGKILL</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 wait</code> — the <em>NOTES</em> section states the zombie rule and the PID 1 reaping obligation directly. <code>man 7 signal</code> under <em>Signal dispositions</em> for the special treatment of PID 1. <code>man 5 proc</code> under <code>/proc/sys/kernel/pid_max</code> for the ceiling. <code>man 1 bash</code> under <em>SHELL BUILTIN COMMANDS</em> for <code>wait -n</code>. For the container-specific framing, the <code>tini</code> project's README is the clearest short write-up of why a one-purpose init exists.</p>
+</article>
 </div>
 </main>
 </div>
