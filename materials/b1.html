@@ -795,6 +795,440 @@ ls: cannot access 'words.txt': No such file or directory
 </article>
 </div>
 
+<!-- ---------------- The shell itself ---------------- -->
+<div class="grp" id="g-shell"><h3>The shell itself</h3>
+
+<article class="lesson" id="cp-b1-10" data-id="b1-10">
+<div class="lesson-head"><span class="cp-id">B1.10</span><h4>Shell variables versus exported environment variables</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"I set the variable and the program still can't see it" is a rite of passage, and the fix — one word, <code>export</code> — is much less interesting than the reason. The environment is one of the simplest mechanisms in the whole operating system: a list of strings, copied once, at the moment a process is created. Understanding that it is a <em>copy</em>, made <em>once</em>, explains why configuration through environment variables behaves the way it does everywhere, up to and including why a Kubernetes pod never notices that you changed its ConfigMap.</p>
+<h5>The concept</h5>
+<p>A <strong>shell variable</strong> is a note the shell keeps for itself. <code>X=1</code> creates one. It is visible to the shell and to anything the shell does on its own, and it is completely invisible to any program the shell starts.</p>
+<p>The <strong>environment</strong> is a separate thing: a plain list of <code>KEY=VALUE</code> strings that the kernel hands to a new process when it starts it, alongside its command-line arguments. That is the entire mechanism — no lookups, no daemon, no shared memory. A list of strings, copied into the new process.</p>
+<p><code>export X</code> marks the name <code>X</code> so that the shell includes it in that list when it starts children. It does not copy anything immediately, and it does not need repeating when the value changes: the mark stays on the name, and whatever the value is at the moment a child is created is what gets copied.</p>
+<div class="flow"><span>parent's environment</span><em>→ copied at creation →</em><span class="hot">child's environment</span><em>✗ no way back ✗</em><span>parent</span></div>
+<p>Three consequences fall out of "copied, once, at creation", and all three are things people try to do and cannot:</p>
+<ul>
+<li><strong>A child can never change its parent's environment.</strong> It has a copy. This is why a script cannot set a variable in your interactive shell — and why <code>source script.sh</code> exists, which runs the file <em>in your current shell</em> rather than in a child, and is therefore the only way to make it work.</li>
+<li><strong>A running process's environment is frozen.</strong> Change <code>X</code> in your shell and a program already running is unaffected, permanently. It read its copy at startup; nothing re-delivers it.</li>
+<li><strong>The environment is readable.</strong> Every process's copy sits at <code>/proc/PID/environ</code>, readable by its owner and by root. Anything you put in an environment variable is visible to anyone who can read that file, which is why B12 will tell you not to put secrets there.</li>
+</ul>
+<p>One more piece of syntax worth having: <code>VAR=value command</code> sets a variable <em>for that one command only</em>, without touching your shell at all. It is the cleanest way to run something with a different setting, and you will use it constantly.</p>
+<h5>Lab</h5>
+<ol>
+<li>Create a shell variable and confirm your own shell can see it, but a child cannot. <code>bash -c</code> starts a fresh shell as a child process.
+<pre class="cmd">X=1
+echo "in this shell: $X"
+bash -c 'echo "in the child: $X"'</pre>
+<pre class="out">in this shell: <b>1</b>
+in the child: <b></b></pre>
+<p>The child printed nothing. It is not that the value was empty — the name does not exist there at all.</p></li>
+<li>Export it and try again. Nothing about the variable changed; only its eligibility to be copied.
+<pre class="cmd">export X
+bash -c 'echo "in the child: $X"'</pre>
+<pre class="out">in the child: <b>1</b></pre></li>
+<li>Confirm the mark persists across value changes — you do not re-export after every assignment.
+<pre class="cmd">X=99
+bash -c 'echo $X'</pre>
+<pre class="out"><b>99</b></pre></li>
+<li>Look at the environment as the list of strings it really is. <code>env</code> prints it; the raw form under <code>/proc</code> is separated by zero bytes, so <code>tr</code> turns them into newlines.
+<pre class="cmd">env | sort | head -6
+echo '---'
+tr '\0' '\n' &lt; /proc/$$/environ | grep '^X='</pre>
+<pre class="out">HOME=/home/ubuntu
+LANG=C.UTF-8
+LOGNAME=ubuntu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PWD=/home/ubuntu
+SHELL=/bin/bash
+---
+<b>X=99</b></pre></li>
+<li>Prove a child cannot reach back. The child sets <code>X</code> to something else; your shell is unmoved.
+<pre class="cmd">bash -c 'X=changed-by-child; echo "child now sees: $X"'
+echo "parent still sees: $X"</pre>
+<pre class="out">child now sees: changed-by-child
+parent still sees: <b>99</b></pre></li>
+<li>Set a variable for one command only, then confirm your shell was never touched.
+<pre class="cmd">X=temporary bash -c 'echo "just this once: $X"'
+echo "and afterwards: $X"</pre>
+<pre class="out">just this once: <b>temporary</b>
+and afterwards: <b>99</b></pre></li>
+<li>See the sourcing distinction, which is the practical version of "a child cannot change its parent". Write a script that sets a variable, run it, then source it.
+<pre class="cmd">echo 'Y=set-by-script' &gt; setvar.sh
+bash setvar.sh; echo "after running: [$Y]"
+source setvar.sh; echo "after sourcing: [$Y]"</pre>
+<pre class="out">after running: <b>[]</b>
+after sourcing: <b>[set-by-script]</b></pre></li>
+<li>Clean up.
+<pre class="cmd">rm -f setvar.sh; unset X Y</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain in one sentence why <code>export</code> is needed at all, using the word "copy". Then predict: after <code>export A=1; bash -c 'A=2'; echo $A</code>, what prints? (<code>1</code> — the child changed its own copy and exited.) Confirm you can read any of your own processes' environments with <code>tr '\0' '\n' &lt; /proc/$$/environ</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>No spaces around the <code>=</code>. <code>X = 1</code> is not an assignment — the shell reads it as the command <code>X</code> with arguments <code>=</code> and <code>1</code>, and reports <code>X: command not found</code>. This is one of the few places where shell syntax is genuinely unforgiving, and it catches people coming from every other language.</p>
+<p><code>/proc/PID/environ</code> shows the environment the process was <em>started</em> with, not its current state — a program is free to modify its own copy in memory afterwards, and that file will not reflect it. For the common case of "what config did this daemon get", it is still exactly the right thing to read.</p>
+<p>Environment variables are a bad place for secrets, and the reason is mechanical rather than theoretical: root can read every process's <code>environ</code>, they are inherited by every child process whether or not it should see them, and they routinely end up in crash dumps, debug logs and <code>ps</code> output. B12 goes into this properly; for now, just notice that the mechanism offers no protection at all.</p>
+<div class="k8s-link">
+<p>Kubernetes offers environment variables as one of the four ways to get configuration into a container (<a href="w3.html#cp-3-21">W3.21 — consume a ConfigMap all four ways</a>), and everything surprising about that choice is in this lesson. The kubelet builds the list of <code>KEY=VALUE</code> strings when it <em>creates</em> the container and hands it over. One copy, at creation.</p>
+<p>So when you update a ConfigMap that a pod consumes via <code>envFrom</code>, absolutely nothing happens — not slowly, not eventually. <a href="w3.html#cp-3-22">W3.22 — update propagation</a> states the rule as "volumes update, env never", and now you know it is not a Kubernetes limitation but the Unix environment behaving exactly as it always has. The fix is to restart the pod, which is to say: create a new process, with a new copy.</p>
+<p>The same reasoning explains why Kubernetes Secrets mounted as environment variables are considered weaker than Secrets mounted as files — <code>/proc/PID/environ</code>, inherited by every child, exactly as above.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 environ</code> — short, and the authoritative description of the mechanism. <code>man 1 env</code> (note <code>env -i</code> for an empty environment), <code>man 1 printenv</code>, and <code>man 1 bash</code> under <em>Shell Variables</em> and the <code>export</code> builtin. <code>man 5 proc</code> for <code>/proc/[pid]/environ</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b1-11" data-id="b1-11">
+<div class="lesson-head"><span class="cp-id">B1.11</span><h4>How a bare word becomes a program: <code>PATH</code>, <code>type</code> and <code>which</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You type <code>ls</code> and something runs. Which something, exactly? On a normal machine the answer is boring; on a machine where somebody has installed a second version of a tool, or set up an alias, or where your <code>PATH</code> has been mangled, the answer is the whole bug. "Command not found for a binary I can see with my own eyes" is this lesson's failure, and it is the first half of B1.16's debugging drill.</p>
+<h5>The concept</h5>
+<p><code>PATH</code> is an environment variable holding a list of directories separated by colons. When you type a word with no slash in it, the shell looks for an executable file of that name in each directory <strong>left to right, and stops at the first match</strong>. Order is everything: a directory earlier in the list wins, which is how <code>/usr/local/bin</code> lets you shadow a system tool on purpose.</p>
+<p>But <code>PATH</code> is only the last step. Bash resolves a bare word through four kinds of thing, in strict order, and the search stops at whichever matches first:</p>
+<table>
+<tr><th>Order</th><th>Kind</th><th>What it is</th><th>Example</th></tr>
+<tr><td>1</td><td>alias</td><td>a text substitution you defined</td><td><code>alias ll='ls -la'</code></td></tr>
+<tr><td>2</td><td>function</td><td>a shell function you defined</td><td><code>k() { kubectl "$@"; }</code></td></tr>
+<tr><td>3</td><td>builtin</td><td>implemented inside the shell itself</td><td><code>cd</code>, <code>export</code>, <code>type</code></td></tr>
+<tr><td>4</td><td>file on <code>PATH</code></td><td>an executable found by the search</td><td><code>/usr/bin/ls</code></td></tr>
+</table>
+<p>Three commands answer "what would run", and they are not interchangeable — this is the distinction worth taking away:</p>
+<ul>
+<li><strong><code>type -a name</code></strong> — a shell builtin, so it knows about all four kinds and lists <em>every</em> match in priority order. This is the one that tells the truth.</li>
+<li><strong><code>command -v name</code></strong> — also a builtin, prints the single thing that would actually run. The right choice inside scripts, because it is standardised and exits non-zero when nothing is found.</li>
+<li><strong><code>which name</code></strong> — an external <em>program</em>, so it cannot possibly see your aliases, functions or builtins. It only walks <code>PATH</code>. It is the one everybody reaches for and the one most likely to mislead.</li>
+</ul>
+<p>One efficiency detail explains a genuinely weird symptom. Having found a command's location, bash caches it in a hash table so it does not repeat the directory search every time. If you then install a newer copy of that program somewhere earlier in <code>PATH</code>, the shell keeps running the old one — from a stale cache entry — until you clear it with <code>hash -r</code>. <code>type</code> will tell you this is happening: it says <em>hashed</em>.</p>
+<h5>Lab</h5>
+<ol>
+<li>Read your <code>PATH</code> as the list it is. <code>tr</code> turns the colons into newlines so the order is obvious.
+<pre class="cmd">echo "$PATH" | tr ':' '\n'</pre>
+<pre class="out">/usr/local/sbin
+/usr/local/bin
+/usr/sbin
+<b>/usr/bin</b>
+/sbin
+/bin</pre>
+<p>Left to right, first match wins. <code>/usr/local/bin</code> comes before <code>/usr/bin</code>, which is exactly why locally installed software takes precedence over the packaged version.</p></li>
+<li>Ask what <code>ls</code> really is, three ways, and compare the answers.
+<pre class="cmd">type -a ls
+command -v ls
+which ls</pre>
+<pre class="out">ls is <b>/usr/bin/ls</b>
+/usr/bin/ls
+/usr/bin/ls</pre>
+<p>All three agree, because nothing is shadowing it. Now create a shadow.</p></li>
+<li>Define an alias and a function with the same name, then look again. This is the priority table from the concept section, made visible.
+<pre class="cmd">alias ls='ls --color=auto'
+type -a ls</pre>
+<pre class="out"><b>ls is aliased to `ls --color=auto'</b>
+ls is /usr/bin/ls</pre>
+<p><code>type -a</code> lists both, in the order the shell would consider them. Run <code>which ls</code> again — it still says <code>/usr/bin/ls</code>, confidently and wrongly, because it cannot see aliases at all.</p></li>
+<li>Prove the builtin-versus-file case with <code>echo</code>, which exists as both.
+<pre class="cmd">type -a echo</pre>
+<pre class="out"><b>echo is a shell builtin</b>
+echo is /usr/bin/echo</pre>
+<p>The builtin wins, so <code>/usr/bin/echo</code> essentially never runs. That is why <code>echo</code>'s flags differ slightly from its manual page — you are not using the program the manual page documents.</p></li>
+<li>Now break <code>PATH</code> on purpose and watch what a broken system feels like. Do this in a subshell (the parentheses) so your real shell is untouched.
+<pre class="cmd">( PATH=/nonexistent; ls /etc )</pre>
+<pre class="out">bash: <b>ls: No such file or directory</b></pre>
+<p>The binary is exactly where it always was. The shell simply has nowhere to look. This is the exact symptom of B1.16's first drill, and the giveaway is that <em>everything</em> breaks at once, not one command.</p></li>
+<li>Confirm the recovery move: an absolute path bypasses <code>PATH</code> entirely, because a word containing a slash is not searched for.
+<pre class="cmd">( PATH=/nonexistent; /usr/bin/ls /etc/hostname )</pre>
+<pre class="out"><b>/etc/hostname</b></pre></li>
+<li>See the hash cache, which is otherwise invisible. Run a command, then ask about it.
+<pre class="cmd">unalias ls
+ls &gt;/dev/null
+type ls
+hash -r
+type ls</pre>
+<pre class="out">ls is <b>hashed</b> (/usr/bin/ls)
+ls is /usr/bin/ls</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Answer without running anything: you install a program to <code>/usr/local/bin</code> that has the same name as one in <code>/usr/bin</code> — which runs, and why? Then: <code>which cd</code> prints nothing, but <code>cd</code> obviously works. Explain, in one sentence. Finally, check the machine in front of you: <code>type -a python3</code> and say what each line means.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>which</code> is an external program and therefore structurally incapable of seeing aliases, functions or builtins. It will also miss anything defined only in your interactive shell. Prefer <code>type -a</code> when you are investigating and <code>command -v</code> when you are scripting; treat <code>which</code> as a habit worth dropping.</p>
+<p>Never put <code>.</code> — or an empty entry, which means the same thing — in <code>PATH</code>. <code>PATH=/usr/bin:</code> has a trailing empty field, which the shell reads as the current directory. Then anyone who can write a file called <code>ls</code> into a directory you happen to <code>cd</code> into gets to run code as you, the moment you type <code>ls</code>. This is an old attack and it still works.</p>
+<p>A <code>PATH</code> assignment in <code>~/.bashrc</code> that omits <code>$PATH</code> — <code>PATH=/opt/mytool/bin</code> instead of <code>PATH=/opt/mytool/bin:$PATH</code> — replaces the whole list rather than adding to it, and every new shell you open is broken. Fixing it requires typing an absolute path (<code>/usr/bin/vim ~/.bashrc</code>), which is worth having done once in a lab before you have to do it under pressure.</p>
+<div class="k8s-link">
+<p>Every container image has a <code>PATH</code>, and it is usually much shorter than a full machine's. When you set <code>command:</code> in a pod spec, the container runtime resolves that word the same way your shell just did — and when it cannot, the container exits immediately with code <strong>127</strong>, the universal "command not found" status, and the message <code>exec: "myapp": executable file not found in $PATH</code>.</p>
+<p>That is one of the fingerprints catalogued in <a href="w6.html#cp-6-16">W6.16 — CrashLoopBackOff mastery and the exit-code alphabet</a>. It is worth recognising as a <em>class</em>: 127 means the process never started, so there are no application logs to read and nothing is wrong with your application. The fault is the path, and the fix is an absolute one in <code>command:</code>, exactly like step 6 above.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code> under <em>COMMAND EXECUTION</em> for the four-way resolution order, and the <code>type</code>, <code>hash</code> and <code>command</code> builtins in <em>SHELL BUILTIN COMMANDS</em>. <code>man 3 exec</code> for how <code>execvp</code> does the <code>PATH</code> search that everything else imitates, and <code>man 8 environment</code> / <code>man 5 environment</code> for where a login shell's initial <code>PATH</code> comes from.</p>
+</article>
+
+<article class="lesson" id="cp-b1-12" data-id="b1-12">
+<div class="lesson-head"><span class="cp-id">B1.12</span><h4>The three quoting states, and the one rule that prevents most shell bugs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Quoting bugs are the worst kind, because they do not produce errors — they produce <em>wrong actions</em>. A script that deletes the wrong files, moves half a filename, or tests an empty string and takes the wrong branch is almost always an unquoted variable. There is essentially one rule, it takes two characters to apply, and this lesson is about internalising it well enough that you do it without deciding to.</p>
+<h5>The concept</h5>
+<p>Before running anything, the shell takes your line apart and rebuilds it: it substitutes variables, then <strong>splits the result into words</strong> on whitespace, then <strong>expands any globs</strong> in those words. Quoting is how you switch parts of that process off. There are three states:</p>
+<table>
+<tr><th>State</th><th>Variable expansion</th><th>Word splitting</th><th>Glob expansion</th><th>Use it for</th></tr>
+<tr><td>no quotes</td><td>yes</td><td><strong>yes</strong></td><td><strong>yes</strong></td><td>when you actually want a glob to expand</td></tr>
+<tr><td><code>"double"</code></td><td>yes</td><td>no</td><td>no</td><td><strong>every variable expansion — the default</strong></td></tr>
+<tr><td><code>'single'</code></td><td>no</td><td>no</td><td>no</td><td>literal text: regexes, passwords, <code>$</code> signs</td></tr>
+</table>
+<p>The middle column is where the damage happens. Unquoted, the shell takes the variable's <em>value</em> and splits it on whitespace — so a filename with a space becomes two separate arguments, and the program dutifully operates on two things that do not exist. Then it glob-expands the pieces, so a value containing <code>*</code> silently turns into a directory listing.</p>
+<p>Hence the rule, which is worth over-applying: <strong>quote every variable expansion.</strong> Write <code>"$f"</code>, not <code>$f</code>. The cost of a redundant pair of quotes is zero; the cost of a missing pair is a script that works on your test data and misbehaves on real data.</p>
+<p>Single quotes are the other tool, and they are absolute: <em>nothing</em> inside them is interpreted, which is exactly what you want for a regex (<code>grep '^a.*b$'</code>, from B1.8), for a password, or for any text containing a literal <code>$</code>. Their one limitation is that a single-quoted string cannot contain a single quote, at all, by any escape — you have to close the quote, add an escaped one, and reopen.</p>
+<p>Finally, one special case you will meet in every script: <code>"$@"</code> means "all the arguments, each kept as its own word", which is almost always what you want when passing arguments through. Unquoted <code>$@</code>, or <code>"$*"</code>, will re-split or flatten them and quietly break any argument containing a space.</p>
+<h5>Lab</h5>
+<ol>
+<li>Make the file that breaks everything, and see the two behaviours side by side.
+<pre class="cmd">cd ~ &amp;&amp; mkdir -p quotetest &amp;&amp; cd quotetest
+touch 'two words.txt'
+f='two words.txt'
+ls -l $f</pre>
+<pre class="out">ls: cannot access 'two': No such file or directory
+ls: cannot access 'words.txt': No such file or directory</pre>
+<p>One filename became two arguments. Note that <code>ls</code> did not report a quoting problem — it reported two missing files, which is a much more confusing symptom.</p></li>
+<li>Add the two characters.
+<pre class="cmd">ls -l "$f"</pre>
+<pre class="out">-rw-rw-r-- 1 ubuntu ubuntu 0 Jul 23 15:40 <b>'two words.txt'</b></pre>
+<p>The single quotes in <code>ls</code>'s output are <code>ls</code> warning <em>you</em> that this name contains a space — coreutils adds them whenever it is writing to a terminal.</p></li>
+<li>Now the glob half of the same problem, which is the more dangerous one because it can affect files you never named.
+<pre class="cmd">touch a.txt b.txt
+g='*'
+echo $g
+echo "$g"</pre>
+<pre class="out"><b>a.txt b.txt two words.txt</b>
+<b>*</b></pre>
+<p>Unquoted, the variable's value was expanded against the directory. Imagine that variable had been built from user input and handed to <code>rm</code>.</p></li>
+<li>See the difference between the two quote characters directly.
+<pre class="cmd">echo "my home is $HOME"
+echo 'my home is $HOME'</pre>
+<pre class="out">my home is <b>/home/ubuntu</b>
+my home is <b>$HOME</b></pre></li>
+<li>Watch an unquoted expansion break a conditional — the version of this bug that produces a wrong decision instead of a wrong file.
+<pre class="cmd">empty=""
+[ $empty = "x" ] &amp;&amp; echo equal
+echo "exit code was $?"
+[ "$empty" = "x" ] &amp;&amp; echo equal
+echo "exit code was $?"</pre>
+<pre class="out">bash: [: =: unary operator expected
+exit code was <b>2</b>
+exit code was <b>1</b></pre>
+<p>Unquoted, the empty value vanished entirely and <code>[</code> received <code>= x</code>, which is not a valid test. Quoted, it received an empty string and correctly answered "not equal".</p></li>
+<li>Do the whole thing properly: a loop over filenames that survives spaces. Quote the expansion in the loop body, and remember from B1.8 that the glob itself is what you want expanded.
+<pre class="cmd">for file in *.txt; do
+  echo "processing: [$file]"
+done</pre>
+<pre class="out">processing: [a.txt]
+processing: [b.txt]
+processing: [<b>two words.txt</b>]</pre></li>
+<li>Clean up.
+<pre class="cmd">cd ~ &amp;&amp; rm -rf quotetest</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the rule in one sentence. Then predict all three outputs before running them, with <code>v='a  b'</code> (two spaces): <code>echo $v</code>, <code>echo "$v"</code>, <code>echo '$v'</code>. (<code>a b</code> — split into two words and rejoined with one space; <code>a  b</code> — both spaces preserved; <code>$v</code> — literal.) If the first one surprises you, that is the bug this lesson exists for.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Command substitution needs quoting too, for exactly the same reason: <code>"$(cat file)"</code>, not <code>$(cat file)</code>. Unquoted, a file whose contents contain spaces or newlines gets split into words on its way into the command.</p>
+<p>A single-quoted string cannot contain a single quote. To write <code>don't</code> you must leave the quoting and come back: <code>'don'\''t'</code>, which reads as [<code>don</code>][escaped quote][<code>t</code>]. It looks like line noise and it is the standard idiom; when it gets bad, switch to double quotes and escape the <code>$</code> signs instead.</p>
+<p>Double quotes are not literal — <code>$</code>, backtick and backslash still work inside them. So <code>"$100"</code> tries to expand a variable, and a Windows-style path in double quotes will have its backslashes eaten. When you want truly untouched text, single quotes are the only answer.</p>
+<div class="k8s-link">
+<p>The place this bites hardest in Kubernetes is <code>kubectl exec</code>, because the text is parsed <strong>twice</strong> — once by your local shell, and once by the shell inside the container. In <code>kubectl exec pod -- sh -c "echo $HOSTNAME"</code>, your local shell expands <code>$HOSTNAME</code> before <code>kubectl</code> is even called, so you send the container your own machine's hostname and get a confusing answer back. Single quotes are what make the variable survive to the far end: <code>-- sh -c 'echo $HOSTNAME'</code>. See <a href="w6.html#cp-6-3">W6.3 — kubectl debug and exec</a>.</p>
+<p>YAML has its own quoting rules on top, and they collide in a way worth knowing before you write manifests: an unquoted <code>yes</code>, <code>no</code>, <code>on</code> or <code>off</code> may be read as a boolean, and an unquoted version number like <code>1.10</code> is a float that loses its trailing zero. Quoting values in YAML is the same defensive habit as quoting expansions in the shell, for the same reason — the parser is trying to be helpful and you would rather it were not.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code>, sections <em>QUOTING</em> and <em>EXPANSION</em> — the second one lists the expansion steps in the exact order the shell performs them, which is the whole model in one page. Then <code>man 1 test</code> for why <code>[ "$x" = y ]</code> needs its quotes. If you write shell scripts regularly, run <code>shellcheck</code> over them; unquoted expansions are its single most common finding.</p>
+</article>
+
+<article class="lesson" id="cp-b1-13" data-id="b1-13">
+<div class="lesson-head"><span class="cp-id">B1.13</span><h4>Exit codes, <code>&amp;&amp;</code>/<code>||</code>, and your first script</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every program that has ever run on Linux returns a number when it finishes, and that number — not its output, not whether it printed something red — is how everything else decides whether it worked. Shell scripts branch on it, <code>systemd</code> restarts services on it, and Kubernetes decides a container has crashed on it. It is the most widely used return value in computing and it takes one lesson to learn completely.</p>
+<h5>The concept</h5>
+<p>When a process exits it hands the kernel a single byte, its <strong>exit status</strong>, which is passed to whatever was waiting for it. The convention is absolute and universal:</p>
+<ul>
+<li><strong>0 means success.</strong> Exactly one way to succeed.</li>
+<li><strong>Anything from 1 to 255 means failure</strong>, and the specific number is that program's way of saying <em>which</em> failure. <code>grep</code> returns 1 for "no lines matched" and 2 for "the file was unreadable" — two very different situations that both mean "not a match".</li>
+</ul>
+<p>Zero-is-success feels backwards until you see why: there is one way for something to work and many ways for it to fail, so the interesting information belongs in the non-zero range. The shell puts the most recent status in the special variable <code>$?</code>.</p>
+<p>Two operators branch on it, and both <strong>short-circuit</strong> — they decide whether to run the right-hand side at all:</p>
+<table>
+<tr><th>Written</th><th>Reads as</th><th>Right side runs when</th></tr>
+<tr><td><code>a &amp;&amp; b</code></td><td>a, <em>and then</em> b</td><td>a succeeded (exit 0)</td></tr>
+<tr><td><code>a || b</code></td><td>a, <em>otherwise</em> b</td><td>a failed (non-zero)</td></tr>
+</table>
+<p>One convention is worth meeting now because it explains a number you will see constantly later. A process killed by a <strong>signal</strong> reports <strong>128 + the signal number</strong>. Signal 9 is <code>SIGKILL</code>, so a killed process reports <strong>137</strong>; signal 15 is <code>SIGTERM</code>, so <strong>143</strong>. If 137 already looks familiar, that is because it is the code every Kubernetes user eventually memorises. B2 covers signals properly.</p>
+<p>Then a script, which is nothing more mysterious than a file of the commands you would have typed. Two things make it runnable. The <strong>shebang</strong> — the two characters <code>#!</code> on the very first line, followed by an interpreter path — is read by the <em>kernel</em>, not the shell: when asked to execute a file, the kernel checks those first two bytes and, if it finds them, runs the named interpreter with your file as its argument. And the <strong>execute bit</strong>, set with <code>chmod +x</code>, is the permission that makes the kernel willing to try at all.</p>
+<p>Write <code>#!/usr/bin/env bash</code> rather than <code>#!/bin/bash</code>: <code>env</code> finds bash via <code>PATH</code>, so the script works on systems that keep it somewhere else. And end your script with a deliberate <code>exit</code> code, because a script that does not specify one returns the status of its last command, which is rarely what you meant.</p>
+<h5>Lab</h5>
+<ol>
+<li>Meet the two simplest programs on the machine. <code>true</code> and <code>false</code> exist only to exit with 0 and 1 — they do nothing else at all.
+<pre class="cmd">true;  echo "true gave:  $?"
+false; echo "false gave: $?"</pre>
+<pre class="out">true gave:  <b>0</b>
+false gave: <b>1</b></pre></li>
+<li>See a real program's failure codes carry information. <code>grep</code> distinguishes "found nothing" from "could not read the file".
+<pre class="cmd">grep root /etc/passwd &gt;/dev/null; echo "found: $?"
+grep zzzznope /etc/passwd;        echo "no match: $?"
+grep root /nonexistent 2&gt;/dev/null; echo "bad file: $?"</pre>
+<pre class="out">found: <b>0</b>
+no match: <b>1</b>
+bad file: <b>2</b></pre></li>
+<li>Chain on success and on failure. Read each line aloud as "do this, and then that" or "do this, otherwise that".
+<pre class="cmd">ls /etc/hostname &amp;&amp; echo "the file is there"
+ls /nope 2&gt;/dev/null || echo "no such file — handled"</pre>
+<pre class="out">/etc/hostname
+<b>the file is there</b>
+<b>no such file — handled</b></pre></li>
+<li>Confirm the short-circuit is real: the right-hand side genuinely does not run.
+<pre class="cmd">false &amp;&amp; echo "you will never see this"
+echo "and the chain's own status was: $?"</pre>
+<pre class="out">and the chain's own status was: <b>1</b></pre></li>
+<li>Write your first script. It checks for an argument, does something useful with it, and reports failure honestly.
+<pre class="cmd">cat &gt; check.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: $0 &lt;path&gt;" &gt;&amp;2
+  exit 2
+fi
+
+if [ -e "$1" ]; then
+  echo "$1 exists"
+  exit 0
+else
+  echo "$1 is missing" &gt;&amp;2
+  exit 1
+fi
+EOF
+chmod +x check.sh</pre>
+<p>Three things to notice: the usage message goes to <strong>stderr</strong> (<code>&gt;&amp;2</code>) because it is a diagnostic, not a result; <code>"$1"</code> is quoted per B1.12; and each branch exits with a distinct code so a caller can tell the failures apart.</p></li>
+<li>Run it three ways and read the codes.
+<pre class="cmd">./check.sh /etc/hostname; echo "-&gt; $?"
+./check.sh /nope;         echo "-&gt; $?"
+./check.sh;               echo "-&gt; $?"</pre>
+<pre class="out">/etc/hostname exists
+-&gt; <b>0</b>
+/nope is missing
+-&gt; <b>1</b>
+usage: ./check.sh &lt;path&gt;
+-&gt; <b>2</b></pre></li>
+<li>Now use it the way exit codes are meant to be used — as the condition in a chain, with no output parsing anywhere.
+<pre class="cmd">./check.sh /etc/hostname &gt;/dev/null &amp;&amp; echo "proceeding" || echo "aborting"</pre>
+<pre class="out"><b>proceeding</b></pre></li>
+<li>Prove the execute bit is what the kernel actually checks. Remove it and watch the failure change character.
+<pre class="cmd">chmod -x check.sh
+./check.sh /etc/hostname</pre>
+<pre class="out">bash: ./check.sh: <b>Permission denied</b></pre>
+<pre class="cmd">chmod +x check.sh</pre></li>
+<li>See the 128+signal convention once, so 137 is never mysterious. Start something, kill it with signal 9, and read the code.
+<pre class="cmd">sleep 60 &amp;
+kill -9 %1
+wait %1; echo "exit code: $?"</pre>
+<pre class="out">exit code: <b>137</b></pre>
+<p>137 = 128 + 9. B2 explains signals; for now, remember that a code above 128 means the process was <em>killed</em> rather than having decided to exit.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Your <code>check.sh</code> returns 0, 1 and 2 for the three cases and prints its diagnostics to stderr — confirm the last part with <code>./check.sh /nope 2&gt;/dev/null</code>, which should print nothing at all. Then answer: what does a container exiting with 143 tell you happened to it? (It was killed by <code>SIGTERM</code>: 128 + 15.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A script written on Windows carries carriage returns at the end of every line, and the shebang then names an interpreter called <code>/usr/bin/env bash\r</code>, which does not exist. The error — <code>bad interpreter: No such file or directory</code>, pointing at a file that is plainly right there — is one of the most confusing in Unix. <code>file script.sh</code> reports <em>CRLF line terminators</em>, and <code>sed -i 's/\r$//' script.sh</code> fixes it.</p>
+<p>The exit status is one byte, so it wraps: <code>exit 256</code> reports 0 and <code>exit -1</code> reports 255. Keep to 1–125 for your own codes; 126 and 127 are reserved by the shell for "found but not executable" and "not found", and anything above 128 will be read as a signal.</p>
+<p><code>set -e</code> is less absolute than it looks. It deliberately does not fire for a command on the left of <code>&amp;&amp;</code> or <code>||</code>, or inside an <code>if</code> condition — those are places where failure is the question being asked. It also does not see a failure in the middle of a pipeline unless you add <code>set -o pipefail</code>, which is exactly why <code>set -euo pipefail</code> is written as one unit.</p>
+<div class="k8s-link">
+<p>A container's exit code is the primary signal Kubernetes has about what happened to your application, and every convention above applies unchanged. It shows up in <code>kubectl describe pod</code> under <code>Last State: Terminated</code>, and it is the first thing to read when a pod is in <code>CrashLoopBackOff</code>.</p>
+<p><a href="w6.html#cp-6-16">W6.16 — CrashLoopBackOff mastery: the exit-code alphabet</a> is that catalogue: <strong>0</strong> means the process finished successfully and Kubernetes restarted it anyway (a config error — you told a long-running workload to run a command that ends); <strong>1</strong> or <strong>2</strong> is an application error, so read the logs; <strong>127</strong> is the <code>PATH</code> failure from B1.11; <strong>137</strong> is <code>SIGKILL</code>, which on a node almost always means the memory limit was hit and the kernel's OOM killer acted (B7 builds that machinery); <strong>143</strong> is <code>SIGTERM</code>, the ordinary shutdown path.</p>
+<p>That last pair is <a href="w3.html#cp-3-5">W3.5 — graceful termination</a>: Kubernetes sends <code>SIGTERM</code>, waits out the grace period, then sends <code>SIGKILL</code>. A container that exits 143 shut down when asked; one that exits 137 during a normal delete ignored the request and had to be forced.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code> under <em>EXIT STATUS</em> and <em>Lists</em> (for <code>&amp;&amp;</code>/<code>||</code>), plus <em>The Set Builtin</em> for <code>-euo pipefail</code>. <code>man 3 exit</code> and <code>man 2 _exit</code> for the underlying call, <code>man 2 execve</code> for the shebang handling — search it for <em>interpreter</em>. <code>man 1 test</code> for the <code>[ ]</code> operators, especially <code>-e</code>, <code>-f</code>, <code>-d</code> and <code>-z</code>.</p>
+</article>
+</div>
+
+<!-- ---------------- Editing ---------------- -->
+<div class="grp" id="g-edit"><h3>Editing</h3>
+
+<article class="lesson" id="cp-b1-14" data-id="b1-14">
+<div class="lesson-head"><span class="cp-id">B1.14</span><h4>Survive <code>vim</code>, because on a broken machine it is what exists</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Nobody has to love vim. But every Linux machine you will ever be dropped into has it, including exam desktops with no internet, rescue shells, and nodes where the control plane is down and a YAML file needs one character changed. A dozen commands is enough to open a file, change it, save it and leave — and being unable to do that on a broken machine is a genuinely bad afternoon. This lesson is the dozen commands, plus one line of configuration that will matter for every manifest you write on this site.</p>
+<h5>The concept</h5>
+<p>vim is <strong>modal</strong>, which is the single idea to absorb. In most editors every keypress inserts a character. In vim, the keyboard means different things depending on which mode you are in, so the letters become commands rather than text.</p>
+<table>
+<tr><th>Mode</th><th>You are</th><th>Enter it with</th><th>Leave it with</th></tr>
+<tr><td><strong>Normal</strong></td><td>issuing commands — the default, and where you should rest</td><td><kbd>Esc</kbd></td><td>—</td></tr>
+<tr><td><strong>Insert</strong></td><td>typing text, like any other editor</td><td><code>i</code>, <code>a</code>, <code>o</code></td><td><kbd>Esc</kbd></td></tr>
+<tr><td><strong>Visual</strong></td><td>selecting a region to act on</td><td><code>v</code>, <code>V</code>, <kbd>Ctrl-v</kbd></td><td><kbd>Esc</kbd></td></tr>
+<tr><td><strong>Command-line</strong></td><td>typing a colon command at the bottom</td><td><code>:</code></td><td><kbd>Enter</kbd> or <kbd>Esc</kbd></td></tr>
+</table>
+<p>Almost all beginner panic is one of two things: typing text while in normal mode (so the letters run commands — press <kbd>Esc</kbd>, then <code>u</code> to undo), or not knowing how to leave. The habit that fixes both: <strong>after every edit, press <kbd>Esc</kbd></strong>. Then you always know where you are.</p>
+<p>The survival set is small enough to memorise today:</p>
+<table>
+<tr><th>Keys</th><th>Does</th></tr>
+<tr><td><code>i</code> / <code>a</code> / <code>o</code></td><td>insert before cursor / after cursor / on a new line below</td></tr>
+<tr><td><kbd>Esc</kbd></td><td>back to normal mode — press it whenever unsure</td></tr>
+<tr><td><code>:w</code> / <code>:q</code> / <code>:wq</code> / <code>:q!</code></td><td>write / quit / write and quit / <strong>quit discarding changes</strong></td></tr>
+<tr><td><code>dd</code> / <code>yy</code> / <code>p</code></td><td>delete a line / copy a line / paste it back</td></tr>
+<tr><td><code>u</code> / <kbd>Ctrl-r</kbd></td><td>undo / redo</td></tr>
+<tr><td><code>/text</code> then <code>n</code></td><td>search forward, then jump to the next match</td></tr>
+<tr><td><code>gg</code> / <code>G</code> / <code>:42</code></td><td>top of file / end of file / go to line 42</td></tr>
+<tr><td><kbd>Ctrl-v</kbd>, move, <code>&gt;</code></td><td>select a block of lines and indent them all</td></tr>
+</table>
+<p><code>:q!</code> is the most important one on the list. It abandons every change and exits, which means <strong>no situation in vim is unrecoverable</strong> — if you have made a mess of a file on a production machine, you can always leave without saving and start again.</p>
+<p>Then the configuration line, which is not optional on this site. YAML — the format of every Kubernetes manifest you will ever write — <strong>forbids tab characters for indentation</strong>, and the parser's error message for one is unhelpful. Putting <code>set ts=2 sw=2 et</code> in <code>~/.vimrc</code> makes the <kbd>Tab</kbd> key insert two spaces instead (<code>et</code> is <em>expandtab</em>), so the problem cannot arise. Do it now, on the sandbox, and again on any machine where you write manifests.</p>
+<h5>Lab</h5>
+<ol>
+<li>Write the config first, so everything after it behaves. This is also your first real vim edit — but do it with a redirect, then verify.
+<pre class="cmd">cat &gt; ~/.vimrc &lt;&lt;'EOF'
+set ts=2 sw=2 et
+set number
+syntax on
+EOF
+cat ~/.vimrc</pre>
+<pre class="out"><b>set ts=2 sw=2 et</b>
+set number
+syntax on</pre></li>
+<li>Open a file and do the complete round trip: insert, escape, save, quit. Type these keys exactly.
+<pre class="cmd">vim practice.yaml</pre>
+<p>Then, in order: press <code>i</code> (you should see <code>-- INSERT --</code> at the bottom), type three lines —</p>
+<pre class="out">apiVersion: v1
+kind: Pod
+metadata:
+  name: test</pre>
+<p>— then press <kbd>Esc</kbd>, then type <code>:wq</code> and press <kbd>Enter</kbd>. You are back at the shell, and the file exists.</p></li>
+<li>Verify the tabs setting actually took effect, which is the entire point of step 1. Reopen the file, press <code>o</code> to open a new line, press <kbd>Tab</kbd>, type <code>x</code>, press <kbd>Esc</kbd>, then <code>:wq</code>. Now look at the bytes.
+<pre class="cmd">cat -A practice.yaml | tail -1</pre>
+<pre class="out">  x$</pre>
+<p>Two spaces and no <code>^I</code>. If you see <code>^Ix$</code> instead, that is a literal tab and your <code>~/.vimrc</code> was not read — check the filename and that it is in your home directory.</p></li>
+<li>Practise the destructive-and-recoverable moves, which is where confidence comes from. Open the file, then: <code>dd</code> to delete the current line, <code>dd</code> again, <code>u</code> to undo, <code>u</code> again — both lines come back. Then <kbd>Ctrl-r</kbd> to redo.
+<pre class="cmd">vim practice.yaml</pre></li>
+<li>Search and jump, still inside the file: type <code>/kind</code> and press <kbd>Enter</kbd> to land on that word, <code>n</code> for the next match, <code>gg</code> to jump to the top and <code>G</code> to the bottom.</li>
+<li>Do the block indent, because it is the one operation that is genuinely painful without vim and trivial with it — and YAML needs it constantly. With the cursor on the first line to indent: press <kbd>Ctrl-v</kbd>, press <code>j</code> a few times to extend the selection down, then press <code>&gt;</code>. Every selected line moves right by two spaces. <code>&lt;</code> moves them back.</li>
+<li>Finally, practise the escape hatch. Make a mess on purpose — hold <code>x</code> down to delete a stream of characters — then type <code>:q!</code> and press <kbd>Enter</kbd>. Confirm the file on disk is untouched.
+<pre class="cmd">cat practice.yaml</pre>
+<pre class="out">apiVersion: v1
+kind: Pod
+metadata:
+  name: test</pre></li>
+<li>If you want the guided version, vim ships its own tutorial — thirty minutes, and it is the best available.
+<pre class="cmd">vimtutor</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From a cold start, and without notes: open a file, add a line, save and quit; reopen it, delete a line, and quit <em>without</em> saving; confirm with <code>cat</code> that the deleted line is still there. Then confirm <code>cat -A</code> shows no <code>^I</code> anywhere in a file you indented with the <kbd>Tab</kbd> key.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If vim seems to have frozen and nothing you type appears, you have probably pressed <kbd>Ctrl-s</kbd>, which is the terminal's "pause output" (a feature older than vim). <kbd>Ctrl-q</kbd> resumes it. The other common freeze is being in a mode you did not expect — <kbd>Esc</kbd> a few times costs nothing.</p>
+<p>After a crash or a disconnected SSH session, vim leaves a <strong>swap file</strong> next to the original (<code>.practice.yaml.swp</code>) and warns you about it on the next open. That file is a feature — it holds your unsaved changes — but it is easy to panic and pick the wrong option. Read the prompt: <code>R</code> recovers your changes, <code>D</code> deletes the swap file and opens the file as it is on disk. If you are unsure, recover, then decide.</p>
+<p>Pasting multi-line text into vim while in insert mode produces a staircase, because vim helpfully auto-indents each line that arrives and the indentation compounds. <code>:set paste</code> before pasting and <code>:set nopaste</code> after turns that off. On an exam machine, this is the difference between a manifest that parses and ten minutes of confusion.</p>
+<p>Do not assume vim exists <em>everywhere</em>. It is fully installed on this Ubuntu image, but a minimal container image typically ships only <code>vi</code> from <code>vim-tiny</code>, or no editor at all — which is one of several reasons B1.6's heredoc and <code>sed -i</code> are worth knowing as alternatives to editing interactively.</p>
+<div class="k8s-link">
+<p><a href="w0.html#cp-0-10">W0.10 — make vim safe for YAML and learn five motions</a> is the advanced track's version of this lesson, and it exists because YAML indentation errors are a leading cause of lost time under exam conditions. The <code>~/.vimrc</code> line you just wrote is the first thing it has you type on the exam machine.</p>
+<p>The specific workflow it drills: <code>kubectl edit</code> opens the live object in vim, and a tab character or a broken indent means the edit is rejected on save, with the object unchanged and your work in a temporary file. The block-indent operation from step 6 is the fix for the most common cause — a whole section pasted at the wrong depth.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>vimtutor</code> first — thirty minutes, hands-on, and it covers everything above in a better order than any written page. Then <code>:help</code> inside vim (and <code>:help &lt;topic&gt;</code>, e.g. <code>:help visual-block</code>), plus <code>man 1 vim</code> for the command-line flags. <code>man 5 vimrc</code> does not exist; the settings are documented at <code>:help options</code>.</p>
+</article>
+</div>
+
 <nav class="pager"><a href="b0.html">← B0 · Your Linux sandbox</a><a href="../beginner.html#b1">Beginner tracker →</a></nav>
 
 <footer>
