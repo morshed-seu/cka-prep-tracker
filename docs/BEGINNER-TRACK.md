@@ -705,12 +705,26 @@ tick the `CLAUDE.md` row and update the `cka-materials-plan` memory.
 | **B-S2** | Wiring, no content: `site.css` additions; generalize `tools/check-links.sh` and `tools/check-html.py`; track switcher into all existing sidebars; `index.html` hero + prefix-scoped reset; `foundations.html` banner and go-deep links; stub `beginner.html` with `PUBLISHED=[]` |
 | **B-S3** | `beginner.html` sections **B0–B7** (119 checkpoints) — ✅ done |
 | **B-S4** | `beginner.html` sections **B8–B14** (106 checkpoints), hours panel — ✅ done |
-| **B-S5** | `materials/b0.html` — **the pattern-setter**: establishes lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks. Review before continuing |
+| **B-S5** | `materials/b0.html` — **the pattern-setter**: establishes lesson anatomy, `k8s-link`, `langpair`, project/outcome blocks — ✅ done |
 | **B-S6 … B-S18** | `materials/b1.html` … `materials/b13.html`, one module per session |
 | **B-S19** | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA |
 
 **Publishing a module** (last step of its session): add its number to `beginner.html`'s `PUBLISHED`
 array, add its entry to the beginner sidebar list on every `materials/b*.html`, run the checkers.
+
+**Pattern set by `materials/b0.html`** — copy its skeleton for every later module:
+
+- Sidebar is the lesson-page shape (`body class="materials"`, brand *Beginner · Foundations*, the
+  three-pill switcher with Beginner `on`, ring panel reading `BN done`, a static `Site` list holding
+  only beginner pages + `foundations.html` + `← Beginner tracker`). No cross-track merging.
+- Cross-track deep links from inside `materials/` are **sibling-relative** (`w3.html#cp-3-16`), never
+  `../materials/…`. Links to the trackers keep the `../` (`../beginner.html#b0`, `../index.html`).
+- Page order: crumb → `header.hero` (two plain paragraphs + `.weights` chips for cps/hours/prereqs) →
+  `.objectives` → `.prereq` → lesson groups → `.quiz` → `.outcome` → `.godeep` → `.pager` → footer.
+  The `::before` headings come from CSS — write the bare `<div class="objectives">`, no `<h3>`.
+- `.k8s-link` goes on **conceptual** lessons only. Site-mechanics lessons (b0-2) and the mini
+  project/drill articles legitimately have none; b0 carries 7 across 9 lessons.
+- Footer states the release the labs were authored against plus the date it was verified.
 
 **Commit size.** The ≤500-added-lines-per-code-commit rule binds: a tracker half and a module page
 both exceed it, so a session lands as several commits along natural boundaries — one per lesson group
