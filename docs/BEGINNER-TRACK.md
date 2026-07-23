@@ -706,11 +706,21 @@ tick the `CLAUDE.md` row and update the `cka-materials-plan` memory.
 | **B-S3** | `beginner.html` sections **B0–B7** (119 checkpoints) — ✅ done |
 | **B-S4** | `beginner.html` sections **B8–B14** (106 checkpoints), hours panel — ✅ done |
 | **B-S5** | `materials/b0.html` — **the pattern-setter**: establishes lesson anatomy, `k8s-link`, `langpair`, project/outcome blocks — ✅ done |
-| **B-S6 … B-S18** | `materials/b1.html` … `materials/b13.html`, one module per session |
+| **B-S6** | `materials/b1.html` — shell, files, filesystem tree (16 checkpoints) — ✅ done |
+| **B-S7 … B-S18** | `materials/b2.html` … `materials/b13.html`, one module per session |
 | **B-S19** | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA |
 
 **Publishing a module** (last step of its session): add its number to `beginner.html`'s `PUBLISHED`
 array, add its entry to the beginner sidebar list on every `materials/b*.html`, run the checkers.
+Also repoint the *previous* module page's pager `next` link from the tracker anchor to the new file.
+
+**Splitting a module across commits.** A full module page runs 1000–1500 lines, well past the
+global ≤500-added-lines-per-code-commit rule, so it takes 3–4 commits. `check-links.sh` globs
+`materials/b[0-9]*.html` the moment the file exists, so it reports the not-yet-written anchors as
+missing on every commit but the last. That is expected and the two rules cannot both hold: split
+along **checkpoint-group boundaries** so each commit is whole lessons (never half-written ones),
+say so in the intermediate commit messages, and require green checkers only at the end of the
+session. B-S6 shipped this way (`90ff0aa` → `ead1b3c` → `f90f704` → publish).
 
 **Pattern set by `materials/b0.html`** — copy its skeleton for every later module:
 

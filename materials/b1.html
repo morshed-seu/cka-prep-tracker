@@ -1229,7 +1229,248 @@ metadata:
 </article>
 </div>
 
-<nav class="pager"><a href="b0.html">← B0 · Your Linux sandbox</a><a href="../beginner.html#b1">Beginner tracker →</a></nav>
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b1-15" data-id="b1-15">
+<div class="lesson-head"><span class="cp-id">B1.15</span><h4><code>sysreport.sh</code> — one machine, one page, built only from pipes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything in this module was a single technique demonstrated in isolation. This is the assembly: one script that answers "what is the state of this machine right now" in about thirty lines, using nothing but the tools you have just learned. You will keep it — later modules ask you to run it <em>before</em> breaking something, so that the "after" has something to be compared against, and a debugging drill with a baseline is a completely different experience from one without.</p>
+<h5>The concept</h5>
+<p>The design brief is deliberately narrow, and each constraint teaches something:</p>
+<ul>
+<li><strong>Every section is a pipeline.</strong> No temporary files, no intermediate variables holding output. If a section needs three steps, it is three programs joined by two pipes — which forces you to think in terms of what each stage receives and emits, per B1.7.</li>
+<li><strong>Output goes to stdout, and only to stdout.</strong> That makes the whole report redirectable (<code>sysreport.sh &gt; before.txt</code>) and pipeable (<code>sysreport.sh | grep -A3 memory</code>) without any special support. Diagnostics — if you add any — go to stderr, per B1.5.</li>
+<li><strong>It is readable in ten seconds.</strong> A tool you keep is a tool you must be able to re-read later and trust. That rules out cleverness.</li>
+</ul>
+<p>One new piece of syntax appears below and is worth naming: a <strong>shell function</strong>. <code>hr(){ …; }</code> defines a name that behaves exactly like a command for the rest of the script — arguments arrive as <code>$1</code>, <code>$2</code> and so on, and it goes into the resolution order at position 2 from B1.11's table. Here it exists only so that every section header is printed identically, in one place.</p>
+<h5>Lab</h5>
+<ol>
+<li>Write it inside the sandbox — unlike B0's snapshot scripts, this one reports on the machine it runs on, so it belongs in the VM. Use the quoted heredoc from B1.6 so that not one <code>$</code> is expanded on the way in.
+<pre class="cmd">mkdir -p ~/bin &amp;&amp; cat &gt; ~/bin/sysreport.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+# One-page snapshot of this machine. Redirect it to keep a baseline:
+#   sysreport.sh &gt; before.txt
+set -euo pipefail
+
+hr(){ printf '\n===== %s =====\n' "$1"; }
+
+hr "host"
+printf '%s | %s | up%s\n' \
+  "$(hostname)" "$(uname -sr)" "$(uptime -p | sed 's/^up//')"
+
+hr "memory"
+free -h | head -2
+
+hr "top 5 processes by RSS"
+ps -eo rss=,pid=,user=,comm= --sort=-rss \
+  | head -5 \
+  | awk '{ printf "%8.1f MB  pid %-7s %-10s %s\n", $1/1024, $2, $3, $4 }'
+
+hr "disk"
+df -h -x tmpfs -x devtmpfs -x squashfs
+
+hr "listening tcp ports"
+ss -tlnp 2&gt;/dev/null \
+  | tail -n +2 \
+  | awk '{ print $4, $6 }' \
+  | sed 's/users:((//; s/)).*//; s/"//g' \
+  | sort -u
+EOF
+chmod +x ~/bin/sysreport.sh</pre></li>
+<li>Confirm <code>~/bin</code> is on your <code>PATH</code> so you can run it by name from anywhere. On Ubuntu the default <code>~/.profile</code> already adds it <em>if the directory existed at login</em> — which it did not until a moment ago, so a fresh shell is needed.
+<pre class="cmd">command -v sysreport.sh || { echo 'export PATH="$HOME/bin:$PATH"' &gt;&gt; ~/.bashrc; source ~/.bashrc; }
+command -v sysreport.sh</pre>
+<pre class="out"><b>/home/ubuntu/bin/sysreport.sh</b></pre></li>
+<li>Run it. Use <code>sudo</code> so the listening-ports section can see which process owns each socket — that was the lesson of B1.9's drill.
+<pre class="cmd">sudo sysreport.sh</pre>
+<pre class="out">===== host =====
+<b>sandbox | Linux 6.8.0-xx-generic | up 1 hour, 12 minutes</b>
+
+===== memory =====
+               total        used        free      shared  buff/cache   available
+Mem:           3.8Gi       412Mi       2.6Gi       1.0Mi       880Mi       <b>3.3Gi</b>
+
+===== top 5 processes by RSS =====
+    80.4 MB  pid 1876    root       containerd
+    53.8 MB  pid 882     root       snapd
+    36.1 MB  pid 640     systemd+   systemd-resolve
+    12.6 MB  pid 1       root       systemd
+     8.2 MB  pid 713     root       systemd-network
+
+===== disk =====
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        19G  2.3G   <b>17G</b>  13% /
+
+===== listening tcp ports =====
+<b>0.0.0.0:22 sshd,pid=882,fd=3</b>
+<b>127.0.0.53%lo:53 systemd-resolve,pid=640,fd=14</b>
+[::]:22 sshd,pid=882,fd=3</pre></li>
+<li>Prove it is a well-behaved Unix program by using it as one — the report is just text on stdout, so every tool from B1.9 applies to it.
+<pre class="cmd">sudo sysreport.sh &gt; ~/baseline.txt
+wc -l ~/baseline.txt
+grep -A2 'listening' ~/baseline.txt</pre>
+<pre class="out">27 /home/ubuntu/baseline.txt
+===== listening tcp ports =====
+0.0.0.0:22 sshd,pid=882,fd=3
+127.0.0.53%lo:53 systemd-resolve,pid=640,fd=14</pre></li>
+<li>Take a baseline now and keep it. Later modules will have you break the machine and compare — and the comparison is what makes the difference obvious.
+<pre class="cmd">sudo sysreport.sh &gt; ~/baseline.txt
+echo "keep this file: ~/baseline.txt"</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>sysreport.sh</code> runs from any directory, prints five sections, and exits 0 (<code>sysreport.sh &gt;/dev/null; echo $?</code>). Redirecting it to a file captures the whole report and leaves nothing on screen — which proves nothing is being written to stderr by accident. Then, for the real test: change one section to answer a question you actually want answered, and confirm it still runs.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Without <code>sudo</code>, the listening-ports section still lists the ports but the process column is empty — the kernel does not reveal socket ownership to unprivileged users. That is not a bug in the script, and the script deliberately does not hide it by calling <code>sudo</code> itself. A tool that silently escalates privileges is a worse tool.</p>
+<p><code>set -e</code> plus a pipeline means a failing stage can abort the whole report — this is why <code>ss</code> has <code>2&gt;/dev/null</code> on it, since it emits warnings in some environments. When you extend the script, test each new section on its own first; a report that dies halfway is less useful than one that prints an empty section.</p>
+<p>Resist growing this past one screen. The value of a baseline tool is that you can read it and know exactly what it did; the moment it needs its own documentation, it has stopped being that. Later modules add their own small tools rather than extending this one.</p>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ps</code> for the <code>-eo</code> output format and <code>--sort</code>, <code>man 1 df</code> for <code>-x</code>, <code>man 1 uptime</code>, <code>man 8 ss</code>. <code>man 1 bash</code> under <em>FUNCTIONS</em> for the <code>hr(){ …; }</code> syntax and <em>Shell Parameter Expansion</em> for <code>$(…)</code>. If you keep writing scripts, install <code>shellcheck</code> and run it over this one.</p>
+</article>
+
+<article class="lesson drill" id="cp-b1-16" data-id="b1-16">
+<div class="lesson-head"><span class="cp-id">B1.16</span><h4>Two symptoms, diagnosed from evidence rather than by guessing</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>In real life you never meet a fault cause-first. You meet a <em>symptom</em> — something that used to work does not — and the skill being trained here is walking from the symptom to the cause by collecting evidence, rather than by cycling through remembered fixes. Both faults below are ones you will genuinely hit, and both have the property that the error message points somewhere other than the problem.</p>
+<p>Take a snapshot first (<code>snapshot.sh</code> on your host), then paste each setup block <em>without reading it closely</em>. The point is the diagnosis path, not the surprise.</p>
+<h5>Drill 1 — "command not found" for a binary that is definitely there</h5>
+<ol class="lab">
+<li>Plant it. This writes a line into your shell's startup file, so the fault survives opening a new terminal — exactly as a real one would.
+<pre class="cmd">printf '\nexport PATH="$HOME/bin"\n' &gt;&gt; ~/.bashrc
+exec bash -l</pre></li>
+<li>Observe. Try to do ordinary work.
+<pre class="cmd">ls
+grep --version
+cat /etc/hostname</pre></li>
+<li>Diagnose before reading anything below. Your goal is a one-sentence statement of the cause, backed by a command whose output proves it. Only then open the reveals in order.</li>
+</ol>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p>Nearly every command fails with <code>bash: ls: command not found</code> — but not <em>all</em> of them: <code>cd</code>, <code>echo</code> and <code>type</code> still work, because they are shell builtins and never needed a lookup (B1.11). Anything in <code>~/bin</code>, such as <code>sysreport.sh</code>, also still works. A brand-new terminal behaves the same way, which tells you the fault is persistent rather than something you typed.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>Two questions, in this order. First: <em>does the binary exist?</em> You cannot use <code>ls</code> to check, so use a builtin — <code>echo /usr/bin/l*</code> globs the directory without running any program, and it prints <code>/usr/bin/ls</code>. So the file is there. Second: <em>can you run it directly?</em> <code>/usr/bin/ls /etc</code> works perfectly. A binary that exists and runs by absolute path but not by name is, by definition, a lookup failure — so look at the thing that does the lookup: <code>echo "$PATH"</code>.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p><code>echo "$PATH"</code> prints just <code>/home/ubuntu/bin</code>. The <code>.bashrc</code> line assigned <code>PATH</code> instead of prepending to it — <code>export PATH="$HOME/bin"</code> rather than <code>export PATH="$HOME/bin:$PATH"</code> — so every system directory was dropped.</p>
+<p>Repair the running shell first, then the file that keeps re-breaking it (note the absolute path to <code>sed</code>, because <code>sed</code> itself is not findable yet):</p>
+<pre class="cmd">export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+/usr/bin/sed -i '/^export PATH="\$HOME\/bin"$/d' ~/.bashrc
+exec bash -l
+ls /etc/hostname</pre>
+<p><strong>Fingerprint:</strong> <em>everything breaks at once, builtins survive, absolute paths work</em> → it is <code>PATH</code>, not the program. The general form of the cause is the B1.11 gotcha: an assignment that replaces the list instead of extending it.</p></details>
+
+<h5>Drill 2 — a script that quietly does the wrong thing to the wrong files</h5>
+<ol class="lab">
+<li>Plant it. This one is contained entirely inside a scratch directory, so nothing you care about is at risk.
+<pre class="cmd">mkdir -p /tmp/drill2 &amp;&amp; cd /tmp/drill2
+touch report.txt notes.txt 'quarterly summary.txt' 'final draft.txt'
+cat &gt; backup.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+dir=${1:-.}
+for f in $(ls $dir); do
+  cp $f $f.bak
+done
+echo "backed up $(ls *.bak | wc -l) files"
+EOF
+chmod +x backup.sh</pre></li>
+<li>Observe. Run it and read what it claims to have done.
+<pre class="cmd">./backup.sh</pre></li>
+<li>Diagnose. Two files did not get backed up and the script reported success anyway. Say exactly why, and name the mechanism — then open the reveals.</li>
+</ol>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p>Errors scroll past — <code>cp: cannot stat 'quarterly': No such file or directory</code> and <code>cp: cannot stat 'summary.txt': No such file or directory</code> — and then the script cheerfully prints <code>backed up 5 files</code>. Check with <code>ls *.bak</code>: the two multi-word files have no backup, and there are stray fragments instead. The count is wrong <em>and</em> the exit code is 0, so anything calling this script would conclude it worked.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>The error names <code>quarterly</code> — a file that does not exist and that you never typed. Something turned one name into two. Watch the script's actual expansions rather than guessing: <code>bash -x ./backup.sh</code> prints every command after expansion, with a <code>+</code> prefix. You will see <code>+ cp quarterly summary.txt quarterly.bak</code> — one <code>cp</code> receiving three arguments where it should have received two.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p>Two distinct bugs, both from B1.12, and the loop has a third problem from B1.8:</p>
+<ul>
+<li><code>for f in $(ls $dir)</code> — the command substitution is unquoted, so its output is split on whitespace. A filename containing a space becomes two loop iterations. Parsing <code>ls</code> at all is the root mistake; a glob gives the shell the names directly, as a proper list, and never involves text-splitting.</li>
+<li><code>cp $f $f.bak</code> — unquoted expansions, so even a correct name would be split again here.</li>
+<li>The script never checks whether <code>cp</code> succeeded, so failures cannot affect the exit code.</li>
+</ul>
+<p>The corrected version:</p>
+<pre class="cmd">cat &gt; backup.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+dir=${1:-.}
+n=0
+for f in "$dir"/*.txt; do
+  [ -e "$f" ] || continue
+  cp -- "$f" "$f.bak"
+  n=$((n+1))
+done
+echo "backed up $n files"
+EOF
+rm -f ./*.bak
+./backup.sh
+ls *.bak</pre>
+<pre class="out">backed up 4 files
+<b>'final draft.txt.bak'</b>  notes.txt.bak  <b>'quarterly summary.txt.bak'</b>  report.txt.bak</pre>
+<p><strong>Fingerprint:</strong> <em>an error naming a file you never created, made of half a real filename</em> → an unquoted expansion split on whitespace. <code>bash -x</code> is the instrument: it shows you what the shell built, which is the only way to see a fault that lives in the gap between what you wrote and what ran. Note also <code>cp --</code>, which stops a filename beginning with <code>-</code> being read as an option, and <code>[ -e "$f" ] || continue</code>, which handles the no-match case from B1.8.</p></details>
+<h5 class="verify">Verify</h5>
+<p>Both drills are done when you can state each fingerprint in one sentence without looking, and when your repaired <code>backup.sh</code> handles all four filenames and reports 4. Clean up with <code>cd ~ &amp;&amp; rm -rf /tmp/drill2</code>, and confirm your <code>~/.bashrc</code> no longer contains the planted line: <code>grep -n 'HOME/bin' ~/.bashrc</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The instinct in drill 1 is to reinstall coreutils, because "<code>ls</code> is missing". Nothing was missing. The lesson generalises: when <em>many</em> unrelated things break simultaneously, the fault is almost never in any of them — it is in something they all depend on. That reasoning is the same one W6 applies at cluster scale.</p>
+<p>The instinct in drill 2 is to add <code>2&gt;/dev/null</code> and make the errors stop. They were the only true thing the script said. Suppressing diagnostics to make output look clean is how a broken script survives for months; the errors were pointing straight at the cause from the first run.</p>
+<p><code>bash -x</code> is worth adopting permanently — it is the cheapest debugging tool in the shell, needs no setup, and can be turned on inside a script for a region with <code>set -x</code> … <code>set +x</code> when you do not want the whole thing traced.</p>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code> under <em>The Set Builtin</em> for <code>-x</code>, and <em>Word Splitting</em> for the mechanism behind drill 2. <code>man 1 cp</code> for <code>--</code>. Then re-read <a href="#cp-b1-11">B1.11</a> and <a href="#cp-b1-12">B1.12</a>, which are the two lessons these drills exist to make permanent.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B1 recall quiz</h3>
+<p>Answer out loud before revealing. Anything you cannot answer here will cost you time in every module that follows, because none of them re-explain it.</p>
+<ol>
+<li>What is the difference between an absolute and a relative path, and where does the machine store the "where I am" that relative paths resolve against?
+<details class="reveal"><summary>Answer</summary><p>An absolute path starts with <code>/</code> and means the same thing typed from anywhere; a relative path does not, and is resolved against the process's <strong>current working directory</strong> — a real property held by the kernel, visible at <code>/proc/PID/cwd</code>, inherited from whatever started the process. That inheritance is why a script using relative paths behaves differently depending on where it was run from.</p></details></li>
+<li><code>/etc</code> versus <code>/var</code> — what is the distinction, and why does it decide what you back up?
+<details class="reveal"><summary>Answer</summary><p><code>/etc</code> is configuration you <em>set</em>: small, text, hand-authored, and not reproducible if lost. <code>/var</code> is state the machine <em>accumulated</em>: logs, caches, databases — large, and mostly regenerable. On a Kubernetes node that is exactly <code>/etc/kubernetes</code> (manifests, certificates) versus <code>/var/lib/kubelet</code> and <code>/var/lib/containerd</code>.</p></details></li>
+<li>Why do <code>/proc</code> and <code>/sys</code> report size 0 for files that plainly have contents?
+<details class="reveal"><summary>Answer</summary><p>Because they are not storage. They are the kernel answering questions through a filesystem-shaped interface: the contents are generated at the moment you read, so there is nothing on any disk to have a size. <code>stat -fc %T /proc</code> says <code>proc</code>, not <code>ext2/ext3</code>.</p></details></li>
+<li>Name the seven <code>ls -l</code> type characters and what each is.
+<details class="reveal"><summary>Answer</summary><p><code>-</code> regular file, <code>d</code> directory, <code>l</code> symlink, <code>c</code> character device, <code>b</code> block device, <code>s</code> socket, <code>p</code> named pipe. All seven live in one tree with the same permission bits and answer the same <code>read</code>/<code>write</code> calls — which is what "everything is a file" actually means. Kubernetes reuses five of them verbatim as <code>hostPath</code> <code>type:</code> values.</p></details></li>
+<li>A file has link count 3. What does that mean, and what happens when you <code>rm</code> one of the names?
+<details class="reveal"><summary>Answer</summary><p>Three directory entries point at the same inode — one file with three names. <code>rm</code> removes a name and decrements the count to 2; the contents are untouched. The file's blocks are only released when the count reaches 0 <em>and</em> no process still holds it open, which is why a deleted log can keep occupying disk until the writer restarts.</p></details></li>
+<li>Which timestamp does <code>chmod</code> move, and what does the "c" stand for?
+<details class="reveal"><summary>Answer</summary><p>ctime, and it stands for <strong>change</strong> — a change to the inode — not creation. <code>chmod</code> alters the inode without touching the contents, so ctime moves and mtime does not. Creation time, where the filesystem records it, appears as <code>Birth:</code> in <code>stat</code>.</p></details></li>
+<li>Why do programs have two output streams instead of one?
+<details class="reveal"><summary>Answer</summary><p>So that results can flow to another program while diagnostics still reach a human. If they were merged, piping a command would feed the next program its error text, and silencing the noise would silence the answer too. Note that stderr is not only for errors — progress bars and status lines go there too, on purpose.</p></details></li>
+<li><code>cmd &gt; f 2&gt;&amp;1</code> versus <code>cmd 2&gt;&amp;1 &gt; f</code> — what is the difference?
+<details class="reveal"><summary>Answer</summary><p>The first sends both streams to the file. The second sends only stdout to the file and leaves stderr on the terminal. <code>2&gt;&amp;1</code> makes descriptor 2 a <em>copy of wherever descriptor 1 points at that moment</em>, and the shell processes redirections left to right — so moving stdout afterwards does not drag stderr with it.</p></details></li>
+<li>Why does <code>yes | head -3</code> terminate, when <code>yes</code> runs forever?
+<details class="reveal"><summary>Answer</summary><p>Both sides of a pipe run at the same time. <code>head</code> prints three lines and exits; <code>yes</code>'s next write has no reader, so the kernel sends it <code>SIGPIPE</code>, which kills it. The pipeline stops as soon as the answer is complete rather than computing output nobody will read.</p></details></li>
+<li>Glob <code>*</code> and regex <code>*</code> — what does each mean, and which program expands each?
+<details class="reveal"><summary>Answer</summary><p>Glob <code>*</code> means "any run of characters" and is expanded by the <strong>shell</strong>, against filenames, before the program starts — the program never sees an asterisk. Regex <code>*</code> means "zero or more of the <em>previous</em> item" and is interpreted by the <strong>program</strong>, against text. The regex equivalent of glob <code>*</code> is <code>.*</code>, and this is why patterns meant for a program must be quoted.</p></details></li>
+<li>Why does a child process never see a variable you set, until you <code>export</code> it — and why can a child never change its parent's environment?
+<details class="reveal"><summary>Answer</summary><p>The environment is a plain list of <code>KEY=VALUE</code> strings <strong>copied</strong> into a new process when it is created; <code>export</code> marks a name for inclusion in that list. Because it is a copy made once, the child's changes are to its own copy and cannot travel back — which is why <code>source</code> exists, and why a Kubernetes container's env never updates when you change the ConfigMap.</p></details></li>
+<li>Every command suddenly reports "command not found", but <code>cd</code> and <code>echo</code> still work. What is the diagnosis and why does that specific evidence prove it?
+<details class="reveal"><summary>Answer</summary><p><code>PATH</code> is broken. <code>cd</code> and <code>echo</code> are shell <strong>builtins</strong> and never require a directory search, so they are unaffected; anything that must be found on disk fails. Confirm by running one by absolute path — <code>/usr/bin/ls</code> works — which proves the binary is fine and only the lookup is broken.</p></details></li>
+<li>State the quoting rule, and say what actually goes wrong without it.
+<details class="reveal"><summary>Answer</summary><p><strong>Quote every variable expansion</strong> — <code>"$f"</code>, never <code>$f</code>. Unquoted, the shell splits the value on whitespace and then glob-expands the pieces, so a filename with a space becomes two arguments and a value containing <code>*</code> becomes a directory listing. The failure mode is not an error message; it is a wrong action on the wrong files.</p></details></li>
+<li>A container exits with 137. What happened, and how do you know?
+<details class="reveal"><summary>Answer</summary><p>It was killed by signal 9, <code>SIGKILL</code> — the convention is <strong>128 + signal number</strong>, and 137 − 128 = 9. It did not choose to exit, so there is no application-level error to find; on a node this almost always means a memory limit was hit and the kernel's OOM killer acted. By the same arithmetic 143 is <code>SIGTERM</code>, the ordinary shutdown path.</p></details></li>
+<li>You are in vim, you have made a mess of a file on a machine you care about, and you do not trust anything you have typed. What do you do?
+<details class="reveal"><summary>Answer</summary><p><kbd>Esc</kbd>, then <code>:q!</code>, then <kbd>Enter</kbd>. That abandons every change and exits, leaving the file on disk exactly as it was. No situation in vim is unrecoverable, which is the fact that makes the editor safe to experiment in.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Navigate any Linux machine by absolute or relative path, and explain where the "current directory" is actually kept.</li>
+<li>Predict which top-level directory an unfamiliar program keeps its configuration, its state and its runtime sockets in — and know which of the three is worth backing up.</li>
+<li>Read every field of <code>ls -l</code>, identify all seven file types, and use <code>stat</code> to answer questions <code>ls</code> cannot.</li>
+<li>Explain a file as an inode with names attached, and use that to account for deleted-but-open files, cheap renames and hard links.</li>
+<li>Route stdin, stdout and stderr independently, and say exactly why <code>2&gt;&amp;1</code> must come after the redirect it copies.</li>
+<li>Compose a pipeline that answers a question no single program on the machine can answer, and know why it stops early when the reader exits.</li>
+<li>Tell a glob from a regex on sight, name which piece of software expands each, and quote accordingly.</li>
+<li>Reach for the right member of the eleven-tool core without thinking, including the three combinations that do most of the work.</li>
+<li>Explain the environment as a one-way copy made at process creation — and derive from that why environment-based configuration never live-updates.</li>
+<li>Diagnose a broken <code>PATH</code> from the evidence rather than by guessing, and repair it from a shell where nothing runs.</li>
+<li>Quote by reflex, and recognise an unquoted-expansion bug from the shape of its error message.</li>
+<li>Write a script with a shebang, an execute bit and honest exit codes, and debug it with <code>bash -x</code>.</li>
+<li>Open, edit, save and abandon a file in vim on a machine with nothing else installed — with <code>~/.vimrc</code> already safe for YAML.</li>
+<li>Keep a machine baseline (<code>sysreport.sh</code>) that later modules compare against.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b0.html">← B0 · Your Linux sandbox</a><a href="../beginner.html#b2">B2 · Processes, threads, signals →</a></nav>
 
 <footer>
 Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-23. Package versions referenced: coreutils 9.4, procps 4.0.4, vim 9.1. Note that <code>net-tools</code> is <em>not</em> installed on this image — <code>ss</code> and <code>ip</code> replace <code>netstat</code> and <code>ifconfig</code>.

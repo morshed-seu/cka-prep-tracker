@@ -70,7 +70,8 @@ Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0
 | B-S3 | `beginner.html` sections B0–B7 (119 checkpoints) | ✅ done |
 | B-S4 | `beginner.html` sections B8–B14 (106 checkpoints) + hours panel | ✅ done |
 | B-S5 | `materials/b0.html` — **pattern-setter** (lesson anatomy, `k8s-link`, `langpair`, project/outcome blocks); review before continuing | ✅ done |
-| B-S6…B-S18 | `materials/b1.html` … `materials/b13.html`, one module per session | ⬜ next (B-S6 = `b1.html`) |
+| B-S6 | `materials/b1.html` — shell, files, filesystem tree (16 cp) | ✅ done |
+| B-S7…B-S18 | `materials/b2.html` … `materials/b13.html`, one module per session | ⬜ next (B-S7 = `b2.html`) |
 | B-S19 | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA | ⬜ |
 
 **Resume recipe for any beginner-track session:** read this table → read the target module's section in `docs/BEGINNER-TRACK.md` → `git log --oneline -8` (what actually landed, vs. just marked done) → run the three checkers for a green baseline → do the work → checkers → commit → tick the row here and update the `cka-materials-plan` memory.
