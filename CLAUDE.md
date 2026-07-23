@@ -1,8 +1,14 @@
 # CLAUDE.md — CKA prep site
 
-Dependency-free static site (GitHub Pages) that takes a user from zero to passing the CKA exam: an 8-week checkpoint **tracker** (`index.html`) plus **self-contained lesson pages** per week. No build step, no external requests — plain HTML/CSS/JS only.
+Dependency-free static site (GitHub Pages) that takes a user from zero to passing the CKA exam. No build step, no external requests — plain HTML/CSS/JS only. It is growing into a **three-track journey**:
 
-The full approved plan is in [`docs/PLAN.md`](docs/PLAN.md). Decisions already made (don't re-ask): fully self-contained lesson depth; all four extras (fault scripts, quizzes, cheat sheets, mock exam); implement one phase per session, in week order.
+| Track | Tracker | Lessons | Plan | Status |
+|---|---|---|---|---|
+| **Beginner** — the Linux/networking/distributed-systems machinery Kubernetes is built from | `beginner.html` | `materials/b0…b14.html` | [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) | in progress (B-S1…B-S19) |
+| **Intermediate** — composing that machinery into containers, runtimes, images, CNI | `intermediate.html` | — | — | future |
+| **Advanced** — Kubernetes itself, through the CKA | `index.html` | `materials/w0…w8.html` | [`docs/PLAN.md`](docs/PLAN.md) | ✅ complete |
+
+Decisions already made (don't re-ask): fully self-contained lesson depth; all four extras (fault scripts, quizzes, cheat sheets, mock exam); implement one phase per session, in track/week order.
 
 ## Commands
 
@@ -49,6 +55,24 @@ There is no build step, package manager, linter, or test framework beyond the tw
 | R8 | Rewrite materials/w8.html + final cross-link/voice-consistency QA over all 9 files | ✅ done |
 
 P0–P8 complete; the site is a full self-contained internals-first curriculum. EP0–EP8 (the toggleable beginner-enrichment pass) is **superseded** — feedback was that bolting optional panels onto otherwise jargon-dense prose wasn't enough; the plan pivoted to rewriting every lesson's core prose in plain English with full depth kept, one unified voice, nothing to toggle (R0–R8, see "Plain-English lesson voice" below and `docs/PLAN.md`'s addendum for the pivot history). R0–R8 are done per the table above (R1 dissolved every `.foundation` callout box in w0/w1 into the main "The concept" prose — EP1's pilot only ever touched w0/w1, so w2–w8 never had any `.foundation`/`.analogy` boxes to begin with) — phases haven't always landed strictly in order when sessions ran in parallel, so check each week's own status above rather than assuming, and check `git log --oneline` for what's actually committed vs. just marked done on disk. Note: `shellcheck` was unavailable in the P8 environment — `mock/setup-exam-1.sh` passed `bash -n` and mirrors the (shellchecked) `labs/faults/` patterns, but run shellcheck on it when available.
+
+## Beginner-track roadmap (update this table at the end of each session)
+
+Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0–B14), ~200 checkpoints, ~75 hours, self-paced. **Every phase below is sized to one session, start to finish**: it ends with green checkers, a commit, and a site that renders with nothing half-written. No session depends on another session's in-memory context.
+
+| Phase | Scope | Status |
+|---|---|---|
+| B-S1 | `docs/BEGINNER-TRACK.md` — curriculum spec (docs-only commit) | ✅ done |
+| B-S2 | Wiring, no content: `site.css` additions; generalize `check-links.sh`/`check-html.py`; track switcher into every sidebar; `index.html` hero + prefix-scoped reset; `foundations.html` banner + go-deep links; stub `beginner.html` (`PUBLISHED=[]`) | ⬜ next |
+| B-S3 | `beginner.html` sections B0–B7 (~106 checkpoints) | ⬜ |
+| B-S4 | `beginner.html` sections B8–B14 (~94 checkpoints) + resume link + hours panel | ⬜ |
+| B-S5 | `materials/b0.html` — **pattern-setter** (lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks); review before continuing | ⬜ |
+| B-S6…B-S18 | `materials/b1.html` … `materials/b13.html`, one module per session | ⬜ |
+| B-S19 | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA | ⬜ |
+
+**Resume recipe for any beginner-track session:** read this table → read the target module's section in `docs/BEGINNER-TRACK.md` → `git log --oneline -8` (what actually landed, vs. just marked done) → run the three checkers for a green baseline → do the work → checkers → commit → tick the row here and update the `cka-materials-plan` memory.
+
+Beginner specifics that differ from the CKA workflow below: anchors are `data-id="bN-M"` ↔ `id="cp-bN-M"` (one rule covers both tracks: **anchor = `cp-` + data-id with a leading `w` stripped**); labs run on a single throwaway Multipass VM named `sandbox` (Ubuntu 24.04), never on the `cp`/`node01`/`node02` cluster; every conceptual lesson ends with a mandatory **"Where this shows up in Kubernetes"** (`.k8s-link`) block deep-linking the advanced lesson anchor; **Docs** links point at `man` pages and kernel docs, not kubernetes.io.
 
 ## Phase workflow
 
@@ -101,6 +125,22 @@ Apply this recipe to every `<article class="lesson">` when rewriting a week (R1�
 | systemd + static pods | the building superintendent who keeps the boiler running directly, before the tenant office can open |
 | quorum / consensus | a small committee that only needs a strict majority to act |
 | PV / PVC / StorageClass | a self-storage facility: a PV is a physical unit already built on the lot, a PVC is a reservation ticket for a unit of some size, a StorageClass is a standing order telling the facility "build a new unit to this spec whenever no existing unit matches a ticket" |
+
+**Beginner-track extension.** The existing hotel metaphor is promoted into the beginner track's spine: **one hotel = one Linux machine; the city of buildings = the cluster.** Same rule — reuse these exact metaphors, don't invent competing ones.
+
+| Concept | Analogy |
+|---|---|
+| kernel / user space | the hotel's engineering staff, who alone touch the wiring; guests must file a work order |
+| system call | that work-order form — the only way a guest reaches engineering |
+| process | a guest staying in the hotel; the PID is their room number |
+| signal | a knock on the door with a standard meaning; SIGKILL is security removing them, no conversation |
+| mount namespace | the room's own closet — same building, different contents |
+| PID namespace | the room's own guest list: they can't see who else is in the hotel |
+| cgroup | the room's metered power and water, with a cap the front desk sets |
+| capabilities | a keyring of individually-issued permits; root is the master key |
+| overlayfs layers | a stack of transparent sheets — you write on the top one, you read through the whole stack |
+| DNS resolver | the hotel operator who looks a name up before dialing |
+| conntrack | the switchboard's log of calls currently in progress |
 
 ## Other components (specs in docs/PLAN.md)
 
