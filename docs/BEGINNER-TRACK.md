@@ -113,6 +113,11 @@ from memory:
 - `kernel.apparmor_restrict_unprivileged_userns=1` on 24.04 restricts unprivileged user namespaces.
   B6's labs must **explain** this rather than silently working around it with `sudo`.
 - Whether `multipass launch 24.04` is still the current LTS image alias.
+  **Checked 2026-07-23: it is not the newest.** Ubuntu **26.04 LTS ("Resolute Raccoon")** has shipped, and
+  Multipass's dynamic `lts` alias now points at it. 24.04 (`noble`) is still available and is what this
+  track and the CKA lab are authored against, so every lab must launch it **explicitly** —
+  `multipass launch 24.04 --name sandbox …` — and must never use `multipass launch lts`, which would
+  silently hand the reader a different kernel and different defaults from the pasted output.
 
 ---
 

@@ -14,8 +14,10 @@ Decisions already made (don't re-ask): fully self-contained lesson depth; all fo
 
 ```bash
 python3 -m http.server 8000        # serve locally → http://localhost:8000
-tools/check-links.sh                # tracker checkpoint <-> lesson anchor bidirectional check (data-id="wN-M" <-> id="cp-N-M")
-tools/check-html.py                  # tag-balance check; defaults to index.html + materials/cheatsheets/mock pages, or pass specific files
+tools/check-links.sh                # both tracks: tracker checkpoint <-> lesson anchor bidirectional check
+                                    #   index.html    data-id="wN-M" <-> materials/wN.html  id="cp-N-M"
+                                    #   beginner.html data-id="bN-M" <-> materials/bN.html  id="cp-bN-M"
+tools/check-html.py                  # tag-balance check; defaults to every root tracker (index/beginner) + materials/cheatsheets/mock, or pass specific files
 node --check assets/lesson.js       # syntax-check the shared JS
 ```
 
@@ -23,10 +25,11 @@ There is no build step, package manager, linter, or test framework beyond the tw
 
 ## Architecture
 
-- `index.html` is the source of truth for checkpoints: `PUBLISHED` (array of week numbers with a lesson page) and `EXTRAS` (cheat sheets/mock, `{t:'title', href:'...'}`) arrays there drive which 📖 links and sidebar entries render. Adding a week's lesson page requires adding its number to `PUBLISHED`.
-- **Anchor scheme**: every tracker checkpoint `<li data-id="wN-M">` in `index.html` must have exactly one matching `<article class="lesson" id="cp-N-M">` in `materials/wN.html`, and vice versa — enforced by `tools/check-links.sh`.
-- **Shared client state**, all via `localStorage`, same-origin so it works free on GitHub Pages: `cka-prep-v1` (checkpoint done/undone, read/written by both `index.html` and every lesson page's done-toggle), `cka-theme` (light/dark, `data-theme` attribute), `cka-beginner-v1` (`.foundation`/`.analogy` visibility, `body.basics-off` class). `assets/lesson.js` is what wires lesson pages into all three; `index.html` has its own copies of the tracker/theme logic inline.
-- `assets/site.css` is the single stylesheet for every page (tracker, lessons, cheat sheets, mock exam) — includes `@media print` rules cheat sheets depend on to fit one page.
+- **Two trackers, same shape**: `index.html` (CKA weeks) and `beginner.html` (B-modules) are each the source of truth for their own checkpoints. Each carries its own inline `PUBLISHED` array (module/week numbers that have a lesson page) and `EXTRAS` array (`{t:'title', href:'...'}`), which drive the `lesson` links and sidebar entries. Publishing a lesson page = adding its number to that tracker's `PUBLISHED`.
+- **Anchor scheme**, one rule for both tracks — **anchor id = `cp-` + data-id with a leading `w` stripped**: `index.html`'s `<li data-id="wN-M">` ↔ `materials/wN.html`'s `<article class="lesson" id="cp-N-M">`, and `beginner.html`'s `<li data-id="bN-M">` ↔ `materials/bN.html`'s `id="cp-bN-M"`. Bidirectional, enforced by `tools/check-links.sh`.
+- **Shared client state**, all via `localStorage`, same-origin so it works free on GitHub Pages: `cka-prep-v1` (checkpoint done/undone — **one key for both tracks**, ids namespaced by the `b` prefix, so cross-track sync is free and each tracker's reset button filters to its own prefix), `cka-theme` (light/dark, `data-theme` attribute), `cka-collapsed-v1` / `cka-grp-collapsed-v1` (section + group collapse). `assets/lesson.js` wires every lesson page into these; the two trackers have their own copies of the tracker/theme logic inline.
+- `assets/site.css` is the single stylesheet for every page (both trackers, lessons, cheat sheets, mock exam) — includes `@media print` rules cheat sheets depend on to fit one page. Beginner-track blocks (`.tracks .objectives .prereq .outcome .lesson.project .lesson.drill .k8s-link .langpair .modlist .godeep`) live at the end; the box headings are CSS `::before` content, so authors write `<div class="k8s-link">` and get the mandatory heading for free.
+- The **three-pill track switcher** (`.tracks`) sits in every sidebar directly after `.brand-row`, with `class="on"` on the current track and Intermediate as an inert `<span>`. Root pages link `beginner.html`/`index.html`; pages in `materials/`, `cheatsheets/`, `mock/` prefix `../`. Per-page "Site" lists are *not* merged across tracks — the switcher is the only crossing point.
 - Lesson pages are otherwise independent static files with no shared templating — conventions below are enforced by convention + the check scripts, not by a build step.
 
 ## Phase roadmap (update this table at the end of each phase)
@@ -63,8 +66,8 @@ Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0
 | Phase | Scope | Status |
 |---|---|---|
 | B-S1 | `docs/BEGINNER-TRACK.md` — curriculum spec (docs-only commit) | ✅ done |
-| B-S2 | Wiring, no content: `site.css` additions; generalize `check-links.sh`/`check-html.py`; track switcher into every sidebar; `index.html` hero + prefix-scoped reset; `foundations.html` banner + go-deep links; stub `beginner.html` (`PUBLISHED=[]`) | ⬜ next |
-| B-S3 | `beginner.html` sections B0–B7 (~106 checkpoints) | ⬜ |
+| B-S2 | Wiring, no content: `site.css` additions; generalize `check-links.sh`/`check-html.py`; track switcher into every sidebar; `index.html` hero + prefix-scoped reset; `foundations.html` banner + go-deep links; stub `beginner.html` (`PUBLISHED=[]`) | ✅ done |
+| B-S3 | `beginner.html` sections B0–B7 (~106 checkpoints) | ⬜ next |
 | B-S4 | `beginner.html` sections B8–B14 (~94 checkpoints) + resume link + hours panel | ⬜ |
 | B-S5 | `materials/b0.html` — **pattern-setter** (lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks); review before continuing | ⬜ |
 | B-S6…B-S18 | `materials/b1.html` … `materials/b13.html`, one module per session | ⬜ |

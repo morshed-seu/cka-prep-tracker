@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tag-balance check for the site's HTML files. Usage: tools/check-html.py [files...]
-Defaults to index.html + all materials/cheatsheets/mock pages. Exits 1 on any mismatch."""
+Defaults to every tracker at the repo root (index.html, beginner.html, ...) plus all
+materials/cheatsheets/mock pages. Exits 1 on any mismatch."""
 import sys, glob
 from html.parser import HTMLParser
 
@@ -22,7 +23,7 @@ class Checker(HTMLParser):
             print(f"  MISMATCH </{tag}> at {self.getpos()}, open: {self.stack[-1] if self.stack else None}")
             self.bad = True
 
-files = sys.argv[1:] or ['index.html'] + sorted(
+files = sys.argv[1:] or sorted(glob.glob('*.html')) + sorted(
     glob.glob('materials/*.html') + glob.glob('cheatsheets/*.html') + glob.glob('mock/*.html'))
 fail = False
 for f in files:
