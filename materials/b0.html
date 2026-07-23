@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B0: build a throwaway Ubuntu 24.04 VM you are allowed to wreck, snapshot and restore it in under a minute, install the toolbelt every later module assumes, and learn to answer your own questions with man.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B0 · Your Linux sandbox — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B0 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b0">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B0 — Your Linux sandbox</h1>
+  <p>Every module in this track is hands-on, and most of them are hands-on in a way that breaks the machine on purpose — you will delete a running program's files, unplug its network, fill its memory, and pull the filesystem out from under it. That is only a good way to learn if breaking things is free. So the first module builds one Linux computer that exists purely to be wrecked: a virtual machine called <code>sandbox</code>, living inside your real computer, that you can reset to a known-good state in about a minute.</p>
+  <p>Nothing here assumes you have used a terminal before. By the end you will have that machine, the tools every later module reaches for, and — the part people skip — the reflex of restoring it without hesitating. Ticking <em>done</em> on a lesson here also ticks the matching checkpoint on the tracker.</p>
+  <div class="weights">
+    <span>Checkpoints<b>9</b></span>
+    <span>Hours<b>~2</b></span>
+    <span>Prerequisites<b>none</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Explain why this track teaches the Linux primitive before it names the Kubernetes feature that wraps it.</li>
+<li>Install a hypervisor front end and launch a specific Ubuntu release on purpose, not by accident.</li>
+<li>Read a machine's vital signs — kernel, distribution, memory, CPUs, disk — and say what each number will constrain later.</li>
+<li>Snapshot the sandbox, break it, and restore it in under a minute, without feeling nervous about it.</li>
+<li>Look up any command, system call or concept offline, using <code>man</code> and its numbered sections.</li>
+<li>Keep two small scripts of your own that make "reset the sandbox" a single word.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p>Nothing. This is the front door of the whole site. You need a computer with roughly 8 GB of RAM and 25 GB of free disk, running Linux, macOS or Windows — the sandbox VM takes 4 GB and 20 GB of that, and only while it is running.</p>
+</div>
+
+<!-- ---------------- How to use this track ---------------- -->
+<div class="grp" id="g-track"><h3>How to use this track</h3>
+
+<article class="lesson" id="cp-b0-1" data-id="b0-1">
+<div class="lesson-head"><span class="cp-id">B0.1</span><h4>Why this track teaches Linux before it teaches Kubernetes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Kubernetes has a reputation for being enormous and arbitrary — a wall of new words you are expected to memorize. That reputation is mostly an accident of how it is usually taught. Almost nothing in Kubernetes is new; it is a thin coordination layer over operating-system machinery that has existed for decades. If you meet the machinery first, the Kubernetes layer stops being vocabulary and starts being obvious.</p>
+<h5>The concept</h5>
+<p>Take one concrete example. A <strong>pod</strong> is often introduced as "the smallest deployable unit in Kubernetes", which explains nothing. What a pod actually <em>is</em>, on the machine: a set of Linux processes that have been given their own private view of a few kernel resources — their own network interfaces, their own process list, their own filesystem root — while still running on the same kernel as everything else on that computer. Those private views are called <strong>namespaces</strong>, they are a Linux kernel feature from 2002–2013, and you can create one by hand with a single command. You will do exactly that in B6, long before anyone says "pod".</p>
+<p>That pattern repeats for essentially every Kubernetes concept worth knowing:</p>
+<table>
+<tr><th>Kubernetes thing</th><th>What it actually is</th><th>Built by hand in</th></tr>
+<tr><td>a pod's isolation</td><td>Linux namespaces (<code>clone</code>, <code>unshare</code>)</td><td>B6</td></tr>
+<tr><td><code>limits.cpu</code> / <code>limits.memory</code></td><td>a number written into a cgroup file</td><td>B7</td></tr>
+<tr><td>a container image</td><td>stacked read-only directories (overlayfs) + a tar file</td><td>B5</td></tr>
+<tr><td>the pod network</td><td>a software bridge, veth pairs, and a NAT rule</td><td>B8, B9</td></tr>
+<tr><td>a Service's cluster IP</td><td>packet-rewriting rules in the kernel's netfilter tables</td><td>B9</td></tr>
+<tr><td>cluster DNS</td><td>a resolver, a search domain, and <code>/etc/resolv.conf</code></td><td>B10</td></tr>
+<tr><td>the kubelet staying up</td><td>a systemd unit with a restart policy</td><td>B11</td></tr>
+<tr><td>every certificate in the cluster</td><td>ordinary PKI: a CA, a key, a signed request</td><td>B12</td></tr>
+<tr><td>etcd surviving a dead node</td><td>Raft consensus over a strict majority</td><td>B13</td></tr>
+</table>
+<p>Hence the order of this track: <em>one machine → one process → what a process may do → its files → isolating it → its network → naming and supervising it → securing it → many machines → assemble</em>. Each module is a prerequisite for the next, which is why there is no calendar here and no suggestion to skip around.</p>
+<p>The device that keeps the three tracks stitched together is a block at the end of every conceptual lesson, headed <strong>"Where this shows up in Kubernetes"</strong>. It names the feature that wraps the primitive you just built and links straight to the advanced lesson that covers it. You are not expected to click it yet — it is there so that when you eventually reach that lesson, it reads as recognition instead of new material.</p>
+<h5>Steps</h5>
+<ol>
+<li>Open the <a href="../beginner.html#outline">track outline</a> and read the fifteen module titles in order. Do not try to understand them; just notice that the first nine are Linux, not Kubernetes.</li>
+<li>Read one Kubernetes-side lesson you have no background for — say <a href="../materials/w3.html#cp-3-16">requests vs limits</a> — purely to notice how it feels right now. It should feel like a foreign language.</li>
+<li>Agree to the order. If you skip to the <a href="../index.html">Advanced track</a> anyway, that is allowed and nothing here breaks; you will simply be memorizing rather than recognizing.</li>
+</ol>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most common way this track fails a reader is impatience in the opposite direction — treating B0–B5 as "basics I already know" and skimming. The point is not the trivia (that <code>ls</code> lists files); it is the mechanism (that <code>ls</code> made an <code>openat</code> system call, which the kernel checked against a permission bitmask attached to an inode). If a module feels familiar, do its debugging drill first: if the drill is quick, skip the module honestly rather than skimming it.</p>
+<div class="k8s-link">
+<p>All of it. This lesson has no single Kubernetes counterpart because it <em>is</em> the map: each row in the table above is a primitive you will build with your own hands here and then meet again wearing a Kubernetes name.</p>
+<p>The clearest single example to look at now, with no expectation of following it: <a href="../materials/w3.html#cp-3-16">W3.16 — requests vs limits</a>. It says a CPU limit becomes a value in <code>cpu.max</code> in a cgroup. After B7 you will have written that file yourself.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">Nothing to look up yet. When you want the shape of the whole curriculum: the <a href="../beginner.html">beginner tracker</a> lists all 225 checkpoints, and <a href="foundations.html">Foundations</a> is a ten-minute express version of the same cross-cutting ideas.</p>
+</article>
+
+<article class="lesson" id="cp-b0-2" data-id="b0-2">
+<div class="lesson-head"><span class="cp-id">B0.2</span><h4>How a checkpoint works, and where your progress is stored</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This site has 225 checkpoints across fifteen modules and no accounts, no server and no sign-in. Knowing exactly where the tick marks live takes thirty seconds and saves you the experience of losing four modules of progress to a cleared browser cache.</p>
+<h5>The concept</h5>
+<p>A <strong>checkpoint</strong> is one skill, sized so that finishing it is unambiguous. Each one appears twice: as a line on the <a href="../beginner.html">tracker</a>, and as a lesson article on a module page like this one. They are the same checkpoint — tick either box and the other follows. The loop is always the same four moves:</p>
+<div class="flow"><span>read the lesson</span><em>→</em><span class="hot">run the Lab</span><em>→</em><span>run Verify, compare output</span><em>→</em><span>tick done</span></div>
+<p>Only the third step decides anything. <strong>Verify</strong> is a command whose output you compare against what the lesson says you should see; if it disagrees, something on your machine is different and finding out why is the actual lesson. Reading alone never ticks a box — the whole design of the track assumes the commands were really run on a real machine that could really break.</p>
+<p>Two more blocks close most modules. The <strong>mini project</strong> builds one small artifact you keep and reuse later (B0's is a pair of scripts you will run before every destructive lab from B5 onward). The <strong>debugging drill</strong> hands you a broken machine and a symptom, with hints and the full diagnosis hidden behind progressive reveals — because in practice you will always meet a failure symptom-first, never cause-first. B0 has no drill: there is nothing built yet to break.</p>
+<p>Progress is stored in your browser's <strong>localStorage</strong> — a small key-value store that a page can write and read back on later visits, scoped to the site's origin and living on your disk, not on any server. This site uses a handful of keys:</p>
+<table>
+<tr><th>Key</th><th>Holds</th></tr>
+<tr><td><code>cka-prep-v1</code></td><td>every ticked checkpoint, both tracks, one entry per <code>data-id</code></td></tr>
+<tr><td><code>cka-theme</code></td><td><code>light</code> or <code>dark</code></td></tr>
+<tr><td><code>cka-collapsed-v1</code>, <code>cka-grp-collapsed-v1</code></td><td>which sections and groups you have collapsed</td></tr>
+</table>
+<p>The consequences are worth stating plainly. Both tracks share <em>one</em> checkpoint store, so beginner and CKA progress are always visible from either tracker, and each tracker's reset button only clears its own prefix. But because the store is per-browser and per-machine, your progress does not follow you to another browser, another computer, or a private window — and "clear site data" erases it. If that matters to you, the fix is a one-liner you will understand after B1: open the browser console and copy <code>localStorage.getItem('cka-prep-v1')</code> into a file.</p>
+<h5>Steps</h5>
+<ol>
+<li>Tick the <em>done</em> box at the top of this lesson.</li>
+<li>Open the <a href="../beginner.html#b0">tracker's B0 section</a> in another tab and confirm checkpoint <strong>B0.2</strong> is already ticked there.</li>
+<li>Untick it on the tracker, come back here, reload this page, and watch the box here follow.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Open your browser's developer tools (<kbd>F12</kbd> on most browsers), go to the console, and run <code>localStorage.getItem('cka-prep-v1')</code>. You should see a small JSON object with an entry per ticked checkpoint, keyed by id:</p>
+<pre class="out">'{"b0-1":1,"b0-2":1}'</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p>Private/incognito windows get their own throwaway localStorage that is discarded when the window closes — a whole evening's ticks can vanish that way. Opening the site as a <code>file://</code> path rather than through a web server also gives you a different (and in some browsers, entirely blocked) storage origin, so ticks may not persist at all; if you are running this site locally, serve it with <code>python3 -m http.server 8000</code> and visit <code>http://localhost:8000</code>.</p>
+<h5>Docs</h5>
+<p class="docs-links">Your browser's own devtools documentation, under "Storage" or "Application". Nothing to install; nothing exam-relevant here — this block is site mechanics only.</p>
+</article>
+</div>
+
+<!-- ---------------- The sandbox VM ---------------- -->
+<div class="grp" id="g-vm"><h3>The sandbox VM</h3>
+
+<article class="lesson" id="cp-b0-3" data-id="b0-3">
+<div class="lesson-head"><span class="cp-id">B0.3</span><h4>Install Multipass — and understand why the sandbox is a VM, not a container</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You need a Linux machine you are allowed to destroy, and you almost certainly do not want it to be the computer you are reading this on. The cheapest way to get one is a <strong>virtual machine</strong>: a complete computer simulated in software, with its own kernel, its own disk and its own network stack, running as a process on your real computer. <a href="https://multipass.run">Multipass</a> makes that a one-line command instead of an afternoon.</p>
+<h5>The concept</h5>
+<p>A <strong>hypervisor</strong> is the piece of software that convinces a guest operating system it is running on real hardware. Modern CPUs help it out with dedicated instructions, so a guest runs at close to native speed. Your computer already has one: KVM on Linux, the Hypervisor framework on macOS, Hyper-V on Windows. <strong>Multipass</strong> is a thin, uniform front end over whichever of those you have, plus a downloader for official Ubuntu cloud images — so the same three commands work on all three host operating systems.</p>
+<p>The choice of a VM rather than a container is deliberate, and it is worth understanding on day one because the distinction is the spine of this entire track. Use the hotel metaphor this track will keep returning to: <strong>one hotel is one Linux machine</strong>. The kernel is the engineering staff — the only ones who touch the wiring. Every program is a guest in a room.</p>
+<ul>
+<li>A <strong>container</strong> is a room in <em>your existing hotel</em>. It gets its own closet and its own guest list, so it feels private, but it calls the same engineering staff as every other room — one kernel, shared. That is what "shares the host kernel" means.</li>
+<li>A <strong>virtual machine</strong> is a whole separate hotel built inside a warehouse on your property. Its own engineering staff, its own wiring, its own everything.</li>
+</ul>
+<p>This track deliberately vandalizes the wiring: B6 replaces the filesystem root out from under a running process, B7 starves processes of memory until the kernel starts killing them, B9 rewrites the packet-filtering rules and then breaks routing on purpose. In a container, "the wiring" is your own computer's kernel state. In a VM, it is a warehouse you can bulldoze.</p>
+<h5>Lab</h5>
+<ol>
+<li>Install Multipass for your host operating system. Pick one line:
+<pre class="cmd">sudo snap install multipass          # Linux
+brew install --cask multipass        # macOS
+# Windows: download and run the installer from multipass.run</pre></li>
+<li>Confirm the client and the background daemon are both alive. This is the only check that matters — an installed binary with a dead daemon looks fine and then hangs on the first real command.
+<pre class="cmd">multipass version</pre>
+<pre class="out">multipass   1.17.0
+multipassd  1.17.0</pre>
+<p>Two lines. If <code>multipassd</code> is missing or reports an error, the service did not start — on Linux, <code>snap services multipass</code> will say so.</p></li>
+<li>Ask Multipass what it can build. This also proves image downloads work before you commit to a 20 GB VM.
+<pre class="cmd">multipass find</pre>
+<pre class="out">Image             Aliases     Version    Description
+20.04             focal       20250xxx   Ubuntu 20.04 LTS
+22.04             jammy       20250xxx   Ubuntu 22.04 LTS
+<b>24.04             noble       20250xxx   Ubuntu 24.04 LTS</b>
+26.04             lts,resolute 2026xxxx  Ubuntu 26.04 LTS</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>multipass version</code> prints two lines, both with a version number, and <code>multipass find</code> lists <code>24.04</code> with the alias <code>noble</code>. That is everything you need before the next lesson.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>On Linux, hardware virtualization has to actually be enabled — it is switched off in the firmware of a surprising number of machines. <code>lscpu | grep -i virtualization</code> printing <code>VT-x</code> (Intel) or <code>AMD-V</code> means you are fine; printing nothing means the setting is off in your BIOS/UEFI, and Multipass will either fall back to painfully slow emulation or refuse outright.</p>
+<p>On Windows, Multipass uses Hyper-V, which is not available on Home editions; the installer offers VirtualBox as the fallback. On any host, running Multipass at the same time as VirtualBox or VMware can fail, because on some platforms only one hypervisor may hold the CPU's virtualization extensions at a time — shut the other one down rather than debugging it.</p>
+<div class="k8s-link">
+<p>A Kubernetes cluster is a set of machines, and this is what "a machine" will mean throughout. When you reach the advanced track's first practical lesson, <a href="../materials/w0.html#cp-0-5">W0.5 — create 3 Ubuntu VMs</a>, it asks for exactly the same command you are about to learn, three times over, to build a control plane and two workers.</p>
+<p>Kubernetes calls each of those machines a <strong>Node</strong>, and a Node object in the API is little more than a record of one such machine's name, addresses and capacity. Everything you will learn about looking after this one sandbox — vital signs, snapshots, restores — is what looking after a node is.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">Multipass command reference: <code>multipass help</code>, and <code>multipass help launch</code> for the flags used next. On Linux, <code>man 1 lscpu</code> for the virtualization check, and <code>man 8 kvm-ok</code> (in the <code>cpu-checker</code> package) for a blunter answer.</p>
+</article>
+
+<article class="lesson" id="cp-b0-4" data-id="b0-4">
+<div class="lesson-head"><span class="cp-id">B0.4</span><h4>Launch <code>sandbox</code> — and always name the release explicitly</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every command output pasted into this track was produced on Ubuntu <strong>24.04 LTS</strong>. A different release means a different kernel, different defaults and different output — and when your screen disagrees with the lesson, you cannot tell whether you made a mistake or the lesson is stale. Naming the release explicitly costs five characters and removes that entire class of confusion.</p>
+<h5>The concept</h5>
+<p>Multipass identifies images by version number (<code>24.04</code>), by codename (<code>noble</code>), and by moving aliases like <code>lts</code>. That last kind is the trap: an alias is a pointer that Canonical repoints when a new release ships, so the same command produces a different machine depending on the day you ran it. As of <strong>July 2026</strong>, <code>lts</code> resolves to <strong>Ubuntu 26.04</strong>, not 24.04. Write <code>multipass launch 24.04</code> and you get what this track was written against, today and in two years.</p>
+<p>Three 24.04 defaults matter enough to name now, because whole modules depend on them:</p>
+<ul>
+<li><strong>cgroups v2 only.</strong> The kernel's resource-limiting machinery has two generations, with completely different file layouts. 24.04 mounts only the v2 unified hierarchy at <code>/sys/fs/cgroup</code>. Every path in B7 assumes that; a v1 machine has a different tree and B7's labs will not find their files.</li>
+<li><strong><code>iptables</code> is really <code>nftables</code>.</strong> The classic firewall command still exists, but on 24.04 it is a compatibility shim that translates into the newer <code>nftables</code> engine. B9 shows both faces of the same rule, which only makes sense on a machine where that shim is in place.</li>
+<li><strong><code>systemd-resolved</code> answers on <code>127.0.0.53</code>.</strong> Name lookups go to a local stub resolver on the loopback address rather than straight to a real DNS server, so <code>/etc/resolv.conf</code> shows one nameserver that is the machine itself. B10 spends a whole lesson on why.</li>
+</ul>
+<p>The resource numbers are chosen the same way: 2 vCPU and 4 GB is enough to run several isolated environments at once in B6 and B9 without swapping, and 20 GB leaves room for the image layers B5 unpacks. They are the VM's ceiling, not a reservation — an idle VM does not hold 4 GB of your host's memory hostage.</p>
+<h5>Lab</h5>
+<ol>
+<li>Launch the machine. The first run downloads an image (a few hundred MB) and takes a couple of minutes; later launches are fast.
+<pre class="cmd">multipass launch 24.04 --name sandbox --cpus 2 --memory 4G --disk 20G</pre>
+<pre class="out">Launched: sandbox</pre></li>
+<li>Confirm it is running and see the address it was given on your host's private VM network.
+<pre class="cmd">multipass list</pre>
+<pre class="out">Name       State      IPv4         Image
+<b>sandbox    Running    10.87.4.112  Ubuntu 24.04 LTS</b></pre></li>
+<li>Get a shell inside it. This is how every lab in every later module begins; the prompt changes to <code>ubuntu@sandbox</code> so you always know which machine you are typing into.
+<pre class="cmd">multipass shell sandbox</pre>
+<pre class="out">Welcome to Ubuntu 24.04 LTS (GNU/Linux 6.8.0-xx-generic x86_64)
+ubuntu@sandbox:~$</pre></li>
+<li>Inside the VM, confirm you got the release you asked for, then leave again with <code>exit</code>.
+<pre class="cmd">lsb_release -cs
+stat -fc %T /sys/fs/cgroup</pre>
+<pre class="out"><b>noble</b>
+<b>cgroup2fs</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Inside the VM, <code>lsb_release -cs</code> prints <code>noble</code> and <code>stat -fc %T /sys/fs/cgroup</code> prints <code>cgroup2fs</code>. The second one is the check that actually matters — it proves the cgroup v2 unified hierarchy that B7 depends on, rather than just trusting the label on the image.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Never write <code>multipass launch lts</code>. It is the single most likely way to end up on a machine whose output silently disagrees with this track — and the failure is nasty precisely because everything <em>looks</em> right: the VM boots, the commands exist, and only the details are different.</p>
+<p>A freshly launched VM keeps working for a minute or two after it says <code>Launched</code>: <code>cloud-init</code> is still finishing first-boot setup, and it holds the package manager's lock while it does. If <code>apt</code> in the next lesson complains that it cannot get a lock, you are not broken — wait, or watch it finish with <code>cloud-init status --wait</code>.</p>
+<p>If the name <code>sandbox</code> is already taken from an earlier attempt, <code>multipass delete sandbox &amp;&amp; multipass purge</code> removes it for good. <code>delete</code> alone only marks it deleted; <code>purge</code> is what frees the disk.</p>
+<div class="k8s-link">
+<p>Pinning an exact version, rather than accepting whatever "latest" means today, is a habit Kubernetes will demand of you constantly. Cluster components have <strong>version skew</strong> rules — how far apart the control plane and the kubelets are allowed to drift — and an unplanned upgrade breaks them: see <a href="../materials/w2.html#cp-2-12">W2.12 — version skew rules</a>.</p>
+<p>It is also why the advanced track's install lesson, <a href="../materials/w0.html#cp-0-6">W0.6</a>, ends with <code>apt-mark hold kubelet kubeadm kubectl</code>: the same instinct as writing <code>24.04</code> instead of <code>lts</code>, applied to a cluster that a routine <code>apt upgrade</code> could otherwise wreck.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>multipass help launch</code> for the flag list and defaults. Inside the VM: <code>man 1 lsb_release</code>, <code>man 1 stat</code> (note <code>-f</code> asks about the <em>filesystem</em>, not the file), and <code>man 7 cgroups</code> — the primary source for all of B7, worth knowing exists even though it will be dense today.</p>
+</article>
+
+<article class="lesson" id="cp-b0-5" data-id="b0-5">
+<div class="lesson-head"><span class="cp-id">B0.5</span><h4>Take the machine's vital signs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Five commands describe any Linux machine well enough to reason about it: what kernel it runs, what distribution wraps that kernel, how much memory it has, how many CPUs, and how much disk. You will run these on the first day at any job, on any node that is misbehaving, and at the start of half the debugging drills in this track. Learn them now, on a machine whose answers you already know, so that later you are reading the numbers rather than the commands.</p>
+<h5>The concept</h5>
+<p>The distinction that trips people up first is <strong>kernel</strong> versus <strong>distribution</strong>. The kernel is the actual operating system core — the engineering staff in the hotel metaphor, the only code that touches hardware, manages memory and decides which program runs next. Linux <em>is</em> that kernel and nothing else. A distribution is everything assembled around it: the shell, the package manager, the default configuration, the release schedule. Ubuntu 24.04 and Debian 12 can run nearly the same kernel and still feel like different machines; that is why "which kernel" and "which distro" are two separate questions with two separate commands.</p>
+<p>Each number you are about to read becomes a constraint in a specific later module, which is the real reason to write them down:</p>
+<table>
+<tr><th>Vital sign</th><th>Command</th><th>Where it binds later</th></tr>
+<tr><td>kernel version</td><td><code>uname -a</code></td><td>which namespace and cgroup features exist at all (B6, B7)</td></tr>
+<tr><td>distribution</td><td><code>lsb_release -a</code></td><td>which init system, firewall backend and resolver you get (B9–B11)</td></tr>
+<tr><td>memory</td><td><code>free -h</code></td><td>the ceiling the OOM killer enforces when B7 starves a cgroup</td></tr>
+<tr><td>CPUs</td><td><code>nproc</code></td><td>what "1 CPU" means as a cgroup quota, and how scheduling is shared (B2, B7)</td></tr>
+<tr><td>disk</td><td><code>df -h /</code></td><td>room for the image layers B5 unpacks by hand</td></tr>
+</table>
+<p>One reading is worth explaining before you see it. <code>free -h</code> prints both <em>free</em> and <em>available</em> memory, and they are very different numbers. <strong>Free</strong> is memory holding nothing at all — on a healthy Linux machine this is always small, because the kernel spends idle memory on caching files it has read, which costs nothing and speeds everything up. <strong>Available</strong> is free memory plus all the cache the kernel would instantly give back if a program asked. Available is the number that answers "can I start something big"; a beginner who reads <em>free</em> concludes their machine is out of memory when it is perfectly healthy.</p>
+<h5>Lab</h5>
+<ol>
+<li>Get into the sandbox if you left it.
+<pre class="cmd">multipass shell sandbox</pre></li>
+<li>Kernel first — version, build date and architecture. The number before the first dash is what matters: kernel features arrive in specific versions.
+<pre class="cmd">uname -a</pre>
+<pre class="out">Linux <b>sandbox</b> <b>6.8.0-xx-generic</b> #xx-Ubuntu SMP PREEMPT_DYNAMIC ... <b>x86_64</b> GNU/Linux</pre></li>
+<li>Now the distribution wrapped around that kernel.
+<pre class="cmd">lsb_release -a</pre>
+<pre class="out">Distributor ID: Ubuntu
+Description:    <b>Ubuntu 24.04 LTS</b>
+Release:        24.04
+Codename:       <b>noble</b></pre></li>
+<li>Memory. Read the <code>available</code> column, not <code>free</code>.
+<pre class="cmd">free -h</pre>
+<pre class="out">               total        used        free      shared  buff/cache   <b>available</b>
+Mem:           <b>3.8Gi</b>       380Mi       2.9Gi        1.0Mi       600Mi       <b>3.4Gi</b>
+Swap:             0B          0B          0B</pre>
+<p>Note <code>total</code> reads 3.8Gi rather than 4.0 — the kernel reserves a slice for itself before reporting. Note also that <strong>swap is 0</strong>: this machine has no overflow space, so memory pressure ends in a kill rather than a slowdown. That is exactly the behaviour B7 wants you to see, and it is also the default a Kubernetes node runs with.</p></li>
+<li>CPUs, then disk.
+<pre class="cmd">nproc
+df -h /</pre>
+<pre class="out"><b>2</b>
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        <b>19G</b>  2.1G   <b>17G</b>  12% /</pre></li>
+<li>Write all five answers down somewhere you will still have in a month — a note file, a paper notebook, anywhere. Later modules ask you to compare against them.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can say, without looking: this machine runs a 6.8 kernel, Ubuntu 24.04 "noble", has ~4 GB RAM with no swap, 2 CPUs, and ~17 GB of disk left. If any of those disagree with the numbers above, re-read B0.4 — the most likely cause is a different release or different <code>launch</code> flags.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>uname -r</code> reports the kernel the machine <em>booted</em>, not the newest one installed. After a kernel upgrade the two differ until you reboot, which is a genuinely common source of "but I installed the fix" confusion — a file in <code>/var/run/reboot-required</code> is Ubuntu's way of telling you.</p>
+<p><code>df</code> shows a filesystem's free space, which is not the same as the space you can actually use: a running program holding an open handle to a deleted file keeps its blocks allocated until it exits, so a disk can be full with nothing visible to <code>du</code>. B5 comes back to this with the inode machinery that explains it.</p>
+<div class="k8s-link">
+<p>These same five numbers, gathered automatically, are most of what a Kubernetes <strong>Node</strong> object contains. The kubelet reports them to the API server as the node's <code>capacity</code>, then subtracts what the system itself needs to produce <code>allocatable</code> — the amount actually offered to workloads.</p>
+<p>That number is the whole basis of scheduling: the scheduler places a pod by checking whether its declared CPU and memory <em>requests</em> fit inside a node's remaining allocatable, which is why <a href="../materials/w3.html#cp-3-16">W3.16 — requests vs limits</a> insists requests are bookkeeping rather than enforcement. And <code>nproc</code> is where "1 CPU" in a pod spec ultimately cashes out.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 uname</code>, <code>man 1 free</code> (read the description of <em>available</em> — it is the part everyone misses), <code>man 1 nproc</code>, <code>man 1 df</code>. For where these numbers come from underneath: <code>man 5 proc</code>, and look at <code>/proc/meminfo</code> and <code>/proc/cpuinfo</code> directly — B3 explains why a directory of fake files is how the kernel answers questions.</p>
+</article>
+</div>
+
+<!-- ---------------- Toolbelt & safety ---------------- -->
+<div class="grp" id="g-tools"><h3>Toolbelt &amp; safety</h3>
+
+<article class="lesson" id="cp-b0-6" data-id="b0-6">
+<div class="lesson-head"><span class="cp-id">B0.6</span><h4>Install the toolbelt every later module assumes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>An Ubuntu cloud image is deliberately minimal — it ships what a server needs to boot, not what a person needs to investigate one. Installing the whole toolbelt once, now, means no later lesson stops to install something mid-experiment, and it gives you a first look at what kind of tools this track is going to make you use.</p>
+<h5>The concept</h5>
+<p><code>apt</code> is Ubuntu's package manager: it downloads software, its dependencies, and its <code>man</code> pages from repositories described in <code>/etc/apt/sources.list.d/</code>. <code>apt update</code> refreshes the local catalogue of what is available; <code>apt install</code> then acts on it. Running <code>install</code> without a recent <code>update</code> is the classic first-day failure — the machine looks for a package version that has since been replaced and reports a 404.</p>
+<p>Every package below is here because a specific module needs it:</p>
+<table>
+<tr><th>Package</th><th>What it gives you</th><th>Needed by</th></tr>
+<tr><td><code>build-essential</code></td><td>the C compiler, linker and headers</td><td>B2, B3 — some things (a signal handler, a raw <code>write</code>) cannot be shown honestly in a shell</td></tr>
+<tr><td><code>strace</code>, <code>ltrace</code></td><td>watch every system call / library call a program makes</td><td>B3 — the X-ray machines of the whole track</td></tr>
+<tr><td><code>iproute2</code></td><td><code>ip</code>: interfaces, addresses, routes, namespaces</td><td>B8, B9</td></tr>
+<tr><td><code>tcpdump</code></td><td>capture packets as they cross an interface</td><td>B8, B9</td></tr>
+<tr><td><code>nftables</code></td><td>the kernel's packet-filtering and NAT tables</td><td>B9 — where a Service's cluster IP really lives</td></tr>
+<tr><td><code>socat</code></td><td>connect anything to anything: TCP, UDP, unix sockets</td><td>B9 — talking over a unix socket by hand</td></tr>
+<tr><td><code>dnsutils</code></td><td><code>dig</code>, <code>nslookup</code></td><td>B10 — asking a specific resolver a specific question</td></tr>
+<tr><td><code>jq</code>, <code>tree</code></td><td>read JSON; see a directory as a shape</td><td>everywhere</td></tr>
+</table>
+<h5>Lab</h5>
+<ol>
+<li>Inside the sandbox, refresh the catalogue and install everything in one go. <code>-y</code> answers the confirmation prompt in advance.
+<pre class="cmd">sudo apt update
+sudo apt install -y build-essential strace ltrace iproute2 tcpdump \
+                    nftables jq tree dnsutils socat</pre></li>
+<li>Check them the way a script would, rather than by eye. <code>command -v</code> prints a tool's path and exits non-zero if it is missing, so the loop names anything that failed.
+<pre class="cmd">for t in cc strace ltrace ip tcpdump nft jq tree dig socat; do
+  command -v "$t" &gt;/dev/null || echo "MISSING: $t"
+done; echo done</pre>
+<pre class="out"><b>done</b></pre>
+<p>A bare <code>done</code> with nothing above it is the pass. Anything printed before it names a package that did not install.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The loop above prints only <code>done</code>. As a second check, <code>strace -c /bin/true</code> should print a small table of system calls — proving not just that <code>strace</code> exists but that the kernel lets it attach, which is the part that actually matters in B3.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If <code>apt</code> reports it <em>could not get lock</em>, <code>cloud-init</code> is still finishing first-boot work and holds it. Wait it out with <code>cloud-init status --wait</code> rather than killing the lock holder — a half-finished package operation is a genuinely annoying state to repair.</p>
+<p>Note that the binary is often not named after the package: you install <code>dnsutils</code> and get <code>dig</code>; you install <code>build-essential</code> and get <code>gcc</code> and <code>cc</code>; you install <code>nftables</code> and get <code>nft</code>. That mismatch is why the verification loop tests commands rather than package names.</p>
+<div class="k8s-link">
+<p>This is the kit you debug a Kubernetes <em>node</em> with — the layer below anything <code>kubectl</code> can reach. When a pod cannot resolve a name or a Service refuses to answer, the ladder ends on the node with exactly these commands.</p>
+<p><a href="../materials/w6.html#cp-6-2">W6.2 — where logs physically live</a> is that ladder written down for the cluster case: when the API server itself is down, <code>kubectl logs</code> is useless and you are back to a shell, a journal and <code>ip</code>. Every rung of it is a tool you just installed.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 apt</code>, <code>man 1 strace</code>, <code>man 8 ip</code> (and the per-object pages it points to, like <code>man 8 ip-netns</code>), <code>man 8 tcpdump</code>, <code>man 8 nft</code>, <code>man 1 jq</code>. Do not read them yet — the point is knowing they are there, offline, on this machine.</p>
+</article>
+
+<article class="lesson" id="cp-b0-7" data-id="b0-7">
+<div class="lesson-head"><span class="cp-id">B0.7</span><h4>Snapshot the VM, break it on purpose, restore it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The single biggest thing that slows beginners down is not difficulty — it is the quiet fear of breaking the machine, which makes them skip exactly the destructive labs that teach the most. The cure is not courage; it is having already done a restore once, while the stakes were zero. Do it now, deliberately, on a machine holding nothing you care about.</p>
+<h5>The concept</h5>
+<p>A <strong>snapshot</strong> freezes the VM's entire disk at one instant. Restoring throws away everything that happened since and puts the disk back exactly as it was — not a merge, not a repair: a replacement. That bluntness is the feature. It means no amount of damage inside the VM is interesting, so you never have to weigh "is this experiment safe" against "will I have to rebuild".</p>
+<p>Two rules follow from how it works. First, <strong>the VM must be stopped</strong> to take or restore a snapshot: a running machine has state in RAM and half-written blocks on disk, and a frozen copy of that would be incoherent. Second, a snapshot is <em>not</em> a backup of your work — it is a rollback point for the machine. Anything you wrote inside the VM and want to keep should also exist outside it, which in this track means on your host, which is exactly what the mini project's scripts and your notes are for.</p>
+<div class="flow"><span>stop</span><em>→</em><span class="hot">snapshot</span><em>→</em><span>start</span><em>→</em><span>experiment freely</span><em>→</em><span>stop</span><em>→</em><span class="hot">restore</span><em>→</em><span>start</span></div>
+<h5>Lab</h5>
+<ol>
+<li>From your <em>host</em> (type <code>exit</code> first if you are inside the VM), stop the machine and take the baseline snapshot. Call it <code>clean</code> — you will come back to this exact name for the rest of the track.
+<pre class="cmd">multipass stop sandbox
+multipass snapshot sandbox --name clean
+multipass start sandbox</pre>
+<pre class="out"><b>Snapshot taken: sandbox.clean</b></pre></li>
+<li>Now break something. <code>/etc/hostname</code> is the file the system reads at boot to learn its own name — harmless to lose on a throwaway VM, and unmistakably gone.
+<pre class="cmd">multipass shell sandbox
+sudo rm /etc/hostname
+cat /etc/hostname</pre>
+<pre class="out">cat: /etc/hostname: <b>No such file or directory</b></pre></li>
+<li>Leave the VM and put it back. <code>restore</code> also requires a stopped machine, and it will ask for confirmation because it is about to discard the current disk — that prompt is the whole safety mechanism, so read it once before answering.
+<pre class="cmd">exit
+multipass stop sandbox
+multipass restore sandbox.clean
+multipass start sandbox</pre>
+<pre class="out">Do you want to take a snapshot of sandbox before discarding its current state? (Yes/no): <b>no</b>
+Snapshot restored: sandbox.clean</pre></li>
+<li>Confirm the damage is gone.
+<pre class="cmd">multipass exec sandbox -- cat /etc/hostname</pre>
+<pre class="out"><b>sandbox</b></pre></li>
+<li>Do the whole cycle once more and time it. Under a minute is the target; the number matters less than the fact that you now know it is small.</li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>multipass list --snapshots</code> shows a snapshot named <code>clean</code> on <code>sandbox</code>, and <code>/etc/hostname</code> exists again with the contents <code>sandbox</code>. If the restore silently did nothing, check you stopped the VM first — a running instance makes <code>restore</code> refuse rather than proceed.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Restoring is destructive in the direction people forget: it discards work done <em>after</em> the snapshot, including work you meant to keep. Answering <code>Yes</code> to that confirmation prompt takes a safety snapshot of the current state first, which is usually the right answer when you are unsure. In a script, <code>-d</code> (<code>--destructive</code>) skips the prompt and discards without asking — convenient and unforgiving, so only use it where discarding is the entire point.</p>
+<p>Each snapshot holds the blocks that have since changed, so they cost disk on your host and stack up if you take one per lab. Prune with <code>multipass delete sandbox.oldname &amp;&amp; multipass purge</code>. And note that snapshots belong to the instance: <code>multipass delete sandbox</code> takes them all with it.</p>
+<div class="k8s-link">
+<p>The same "stop it, snapshot it, restore it" reflex is a marked CKA exam skill, applied one level up — to the cluster's database instead of a whole machine. Every object in a Kubernetes cluster lives in <strong>etcd</strong>, and <code>etcdctl snapshot save</code> takes exactly this kind of point-in-time copy of it.</p>
+<p>See <a href="../materials/w2.html#cp-2-17">W2.17 — take an etcd snapshot</a> and <a href="../materials/w2.html#cp-2-18">W2.18 — restore it</a>. The rules rhyme with the ones here: restoring replaces rather than merges, and the control plane must be stopped while it happens. The advanced track also snapshots its lab VMs for the same reason you just did — <a href="../materials/w0.html#cp-0-8">W0.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>multipass help snapshot</code>, <code>multipass help restore</code>, <code>multipass help delete</code>. Inside the VM, <code>man 5 hostname</code> explains the file you just deleted and <code>man 1 hostnamectl</code> the modern way to change it.</p>
+</article>
+
+<article class="lesson" id="cp-b0-8" data-id="b0-8">
+<div class="lesson-head"><span class="cp-id">B0.8</span><h4>Answer your own questions offline with <code>man</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every command, configuration file, system call and concept on this machine already has authoritative documentation installed on it. Learning to read that instead of searching the web is faster, always matches <em>your</em> version, and works in the places this material is heading — a locked-down exam desktop, a production node with no internet, a shell inside a container.</p>
+<h5>The concept</h5>
+<p>The manual is split into numbered <strong>sections</strong>, and the numbers are not decoration: the same name legitimately appears in several sections meaning different things, and asking for the wrong one is why <code>man</code> sometimes seems to answer a question you did not ask.</p>
+<table>
+<tr><th>Section</th><th>Contains</th><th>Example</th></tr>
+<tr><td><strong>1</strong></td><td>commands you type</td><td><code>man 1 ls</code>, <code>man 1 printf</code></td></tr>
+<tr><td><strong>2</strong></td><td>system calls — requests to the kernel</td><td><code>man 2 mount</code>, <code>man 2 clone</code></td></tr>
+<tr><td><strong>3</strong></td><td>library functions (C)</td><td><code>man 3 printf</code></td></tr>
+<tr><td><strong>5</strong></td><td>file formats</td><td><code>man 5 proc</code>, <code>man 5 resolv.conf</code></td></tr>
+<tr><td><strong>7</strong></td><td>concepts and overviews</td><td><code>man 7 signal</code>, <code>man 7 namespaces</code></td></tr>
+<tr><td><strong>8</strong></td><td>administration commands</td><td><code>man 8 mount</code>, <code>man 8 ip</code></td></tr>
+</table>
+<p>The pairs are the point. <code>man 1 printf</code> is the shell command; <code>man 3 printf</code> is the C function with the same name. <code>man 8 mount</code> is the tool you type; <code>man 2 mount</code> is the system call that tool makes — and B5 needs the second one. Running <code>man mount</code> without a number gives you whichever section wins a fixed priority order, which is usually 1 or 8 and almost never the one this track wants.</p>
+<p>Section <strong>7</strong> is the underrated one. It holds long conceptual essays rather than command syntax, and three of them — <code>man 7 namespaces</code>, <code>man 7 capabilities</code>, <code>man 7 cgroups</code> — are the primary sources for entire modules of this track. They are dense on a first read and that is fine; you are learning that they exist.</p>
+<h5>Lab</h5>
+<ol>
+<li>Read a section-7 concept page end to end — this one describes every signal a process can receive, and B2 is built on it. Navigate with the arrow keys, search with <code>/</code>, quit with <code>q</code>.
+<pre class="cmd">man 7 signal</pre></li>
+<li>Prove the sections really differ. Open both and compare the first paragraph of each: one describes a command-line tool with flags, the other a kernel call with C arguments.
+<pre class="cmd">man 8 mount
+man 2 mount</pre></li>
+<li>Search when you do not know the name yet. <code>apropos</code> (identical to <code>man -k</code>) searches every page's one-line description.
+<pre class="cmd">apropos namespace | head -5</pre>
+<pre class="out">namespaces (7)       - overview of Linux namespaces
+<b>unshare (1)          - run program in new namespaces</b>
+<b>unshare (2)          - disassociate parts of the process execution context</b>
+setns (2)            - reassociate thread with a namespace
+nsenter (1)          - run program in different namespaces</pre>
+<p>Note <code>unshare</code> appearing as both <code>(1)</code> and <code>(2)</code> — the command and the system call it wraps. That pairing is the shape of most of this track.</p></li>
+<li>Know the faster path for a flag you half-remember. Almost every tool answers <code>--help</code> in a screen, without a pager.
+<pre class="cmd">ip --help 2&gt;&amp;1 | head -3</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without searching the web, answer: which section documents <code>/etc/resolv.conf</code>, and which documents the <code>clone</code> system call? Check yourself with <code>man -f resolv.conf</code> and <code>man -f clone</code> — <code>-f</code> prints just the sections a name appears in.</p>
+<pre class="out">resolv.conf (5)      - resolver configuration file
+clone (2)            - create a child process
+clone (3)            - ...</pre>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>apropos</code> depends on a search index that is built by a background job, so on a VM launched minutes ago it can report <em>nothing appropriate</em> for names that plainly exist. Building it by hand with <code>sudo mandb</code> takes a few seconds and fixes it permanently.</p>
+<p>Also, minimal images sometimes ship with man pages stripped out to save space. Ubuntu's Multipass image keeps them, but a container image usually does not — which is worth remembering before you plan to read documentation from inside one.</p>
+<div class="k8s-link">
+<p>Kubernetes has its own version of this, and it is the highest-value habit in the whole exam: <code>kubectl explain</code>. It reads the API schema out of your live cluster and describes any field of any object — <code>kubectl explain pod.spec.containers.livenessProbe</code> — with no browser and no guessing about which version's fields you are looking at.</p>
+<p><a href="../materials/w0.html#cp-0-11">W0.11 — kubectl explain</a> drills it. The instinct is identical to the one you are building here: the machine in front of you already knows, and asking it is faster and more accurate than asking the internet.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 man</code> (the manual's manual — read the SECTIONS part), <code>man 1 apropos</code>, <code>man 8 mandb</code>. Then browse <code>man 7 man-pages</code> for the conventions every page follows, which makes unfamiliar ones far quicker to skim.</p>
+</article>
+</div>
+
+<!-- ---------------- Project ---------------- -->
+<div class="grp" id="g-project"><h3>Project</h3>
+
+<article class="lesson project" id="cp-b0-9" data-id="b0-9">
+<div class="lesson-head"><span class="cp-id">B0.9</span><h4><code>snapshot.sh</code> / <code>restore.sh</code> — make resetting the sandbox one word</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You just proved a restore is cheap. But "cheap" only changes your behaviour if it is also <em>effortless</em> — three commands with an instance-dot-snapshot name to remember is exactly enough friction to make you skip the interesting labs. Two small scripts remove it, and you will run them before every destructive lab from B5 onward.</p>
+<h5>The concept</h5>
+<p>These live on your <strong>host</strong>, not in the VM — they drive the VM from outside, and a script inside a machine cannot restore that machine. Three design decisions are worth naming, because they recur every time you write a small tool:</p>
+<ul>
+<li><strong>Fail loudly.</strong> <code>set -euo pipefail</code> makes the shell stop at the first failing command (<code>-e</code>), treat an unset variable as an error (<code>-u</code>), and notice a failure in the middle of a pipeline (<code>-o pipefail</code>). Without it, a failed <code>stop</code> is followed cheerfully by a <code>snapshot</code> that cannot work.</li>
+<li><strong>Defaults, not arguments.</strong> <code>${1:-sandbox}</code> means "the first argument, or <code>sandbox</code> if there isn't one". You type <code>snapshot.sh</code> and it does the obvious thing; the argument is there for the day you have a second VM.</li>
+<li><strong>Do not parse output meant for humans.</strong> <code>restore.sh</code> needs the newest snapshot's name, and the tempting move is to scrape it from <code>multipass list --snapshots</code>. That output's shape is not a promise. Instead <code>snapshot.sh</code> records what it created in a small state file, and <code>restore.sh</code> reads that — one fact, written by the thing that knows it.</li>
+</ul>
+<h5>Lab</h5>
+<ol>
+<li>Create both files on your host, somewhere on your <code>PATH</code> (<code>~/bin</code> is conventional; <code>mkdir -p ~/bin</code> if it does not exist).
+<p class="docs-links">Both listings are given in full in the next section of this lesson.</p></li>
+<li>Make them executable — a file is not a command until its execute bit is set. B1 and B4 explain exactly what that bit is.
+<pre class="cmd">chmod +x ~/bin/snapshot.sh ~/bin/restore.sh</pre></li>
+<li>If <code>snapshot.sh</code> is not found when you type it, <code>~/bin</code> is not on your <code>PATH</code>. Add it, then reload your shell config:
+<pre class="cmd">echo 'export PATH="$HOME/bin:$PATH"' &gt;&gt; ~/.bashrc
+source ~/.bashrc</pre></li>
+<li>Use them for real: take a snapshot, break the VM, restore it — this time in two words.
+<pre class="cmd">snapshot.sh
+multipass exec sandbox -- sudo rm -rf /etc/apt
+restore.sh
+multipass exec sandbox -- ls /etc/apt</pre>
+<pre class="out">snapshot: sandbox.20260723-141205
+restored: sandbox.20260723-141205
+<b>apt.conf.d  sources.list.d  trusted.gpg.d</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Running <code>restore.sh</code> with no arguments, from any directory, puts the sandbox back and prints the snapshot it used — and <code>/etc/apt</code> is present again after you deleted it. Keep the <code>clean</code> snapshot from B0.7 around as a floor to fall back to: <code>restore.sh sandbox clean</code> returns to the freshly-built machine at any point in the track.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>restore.sh</code> uses <code>--destructive</code>, which skips the confirmation prompt and throws the current disk away without asking. That is the right trade for a sandbox whose entire purpose is being disposable, and the wrong trade everywhere else — do not carry that flag into a script that touches anything you would miss.</p>
+<p>These scripts do exactly two things well and nothing else; resist growing them. Later modules add their own small tools, and the value of each is that you can read the whole thing in ten seconds and know what it will do to your machine.</p>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code> — enormous, but the sections on <em>Parameter Expansion</em> (for <code>${1:-default}</code>) and <em>The Set Builtin</em> (for <code>-euo pipefail</code>) are the two worth finding now. <code>man 1 chmod</code>, <code>man 1 date</code> for the timestamp format.</p>
+</article>
+</div>
+
+<nav class="pager"><a href="../beginner.html#b0">← Beginner tracker</a><a href="../beginner.html#b1">B1 · Shell, files and the filesystem tree →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass 1.17, verified 2026-07-23. Launch the release by number, never by the <code>lts</code> alias — as of July 2026 that alias points at Ubuntu 26.04.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
