@@ -31,7 +31,7 @@ journey rather than three courses in a trench coat.
 
 ## Shape of the track
 
-15 modules · ~200 checkpoints · ~75 hours · self-paced. There is deliberately **no calendar**: the
+15 modules · 225 checkpoints · ~75 hours · self-paced. There is deliberately **no calendar**: the
 8-week clock belongs to the advanced track. Ordering is strictly dependency-driven:
 
 ```
@@ -41,22 +41,30 @@ one machine → one process → what a process may do → its files → isolatin
 
 Each module is a prerequisite for the next. Extra prerequisites are noted per module.
 
+**How the checkpoint counts are derived** (settled in B-S3, when the counts stopped being an
+estimate): a module's total is the sum of its **checkpoint groups** below, **plus one checkpoint for
+its mini project and one for its debugging drill**, which live in a trailing `Project & drill` group
+on the tracker. They have to be tickable, because the module page anatomy gives each its own
+`<article class="lesson project">` / `.drill`, and `tools/check-links.sh` requires exactly one tracker
+checkpoint per lesson anchor. B0 has no drill (+1); B14's groups already *are* its capstone and
+gauntlet (+0). That is why the track total is 225 rather than the ~200 first estimated in B-S1.
+
 | # | Module | cps | hrs |
 |---|---|---|---|
-| B0 | Your Linux sandbox | 8 | 2 |
-| B1 | Shell, files, and the filesystem tree | 14 | 4 |
-| B2 | Processes, threads, signals | 16 | 6 |
-| B3 | Kernel space, user space, system calls | 12 | 4 |
-| B4 | Users, groups, permissions, capabilities | 13 | 4 |
-| B5 | Files for real: VFS, storage, overlayfs | 16 | 6 |
+| B0 | Your Linux sandbox | 9 | 2 |
+| B1 | Shell, files, and the filesystem tree | 16 | 4 |
+| B2 | Processes, threads, signals | 18 | 6 |
+| B3 | Kernel space, user space, system calls | 14 | 4 |
+| B4 | Users, groups, permissions, capabilities | 15 | 4 |
+| B5 | Files for real: VFS, storage, overlayfs | 18 | 6 |
 | B6 | Isolation I — namespaces, chroot, pivot_root | 15 | 6 |
-| B7 | Isolation II — cgroups v2 | 12 | 4 |
-| B8 | Networking I — the real network | 16 | 6 |
-| B9 | Networking II — virtual networking & packet filtering | 18 | 8 |
-| B10 | Names — DNS and resolution | 11 | 4 |
-| B11 | Service management — systemd, logs, boot | 12 | 4 |
-| B12 | Security fundamentals | 14 | 5 |
-| B13 | Distributed systems fundamentals | 13 | 5 |
+| B7 | Isolation II — cgroups v2 | 14 | 4 |
+| B8 | Networking I — the real network | 18 | 6 |
+| B9 | Networking II — virtual networking & packet filtering | 20 | 8 |
+| B10 | Names — DNS and resolution | 13 | 4 |
+| B11 | Service management — systemd, logs, boot | 14 | 4 |
+| B12 | Security fundamentals | 16 | 5 |
+| B13 | Distributed systems fundamentals | 15 | 5 |
 | B14 | Capstone & track assessment | 10 | 6 |
 
 ## Module page anatomy
@@ -124,7 +132,7 @@ from memory:
 ## B0 — Your Linux sandbox
 
 **Prerequisites:** none. This is the front door of the whole site for a beginner.
-**8 checkpoints · ~2 hours**
+**9 checkpoints · ~2 hours**
 
 **Objectives.** Build a Linux machine you own and can destroy; restore it from a snapshot in under a
 minute; install the toolbelt every later module assumes; know how to look up a command without a
@@ -153,7 +161,7 @@ makes beginners avoid the interesting labs.
 ## B1 — Shell, files, and the filesystem tree
 
 **Prerequisites:** B0.
-**14 checkpoints · ~4 hours**
+**16 checkpoints · ~4 hours**
 
 **Objectives.** Move around any Linux box without a file manager; read `ls -l` completely; compose
 small tools with pipes; understand exit codes; know where the system keeps things and why; edit a
@@ -188,7 +196,7 @@ silently does the wrong thing because of unquoted variable expansion with spaces
 ## B2 — Processes, threads, signals
 
 **Prerequisites:** B1.
-**16 checkpoints · ~6 hours**
+**18 checkpoints · ~6 hours**
 
 **Objectives.** Say precisely what a process *is*; read the process tree; interpret every process
 state including D and Z; explain fork/exec/wait; predict what a signal does; write a program that
@@ -226,7 +234,7 @@ follows the grace period.
 ## B3 — Kernel space, user space, system calls
 
 **Prerequisites:** B2.
-**12 checkpoints · ~4 hours**
+**14 checkpoints · ~4 hours**
 
 **Objectives.** Draw the user/kernel boundary; explain what crossing it costs and why it exists; read
 an `strace` and tell the program's story from it; triage an error from its `errno`; know `/proc` and
@@ -260,7 +268,7 @@ ladder: distinguishing `ENOENT` from `EACCES` from `EPERM` from `EISDIR` by symp
 ## B4 — Users, groups, permissions, capabilities
 
 **Prerequisites:** B1 (B2 helpful).
-**13 checkpoints · ~4 hours**
+**15 checkpoints · ~4 hours**
 
 **Objectives.** Predict whether an operation will be permitted before running it; read and write mode
 bits in octal; explain why directory `x` is not file `x`; explain root as ~40 separate capabilities
@@ -292,7 +300,7 @@ levels up), and a setuid binary that stops working after `cp` (bits and ownershi
 ## B5 — Files for real: VFS, storage, overlayfs
 
 **Prerequisites:** B1, B4.
-**16 checkpoints · ~6 hours**
+**18 checkpoints · ~6 hours**
 
 **Objectives.** Explain what mounting actually does; tell an inode from a filename; diagnose a full
 disk that has no large files; build a layered filesystem by hand and find the copy-up; explain what a
@@ -363,7 +371,7 @@ remount), and a namespace that will not go away (a leaked bind mount of `/proc/P
 ## B7 — Isolation II — cgroups v2
 
 **Prerequisites:** B2, B6.
-**12 checkpoints · ~4 hours**
+**14 checkpoints · ~4 hours**
 
 **Objectives.** Explain what a cgroup controls and what it doesn't; navigate `/sys/fs/cgroup`; set a
 CPU cap and *measure* the throttling; trigger an OOM kill deliberately and read the evidence;
@@ -398,7 +406,7 @@ classes (`materials/w3.html#cp-3-17`), node-pressure eviction (`materials/w3.htm
 ## B8 — Networking I — the real network
 
 **Prerequisites:** B1, B3.
-**16 checkpoints · ~6 hours**
+**18 checkpoints · ~6 hours**
 
 **Objectives.** Use the layers as a troubleshooting ladder rather than exam trivia; do CIDR math in
 your head for common masks; read a routing table and predict which route wins; explain a TCP
@@ -433,7 +441,7 @@ output pasted under each stage.
 ## B9 — Networking II — virtual networking & packet filtering
 
 **Prerequisites:** B6, B8. *The heaviest module — plan two sittings.*
-**18 checkpoints · ~8 hours**
+**20 checkpoints · ~8 hours**
 
 **Objectives.** Build a working private network out of namespaces, veth pairs and a bridge; route and
 NAT its traffic to the outside; read and write netfilter rules; explain DNAT-based load balancing;
@@ -470,7 +478,7 @@ iptables walk (`materials/w4.html#cp-4-9`), NetworkPolicy (`materials/w4.html#cp
 ## B10 — Names — DNS and resolution
 
 **Prerequisites:** B8 (B9 helpful).
-**11 checkpoints · ~4 hours**
+**13 checkpoints · ~4 hours**
 
 **Objectives.** Explain what happens between a hostname and an IP address, in order; read
 `/etc/resolv.conf` including `search` and `ndots`; read `dig` output; run a resolver and break it
@@ -501,7 +509,7 @@ Services (`materials/w4.html#cp-4-14`).
 ## B11 — Service management — systemd, logs, boot
 
 **Prerequisites:** B2, B7.
-**12 checkpoints · ~4 hours**
+**14 checkpoints · ~4 hours**
 
 **Objectives.** Write a unit file from scratch; explain the difference between ordering and
 requirement; use drop-ins instead of editing vendor units; find out why a service won't start from
@@ -531,7 +539,7 @@ a `Restart=always` loop that hides a config error behind an endless restart.
 ## B12 — Security fundamentals
 
 **Prerequisites:** B4, B8.
-**14 checkpoints · ~5 hours**
+**16 checkpoints · ~5 hours**
 
 **Objectives.** Frame a system's trust boundaries; tell hashing, encoding and encryption apart; run
 your own CA; issue and verify a certificate with correct SANs; set up mutual TLS and read every
@@ -564,7 +572,7 @@ base64 (`materials/w3.html#cp-3-23`).
 ## B13 — Distributed systems fundamentals
 
 **Prerequisites:** B2, B8, B11.
-**13 checkpoints · ~5 hours**
+**15 checkpoints · ~5 hours**
 
 **Objectives.** Say what changes the moment there are two machines instead of one; do quorum
 arithmetic and explain odd member counts; explain consensus at "teach a colleague" level; recognize
@@ -684,8 +692,8 @@ tick the `CLAUDE.md` row and update the `cka-materials-plan` memory.
 |---|---|
 | **B-S1** | This document. Docs-only commit |
 | **B-S2** | Wiring, no content: `site.css` additions; generalize `tools/check-links.sh` and `tools/check-html.py`; track switcher into all existing sidebars; `index.html` hero + prefix-scoped reset; `foundations.html` banner and go-deep links; stub `beginner.html` with `PUBLISHED=[]` |
-| **B-S3** | `beginner.html` sections **B0–B7** (~106 checkpoints) |
-| **B-S4** | `beginner.html` sections **B8–B14** (~94 checkpoints), resume link, hours panel |
+| **B-S3** | `beginner.html` sections **B0–B7** (119 checkpoints) — ✅ done |
+| **B-S4** | `beginner.html` sections **B8–B14** (106 checkpoints), resume link, hours panel |
 | **B-S5** | `materials/b0.html` — **the pattern-setter**: establishes lesson anatomy, `k8s-link`, `langpair`, project/drill/outcome blocks. Review before continuing |
 | **B-S6 … B-S18** | `materials/b1.html` … `materials/b13.html`, one module per session |
 | **B-S19** | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA |
