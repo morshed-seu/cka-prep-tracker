@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B2: what a process actually is, how fork/exec/wait creates one, the process states including D and Z, exit codes and the 128+signal convention, threads, the signal table, and the graceful-shutdown pattern behind exit code 137.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B2 · Processes, threads, signals — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B2 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b2">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B2 — Processes, threads, signals</h1>
+  <p>A container is a process. Not "like" a process, not "a lightweight virtual machine" — a perfectly ordinary Linux process, with some of its settings adjusted. That single sentence is the reason this module exists, and it is the one that makes the rest of the track make sense: everything Kubernetes does to a workload is something Linux has been doing to processes since the 1970s. Start it. Watch it. Ask it politely to stop. Wait a while. Give up and kill it. Report why it died.</p>
+  <p>So this module is where you learn to narrate all of that, precisely, on a machine you can see all of. When you later read <code>Exit Code: 137</code> in a pod's status at three in the morning, you will not be looking up what 137 means — you will already know that it is 128 + 9, that 9 is <code>SIGKILL</code>, that nothing inside the program chose to exit, and therefore that the answer is outside the program.</p>
+  <div class="weights">
+    <span>Checkpoints<b>18</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>B1</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Say precisely what a process <em>is</em>, in four parts, and point at each part on a live one.</li>
+<li>Read <code>ps aux</code> column by column, and explain why VSZ is always far larger than RSS.</li>
+<li>Read the process tree and trace any process up to PID 1.</li>
+<li>X-ray a running process through <code>/proc/PID/</code> without stopping it.</li>
+<li>Explain why creating a process takes three system calls — <code>fork</code>, <code>exec</code>, <code>wait</code> — and what happens in the gap between the first two.</li>
+<li>Interpret every process state, including the two that scare people: <strong>D</strong> and <strong>Z</strong>.</li>
+<li>Read an exit code as a message, including the <strong>128 + signal</strong> convention that produces 137 and 143.</li>
+<li>Explain orphans, zombies, reaping, and what PID 1 owes its children.</li>
+<li>Describe a thread as the kernel sees it, and know when the distinction changes your diagnosis.</li>
+<li>Recall the signal table worth memorizing, and predict a signal's default action before sending it.</li>
+<li>Catch a signal in your own program — and explain why two of them can never be caught.</li>
+<li>Implement graceful shutdown: catch TERM, finish in-flight work, exit 0.</li>
+<li>Write a mini-supervisor that forks, forwards signals, reaps, and restarts with backoff — a baby kubelet.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B1.</strong> Every lab here reads <code>/proc</code> with the tools you already have — <code>ls</code>, <code>cat</code>, <code>grep</code>, pipes, quoting, <code>$?</code>. The mini project is a shell script plus a small C program and a small Python program; if <code>gcc</code> is missing, <code>sudo apt install -y build-essential</code>. Take a snapshot before you start (<code>snapshot.sh</code> from <a href="b0.html#cp-b0-9">B0.9</a>) — one drill deliberately wedges a process in a state you cannot kill.</p>
+</div>
+
+<!-- ---------------- What a process is ---------------- -->
+<div class="grp" id="g-what"><h3>What a process is</h3>
+
+<article class="lesson" id="cp-b2-1" data-id="b2-1">
+<div class="lesson-head"><span class="cp-id">B2.1</span><h4>Define a process precisely — four things and a number</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Process" is one of those words everybody uses and few people can define, which is fine until you need to reason about one that is misbehaving. If your mental model is "a running program", you have no way to answer questions like <em>why does this container see a different <code>/etc/hosts</code></em>, or <em>how can two processes share memory</em>, or <em>what exactly does a container add</em>. A four-part definition answers all three, and every later module in this track modifies exactly one of the four parts.</p>
+<h5>The concept</h5>
+<p>Start with the distinction that the word hides. A <strong>program</strong> is a file sitting on disk — <code>/usr/bin/sleep</code> is a program, and it is just bytes, doing nothing. A <strong>process</strong> is one running instance of a program: the kernel has read those bytes into memory, given them somewhere to live, and started executing them. One program can have a thousand processes running from it at once, and they do not interfere with each other in the slightest.</p>
+<p>In our hotel picture, a process is <strong>a guest staying in the hotel</strong>, and its <abbr title="process ID — the number the kernel uses to identify a live process">PID</abbr> is their room number. That gives you the two most-missed properties for free. Room numbers are unique <em>while someone is in the room</em> — no two guests share 412 today — but they get reused: next month a different guest is in 412, and a note addressed to "whoever is in 412" reaches the wrong person. Exactly the same is true of PIDs, and it is the reason you will see careful scripts check <em>which</em> process a PID is before signalling it.</p>
+<p>Now the definition. A process is four things plus that number:</p>
+<table>
+<tr><th>Part</th><th>Plainly</th><th>Where you can see it</th></tr>
+<tr><td><strong>Address space</strong></td><td>its private memory — code, data, stack, and anything it mapped in</td><td><code>/proc/PID/maps</code></td></tr>
+<tr><td><strong>File descriptors</strong></td><td>a numbered table of everything it has open: files, sockets, pipes, terminals</td><td><code>/proc/PID/fd/</code></td></tr>
+<tr><td><strong>Credentials</strong></td><td>which user and groups it runs as, and therefore what it may touch</td><td><code>/proc/PID/status</code></td></tr>
+<tr><td><strong>PID</strong></td><td>its identifier while it lives, and its parent's in PPID</td><td><code>/proc/PID/</code> itself</td></tr>
+</table>
+<p>"Private memory" is worth one extra sentence, because it is the property everything else rests on. Two processes can both have a valid address <code>0x400000</code>, and those are two completely different bytes of physical memory — the kernel and the CPU together maintain a per-process translation from the addresses a process uses to the physical memory it actually occupies. A process therefore cannot read another process's memory by accident. It cannot even address it. That isolation is not a feature somebody added for security; it is how memory has worked on Linux from the start, and it is why "processes are already fairly isolated" is the honest starting point for understanding containers.</p>
+<p>Which brings us to the payoff. There is <strong>no container object in the Linux kernel</strong>. Nothing in the source code is called a container. What a container runtime does is start an ordinary process with all four of those parts adjusted — different credentials (B4), a different view of the filesystem so its descriptors reach different files (B5), a private set of PIDs so it cannot see the rest of the hotel (B6), and a cap on how much memory and CPU its address space may consume (B7). Strip those adjustments away and you have a plain process; that is all a container ever was.</p>
+<div class="flow"><span>program on disk</span><em>→</em><span class="hot">process</span><em>=</em><span>address space</span><em>+</em><span>open descriptors</span><em>+</em><span>credentials</span><em>+</em><span>PID</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Shell in and start one long-lived process you can poke at for the rest of this lesson. <code>sleep 900</code> does nothing for fifteen minutes, which makes it a perfect specimen. The <code>&amp;</code> puts it in the background so you get your prompt back, and <code>$!</code> holds the PID of the most recent background job.
+<pre class="cmd">multipass shell sandbox
+sleep 900 &amp;
+pid=$!
+echo "our specimen is PID $pid"</pre>
+<pre class="out">[1] 2411
+our specimen is PID <b>2411</b></pre></li>
+<li>Point at part one, the address space. Each line is one mapped region: a range of addresses, its permissions, and what is mapped there. You do not need to read it all — notice only that memory is a set of labelled regions, not one undifferentiated blob.
+<pre class="cmd">head -4 /proc/$pid/maps</pre>
+<pre class="out"><b>55d3f0a2a000-55d3f0a2c000 r--p 00000000 08:01 2097  /usr/bin/sleep</b>
+55d3f0a2c000-55d3f0a30000 r-xp 00002000 08:01 2097  /usr/bin/sleep
+55d3f0a30000-55d3f0a32000 r--p 00006000 08:01 2097  /usr/bin/sleep
+7f8c1e400000-7f8c1e428000 r--p 00000000 08:01 4231  /usr/lib/x86_64-linux-gnu/libc.so.6</pre></li>
+<li>Point at part two, the open descriptors. Every process starts with at least the three streams from <a href="b1.html#cp-b1-5">B1.5</a> — 0, 1, 2 — and here they all point at your terminal, because <code>sleep</code> inherited them from your shell.
+<pre class="cmd">ls -l /proc/$pid/fd</pre>
+<pre class="out">lrwx------ 1 ubuntu ubuntu 64 Jul 23 09:14 <b>0 -&gt; /dev/pts/0</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 23 09:14 <b>1 -&gt; /dev/pts/0</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 23 09:14 <b>2 -&gt; /dev/pts/0</b></pre></li>
+<li>Point at part three, the credentials. <code>Uid</code> and <code>Gid</code> each list four numbers (real, effective, saved, filesystem) — B4 explains why there are four; for now, all four being 1000 means "this is plainly the <code>ubuntu</code> user, with no privilege games in play".
+<pre class="cmd">grep -E '^(Name|Pid|PPid|Uid|Gid)' /proc/$pid/status</pre>
+<pre class="out">Name:   sleep
+Pid:    <b>2411</b>
+PPid:   <b>2260</b>
+Uid:    <b>1000    1000    1000    1000</b>
+Gid:    1000    1000    1000    1000</pre></li>
+<li>Now prove the "one program, many processes" point, and the private-memory point at the same time. Start two more sleepers from the same binary and note that they are three unrelated processes with three PIDs.
+<pre class="cmd">sleep 900 &amp; sleep 900 &amp;
+pgrep -a sleep</pre>
+<pre class="out"><b>2411 sleep 900</b>
+<b>2455 sleep 900</b>
+<b>2456 sleep 900</b></pre></li>
+<li>Clean up. <code>pkill</code> matches by name; you will meet it properly in B2.15.
+<pre class="cmd">pkill sleep
+pgrep -a sleep || echo "none left"</pre>
+<pre class="out">none left</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking, name the four parts of a process and one file under <code>/proc/PID/</code> that shows each. Then answer: if a program is 2 MB on disk and you run 50 copies of it, roughly how much memory is used by the program's code? (Close to 2 MB total, not 100 MB — the read-only code pages are mapped from the same file and shared between all 50 address spaces. Private memory means each process cannot <em>modify</em> another's; it does not mean the kernel duplicates identical read-only pages.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>PID reuse is real and bites scripts. A script that records a PID, sleeps, and later runs <code>kill $pid</code> can signal an entirely unrelated process that has since inherited that number. On a busy machine the counter wraps in minutes. The robust patterns are to check identity first (<code>ps -p "$pid" -o comm=</code>), or to let something that tracks processes properly do it for you — which is precisely what systemd does in B11 and what your supervisor in B2.17 will do by holding a real parent-child relationship rather than a remembered number.</p>
+<p><code>/proc/PID/environ</code> and <code>/proc/PID/maps</code> are readable only by the owner and root, so <code>cat /proc/1/environ</code> as an ordinary user gives "Permission denied" rather than an empty file. That is a credentials check, not a missing file, and <code>sudo</code> answers it. Do not conclude a <code>/proc</code> file is empty until you have tried it with privilege.</p>
+<p>A process is not the same thing as a <em>job</em>. <code>[1] 2411</code> shows both: <code>%1</code> is your shell's job number, meaningful only in that shell, and 2411 is the kernel's PID, meaningful everywhere. <code>kill %1</code> and <code>kill 2411</code> happen to do the same thing here, but only the second one works from another terminal.</p>
+<div class="k8s-link">
+<p>Everything in the pod spec is an adjustment to one of those four parts, and once you see that, the API stops looking like a grab-bag. <code>securityContext.runAsUser</code> sets the credentials. <code>volumeMounts</code> changes what the descriptors can reach. <code>resources.limits</code> caps the address space. <code>shareProcessNamespace</code> changes which PIDs are visible. There is no fifth kind of thing.</p>
+<p>The clearest place to see this from the Kubernetes side is <a href="w3.html#cp-3-16">W3.16 — requests vs limits: scheduler bookkeeping vs cgroup enforcement</a>: a limit is not a promise the container makes, it is a number written into a kernel control file that applies to that process. B7 is where you write that file by hand.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 proc</code> is the reference for every file mentioned here — it is long, so search (<code>/</code>) for <code>/proc/[pid]/status</code> and <code>/proc/[pid]/maps</code> rather than reading front to back. <code>man 7 credentials</code> covers the four uid fields. For the definition itself, <code>man 2 fork</code>'s opening paragraph is unexpectedly good on what a process consists of, because it has to list everything a copy inherits.</p>
+</article>
+
+<article class="lesson" id="cp-b2-2" data-id="b2-2">
+<div class="lesson-head"><span class="cp-id">B2.2</span><h4>Read <code>ps</code> column by column</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>ps</code> is the first command you type on any machine that is behaving strangely, and most people read three of its columns and skip the rest. The skipped ones are where the answers are. Two of them — VSZ and RSS — are also responsible for a recurring false alarm: someone sees a process "using 2 GB" on a machine with 4 GB free and starts a fire drill over memory that was never occupied.</p>
+<h5>The concept</h5>
+<p><code>ps</code> has two personalities because it inherited two different traditions, BSD and System V. <code>ps aux</code> is the BSD spelling (note: no dash), <code>ps -ef</code> is the System V spelling. They show almost the same processes in different columns, and you should be able to read both because both appear in every set of instructions on the internet. A third form, <code>ps -eo …</code>, lets you ask for exactly the columns you want, and it is the one worth building a habit around.</p>
+<p>Here is what each column is actually telling you:</p>
+<table>
+<tr><th>Column</th><th>What it is</th><th>What it is good for</th></tr>
+<tr><td><code>PID</code></td><td>this process's number</td><td>the handle for everything else you will do</td></tr>
+<tr><td><code>PPID</code></td><td>its parent's number</td><td>who started it — the single most useful column, and absent from <code>ps aux</code></td></tr>
+<tr><td><code>USER</code></td><td>the credentials it runs as</td><td>whether it can touch what you think it can</td></tr>
+<tr><td><code>STAT</code></td><td>its state, plus modifier letters</td><td>whether it is running, waiting, wedged or dead (B2.7)</td></tr>
+<tr><td><code>%CPU</code></td><td>CPU time used ÷ time alive</td><td><em>an average since it started</em>, not a live reading</td></tr>
+<tr><td><code>%MEM</code></td><td>RSS as a fraction of physical RAM</td><td>a quick sort key, nothing more</td></tr>
+<tr><td><code>VSZ</code></td><td>virtual size — address space reserved, in KB</td><td>almost never what you want</td></tr>
+<tr><td><code>RSS</code></td><td>resident set size — physical memory actually occupied, in KB</td><td>the number to look at</td></tr>
+<tr><td><code>START</code></td><td>when it began</td><td>"did this start when the incident started?"</td></tr>
+<tr><td><code>TIME</code></td><td>total CPU time consumed</td><td>distinguishes busy from merely long-lived</td></tr>
+<tr><td><code>COMMAND</code></td><td>how it was invoked</td><td>arguments included — often the whole diagnosis</td></tr>
+</table>
+<p>The VSZ/RSS pair deserves the explanation, because the gap is enormous and alarming until you know why. <strong>VSZ is a reservation; RSS is occupancy.</strong> A process can ask the kernel for an address range without ever touching it, and the kernel is happy to agree, because agreeing costs nothing — no physical memory is committed until the process actually reads or writes a page. Mapping a 10 GB file adds 10 GB to VSZ and nothing to RSS until you read from it. A language runtime that reserves a large heap up front looks terrifying in VSZ and modest in RSS. So: <strong>VSZ is what the process asked for, RSS is what it is holding, and only RSS is a resource anyone is competing for.</strong></p>
+<p>One honest caveat on RSS, so you do not over-trust it either: shared pages are counted in full for every process that maps them. Fifty copies of the same program each report the shared library's pages in their own RSS, so adding up every RSS on a machine gives a total larger than the machine has. RSS is the right per-process number and the wrong thing to sum. <code>free -m</code> and, later, cgroup accounting (B7) are what answer "how much memory is really in use".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at both traditions side by side on the same machine, so the column differences are concrete rather than theoretical.
+<pre class="cmd">ps aux | head -4
+echo '---'
+ps -ef | head -4</pre>
+<pre class="out">USER  PID %CPU %MEM    VSZ   RSS TTY STAT START TIME COMMAND
+root    1  0.0  0.3 167404 12920 ?   Ss   09:01 0:02 /sbin/init
+root    2  0.0  0.0      0     0 ?   S    09:01 0:00 [kthreadd]
+root    3  0.0  0.0      0     0 ?   I&lt;   09:01 0:00 [rcu_gp]
+---
+UID    PID  PPID C STIME TTY   TIME CMD
+root     1     0 0 09:01 ?     00:00:02 /sbin/init
+root     2     0 0 09:01 ?     00:00:00 [kthreadd]
+root     3     2 0 09:01 ?     00:00:00 [rcu_gp]</pre></li>
+<li>Ask for exactly the columns that matter, sorted by the one that matters. This is the form worth memorising: <code>-e</code> means every process, <code>-o</code> picks columns, and a trailing <code>=</code> on a column name suppresses its header.
+<pre class="cmd">ps -eo pid,ppid,user,stat,rss,etime,comm --sort=-rss | head -6</pre>
+<pre class="out">  PID  PPID USER     STAT   RSS     ELAPSED COMMAND
+ 1876     1 root     Ssl  <b>82304</b>    01:32:11 containerd
+  882     1 root     Ssl  55096    01:32:14 snapd
+  640     1 systemd+ Ssl  36980    01:32:15 systemd-resolve
+    1     0 root     Ss   12920    01:32:18 systemd
+  713     1 root     Ssl   8404    01:32:15 systemd-network</pre></li>
+<li>Now make the VSZ/RSS gap appear on demand. This Python one-liner reserves a gigabyte of address space without writing to it, then sleeps — the reservation exists, the memory does not.
+<pre class="cmd">python3 -c 'import mmap,time; m=mmap.mmap(-1, 1024*1024*1024); time.sleep(300)' &amp;
+sleep 1
+ps -o pid,vsz,rss,comm -p $!</pre>
+<pre class="out">  PID     VSZ   RSS COMMAND
+ 2612 <b>1071204</b>  <b>9856</b> python3</pre></li>
+<li>Read that: about 1 GB reserved, about 10 MB actually occupied. Now touch every page of the reservation and watch RSS — and only RSS — climb to meet it.
+<pre class="cmd">kill %1
+python3 -c 'import mmap,time; m=mmap.mmap(-1, 1024*1024*1024); m.write(b"x"*1024*1024*1024); time.sleep(300)' &amp;
+sleep 3
+ps -o pid,vsz,rss,comm -p $!</pre>
+<pre class="out">  PID     VSZ     RSS COMMAND
+ 2648 <b>1071456</b> <b>1058304</b> python3</pre></li>
+<li>Confirm the machine agrees, then stop it. <code>free -m</code> shows the gigabyte genuinely gone from <code>available</code> in the second case and not in the first — this is the check that turns "VSZ is not real" from a claim into something you have seen.
+<pre class="cmd">free -m
+kill %1</pre></li>
+<li>Finally, note what <code>%CPU</code> really says. Run something busy for ten seconds and compare <code>ps</code>'s figure with <code>top</code>'s: <code>ps</code> reports an average over the process's whole life, so a process that pinned a core for one second an hour ago shows nearly 0%.
+<pre class="cmd">timeout 10 sh -c 'while :; do :; done' &amp;
+sleep 5; ps -o pid,%cpu,etime,comm -p $!</pre>
+<pre class="out">  PID %CPU     ELAPSED COMMAND
+ 2701 <b>99.4</b>       00:05 sh</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From memory, produce a listing of the five biggest processes by real memory, showing who owns each and who started it — <code>ps -eo pid,ppid,user,rss,comm --sort=-rss | head -6</code>. Then explain to yourself why the machine is not in trouble even though one process shows a VSZ larger than the machine's total RAM.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>ps aux</code> has no PPID column, which is the column you most often need. Every "who launched this?" investigation stalls for a moment on that omission. <code>ps -ef</code> has it, and <code>ps -eo</code> lets you ask for it — build the habit of the third form and the problem disappears.</p>
+<p>Processes shown in square brackets — <code>[kthreadd]</code>, <code>[rcu_gp]</code> — are <strong>kernel threads</strong>, not user programs. They have no address space of their own, which is why their VSZ and RSS are 0, and you cannot kill them or strace them meaningfully. When something in brackets is consuming CPU it is a signal about the kernel's work (I/O, memory reclaim), not about a program you can restart.</p>
+<p><code>%CPU</code> from <code>ps</code> is a lifetime average and <code>%CPU</code> from <code>top</code> is a sample of the last interval. They disagree constantly and both are correct. If you want "what is hot right now", use <code>top</code>; if you want "what has consumed the most CPU since boot", use <code>ps</code>'s <code>TIME</code> column, which is the honest cumulative figure.</p>
+<p>The <code>COMMAND</code> column is truncated by terminal width in <code>ps aux</code>, and the truncated part is usually the arguments that would have told you which config file the process is using. <code>ps -ww -ef</code> disables the truncation, or read <code>/proc/PID/cmdline</code> directly as in B2.4.</p>
+<div class="k8s-link">
+<p>The VSZ/RSS distinction is the reason <code>kubectl top pod</code> and a container's own memory reporting so often disagree with intuition. Kubernetes cares about a number closer to RSS — specifically the cgroup's accounting of pages actually charged to the container — because that is what competes for the node's memory and what the OOM killer acts on. A container with a huge virtual size and a small resident size is not close to its limit at all.</p>
+<p>Follow this into <a href="w3.html#cp-3-17">W3.17 — QoS classes: derived, not declared</a>, where which pod gets killed first under memory pressure is decided by real usage against declared requests, and into <a href="w6.html#cp-6-12">W6.12 — reading node Conditions</a>, where <code>MemoryPressure</code> is the node saying the same thing at machine scale.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ps</code> is genuinely large; the sections to know are <em>STANDARD FORMAT SPECIFIERS</em> (every column name available to <code>-o</code>) and <em>PROCESS STATE CODES</em> (which B2.7 uses). <code>man 1 free</code> for the <code>available</code> column, which is the one to trust. <code>man 5 proc</code> under <code>/proc/[pid]/statm</code> shows where these numbers come from — <code>ps</code> is only formatting files you could read yourself.</p>
+</article>
+
+<article class="lesson" id="cp-b2-3" data-id="b2-3">
+<div class="lesson-head"><span class="cp-id">B2.3</span><h4>See the process tree, and trace yourself up to PID 1</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Processes on Linux are not a flat list — they are a family tree, and the shape of that tree is frequently the whole answer. "Why is there a stray <code>python3</code> eating CPU?" is unanswerable from a flat listing and obvious from a tree, where you can see it hanging off a cron job. Later, when you look at a container host, the tree is what shows you the runtime supervising the containers, and each container's processes hanging beneath it.</p>
+<h5>The concept</h5>
+<p>Every process except one has a parent: the process that created it. The exception is <strong>PID 1</strong>, started by the kernel at boot, which has no parent and is the root of the whole tree. On Ubuntu 24.04 that is <code>systemd</code>, which B11 covers properly. So from any process you can follow PPID upward, one step at a time, and you will always arrive at 1 — there is exactly one path, and no cycles.</p>
+<p>Continuing the hotel: PID 1 is the front desk, and every guest arrived by someone letting them in. Follow "who let you in?" back far enough and you always reach the front desk, because the building has only one entrance.</p>
+<p>Two things about the tree surprise people the first time. First, the parent link survives the parent's own commands — your shell is a child of the SSH daemon session, which is a child of <code>systemd</code>, and that chain does not change as you type. Second, the link <em>can</em> change: if a parent dies while its child is still running, the child is not killed. It is handed to PID 1, which becomes its new parent. That is called re-parenting, it is how orphans work, and B2.9 is entirely about the consequences.</p>
+<p><code>pstree</code> draws this. <code>pstree -p</code> adds PIDs, which you almost always want. By default it collapses identical siblings into <code>sleep(2411,2455,2456)</code> form, which is a feature — a runaway that has forked 400 copies of itself shows as one line with 400 numbers, and the shape tells you instantly that you are looking at a fork problem rather than 400 unrelated events.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Draw the whole tree from the root. Read the first few lines as a sentence: <code>systemd</code> started everything, directly or indirectly.
+<pre class="cmd">pstree -p | head -12</pre>
+<pre class="out"><b>systemd(1)</b>─┬─agetty(721)
+          ├─containerd(1876)─┬─{containerd}(1877)
+          │                  └─{containerd}(1878)
+          ├─cron(701)
+          ├─dbus-daemon(689)
+          ├─multipathd(542)─┬─{multipathd}(544)
+          │                 └─{multipathd}(545)
+          ├─sshd(882)───sshd(2244)───sshd(2255)───<b>bash(2260)</b>───pstree(2712)
+          ├─systemd-journal(389)
+          ├─systemd-network(713)
+          └─systemd-resolve(640)</pre></li>
+<li>Find yourself in it. <code>$$</code> is your shell's own PID — the shell substitutes it before <code>pstree</code> ever runs.
+<pre class="cmd">echo "my shell is $$"
+pstree -ps $$</pre>
+<pre class="out">my shell is 2260
+<b>systemd(1)───sshd(882)───sshd(2244)───sshd(2255)───bash(2260)───pstree(2721)</b></pre></li>
+<li>Now walk the same chain by hand, so you know <code>pstree</code> is not doing anything you could not do yourself. Each step reads one process's PPID out of <code>/proc</code> and moves up.
+<pre class="cmd">p=$$
+while [ "$p" -ne 0 ]; do
+  read -r _ comm _ ppid _ &lt; /proc/$p/stat
+  echo "$p $comm (parent $ppid)"
+  p=$ppid
+done</pre>
+<pre class="out">2260 (bash) (parent 2255)
+2255 (sshd) (parent 2244)
+2244 (sshd) (parent 882)
+882 (sshd) (parent 1)
+<b>1 (systemd) (parent 0)</b></pre></li>
+<li>Make the tree show you something. Start three sleepers from your shell and watch them appear as children, collapsed onto one line.
+<pre class="cmd">sleep 300 &amp; sleep 300 &amp; sleep 300 &amp;
+pstree -p $$</pre>
+<pre class="out">bash(2260)─┬─<b>sleep(2740)</b>
+           ├─<b>sleep(2741)</b>
+           └─<b>sleep(2742)</b></pre></li>
+<li>Then watch re-parenting happen live — this is the mechanism B2.9 builds on. Start a sleeper from a <em>subshell</em>, let the subshell exit, and see the orphan land on PID 1.
+<pre class="cmd">( sleep 300 &amp; echo "child is $!" )
+sleep 1
+ps -o pid,ppid,comm -p $(pgrep -n sleep)</pre>
+<pre class="out">child is 2755
+  PID  PPID COMMAND
+ 2755     <b>1</b> sleep</pre></li>
+<li>Clean up.
+<pre class="cmd">pkill sleep; pstree -p $$</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Run <code>pstree -ps $$</code> and narrate the chain out loud, naming what each link is: the init system, the listening SSH daemon, the per-connection SSH processes, your shell. Then predict, before running it, what <code>ps -o ppid= -p 1</code> prints. (0 — a placeholder meaning "no parent", not a real process.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Names in curly braces — <code>{containerd}(1877)</code> — are <strong>threads</strong>, not child processes. <code>pstree</code> shows them by default and it makes a busy tree look far more populated than it is. <code>pstree -T</code> hides them, and B2.10 explains what they are.</p>
+<p>Killing a parent does <em>not</em> kill its children. This is the single most common wrong assumption about the tree: people kill a supervising process expecting the work to stop, and the work carries on happily, re-parented to PID 1 and now much harder to find. To stop a whole group you need something that tracks the group — <code>kill -- -PGID</code> for a process group, or the cgroup-based supervision systemd does in B11, which is exactly why systemd exists.</p>
+<p>The tree you see is the tree in <em>your</em> PID namespace. Inside a container, <code>pstree</code> shows the container's own process as PID 1 and nothing else on the machine — same kernel, different view. B6 builds that view from scratch, and until then it is worth knowing that "PID 1" is always relative to who is asking.</p>
+<div class="k8s-link">
+<p>On a Kubernetes node the tree <em>is</em> the architecture diagram. <code>systemd</code> at the top; <code>kubelet</code> and <code>containerd</code> as its children; under <code>containerd</code>, one <code>containerd-shim</code> per pod sandbox; and under each shim, the container's own PID 1 and its children. Running <code>pstree -p</code> on a node and finding your workload at the bottom of that chain is the moment "a pod is just processes on a machine" stops being a slogan.</p>
+<p>The supervising link at the top is the subject of <a href="w1.html#cp-1-19">W1.19 — the kubelet's syncLoop and its three pod sources</a>: the kubelet is a process whose entire job is deciding which other processes should exist on this node, which is structurally the same job as the supervisor you will write in B2.17.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 pstree</code> — short, worth reading in full; note <code>-T</code>, <code>-a</code> (show arguments) and <code>-s</code> (show ancestors). <code>man 5 proc</code> under <code>/proc/[pid]/stat</code> documents the field order used in the walk-by-hand step, including why <code>comm</code> arrives wrapped in parentheses. <code>man 1 ps</code> under <em>PROCESS SELECTION</em> for <code>--ppid</code>, which lists a process's children directly.</p>
+</article>
+
+<article class="lesson" id="cp-b2-4" data-id="b2-4">
+<div class="lesson-head"><span class="cp-id">B2.4</span><h4>X-ray a live process through <code>/proc/PID/</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Almost every diagnostic tool you will ever use on Linux — <code>ps</code>, <code>top</code>, <code>lsof</code>, <code>htop</code> — is a formatter over <code>/proc</code>. Knowing that is not trivia: it means when a tool is missing, gives an answer you distrust, or has no flag for what you want, you can still get the truth by reading a file. On a stripped-down container image with no tools at all, <code>/proc</code> is often the <em>only</em> thing available, and it is enough.</p>
+<h5>The concept</h5>
+<p><code>/proc</code> is not a directory of files on a disk. It is a <strong>filesystem-shaped interface to kernel data structures</strong> — you already saw in <a href="b1.html#cp-b1-3">B1.3</a> that its files report size 0 while plainly having contents, and the reason is that the contents do not exist until you read them. The kernel generates the text at the moment of the read. B3 takes this apart properly; here, use it.</p>
+<p>Every live process has a directory <code>/proc/PID/</code>, and a handful of entries in it answer almost every question you will have:</p>
+<table>
+<tr><th>Entry</th><th>Answers</th><th>Note</th></tr>
+<tr><td><code>cmdline</code></td><td>exactly how it was invoked, arguments included</td><td>NUL-separated, so pipe through <code>tr '\0' ' '</code></td></tr>
+<tr><td><code>environ</code></td><td>the environment it was given</td><td>the copy made at exec — see B1.13</td></tr>
+<tr><td><code>fd/</code></td><td>every open file, socket and pipe, as symlinks</td><td>the answer to "who is holding this file?"</td></tr>
+<tr><td><code>status</code></td><td>state, uids, thread count, memory, signal masks</td><td>human-readable summary of everything</td></tr>
+<tr><td><code>maps</code></td><td>the layout of its address space</td><td>which libraries it actually loaded</td></tr>
+<tr><td><code>cwd</code></td><td>its current directory, as a symlink</td><td>the thing relative paths resolve against (B1.1)</td></tr>
+<tr><td><code>exe</code></td><td>the binary it is running, as a symlink</td><td>still valid after the file is deleted</td></tr>
+</table>
+<p>Two of those are worth calling out because they solve real problems. <code>fd/</code> is how you find the process still holding a deleted 40 GB log file: when a file is unlinked but a process still has it open, the disk space is not freed (this is the link-count rule from <a href="b1.html#cp-b1-4">B1.4</a>), and <code>ls -l /proc/*/fd</code> shows the symlink with <code>(deleted)</code> appended. Nothing else on the machine will tell you. And <code>exe</code> keeps pointing at the original binary even after an upgrade replaces the file on disk, which is how you discover that a service is still running last week's version.</p>
+<p>The shorthand <code>/proc/self/</code> always refers to <em>the process doing the reading</em>. So <code>cat /proc/self/cmdline</code> describes the <code>cat</code>, not your shell — a small joke the kernel plays on everyone once.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a specimen with distinctive arguments and a custom environment variable, so you can recognise both when you find them.
+<pre class="cmd">MARKER=hello-b2 sleep 900 --verbose &amp;
+pid=$!
+echo $pid</pre>
+<pre class="out">[1] 2812
+2812</pre></li>
+<li>Read how it was invoked. The arguments are separated by NUL bytes rather than spaces, which is deliberate — it means an argument containing a space is unambiguous — so translate them for display.
+<pre class="cmd">tr '\0' ' ' &lt; /proc/$pid/cmdline; echo</pre>
+<pre class="out"><b>sleep 900 --verbose</b> </pre></li>
+<li>Read its environment and find your marker. This is the same NUL-separated format, and it is a snapshot taken at exec time — changing the variable in your shell now would not change this file.
+<pre class="cmd">tr '\0' '\n' &lt; /proc/$pid/environ | grep MARKER</pre>
+<pre class="out"><b>MARKER=hello-b2</b></pre></li>
+<li>Read the summary. <code>status</code> is the one file to look at when you do not yet know what you are looking for.
+<pre class="cmd">grep -E '^(Name|State|Pid|PPid|Threads|VmRSS)' /proc/$pid/status</pre>
+<pre class="out">Name:   sleep
+State:  <b>S (sleeping)</b>
+Pid:    2812
+PPid:   2260
+Threads:        <b>1</b>
+VmRSS:  <b>1664 kB</b></pre></li>
+<li>Now solve the deleted-file problem for real, because it is the reason this lesson exists. Start a writer, delete its file out from under it, and watch the space stay gone.
+<pre class="cmd">( dd if=/dev/zero of=/tmp/big.log bs=1M count=500 status=none; sleep 600 ) &amp;
+sleep 3
+df -h /tmp | tail -1
+rm /tmp/big.log
+df -h /tmp | tail -1</pre>
+<pre class="out">/dev/sda1        19G  2.8G   16G  16% /
+/dev/sda1        19G  <b>2.8G</b>   16G  16% /</pre></li>
+<li>The file is gone from the directory and the space is still used. Find the culprit through <code>/proc</code> — this is the move that no other tool gives you.
+<pre class="cmd">sudo ls -l /proc/*/fd 2&gt;/dev/null | grep deleted</pre>
+<pre class="out">l-wx------ 1 ubuntu ubuntu 64 Jul 23 09:31 3 -&gt; <b>/tmp/big.log (deleted)</b></pre></li>
+<li>Release it by ending the holder, and confirm the space returns. In production this is why "I deleted the logs but the disk is still full" is answered by restarting the service, not by deleting more.
+<pre class="cmd">pkill -f 'sleep 600'
+sleep 1
+df -h /tmp | tail -1</pre>
+<pre class="out">/dev/sda1        19G  <b>2.3G</b>   17G  13% /</pre></li>
+<li>Finally, meet <code>/proc/self</code> and its small joke.
+<pre class="cmd">tr '\0' ' ' &lt; /proc/self/cmdline; echo
+pkill sleep</pre>
+<pre class="out"><b>tr \0   </b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Pick any PID from <code>ps -ef</code> and, using only <code>/proc</code>, state: what command line it was started with, which directory it considers current, how many threads it has, and one file it currently has open. Then reproduce the deleted-file scenario from scratch and find the holder without looking at the lab above.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>cat /proc/PID/cmdline</code> looks like it prints everything joined together — <code>sleep900--verbose</code> — because the NUL separators are invisible in a terminal. Nothing is wrong; you are seeing the format correctly and the terminal is hiding the delimiters. Always pipe through <code>tr</code>.</p>
+<p>Reading <code>environ</code>, <code>maps</code> and <code>fd/</code> of a process you do not own requires root, and the failure is a permission error rather than an empty result. This matters more than it sounds: environment variables routinely contain credentials, so the kernel protecting <code>environ</code> is the only thing stopping any user on the machine from harvesting every secret passed to every service. It is also why passing secrets by environment variable is weaker than passing them by file.</p>
+<p>Everything in <code>/proc/PID/</code> is a snapshot generated at read time, so two reads a millisecond apart can disagree, and a process can exit between your <code>ps</code> and your <code>cat</code> — leaving you with "No such file or directory" for a PID that existed a moment ago. That is not an error to debug; it is the process having ended.</p>
+<p><code>lsof</code> gives you the deleted-file answer more conveniently (<code>sudo lsof +L1</code>), and it is worth installing. But it is not present on minimal images, including most container images, and it is reading exactly the files you just read. Know the manual method; use the tool when it is there.</p>
+<div class="k8s-link">
+<p>This is the technique that survives the worst case in Kubernetes: a container with no shell, no <code>ps</code>, and nothing to exec into. From the node you can still find the container's PID and read everything about it through <code>/proc</code>, because the kernel is shared and <code>/proc</code> is the kernel's own interface. Distroless images make this the normal path, not the fallback.</p>
+<p>The Kubernetes-native version of the same move is <a href="w6.html#cp-6-3">W6.3 — kubectl debug: ephemeral containers for shell-less pods</a>, which attaches a container full of tools into the target pod's namespaces so that its <code>/proc</code> view includes your workload. Same idea, wrapped in an API. And the deleted-file trap reappears at cluster scale as a node whose disk stays full after log rotation — which surfaces as <code>DiskPressure</code> in <a href="w6.html#cp-6-12">W6.12</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 proc</code> is the whole lesson in reference form — and on Ubuntu 24.04 it has been split, so also check <code>man 5 proc_pid_status</code> and <code>man 5 proc_pid_maps</code> if a subsection seems missing. <code>man 8 lsof</code> for <code>+L1</code>. <code>man 1 tr</code> for the <code>\0</code> translation. When a tool's output confuses you, the honest next step is <code>man 5 proc</code> and reading the source of the number yourself.</p>
+</article>
+</div>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
