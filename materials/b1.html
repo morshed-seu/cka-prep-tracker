@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B1: move around a Linux box without a file manager, read ls -l completely, compose small tools with pipes, understand the shell's variables, PATH, quoting and exit codes, and survive vim.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B1 · Shell, files and the filesystem tree — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B1 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b1">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B1 — Shell, files, and the filesystem tree</h1>
+  <p>The shell has a reputation for being the hard, old-fashioned way to use a computer — a worse file manager that makes you type. That is a misreading. A file manager lets you do the things somebody anticipated; the shell is a small programming language for <em>composing</em> a dozen tiny programs into an answer nobody anticipated, including you, ten seconds ago. "Which five processes are using the most memory, and who owns them?" is not a button anywhere. It is one line here.</p>
+  <p>This module is the vocabulary every other module on the site speaks. Nothing after it will re-explain what a pipe is, what <code>$?</code> means, or why <code>/etc</code> and <code>/var</code> are different places — so take the labs literally, on the sandbox you built in B0, and run every command rather than reading it.</p>
+  <div class="weights">
+    <span>Checkpoints<b>16</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>B0</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Move to any directory on any Linux machine, by absolute or relative path, without hesitating.</li>
+<li>Name the job of every top-level directory, and predict where an unfamiliar program keeps its config and its state.</li>
+<li>Read every column of <code>ls -l</code> out loud, including the type character, and go one level deeper with <code>stat</code>.</li>
+<li>Explain what an inode is, why deleting a file is really deleting a name, and which timestamp moves when.</li>
+<li>Route a program's three streams deliberately, and chain programs into a pipeline that answers a real question.</li>
+<li>Tell a shell glob from a regular expression, and say which piece of software expands each.</li>
+<li>Use the working core of <code>grep sed awk cut sort uniq wc head tail find xargs</code> without reaching for a manual.</li>
+<li>Explain the difference between a shell variable and an environment variable, and how <code>PATH</code> turns a word into a program.</li>
+<li>Quote correctly by reflex, and know exactly what breaks when you do not.</li>
+<li>Write, run and debug a small script that reports its own success or failure through an exit code.</li>
+<li>Open, edit, save and quit <code>vim</code> on a machine where nothing else is installed.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B0.</strong> You need the <code>sandbox</code> VM, the toolbelt installed in <a href="b0.html#cp-b0-6">B0.6</a>, and — this matters more here than it looks — the <code>clean</code> snapshot from <a href="b0.html#cp-b0-7">B0.7</a>. This module has you delete files and break your own <code>PATH</code> on purpose. Take a snapshot before you start: <code>snapshot.sh</code>.</p>
+</div>
+
+<!-- ---------------- Paths and the tree ---------------- -->
+<div class="grp" id="g-paths"><h3>Paths and the tree</h3>
+
+<article class="lesson" id="cp-b1-1" data-id="b1-1">
+<div class="lesson-head"><span class="cp-id">B1.1</span><h4>Move around without a file manager</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A path is an address, and almost everything you will type for the rest of this site is either a path or a command that takes one. Kubernetes manifests are paths, certificates are paths, a broken node is diagnosed by knowing which path to look in. Getting fluent at moving around is not a preliminary to the real work — it <em>is</em> a large fraction of the real work, and it takes about twenty minutes to stop being slow at it.</p>
+<h5>The concept</h5>
+<p>Linux has exactly <strong>one</strong> tree of files, and its root is a single character: <code>/</code>. There is no <code>C:</code> and no <code>D:</code>. If you plug in a second disk, it does not become a new letter — it gets <em>grafted onto</em> some directory inside the existing tree, and from then on it just looks like a folder. That grafting is called <strong>mounting</strong>, and B5 takes it apart in detail. For now, absorb the consequence: every file on the machine has exactly one address that starts at <code>/</code>.</p>
+<p>An <strong>absolute path</strong> is one of those addresses written out in full: <code>/etc/systemd/system</code>. It means the same thing typed from anywhere, by anyone, at any time. A <strong>relative path</strong> is a shortcut that is interpreted from wherever you currently are — <code>system</code>, typed while you are sitting in <code>/etc/systemd</code>, means the same directory. The rule is simply: <em>starts with a slash → absolute; anything else → relative</em>.</p>
+<p>"Wherever you currently are" is not a fiction the shell maintains for your convenience. It is a real property of the running process, held by the kernel, called the <strong>current working directory</strong>. Every process has one, inherited from whatever started it, and you can look at any process's copy of it directly — <code>/proc/self/cwd</code> is a symbolic link pointing at the directory of whatever process is asking. When a program opens the relative path <code>config.yaml</code>, the kernel resolves it against that stored directory. This is why a script that works when you run it from its own folder mysteriously fails when run from somewhere else, and it is the whole explanation of that bug.</p>
+<p>Four shorthands do most of the work, and they are ordinary directory entries or shell features, not magic:</p>
+<table>
+<tr><th>Shorthand</th><th>Means</th><th>What it really is</th></tr>
+<tr><td><code>.</code></td><td>here</td><td>a real entry in every directory, pointing at itself</td></tr>
+<tr><td><code>..</code></td><td>one level up</td><td>a real entry in every directory, pointing at its parent</td></tr>
+<tr><td><code>~</code></td><td>your home directory</td><td>expanded by the <em>shell</em> from <code>$HOME</code> before the command runs</td></tr>
+<tr><td><code>-</code></td><td>the directory you were in before</td><td>a <code>cd</code> feature, remembered in <code>$OLDPWD</code></td></tr>
+</table>
+<p>One more thing worth knowing on day one, because it explains a confusing error later: <code>cd</code> is not a program. It is built into the shell itself. It has to be — a program runs as a separate process with its own working directory, so a <code>/usr/bin/cd</code> would change its own directory and then exit, leaving your shell exactly where it was. Anything that must change the shell's own state (<code>cd</code>, <code>export</code>, <code>exit</code>) is necessarily a builtin.</p>
+<div class="flow"><span>you type <code>cd system</code></span><em>→</em><span class="hot">shell changes its own cwd</span><em>→</em><span>kernel records it on the process</span><em>→</em><span>later relative paths resolve against it</span></div>
+<h5>Lab</h5>
+<ol>
+<li>Shell into the sandbox and find out where you start. A fresh login always begins in your home directory.
+<pre class="cmd">multipass shell sandbox
+pwd</pre>
+<pre class="out"><b>/home/ubuntu</b></pre></li>
+<li>Go to <code>/etc/systemd/system</code> the obvious way — absolute, from anywhere, unambiguous.
+<pre class="cmd">cd /etc/systemd/system
+pwd</pre>
+<pre class="out"><b>/etc/systemd/system</b></pre></li>
+<li>Come home three different ways, checking with <code>pwd</code> each time. All three are the same destination expressed differently: the shell's expansion of <code>~</code>, the variable it expands from, and <code>cd</code>'s no-argument default.
+<pre class="cmd">cd ~      ; pwd
+cd "$HOME"; pwd
+cd        ; pwd</pre>
+<pre class="out"><b>/home/ubuntu</b>
+<b>/home/ubuntu</b>
+<b>/home/ubuntu</b></pre></li>
+<li>Now go back the relative way, one step at a time, to feel the difference. Nothing here starts with a slash, so every piece is interpreted from where you already are.
+<pre class="cmd">cd /etc/systemd/system
+cd ..; pwd
+cd ../..; pwd
+cd etc/systemd; pwd</pre>
+<pre class="out"><b>/etc/systemd</b>
+<b>/</b>
+<b>/etc/systemd</b></pre></li>
+<li>Jump back and forth with <code>-</code>. This is the single most useful navigation habit there is: you are almost always alternating between two directories.
+<pre class="cmd">cd /var/log; pwd
+cd -; pwd
+cd -; pwd</pre>
+<pre class="out"><b>/var/log</b>
+/etc/systemd
+/var/log</pre>
+<p><code>cd -</code> prints the directory it moved to, which is why the second and third lines appear without you asking.</p></li>
+<li>Prove the working directory is a kernel-held property of the process, not a shell invention. <code>$$</code> is the shell's own process id, and the <code>cwd</code> entry under it is a symlink the kernel maintains.
+<pre class="cmd">cd /etc
+readlink /proc/$$/cwd</pre>
+<pre class="out"><b>/etc</b></pre></li>
+<li>Finally, look at a directory properly. <code>-l</code> gives one file per line with details, <code>-a</code> includes the entries whose names begin with a dot — which are not "hidden" in any security sense, just conventionally skipped by <code>ls</code>.
+<pre class="cmd">cd ~
+ls -la</pre>
+<pre class="out">total 32
+drwxr-x--- 4 ubuntu ubuntu 4096 Jul 23 14:02 <b>.</b>
+drwxr-xr-x 3 root   root   4096 Jul 23 13:55 <b>..</b>
+-rw-r--r-- 1 ubuntu ubuntu  220 Mar 31 2024 .bash_logout
+-rw-r--r-- 1 ubuntu ubuntu 3771 Mar 31 2024 .bashrc</pre>
+<p>The first two entries are <code>.</code> and <code>..</code> themselves — visible proof that they are ordinary directory entries rather than shell syntax.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From a fresh shell, get to <code>/etc/systemd/system</code> and back to your home directory three different ways without looking at this page, checking <code>pwd</code> each time. Then answer without running it: after <code>cd /var/log</code> followed by <code>cd ../../etc</code>, what does <code>pwd</code> print? (<code>/etc</code> — up to <code>/var</code>, up to <code>/</code>, down into <code>etc</code>.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>which cd</code> prints nothing and exits non-zero, which looks like <code>cd</code> is missing. It is not — <code>which</code> only searches <code>PATH</code> for executable files, and <code>cd</code> is a shell builtin with no file anywhere. <code>type cd</code> is the command that answers correctly, and B1.11 comes back to exactly this distinction.</p>
+<p>Relative paths in scripts are the classic silent bug. A script containing <code>cat config.yaml</code> works when you run it from its own directory and fails from anywhere else, because the path resolves against the <em>caller's</em> working directory, not the script's. The fix is to use an absolute path or to compute one from the script's own location — and the habit of noticing which one you have written.</p>
+<p>A path that goes through a symbolic link has two truthful answers for "where am I". By default <code>cd</code> and <code>pwd</code> keep the route you typed; <code>cd -P</code> and <code>pwd -P</code> resolve the links and give you the physical location. On a machine where <code>/bin</code> is a symlink to <code>/usr/bin</code> — which is every modern Ubuntu — this is the difference between <code>pwd</code> saying <code>/bin</code> and <code>pwd -P</code> saying <code>/usr/bin</code>.</p>
+<div class="k8s-link">
+<p>The reason "one tree, and you can graft anything anywhere onto it" is worth this much attention: it is the entire mechanism by which a container gets a filesystem. A container is handed a different <code>/</code>, assembled by mounting things into place, and the processes inside it navigate that tree with exactly the paths you just used — unable to tell, and not caring, that it is not the machine's real root.</p>
+<p>You can see the machinery from the node side in <a href="w5.html#cp-5-2">W5.2 — where volumes actually live</a>: every volume a pod uses is a real directory under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes</code> on the host, mounted into the container at whatever path the pod spec asked for. Two absolute paths, one graft.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 path_resolution</code> is the authoritative description of how the kernel turns a string into a file, and it is short — read it. Then <code>man 1 bash</code> and search (<code>/</code>) for <em>SHELL BUILTIN COMMANDS</em> for <code>cd</code>, and <code>man 5 proc</code> for what <code>/proc/self/cwd</code> is.</p>
+</article>
+
+<article class="lesson" id="cp-b1-2" data-id="b1-2">
+<div class="lesson-head"><span class="cp-id">B1.2</span><h4>Tour the standard directories and learn them by their job</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Sit down at an unfamiliar Linux machine and you already know where to look — not because you have seen that machine before, but because the layout is a published standard that nearly everything follows. Learning the top level once buys you the ability to guess correctly for the rest of your career: where a service keeps its settings, where it writes its logs, where its data lives, and which of the three you are allowed to delete.</p>
+<h5>The concept</h5>
+<p>The layout has a name — the <abbr title="Filesystem Hierarchy Standard: the published convention describing what belongs in each top-level directory">FHS</abbr>, the Filesystem Hierarchy Standard — and the useful way to learn it is not as a list of names but as a set of <em>jobs</em>. Every directory answers one question about the data in it: did a human configure this, did the machine accumulate it, did a package install it, or is it not really a file at all?</p>
+<table>
+<tr><th>Directory</th><th>Its job</th><th>What that means in practice</th></tr>
+<tr><td><code>/etc</code></td><td>configuration you <em>set</em></td><td>text files, editable, worth backing up; nothing here is generated by running the service</td></tr>
+<tr><td><code>/var</code></td><td>state the machine <em>accumulates</em></td><td>logs, databases, caches, spools — grows on its own, and is where "disk full" comes from</td></tr>
+<tr><td><code>/usr</code></td><td>programs and their data</td><td>installed by the package manager, effectively read-only to you; <code>/usr/bin</code>, <code>/usr/lib</code>, <code>/usr/share</code></td></tr>
+<tr><td><code>/home</code></td><td>people</td><td>one directory per human user; yours is <code>/home/ubuntu</code></td></tr>
+<tr><td><code>/tmp</code></td><td>scratch</td><td>anyone may write here, and the system deletes it out from under you</td></tr>
+<tr><td><code>/run</code></td><td>runtime state since boot</td><td>lives in memory, empty at every boot: process ids, unix sockets</td></tr>
+<tr><td><code>/dev</code></td><td>devices as files</td><td>disks, terminals, <code>/dev/null</code> — the hardware, addressable by path</td></tr>
+<tr><td><code>/proc</code></td><td>the kernel, answering questions</td><td>not on any disk; one directory per running process, invented on read</td></tr>
+<tr><td><code>/sys</code></td><td>the kernel's device and tuning knobs</td><td>also invented on read; where B7 will write a memory limit</td></tr>
+<tr><td><code>/boot</code></td><td>what is needed to start</td><td>the kernel image itself and the bootloader</td></tr>
+<tr><td><code>/opt</code>, <code>/srv</code></td><td>third-party software; served data</td><td>often empty; the standard's escape hatches</td></tr>
+</table>
+<p>Two of those rows deserve emphasis now because whole modules stand on them. <strong><code>/proc</code> and <code>/sys</code> are not storage.</strong> Nothing in them is on the disk. They are a conversation with the running kernel wearing the costume of a filesystem: when you read <code>/proc/meminfo</code>, no file is opened — the kernel generates that text at the instant you ask. This is a deliberate design choice, and it is why every tool that reports on the system (<code>ps</code>, <code>free</code>, <code>top</code>) turns out to be a thin wrapper around reading text files. B3 makes you watch it happen.</p>
+<p>And the <strong><code>/etc</code> versus <code>/var</code> distinction</strong> is the one that pays off constantly, because it tells you which files are precious. Configuration is what you set and can rewrite; state is what the machine produced and mostly cannot be regenerated. On a Kubernetes node those two directories are exactly where everything interesting lives — <code>/etc/kubernetes</code> holds the manifests and certificates somebody configured, <code>/var/lib/kubelet</code> and <code>/var/lib/containerd</code> hold gigabytes the machine accumulated by running.</p>
+<p>One historical wrinkle you will see the moment you run the lab: on modern Ubuntu, <code>/bin</code>, <code>/sbin</code> and <code>/lib</code> are no longer directories at all. They are symbolic links to their counterparts inside <code>/usr</code> — a tidy-up known as the "merged <code>/usr</code>" transition, done so that everything a package installs lives under one subtree that can be shared or mounted read-only. The old names still work, which is the point.</p>
+<h5>Lab</h5>
+<ol>
+<li>Look at the root of the tree with types shown. Read down the list and say each entry's job out loud before moving on — that sounds silly and is the actual exercise.
+<pre class="cmd">ls -l /</pre>
+<pre class="out"><b>lrwxrwxrwx  1 root root    7 Apr 22  2024 bin -&gt; usr/bin</b>
+drwxr-xr-x  4 root root 4096 Jul 23 13:55 boot
+drwxr-xr-x 16 root root 3900 Jul 23 14:01 dev
+drwxr-xr-x 96 root root 4096 Jul 23 14:02 <b>etc</b>
+drwxr-xr-x  3 root root 4096 Jul 23 13:56 <b>home</b>
+dr-xr-xr-x 13 root root    0 Jul 23 14:01 <b>proc</b>
+drwxr-xr-x 25 root root  660 Jul 23 14:02 <b>run</b>
+dr-xr-xr-x 13 root root    0 Jul 23 14:01 <b>sys</b>
+drwxrwxrwt 11 root root 4096 Jul 23 14:03 <b>tmp</b>
+drwxr-xr-x 12 root root 4096 Apr 22  2024 <b>usr</b>
+drwxr-xr-x 13 root root 4096 Jul 23 13:56 <b>var</b></pre>
+<p>Note the first line: <code>bin</code> is an <code>l</code>, a symlink, pointing at <code>usr/bin</code>. Note also that <code>proc</code> and <code>sys</code> report size <code>0</code> — there is nothing there to have a size.</p></li>
+<li>Confirm that <code>/proc</code> is generated rather than stored. Ask what kind of filesystem is mounted at each of three places; the answers are three different words, and only one of them is a disk.
+<pre class="cmd">stat -fc '%n: %T' / /proc /sys /run</pre>
+<pre class="out">/: <b>ext2/ext3</b>
+/proc: <b>proc</b>
+/sys: <b>sysfs</b>
+/run: <b>tmpfs</b></pre>
+<p><code>ext2/ext3</code> is how <code>stat</code> labels the ext4 filesystem on your virtual disk. The other three are not disks at all: <code>proc</code> and <code>sysfs</code> are the kernel answering questions, <code>tmpfs</code> is memory pretending to be a disk.</p></li>
+<li>Watch the kernel invent a file. <code>/proc/uptime</code> has no size and no blocks, yet it has content — and the content is different every time you read it.
+<pre class="cmd">ls -l /proc/uptime
+cat /proc/uptime; sleep 2; cat /proc/uptime</pre>
+<pre class="out">-r--r--r-- 1 root root <b>0</b> Jul 23 14:05 /proc/uptime
+<b>412.55</b> 806.12
+<b>414.61</b> 810.23</pre></li>
+<li>Find where the machine's state is piling up. <code>du</code> adds up the disk used by a directory tree; <code>-s</code> asks for one summary line per argument and <code>-h</code> for human-readable units.
+<pre class="cmd">sudo du -sh /var/log /var/lib /etc /home</pre>
+<pre class="out">12M     <b>/var/log</b>
+248M    <b>/var/lib</b>
+5.1M    /etc
+92K     /home</pre>
+<p>The shape of that answer is the general case: configuration is small, state is large. On a Kubernetes node the same command puts hundreds of megabytes or more under <code>/var/lib/containerd</code>.</p></li>
+<li>Prove <code>/run</code> is memory-backed and therefore empty at every boot, by looking at what is there now — process id files and sockets, nothing that would survive a restart.
+<pre class="cmd">ls /run | head -8</pre>
+<pre class="out">containerd
+lock
+log
+sshd.pid
+systemd
+udev
+user
+utmp</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking, say which directory each of these belongs in: an SSH server's settings; yesterday's authentication log; the <code>ls</code> binary; a running process's memory statistics; a lock file that must vanish on reboot. (<code>/etc/ssh</code>, <code>/var/log</code>, <code>/usr/bin</code>, <code>/proc</code>, <code>/run</code>.) Then check yourself: <code>ls /etc/ssh/sshd_config /var/log/auth.log /usr/bin/ls /proc/self/status /run/lock</code> should print all five paths with no errors.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>/tmp</code> is genuinely temporary — <code>systemd-tmpfiles</code> cleans files there on a schedule and the directory is emptied at boot, so anything you leave overnight may simply be gone. That is a feature, not a bug, and it is why "I'll just put it in <code>/tmp</code> for a minute" is fine and "I'll keep my notes in <code>/tmp</code>" is not. Its permissions look alarming (<code>drwxrwxrwt</code> — everyone may write) but the trailing <code>t</code> is the sticky bit, which stops you deleting other people's files there; B4 covers it properly.</p>
+<p>Writing your own files into <code>/usr</code> works right up until the package manager overwrites or removes them, because <code>/usr</code> is considered owned by the packaging system. Local additions belong in <code>/usr/local</code> or <code>/opt</code>, which exist precisely so the two never collide.</p>
+<p>Do not assume every entry under <code>/proc</code> is a process. The numbered directories are (one per process id), but the named ones — <code>meminfo</code>, <code>cpuinfo</code>, <code>mounts</code>, <code>sys</code> — are system-wide, and <code>/proc/sys</code> in particular is a completely different thing from the <code>/sys</code> directory: it holds tunable kernel parameters, the ones <code>sysctl</code> reads and writes.</p>
+<div class="k8s-link">
+<p>When something on a Kubernetes node breaks badly enough that <code>kubectl</code> cannot help — the API server itself is down, or the kubelet never started — the only thing left is a shell on the node and the knowledge of which directory to open. That ladder is <a href="w6.html#cp-6-2">W6.2 — where logs physically live</a>, and every rung of it is a path in the table above.</p>
+<p>The map is short and worth recognising now: <code>/etc/kubernetes</code> holds the control-plane manifests and the whole certificate tree; <code>/var/lib/kubelet</code> holds the kubelet's state and every pod's volumes (<a href="w5.html#cp-5-2">W5.2</a>); <code>/var/log/pods</code> and <code>/var/log/containers</code> hold what <code>kubectl logs</code> normally hands you; <code>/var/lib/containerd</code> holds the unpacked image layers you will build by hand in B5. Configuration in <code>/etc</code>, accumulated state in <code>/var</code> — the same rule, one layer up.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 file-hierarchy</code> is the modern, systemd-flavoured description of this layout and is more readable than the standard itself. <code>man 5 proc</code> is the enormous, authoritative reference for every file under <code>/proc</code> — skim its table of contents, do not read it. <code>man 8 systemd-tmpfiles</code> explains exactly when <code>/tmp</code> is cleaned.</p>
+</article>
+
+<article class="lesson" id="cp-b1-3" data-id="b1-3">
+<div class="lesson-head"><span class="cp-id">B1.3</span><h4>Read <code>ls -l</code> completely, left to right</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Most people learn <code>ls -l</code> by absorbing two of its columns — the name, and roughly whether something is a directory — and ignore the rest for years. Every column is load-bearing. The very first character alone will one day tell you why a program is hanging on something that looks like an ordinary file, and the permission triads are the answer to about a third of all "permission denied" mysteries.</p>
+<h5>The concept</h5>
+<p>One line of <code>ls -l</code> carries eight pieces of information, in a fixed order:</p>
+<pre class="out">- rw-r--r--  1  root  root  1024  Jul 23 14:02  /etc/hostname
+1     2      3    4     5      6         7             8
+
+1  type character        what kind of thing this is
+2  permission triads     what owner / group / everyone else may do
+3  link count            how many names in the tree point at this file
+4  owner                 the user who owns it
+5  group                 the group that owns it
+6  size                  bytes of content (or major,minor for a device)
+7  mtime                 when the contents last changed
+8  name</pre>
+<p>The <strong>type character</strong> is the one that repays learning today, because "everything is a file" turns out to be meant literally. Seven different kinds of thing appear in the same tree, with the same permission bits, answering the same <code>read</code> and <code>write</code> system calls — and only this character tells them apart.</p>
+<table>
+<tr><th>Char</th><th>Kind</th><th>What it is</th><th>Find one at</th></tr>
+<tr><td><code>-</code></td><td>regular file</td><td>bytes on a disk</td><td><code>/etc/hostname</code></td></tr>
+<tr><td><code>d</code></td><td>directory</td><td>a list mapping names to inode numbers</td><td><code>/etc</code></td></tr>
+<tr><td><code>l</code></td><td>symbolic link</td><td>a file whose contents are another path</td><td><code>/bin</code></td></tr>
+<tr><td><code>c</code></td><td>character device</td><td>a driver you read/write a byte at a time</td><td><code>/dev/null</code>, your terminal</td></tr>
+<tr><td><code>b</code></td><td>block device</td><td>a driver addressed in fixed-size blocks</td><td><code>/dev/sda</code></td></tr>
+<tr><td><code>s</code></td><td>socket</td><td>two-way local communication between processes</td><td><code>/run/systemd/private</code></td></tr>
+<tr><td><code>p</code></td><td>named pipe (FIFO)</td><td>a one-way pipe that has a name in the tree</td><td>one you make with <code>mkfifo</code></td></tr>
+</table>
+<p>That uniformity is not a curiosity; it is the design decision the entire operating system rests on. A program that can write to a file can write to a terminal, a disk, a network peer or another program without knowing which — same <code>write</code> call, different type character. It is why B3's <code>strace</code> can show one program talking to all four in identical syntax, and why a container runtime can hand a process a socket where it expected a file and nothing notices.</p>
+<p>The <strong>permission triads</strong> are three groups of <code>rwx</code>: what the owner may do, what members of the group may do, what everyone else may do. A <code>-</code> means that bit is off. The full semantics — including the surprise that <code>x</code> on a <em>directory</em> means "may traverse", not "may execute" — is B4's job; for now just read them aloud correctly.</p>
+<p>The <strong>link count</strong> is the field people skip and then find baffling. It is the number of directory entries pointing at this file's underlying object. For a regular file it is normally 1. For a directory it is at least 2, because a directory is named by its parent <em>and</em> by its own <code>.</code> entry — and it gains one more for every subdirectory, since each of those contains a <code>..</code> pointing back. That is why <code>ls -ld /etc</code> shows a link count in the nineties: <code>/etc</code> has that many subdirectories. B1.4 takes the idea apart.</p>
+<h5>Lab</h5>
+<ol>
+<li>Get one of each type character on screen. Two of them do not exist yet, so make them: <code>mkfifo</code> creates a named pipe, and the socket you can borrow from systemd.
+<pre class="cmd">cd ~
+mkfifo mypipe
+ls -l /etc/hostname /bin /dev/null /dev/sda mypipe
+ls -ld /etc
+ls -l /run/systemd/private</pre>
+<pre class="out"><b>-</b>rw-r--r--  1 root root    8 Jul 23 13:56 /etc/hostname
+<b>l</b>rwxrwxrwx  1 root root    7 Apr 22  2024 /bin -&gt; usr/bin
+<b>c</b>rw-rw-rw-  1 root root <b>1, 3</b> Jul 23 14:01 /dev/null
+<b>b</b>rw-rw----  1 root disk <b>8, 0</b> Jul 23 14:01 /dev/sda
+<b>p</b>rw-rw-r--  1 ubuntu ubuntu 0 Jul 23 14:20 mypipe
+<b>d</b>rwxr-xr-x 96 root root 4096 Jul 23 14:02 /etc
+<b>s</b>rw-rw-rw-  1 root root    0 Jul 23 14:01 /run/systemd/private</pre>
+<p>Look at the size column on the two device lines: it is not a size at all but a pair of numbers, <code>1, 3</code> and <code>8, 0</code>. Those are the <strong>major and minor device numbers</strong> — the major picks which kernel driver handles it, the minor picks which device that driver means. A device file has no contents; it is an address label for a driver.</p></li>
+<li>Prove the named pipe really is a pipe, by using it as one. Open two terminals into the sandbox — or use a background job, as here. The reader blocks until something writes.
+<pre class="cmd">cat mypipe &amp;
+echo 'hello through a file' &gt; mypipe</pre>
+<pre class="out"><b>hello through a file</b></pre>
+<p>Nothing was ever stored. <code>mypipe</code> still has size 0. The text went from one process to the other through the kernel, using a name in the filesystem purely as a meeting point.</p></li>
+<li>Read the link counts and check the arithmetic. A directory's count is 2 plus the number of subdirectories it has.
+<pre class="cmd">ls -ld /etc/systemd
+ls -l /etc/systemd | grep -c '^d'</pre>
+<pre class="out">drwxr-xr-x <b>5</b> root root 4096 Jul 23 13:56 /etc/systemd
+<b>3</b></pre>
+<p>Link count 5 = 1 (its name in <code>/etc</code>) + 1 (its own <code>.</code>) + 3 (a <code>..</code> in each of its three subdirectories). If your numbers differ, do the same arithmetic with yours — the relationship is what matters.</p></li>
+<li>See what a symlink actually contains. It is not a pointer the kernel keeps in a table; it is a tiny file whose entire contents are a path string, which is why its size is exactly the length of that string.
+<pre class="cmd">ls -l /bin
+readlink /bin</pre>
+<pre class="out">lrwxrwxrwx 1 root root <b>7</b> Apr 22  2024 /bin -&gt; usr/bin
+<b>usr/bin</b></pre>
+<p>Size 7, and <code>usr/bin</code> is seven characters. That is the whole file.</p></li>
+<li>Clean up the pipe.
+<pre class="cmd">rm mypipe</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You found and can point at one example of each of <code>-</code> <code>d</code> <code>l</code> <code>c</code> <code>b</code> <code>s</code> <code>p</code> on your own machine. Then answer without running it: <code>ls -l</code> shows a file with link count 3 — how many names does that file have in the filesystem, and what happens to the contents if you delete one of them? (Three names; deleting one leaves the other two and the contents entirely intact.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>ls -l</code> on a symbolic link describes <em>the link</em>, not what it points at — the permissions <code>lrwxrwxrwx</code> are meaningless, since access is always decided by the target. Add <code>-L</code> to follow the link and report the target instead. This trips people up when they check permissions on a symlinked config file, see <code>rwxrwxrwx</code>, and conclude the file is world-writable.</p>
+<p>The size column for a directory (usually 4096) is the size of the list of names, not of everything inside it. A directory holding a hundred gigabytes still reads 4096. To ask the question you meant, use <code>du -sh</code>.</p>
+<p>Names beginning with a dot are not shown unless you pass <code>-a</code>, and this has bitten everybody at least once: you copy a directory, or empty one with <code>rm *</code>, and the dotfiles quietly stay behind because the shell's <code>*</code> does not match them either. B1.8 explains why the glob behaves that way.</p>
+<div class="k8s-link">
+<p>Those type characters are not trivia in Kubernetes — they appear verbatim in the API. A <code>hostPath</code> volume takes an optional <code>type:</code> field whose allowed values are literally <code>Directory</code>, <code>File</code>, <code>Socket</code>, <code>CharDevice</code> and <code>BlockDevice</code>, and the kubelet refuses to start the pod if what it finds on the node is a different type from what you declared. See <a href="w5.html#cp-5-1">W5.1 — the ephemeral volumes</a>.</p>
+<p>That check exists because the alternative is worse: with no type declared, the kubelet will happily <em>create an empty directory</em> at a path you meant to be a file, and the failure surfaces much later as an application reading nothing. The socket case is the one you will meet in real life — mounting <code>/var/run/docker.sock</code> or a CSI driver's socket into a container is exactly the <code>s</code> from the table above, handed across a namespace boundary.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ls</code> for the flags, but the field descriptions live in <code>man 1 stat</code> and <code>man 2 stat</code> — the latter documents the type bits the character comes from. <code>man 7 inode</code> is the concise reference for the file types themselves. <code>man 1 mkfifo</code> and <code>man 7 fifo</code> for named pipes, <code>man 4 null</code> for the device file you will use constantly in B1.6.</p>
+</article>
+
+<article class="lesson" id="cp-b1-4" data-id="b1-4">
+<div class="lesson-head"><span class="cp-id">B1.4</span><h4>Go one level deeper with <code>stat</code>: inodes, links and the three timestamps</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There is one idea in this lesson, and it quietly explains a dozen otherwise-confusing behaviours: <strong>a file is not its name</strong>. The name and the file are separate objects, and the name is the disposable one. Once you have that, "why is my disk full when I deleted the log", "why did my config change not take effect", and "why does <code>mv</code> across disks take a minute when across directories it is instant" all stop being mysteries and become the same fact.</p>
+<h5>The concept</h5>
+<p>Every file on a filesystem is an <strong>inode</strong> — a numbered record holding everything about the file <em>except</em> its name: the type, the permissions, the owner, the size, the timestamps, and the list of disk blocks with the actual contents. A directory is just a table mapping names to inode numbers. So the name lives in the directory, and the file lives in the inode, and they are joined only by that number.</p>
+<div class="flow"><span>directory entry<br><code>"notes.txt"</code></span><em>→</em><span class="hot">inode 262145</span><em>→</em><span>permissions, owner,<br>timestamps, block list</span><em>→</em><span>the bytes</span></div>
+<p>Several names may point at the same inode. Each such name is a <strong>hard link</strong>, and the inode counts them — that is the link count from B1.3. The consequences fall straight out:</p>
+<ul>
+<li><strong>Deleting is unlinking.</strong> <code>rm</code> removes a <em>name</em> and decrements the count. The file itself is only destroyed when the count reaches zero <em>and</em> no process still has it open. This is exactly why a deleted log file can keep occupying disk space until the program writing it is restarted — <code>du</code> cannot see it because it has no name left, but the blocks are still allocated.</li>
+<li><strong>Renaming is cheap.</strong> <code>mv</code> within one filesystem rewrites a directory entry and touches nothing else, however large the file. Across filesystems it must genuinely copy and delete, because inode numbers are only meaningful within one filesystem.</li>
+<li><strong>Hard links are not copies.</strong> There is one file with two names; writing through either name changes the same bytes. And a hard link cannot cross filesystems or (normally) point at a directory, for the same reason.</li>
+</ul>
+<p>A <strong>symbolic link</strong> is the other thing entirely, and worth contrasting once: it is its own inode, whose contents are a <em>path string</em> the kernel re-resolves on every access. So a symlink can cross filesystems, can point at something that does not exist, and breaks if the target is renamed — none of which is true of a hard link.</p>
+<p>Then the three timestamps, which are three genuinely different questions and are constantly confused:</p>
+<table>
+<tr><th>Field</th><th>Question it answers</th><th>Moved by</th></tr>
+<tr><td><strong>atime</strong> — access</td><td>when were the contents last <em>read</em>?</td><td><code>cat</code>, and any read — but see the gotcha</td></tr>
+<tr><td><strong>mtime</strong> — modify</td><td>when did the <em>contents</em> last change?</td><td>writing to the file; this is what <code>ls -l</code> shows</td></tr>
+<tr><td><strong>ctime</strong> — change</td><td>when did the <em>inode</em> last change?</td><td>writing, <em>and also</em> <code>chmod</code>, <code>chown</code>, adding a hard link</td></tr>
+</table>
+<p>The trap is the name: <strong>ctime is not creation time.</strong> It is "inode change time", and it moves on permission changes that leave the contents untouched. Traditional Unix simply did not record creation time at all; modern Linux filesystems do keep a birth time, which <code>stat</code> will show as <code>Birth:</code> when the filesystem supports it.</p>
+<h5>Lab</h5>
+<ol>
+<li>Make a file and read its inode record. Every field in this output was described above — go through them one at a time.
+<pre class="cmd">cd ~
+echo hello &gt; notes.txt
+stat notes.txt</pre>
+<pre class="out">  File: notes.txt
+  Size: 6          Blocks: 8          IO Block: 4096   regular file
+Device: 8,1  <b>Inode: 262145</b>  <b>Links: 1</b>
+Access: (0644/-rw-r--r--)  Uid: ( 1000/  ubuntu)   Gid: ( 1000/  ubuntu)
+<b>Access: 2026-07-23 14:30:01.000000000 +0000</b>
+<b>Modify: 2026-07-23 14:30:01.000000000 +0000</b>
+<b>Change: 2026-07-23 14:30:01.000000000 +0000</b>
+ Birth: 2026-07-23 14:30:01.000000000 +0000</pre></li>
+<li>Give the same file a second name. Nothing is copied; the link count goes up and both names report the identical inode number.
+<pre class="cmd">ln notes.txt second-name.txt
+stat -c '%i %h %n' notes.txt second-name.txt</pre>
+<pre class="out"><b>262145 2</b> notes.txt
+<b>262145 2</b> second-name.txt</pre>
+<p><code>-c</code> lets you ask for exactly the fields you want: <code>%i</code> inode, <code>%h</code> link count, <code>%n</code> name. Same inode, count now 2.</p></li>
+<li>Prove they are one file, then prove that deleting a name is not deleting the file.
+<pre class="cmd">echo 'written through the second name' &gt;&gt; second-name.txt
+cat notes.txt
+rm notes.txt
+cat second-name.txt</pre>
+<pre class="out">hello
+<b>written through the second name</b>
+hello
+<b>written through the second name</b></pre></li>
+<li>Now watch each timestamp move for its own reason. First <code>chmod</code>, which changes the inode but not one byte of content: <strong>ctime moves, mtime does not.</strong>
+<pre class="cmd">stat -c 'mtime=%y ctime=%z' second-name.txt
+chmod 600 second-name.txt
+stat -c 'mtime=%y ctime=%z' second-name.txt</pre>
+<pre class="out">mtime=2026-07-23 14:31:12 <b>ctime=2026-07-23 14:31:12</b>
+mtime=2026-07-23 14:31:12 <b>ctime=2026-07-23 14:33:40</b></pre></li>
+<li>Then a write, which changes the contents and therefore moves both.
+<pre class="cmd">echo more &gt;&gt; second-name.txt
+stat -c 'mtime=%y ctime=%z' second-name.txt</pre>
+<pre class="out"><b>mtime=2026-07-23 14:34:07 ctime=2026-07-23 14:34:07</b></pre></li>
+<li><code>touch</code> with no options sets all three to now, without changing the contents — which is exactly what it is for, and why <code>touch</code> is the standard way to make something look freshly built.
+<pre class="cmd">touch second-name.txt
+stat -c '%y | %z | %s bytes' second-name.txt</pre>
+<pre class="out">2026-07-23 14:35:22 | 2026-07-23 14:35:22 | <b>38 bytes</b></pre></li>
+<li>See the deleted-but-still-open case for yourself, because it is the one that costs people an afternoon. Start a process writing to a file, delete the file's only name, then look at the space.
+<pre class="cmd">sleep 300 &gt; ghost.log &amp;
+rm ghost.log
+ls ghost.log
+sudo ls -l /proc/$!/fd/1</pre>
+<pre class="out">ls: cannot access 'ghost.log': <b>No such file or directory</b>
+l-wx------ 1 ubuntu ubuntu 64 Jul 23 14:36 /proc/4412/fd/1 -&gt; <b>/home/ubuntu/ghost.log (deleted)</b></pre>
+<p>The name is gone from the directory, so nothing that walks the tree can find it, but the process still holds it open — link count 0, open count 1 — so the inode and its blocks live on until that process exits. Kill it with <code>kill %1</code> and the space returns.</p></li>
+<li>Clean up.
+<pre class="cmd">kill %1 2&gt;/dev/null; rm -f second-name.txt</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, without looking: why <code>chmod</code> moves ctime but not mtime; why <code>rm</code> on a file with link count 3 destroys nothing; and why a full disk can show no large files under <code>du</code>. Then check the first one mechanically — <code>stat -c '%h' /etc</code> should print a number well above 2, and you should be able to say what that number counts.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>atime is not updated the way you would expect, and if you test it naively you will conclude your machine is broken. Linux mounts filesystems with <code>relatime</code> by default: the access time is only written if it was older than the modify time, or older than about a day. Updating it on every read would mean a disk write for every file read, which is an absurd price for a field almost nobody uses.</p>
+<p>"ctime is creation time" is such a common misreading that it is worth over-learning the correct one: <strong>c is for change</strong>, meaning a change to the inode. If you want creation time, look for <code>Birth:</code> in <code>stat</code> output — and be ready for a dash instead, because not every filesystem records it.</p>
+<p>Editors are where the inode idea reaches out and bites. Many of them — <code>vim</code> included, by default — do not write into your file; they write a new file and rename it over the top, which gives you a <em>new inode</em>. So a hard link you carefully made to that file no longer follows the changes, and a program holding the old file open keeps reading the old contents. Anything that must survive editing should be a symlink, or you should configure the editor to write in place.</p>
+<div class="k8s-link">
+<p>Kubernetes uses this exact machinery, and knowing it explains one of the platform's most confusing behaviours. When you mount a ConfigMap or Secret into a pod, the kubelet does not edit files in place. It writes the new contents into a fresh timestamped directory and then <strong>atomically swaps a symlink</strong> to point at it — the same "the name is the disposable part" trick you just used with <code>ln</code>, applied so that a container can never observe a half-updated set of files.</p>
+<p>The consequence is <a href="w3.html#cp-3-22">W3.22 — update propagation: volumes update, env never, subPath never</a>. A ConfigMap mounted as a volume updates live, because the symlink is re-pointed under the running process. Mounted with <code>subPath</code>, it does not — because <code>subPath</code> mounts one <em>file</em> directly, bypassing the symlink swap, and the container is left holding the original inode. That is not a Kubernetes quirk. That is inodes.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 inode</code> — the concise, authoritative description of everything in this lesson, including the timestamp definitions. <code>man 1 stat</code> for the <code>-c</code> format specifiers, <code>man 2 stat</code> for the underlying system call, <code>man 1 ln</code> for hard versus symbolic (<code>-s</code>), and <code>man 5 fstab</code> if you want to see where <code>relatime</code> is set.</p>
+</article>
+</div>
+
+<nav class="pager"><a href="b0.html">← B0 · Your Linux sandbox</a><a href="../beginner.html#b1">Beginner tracker →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-23. Package versions referenced: coreutils 9.4, procps 4.0.4, vim 9.1. Note that <code>net-tools</code> is <em>not</em> installed on this image — <code>ss</code> and <code>ip</code> replace <code>netstat</code> and <code>ifconfig</code>.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
