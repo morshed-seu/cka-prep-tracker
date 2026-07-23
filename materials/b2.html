@@ -378,6 +378,320 @@ pkill sleep</pre>
 <p class="docs-links"><code>man 5 proc</code> is the whole lesson in reference form — and on Ubuntu 24.04 it has been split, so also check <code>man 5 proc_pid_status</code> and <code>man 5 proc_pid_maps</code> if a subsection seems missing. <code>man 8 lsof</code> for <code>+L1</code>. <code>man 1 tr</code> for the <code>\0</code> translation. When a tool's output confuses you, the honest next step is <code>man 5 proc</code> and reading the source of the number yourself.</p>
 </article>
 </div>
+
+<!-- ---------------- Lifecycle ---------------- -->
+<div class="grp" id="g-life"><h3>Lifecycle</h3>
+
+<article class="lesson" id="cp-b2-5" data-id="b2-5">
+<div class="lesson-head"><span class="cp-id">B2.5</span><h4>How a process is really created: <code>fork</code>, then <code>exec</code>, then <code>wait</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every other operating system you have used offers one call that means "run this program". Linux does not, and the split looks like a historical accident until you notice that the gap between the two calls is where <em>everything interesting happens</em>. Shell redirection lives in that gap. Dropping privileges lives in that gap. Joining a cgroup, entering namespaces, setting resource limits — every one of them happens in the moment after a process has been created and before it has become the program you asked for. Container runtimes are, almost entirely, code that runs in that gap.</p>
+<h5>The concept</h5>
+<p>Three calls, each with one job:</p>
+<ul>
+<li><strong><code>fork()</code></strong> makes a near-identical copy of the calling process. Two processes now exist, both sitting at the same line of code, both about to return from the same call. They are distinguished only by what <code>fork</code> returns: the child gets <code>0</code>, the parent gets the child's PID. That one difference is how each half knows which half it is.</li>
+<li><strong><code>exec()</code></strong> throws away the calling process's program and loads a different one in its place. This is not "start a new process" — the PID does not change, the open descriptors do not change, the credentials do not change. Only the code and memory are replaced. A successful <code>exec</code> never returns, because there is nothing left to return to.</li>
+<li><strong><code>wait()</code></strong> blocks the parent until a child ends, and hands back that child's exit status. Without it the parent has no way to learn whether its child succeeded, and the child's exit status has nowhere to go — which is where zombies come from (B2.9).</li>
+</ul>
+<p>Now the payoff. Between <code>fork</code> and <code>exec</code>, the child is a copy of the parent that is <em>already running its own code</em> and can therefore adjust <strong>itself</strong> before becoming the target program. It does not have to ask the parent to set things up, and it does not need the target program to cooperate. That is why <code>ls &gt; out.txt</code> works with a program that knows nothing about redirection: the shell forks, the child points its own descriptor 1 at <code>out.txt</code>, and only then execs <code>ls</code>, which writes to descriptor 1 exactly as it always does.</p>
+<svg viewBox="0 0 660 210" width="100%" style="max-width:660px" role="img" aria-label="Timeline: the parent calls fork, producing a child that first adjusts itself in the gap, then calls exec to become a new program; when the child exits, the parent's wait returns with its status.">
+  <rect x="8" y="8" width="644" height="194" rx="10" fill="none" stroke="var(--line)"/>
+
+  <line x1="40" y1="52" x2="620" y2="52" stroke="var(--ink)" stroke-width="2"/>
+  <text x="40" y="38" fill="var(--muted)" font-size="11">parent</text>
+  <line x1="40" y1="150" x2="620" y2="150" stroke="var(--ink)" stroke-width="2"/>
+  <text x="40" y="184" fill="var(--muted)" font-size="11">child (same PID from fork to exit)</text>
+
+  <path d="M170 52 L170 150" stroke="var(--accent)" stroke-width="2"/>
+  <circle cx="170" cy="52" r="4" fill="var(--accent)"/>
+  <text x="170" y="30" fill="var(--accent)" font-size="12" text-anchor="middle">fork()</text>
+
+  <rect x="176" y="128" width="132" height="44" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="242" y="146" fill="var(--ink)" font-size="10.5" text-anchor="middle">the gap: redirect fds,</text>
+  <text x="242" y="160" fill="var(--ink)" font-size="10.5" text-anchor="middle">drop privs, join cgroup</text>
+
+  <circle cx="330" cy="150" r="4" fill="var(--accent)"/>
+  <text x="330" y="120" fill="var(--accent)" font-size="12" text-anchor="middle">exec()</text>
+  <text x="410" y="140" fill="var(--muted)" font-size="10.5" text-anchor="middle">now running the target program</text>
+
+  <circle cx="520" cy="150" r="4" fill="var(--ink)"/>
+  <text x="520" y="184" fill="var(--ink)" font-size="11" text-anchor="middle">exit(status)</text>
+  <path d="M520 150 L520 52" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <circle cx="520" cy="52" r="4" fill="var(--ink)"/>
+  <text x="520" y="30" fill="var(--ink)" font-size="12" text-anchor="middle">wait() returns</text>
+
+  <path d="M176 52 L512 52" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 3"/>
+  <text x="344" y="70" fill="var(--muted)" font-size="10.5" text-anchor="middle">parent blocked in wait()</text>
+</svg>
+<p>Read left to right: one process becomes two at <code>fork</code>, the child rearranges its own world, <code>exec</code> swaps in the new program without changing the PID, and the exit status travels back up the dashed line when the parent calls <code>wait</code>.</p>
+<p>One more thing worth knowing, because "makes a copy" sounds ruinously expensive: it is not a real copy. The kernel gives parent and child the same physical pages marked read-only, and only duplicates a page when one of them writes to it — <strong>copy-on-write</strong>. Since the overwhelmingly common case is <code>fork</code> immediately followed by <code>exec</code>, which discards the memory anyway, almost nothing is ever actually copied.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See the gap without writing any C at all. Your shell does this thousands of times a day: it forks, the child redirects its own descriptor 1, then it execs a program that has no idea redirection happened.
+<pre class="cmd">cd ~
+ls /etc &gt; /tmp/listing.txt
+head -3 /tmp/listing.txt</pre>
+<pre class="out">adduser.conf
+alsa
+alternatives</pre></li>
+<li>Prove the "exec does not change the PID" claim, which is the part people disbelieve. <code>exec</code> is also a shell builtin, and using it makes your shell replace <em>itself</em> — same process, new program.
+<pre class="cmd">echo "shell PID is $$"
+bash -c 'echo "subshell PID is $$"; exec sleep 5; echo "never printed"'</pre>
+<pre class="out">shell PID is 2260
+subshell PID is <b>2901</b></pre>
+<p>While that runs, in a second terminal, <code>ps -o pid,comm -p 2901</code> shows PID 2901 is now <code>sleep</code>. Same process; different program. And the final <code>echo</code> never runs, because a successful <code>exec</code> has nowhere to return to.</p></li>
+<li>Now write the three calls out explicitly. Create <code>~/forkdemo.c</code>:
+<pre class="cmd">cat &gt; ~/forkdemo.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/wait.h&gt;
+
+int main(void) {
+    printf("before fork: pid=%d\n", getpid());
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (pid &lt; 0) { perror("fork"); exit(1); }
+
+    if (pid == 0) {
+        /* the gap: we are the child, and we can adjust ourselves */
+        printf("  child: pid=%d ppid=%d\n", getpid(), getppid());
+        fflush(stdout);
+        execlp("date", "date", "+%H:%M:%S", (char *)NULL);
+        perror("exec");           /* only reached if exec failed */
+        exit(127);
+    }
+
+    int status;
+    waitpid(pid, &amp;status, 0);
+    if (WIFEXITED(status))
+        printf("parent: child %d exited with %d\n", pid, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        printf("parent: child %d killed by signal %d\n", pid, WTERMSIG(status));
+    return 0;
+}
+EOF
+gcc -Wall -o ~/forkdemo ~/forkdemo.c &amp;&amp; ~/forkdemo</pre>
+<pre class="out">before fork: pid=2934
+  <b>child: pid=2935 ppid=2934</b>
+09:47:12
+<b>parent: child 2935 exited with 0</b></pre></li>
+<li>Read what happened line by line: one process printed the first line; after <code>fork</code> there were two; the child printed its own identity and then <em>became</em> <code>date</code> without changing PID; the parent's <code>waitpid</code> unblocked and collected the status. Three calls, three distinct jobs.</li>
+<li>Now use the gap for something real. Add a redirection to the child before it execs, and the target program is redirected without knowing it — exactly the mechanism from step 1.
+<pre class="cmd">sed -i '4i #include &lt;fcntl.h&gt;' ~/forkdemo.c
+sed -i 's#/\* the gap.*#int fd = open("/tmp/child.out", O_WRONLY|O_CREAT|O_TRUNC, 0644); dup2(fd, 1);#' ~/forkdemo.c
+gcc -Wall -o ~/forkdemo ~/forkdemo.c &amp;&amp; ~/forkdemo</pre>
+<pre class="out">before fork: pid=2961
+parent: child 2962 exited with 0</pre>
+<p>The child's two lines are missing from the terminal. They are in the file, and one of them was written by <code>date</code> — a program with no redirection code in it anywhere:</p>
+<pre class="cmd">cat /tmp/child.out</pre>
+<pre class="out"><b>  child: pid=2962 ppid=2961</b>
+<b>09:48:30</b></pre></li>
+<li>Finally, watch copy-on-write refuse to be expensive. Fork a process holding a gigabyte and ask how much physical memory the two of them are really costing. <code>Pss</code> — proportional set size — divides each shared page's cost between everyone mapping it, which is exactly the question RSS cannot answer.
+<pre class="cmd">free -m | awk 'NR==2{print "available before: " $7 " MB"}'
+python3 -c '
+import os, time
+buf = bytearray(1024*1024*1024)
+pid = os.fork()
+if pid == 0:
+    time.sleep(15); os._exit(0)
+time.sleep(2)
+os.system("free -m | awk \"NR==2{print \\\"available after fork: \\\" \\$7 \\\" MB\\\"}\"")
+os.system("grep -H ^Pss: /proc/%d/smaps_rollup /proc/%d/smaps_rollup" % (os.getpid(), pid))
+os.system("grep -H VmRSS /proc/%d/status /proc/%d/status" % (os.getpid(), pid))
+os.wait()'</pre>
+<pre class="out">available before: 2698 MB
+available after fork: <b>1681 MB</b>
+/proc/3011/smaps_rollup:Pss:    <b>527024 kB</b>
+/proc/3012/smaps_rollup:Pss:    <b>526293 kB</b>
+/proc/3011/status:VmRSS:       <b>1058056 kB</b>
+/proc/3012/status:VmRSS:       <b>1054156 kB</b></pre>
+<p>Read those four numbers carefully, because they make two separate points. The fork cost the machine about one gigabyte in total, not two — that is copy-on-write. And each process reports the <em>whole</em> gigabyte in RSS while reporting <em>half</em> of it in Pss, which is the B2.2 caveat made concrete: RSS counts a shared page in full for everyone who maps it, so it is the right per-process number and the wrong thing to add up.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, without notes, why <code>ls &gt; out.txt</code> works even though <code>ls</code> contains no code about files named <code>out.txt</code>. Then answer: after a successful <code>execlp</code>, why is the following line of C unreachable? And: what does <code>fork</code> return, in each of the two processes?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Forgetting <code>fflush(stdout)</code> before <code>fork</code> is a classic and produces baffling duplicate output. Standard output to a file is block-buffered, so text you "printed" may still be sitting in the process's buffer — and <code>fork</code> copies the buffer, so both processes flush it later and the line appears twice. It is not a fork bug; it is a copy of unflushed state behaving exactly as documented.</p>
+<p><code>exec</code> failing does not end the process, it just returns. That is why every correct fork/exec has an <code>exit()</code> immediately after the <code>exec</code> call — without it, a failed exec leaves you with a stray copy of the parent running the parent's code, which is a genuinely confusing bug to inherit. The conventional exit code there is 127, matching the shell's "command not found" (B2.8).</p>
+<p>The child inherits open descriptors, and that includes ones you did not think about. A child holding an inherited descriptor to a log file or a listening socket keeps that resource alive after the parent is gone — this is the reason a restarted service sometimes cannot bind its port ("address already in use") even though the old process is definitely dead: a forgotten child still holds the socket. The fix is the <code>FD_CLOEXEC</code> flag, which closes a descriptor automatically at <code>exec</code>.</p>
+<div class="k8s-link">
+<p>The gap between fork and exec is, quite literally, where a container is made. When containerd starts your workload, the low-level runtime (<code>runc</code>) forks, and in that gap the child enters new namespaces, joins the cgroup that will enforce the pod's limits, sets the uid from <code>securityContext</code>, changes its root to the image's filesystem, and drops capabilities — and only then execs the image's entrypoint. Your program starts already inside a container and never knows a container happened.</p>
+<p>You can see the resulting structure from the Kubernetes side in <a href="w1.html#cp-1-19">W1.19 — the kubelet's syncLoop</a> and its supervision chain, and the consequences of the exec'd program's identity in <a href="w3.html#cp-3-5">W3.5 — graceful termination</a>, where whichever program got exec'd is the one that must handle SIGTERM.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 fork</code> — read the <em>DESCRIPTION</em> in full; its list of what is and is not inherited is the most compact definition of a process anywhere. <code>man 3 execlp</code> for the whole <code>exec</code> family and what the letters mean (<code>l</code> list, <code>v</code> vector, <code>p</code> search PATH, <code>e</code> explicit environment). <code>man 2 waitpid</code> for the <code>WIFEXITED</code>/<code>WEXITSTATUS</code> macros used above. <code>man 1 bash</code> under <em>SHELL BUILTIN COMMANDS</em> for <code>exec</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b2-6" data-id="b2-6">
+<div class="lesson-head"><span class="cp-id">B2.6</span><h4>Watch parenthood concretely, and see what a child inherits</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Inheritance is where a whole class of "but it works when I run it by hand!" bugs comes from. A program run from your terminal inherits your environment, your working directory, your open terminal and your user. The same program started by a service manager inherits an almost empty environment, <code>/</code> as its directory, no terminal at all, and possibly a different user. Nothing about the program changed; everything about what it was handed did. Being able to list what crosses the fork boundary turns those bugs from mysteries into a checklist.</p>
+<h5>The concept</h5>
+<p>The parent/child relationship is not a bookkeeping detail — it carries real consequences. The parent is the only process that can <code>wait()</code> for this child and therefore the only one that can learn how it died. If the parent disappears, the child is re-parented to PID 1 (B2.3, and B2.9 in depth). And a great deal of a process's behaviour is decided before it ever runs a line of its own code, by what it was handed.</p>
+<p>What a child gets from its parent, at <code>fork</code>, and keeps across <code>exec</code>:</p>
+<table>
+<tr><th>Inherited</th><th>Why it matters</th></tr>
+<tr><td>environment variables</td><td><code>PATH</code>, <code>HOME</code>, <code>LANG</code>, and every credential passed this way</td></tr>
+<tr><td>current working directory</td><td>what relative paths resolve against (B1.1)</td></tr>
+<tr><td>open file descriptors</td><td>including 0/1/2 — this is why output goes where it goes</td></tr>
+<tr><td>credentials (uid, gid, groups)</td><td>what it is allowed to touch</td></tr>
+<tr><td>umask, resource limits, signal dispositions¹</td><td>quiet defaults that shape behaviour</td></tr>
+<tr><td>controlling terminal, process group, session</td><td>whether Ctrl-C reaches it</td></tr>
+</table>
+<p>¹ With one important exception: signal <em>handlers</em> cannot survive <code>exec</code>, because the code implementing them is gone. Signals set to be <em>ignored</em> stay ignored; everything else resets to default. B2.14 comes back to this.</p>
+<p>What a child does <strong>not</strong> get is equally important: it does not share the parent's memory (copy-on-write means it gets its own copy on first write), and changes it makes to any of the above are its own. This is the deep reason a child can never change its parent's environment or working directory — it is modifying a copy. That is the whole explanation of why <code>cd</code> must be a shell builtin (B1.1) and why <code>source</code> exists.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a background job and look at the relationship directly.
+<pre class="cmd">sleep 400 &amp;
+ps -o pid,ppid,comm -p $! ; echo "my shell: $$"</pre>
+<pre class="out">  PID  PPID COMMAND
+ 3102  <b>2260</b> sleep
+my shell: <b>2260</b></pre></li>
+<li>Confirm it in the tree, then confirm the reverse direction — list all of your shell's children.
+<pre class="cmd">pstree -p $$
+ps --ppid $$ -o pid,comm</pre>
+<pre class="out">bash(2260)───sleep(3102)
+  PID COMMAND
+ 3102 sleep</pre></li>
+<li>Now watch inheritance carry a variable across the boundary. Set a variable, <code>export</code> it, and read it out of the child's own <code>environ</code> — the child was never told about it, it simply woke up with it.
+<pre class="cmd">export TRACE_ID=abc123
+sleep 400 &amp;
+tr '\0' '\n' &lt; /proc/$!/environ | grep -E 'TRACE_ID|^PWD='</pre>
+<pre class="out"><b>TRACE_ID=abc123</b>
+<b>PWD=/home/ubuntu</b></pre></li>
+<li>Prove the copy is one-way. A child cannot change its parent's environment or directory, no matter how hard it tries.
+<pre class="cmd">bash -c 'export TRACE_ID=changed; cd /tmp; echo "child sees $TRACE_ID in $PWD"'
+echo "parent still sees $TRACE_ID in $PWD"</pre>
+<pre class="out">child sees changed in /tmp
+<b>parent still sees abc123 in /home/ubuntu</b></pre></li>
+<li>Show inheritance of the working directory doing real damage, which is the practical version of the lesson. The same script gives different answers depending on where its caller was standing.
+<pre class="cmd">mkdir -p /tmp/inh &amp;&amp; echo 'from the good directory' &gt; /tmp/inh/config.txt
+printf '#!/bin/bash\ncat config.txt\n' &gt; /tmp/inh/show.sh &amp;&amp; chmod +x /tmp/inh/show.sh
+cd /tmp/inh &amp;&amp; ./show.sh
+cd ~ &amp;&amp; /tmp/inh/show.sh</pre>
+<pre class="out">from the good directory
+<b>cat: config.txt: No such file or directory</b></pre></li>
+<li>Finally, see the difference that catches people out in production: compare the environment your interactive shell hands out with the one a service manager hands out. This is why "it works in my terminal" is not evidence.
+<pre class="cmd">env | wc -l
+sudo systemd-run --quiet --wait --pipe env | wc -l
+sudo systemd-run --quiet --wait --pipe sh -c 'echo "PWD=$PWD"; echo "PATH=$PATH"; echo "USER=${USER:-unset}"'</pre>
+<pre class="out">24
+<b>6</b>
+PWD=<b>/</b>
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+USER=<b>unset</b></pre></li>
+<li>Clean up.
+<pre class="cmd">pkill sleep; rm -rf /tmp/inh; unset TRACE_ID</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>List six things a child inherits from its parent, then state the one category that cannot survive <code>exec</code> and why. Then explain the step-5 failure in one sentence that mentions neither "the script" nor "the file" as the cause.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>$!</code> holds the PID of the most recent background job and it is overwritten by the next one. Capture it into a named variable immediately (<code>pid=$!</code>) if you plan to use it more than once — half the confusing shell scripts in the world are confusing because <code>$!</code> moved.</p>
+<p>The "empty environment under a service manager" difference bites hardest with <code>PATH</code>. A script that calls <code>mytool</code> works from your shell because <code>~/bin</code> is on your interactive <code>PATH</code>, and fails as a service because the service's <code>PATH</code> is the short system default. Use absolute paths in anything that will be run by something other than you — the same rule as relative paths, for the same reason.</p>
+<p>Inheriting a terminal is what makes Ctrl-C work, and not inheriting one is what makes a background job outlive your shell. A process with no controlling terminal cannot be interrupted from a keyboard at all, which is a feature for daemons and a surprise the first time you cannot stop something.</p>
+<div class="k8s-link">
+<p>A container's environment is fixed at exec and inherited exactly like this — which is the entire explanation of <a href="w3.html#cp-3-22">W3.22 — update propagation: volumes update, env never</a>. When you change a ConfigMap, a value mounted as a <em>file</em> is re-written by the kubelet and the container can read the new value; a value injected as an <em>environment variable</em> was copied into the process at creation and there is no mechanism, anywhere in Linux, to change it afterwards. Not a Kubernetes limitation — a process limitation.</p>
+<p>The same inheritance rule explains <code>workingDir</code> in a container spec, and why an image's <code>ENTRYPOINT</code> that uses relative paths breaks when someone overrides <code>workingDir</code>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 fork</code>'s inheritance list again — this time read the "the child does not inherit" half. <code>man 7 environ</code> for what the environment is and the conventional variables. <code>man 1 systemd-run</code> for the trick in step 6, and <code>man 5 systemd.exec</code> for every environment-shaping directive a unit can set — B11 uses these in earnest.</p>
+</article>
+
+<article class="lesson" id="cp-b2-7" data-id="b2-7">
+<div class="lesson-head"><span class="cp-id">B2.7</span><h4>Process states — and the two that mean trouble</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"The process is stuck" is not a diagnosis, it is an observation, and the state letter is what turns one into the other. A process in <strong>S</strong> is not stuck at all — it is waiting for something perfectly normal. A process in <strong>D</strong> is stuck in a way you cannot fix by killing it, and is telling you the problem is underneath it. A process in <strong>Z</strong> is not a process at all any more. Three completely different situations that all look like "it's hung" from the outside.</p>
+<h5>The concept</h5>
+<p>At any instant, every process is in exactly one state, and there are only a handful:</p>
+<table>
+<tr><th>Letter</th><th>Name</th><th>Plainly</th></tr>
+<tr><td><strong>R</strong></td><td>running or runnable</td><td>on a CPU right now, or queued and ready to be</td></tr>
+<tr><td><strong>S</strong></td><td>interruptible sleep</td><td>waiting for something — a keystroke, a packet, a timer — and a signal will wake it</td></tr>
+<tr><td><strong>D</strong></td><td>uninterruptible sleep</td><td>waiting inside the kernel for I/O that cannot safely be interrupted; signals do not reach it</td></tr>
+<tr><td><strong>T</strong></td><td>stopped</td><td>suspended by SIGSTOP or Ctrl-Z, will resume on SIGCONT</td></tr>
+<tr><td><strong>Z</strong></td><td>zombie</td><td>already dead; only its exit status remains, waiting to be collected</td></tr>
+<tr><td><strong>I</strong></td><td>idle</td><td>an idle kernel thread — normal, and excluded from load averages</td></tr>
+</table>
+<p>Most processes on a healthy machine are in <strong>S</strong>, and that is what "idle" looks like from the inside: a hundred programs each blocked in a call that says "wake me when something happens". It is not a problem to be solved.</p>
+<p><strong>D</strong> is the one that matters at three in the morning. The process asked the kernel for something — read this disk block, talk to this network filesystem — and the kernel is in the middle of a sequence it cannot abandon halfway without leaving data structures inconsistent. So it refuses delivery of <em>all</em> signals, including <code>SIGKILL</code>. The consequences are worth stating bluntly: <strong>you cannot kill a D-state process.</strong> Not with <code>-9</code>, not as root, not ever, until the I/O it is waiting on completes or fails. A pile of processes in D means the layer beneath them is wedged — a failing disk, a hung NFS mount, a storage backend that stopped answering — and the fix is down there, not up here.</p>
+<p>Why does uninterruptible sleep exist at all? Because the alternative is worse. If a signal could yank a process out of the middle of a block-device write, the kernel would have to be able to unwind every partially-completed operation in every driver, correctly, always. Linux takes the simpler and safer bargain: some waits are short and cannot be interrupted. When one turns out not to be short, you get a wedged process — and an unambiguous signal about where the real fault is.</p>
+<p><strong>Z</strong>, the zombie, is not stuck: it is finished. Its memory is gone, its descriptors are closed, and all that survives is a small kernel record holding the exit status until the parent calls <code>wait()</code>. B2.9 is about that record. For now, know that a zombie consumes no memory and no CPU, cannot be killed (there is nothing left to kill), and is a message about its <em>parent</em>.</p>
+<p><code>ps</code>'s <code>STAT</code> column appends modifier letters to the state, and they are useful: <code>s</code> session leader, <code>l</code> multi-threaded, <code>+</code> in the foreground process group, <code>&lt;</code> high priority, <code>N</code> low priority. So <code>Ssl</code> reads as "sleeping, session leader, multi-threaded" — a completely ordinary daemon.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Take a census of your machine's states. On anything healthy, S dominates by a wide margin.
+<pre class="cmd">ps ax -o stat= | cut -c1 | sort | uniq -c | sort -rn</pre>
+<pre class="out">     <b>92 S</b>
+     31 I
+      2 R
+      1 D</pre></li>
+<li>Produce an <strong>R</strong> on demand — a loop that never blocks is always runnable.
+<pre class="cmd">timeout 15 sh -c 'while :; do :; done' &amp;
+sleep 1; ps -o pid,stat,comm -p $!</pre>
+<pre class="out">  PID STAT COMMAND
+ 3210 <b>R</b>    sh</pre></li>
+<li>Produce an <strong>S</strong> — a process waiting on a timer is the simplest possible sleeper.
+<pre class="cmd">sleep 400 &amp;
+ps -o pid,stat,comm -p $!</pre>
+<pre class="out">  PID STAT COMMAND
+ 3225 <b>S</b>    sleep</pre></li>
+<li>Produce a <strong>T</strong>, and bring it back. This is Ctrl-Z, spelled out as the signals it actually sends.
+<pre class="cmd">kill -STOP $!
+ps -o pid,stat,comm -p $!
+kill -CONT $!
+ps -o pid,stat,comm -p $!</pre>
+<pre class="out">  PID STAT COMMAND
+ 3225 <b>T</b>    sleep
+  PID STAT COMMAND
+ 3225 <b>S</b>    sleep</pre></li>
+<li>Produce a <strong>Z</strong>. Getting this right needs a parent that lives on but never reaps — note the <code>exec</code>, which turns the shell into <code>sleep</code>: an ordinary bash would have quietly reaped the child for you and you would see nothing. Use <code>args</code> rather than <code>comm</code> as the output format, because only <code>args</code> shows the <code>&lt;defunct&gt;</code> marker.
+<pre class="cmd">bash -c 'sleep 1 &amp; exec sleep 60' &amp;
+parent=$!
+sleep 3
+ps --ppid $parent -o pid,ppid,stat,args</pre>
+<pre class="out">  PID  PPID STAT COMMAND
+ 3247  3246 <b>Z</b>    [sleep] &lt;defunct&gt;</pre></li>
+<li>Confirm a zombie is not a process you can act on. Killing it does nothing, because there is nothing there; it disappears when its <em>parent</em> ends and PID 1 reaps it.
+<pre class="cmd">z=$(pgrep -P $parent)
+kill -9 $z; sleep 1; ps -o pid,stat,args -p $z
+kill $parent; sleep 1; ps -o pid= -p $z 2&gt;/dev/null || echo "gone"</pre>
+<pre class="out">  PID STAT COMMAND
+ 3247 <b>Z</b>    [sleep] &lt;defunct&gt;
+gone</pre></li>
+<li>Produce a <strong>D</strong>, safely and briefly. Heavy synchronous writes put the writer into uninterruptible sleep for as long as the device takes; catch it in the act by sampling repeatedly.
+<pre class="cmd">dd if=/dev/zero of=/tmp/dtest bs=1M count=2000 oflag=direct status=none &amp;
+for i in 1 2 3 4 5; do ps -o pid,stat,wchan:20,comm -p $! --no-headers; sleep 0.4; done
+wait; rm -f /tmp/dtest</pre>
+<pre class="out"> 3301 <b>D</b>    blk_io_schedule      dd
+ 3301 <b>D</b>    blk_io_schedule      dd
+ 3301 R    -                    dd
+ 3301 <b>D</b>    blk_io_schedule      dd
+ 3301 D    blk_io_schedule      dd</pre>
+<p>Depending on how fast the disk is, some samples may land while <code>dd</code> is briefly runnable, and on a faster device the whole write may finish before five samples — raise <code>count</code> until you catch it.</p></li>
+<li>Note the <code>WCHAN</code> column: it names the kernel function the process is asleep in, which is the single most useful piece of evidence about a D-state process. The exact name varies by kernel version — <code>blk_io_schedule</code>, <code>submit_bio_wait</code> and friends all say "waiting on a block device". A hung network mount would say something with <code>nfs</code> or <code>rpc</code> in it instead, and that names your culprit.
+<pre class="cmd">pkill sleep; pkill -f 'while :'</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Say out loud what each of R, S, D, Z, T means and, for each, whether <code>kill -9</code> will do anything. (R: yes. S: yes. D: no — signals are not delivered. Z: no — already dead. T: yes, KILL is delivered even to a stopped process.) Then reproduce a zombie and a D-state process from memory.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A brief flicker of D is completely normal — every disk read passes through it. What is abnormal is D that <em>persists</em>, or many processes in D at once. Judge by duration and count, not by presence, or you will chase healthy machines.</p>
+<p>Load average counts D-state processes, not just running ones. This is why a machine with an idle CPU can report a load average of 40: forty processes are all queued behind one wedged storage device. Load average on Linux is "runnable plus uninterruptible", which makes it a useful I/O signal and a misleading CPU signal.</p>
+<p>Zombies are counted against the system-wide PID limit, so an army of them can eventually prevent <em>any</em> new process from starting — including the shell you were going to use to fix it. The damage is never memory; it is always PID exhaustion. Check <code>cat /proc/sys/kernel/pid_max</code> for the ceiling you are heading toward.</p>
+<p>The zombie you see is a symptom whose cause is one row up in the tree. Killing the zombie is meaningless; killing or fixing the <em>parent</em> is what resolves it, because either the parent starts reaping or it dies and PID 1 reaps for it.</p>
+<div class="k8s-link">
+<p>These states are what the node-side reality of a stuck pod looks like. A pod that will not leave <code>Terminating</code> and does not respond to <code>--force</code> is frequently a container process wedged in D on a volume whose storage backend has gone away — and no amount of API-level pressure can help, because the kernel will not deliver the signal. That is why <a href="w6.html#cp-6-18">W6.18 — the quiet failures: not-Ready pods, stuck Terminating</a> sends you to the node, and why <a href="w5.html#cp-5-2">W5.2 — where volumes actually live</a> is where the answer usually is.</p>
+<p>Zombie accumulation shows up as node <code>PIDPressure</code> — see <a href="w6.html#cp-6-12">W6.12 — read node Conditions fluently</a> — and its cause is almost always the container PID 1 problem covered in B2.9.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ps</code> under <em>PROCESS STATE CODES</em> lists every letter and modifier — worth reading once end to end, it is half a page. <code>man 5 proc</code> under <code>/proc/[pid]/stat</code> for the raw state field, and <code>/proc/[pid]/wchan</code> for the sleeping-in function. <code>man 1 uptime</code> is thin on this, so read <code>man 5 proc</code> under <code>/proc/loadavg</code> for what load average actually counts.</p>
+</article>
+
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
