@@ -409,6 +409,392 @@ l-wx------ 1 ubuntu ubuntu 64 Jul 23 14:36 /proc/4412/fd/1 -&gt; <b>/home/ubuntu
 </article>
 </div>
 
+<!-- ---------------- Composing tools ---------------- -->
+<div class="grp" id="g-compose"><h3>Composing tools</h3>
+
+<article class="lesson" id="cp-b1-5" data-id="b1-5">
+<div class="lesson-head"><span class="cp-id">B1.5</span><h4>Every program is born with three channels, not one</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Beginners think of a program as having "output" — one stream of text that appears on the screen. It has two, and they are kept deliberately separate: results on one, complaints on the other. Once you can see both channels, a whole class of confusing behaviour resolves itself: why an error still appears on screen after you sent everything to a file, why a pipeline carries clean data even when something went wrong, and why <code>2&gt;/dev/null</code> is the single most-typed incantation in shell scripting.</p>
+<h5>The concept</h5>
+<p>When a process opens anything — a file, a terminal, a network connection, a pipe — the kernel hands it back a small integer to refer to that thing by. The integer is called a <strong>file descriptor</strong>, and from the process's point of view it is the only handle it has. Descriptor numbers are per-process and start at 0, handed out lowest-first.</p>
+<p>Every process is <em>born</em> with the first three already open, inherited from whatever started it. It does not open them and cannot count on their being anything in particular; it just uses them:</p>
+<table>
+<tr><th>fd</th><th>Name</th><th>Its job</th><th>Where it points by default</th></tr>
+<tr><td><strong>0</strong></td><td><code>stdin</code></td><td>where input comes from</td><td>your keyboard, via the terminal</td></tr>
+<tr><td><strong>1</strong></td><td><code>stdout</code></td><td>the <em>results</em> — the answer you asked for</td><td>your screen, via the terminal</td></tr>
+<tr><td><strong>2</strong></td><td><code>stderr</code></td><td>diagnostics — errors, warnings, progress</td><td>your screen, via the terminal</td></tr>
+</table>
+<p>Because all three normally point at the same terminal, they <em>look</em> like one stream, and that is exactly why the separation is invisible until you go looking for it. The reason it exists is worth stating plainly: <strong>results are for the next program, diagnostics are for the human.</strong> If a tool mixed its error messages into its results, then piping it into another program would feed that program garbage — and suppressing the garbage would suppress the answer too. Two channels lets a pipeline carry clean data downstream while errors still reach you.</p>
+<p>Remember the terminal itself is a file, of type <code>c</code> from B1.3. Nothing about descriptors 0, 1 and 2 knows or cares that a terminal is on the other end; that is the whole point, and it is why the same program works identically when you redirect its output to a file or pipe it into another program in the next two lessons.</p>
+<div class="flow"><span>keyboard</span><em>→</em><span>fd 0 · stdin</span><em>→</em><span class="hot">your program</span><em>→</em><span>fd 1 · stdout — the results</span><em>and, separately,</em><span>fd 2 · stderr — the complaints</span></div>
+<h5>Lab</h5>
+<ol>
+<li>Run one command that succeeds and fails at the same time. <code>ls</code> is asked about two paths: one exists, one does not, so it produces both a result and an error.
+<pre class="cmd">cd ~
+ls /nope /etc/hostname</pre>
+<pre class="out"><b>ls: cannot access '/nope': No such file or directory</b>
+/etc/hostname</pre>
+<p>Two lines, apparently from one stream. Now prove they are not.</p></li>
+<li>Send only the results to a file. The redirect <code>&gt;</code> touches descriptor 1 and nothing else, so the error is left pointing at your terminal.
+<pre class="cmd">ls /nope /etc/hostname &gt; out.txt
+cat out.txt</pre>
+<pre class="out"><b>ls: cannot access '/nope': No such file or directory</b>
+/etc/hostname</pre>
+<p>Read that carefully: the error appeared <em>immediately</em>, on screen, from the first command — while the result went silently into the file and only showed up when you <code>cat</code>ted it. Two channels, demonstrated in four words of syntax.</p></li>
+<li>Now do the opposite and capture only the complaints, leaving results on screen. <code>2&gt;</code> redirects descriptor 2 by number.
+<pre class="cmd">ls /nope /etc/hostname 2&gt; err.txt
+cat err.txt</pre>
+<pre class="out">/etc/hostname
+<b>ls: cannot access '/nope': No such file or directory</b></pre></li>
+<li>Look at your own shell's three descriptors as files. The kernel exposes every open descriptor of every process under <code>/proc/PID/fd</code>, as symlinks to whatever they point at.
+<pre class="cmd">ls -l /proc/$$/fd</pre>
+<pre class="out">lrwx------ 1 ubuntu ubuntu 64 Jul 23 14:40 <b>0 -&gt; /dev/pts/0</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 23 14:40 <b>1 -&gt; /dev/pts/0</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 23 14:40 <b>2 -&gt; /dev/pts/0</b></pre>
+<p>All three point at <code>/dev/pts/0</code> — your terminal, a character device. This is the picture the next lesson rewires.</p></li>
+<li>Watch a redirect change that picture from the inside. Run a shell whose stdout has been sent to a file, and ask it about its own descriptors.
+<pre class="cmd">bash -c 'ls -l /proc/$$/fd' &gt; fds.txt; cat fds.txt</pre>
+<pre class="out">lrwx------ 1 ubuntu ubuntu 64 Jul 23 14:41 0 -&gt; /dev/pts/0
+l-wx------ 1 ubuntu ubuntu 64 Jul 23 14:41 <b>1 -&gt; /home/ubuntu/fds.txt</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 23 14:41 2 -&gt; /dev/pts/0</pre>
+<p>Descriptor 1 now points at the file — and note it is <code>l-wx</code>, write-only, because that is all a <code>&gt;</code> redirect asks for. The program was never told; the shell rewired it before the program started.</p></li>
+<li>Clean up.
+<pre class="cmd">rm -f out.txt err.txt fds.txt</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Predict, then run: what does <code>ls /nope /etc/hostname 2&gt; /dev/null</code> print, and what does <code>ls /nope /etc/hostname &gt; /dev/null</code> print? (The first prints only <code>/etc/hostname</code>; the second prints only the error.) If both surprise you, redo steps 2 and 3 — everything in B1.6 builds directly on this.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><strong>stderr is not only for errors.</strong> Plenty of well-behaved programs write progress bars, counters and status lines there on purpose, precisely so that the results on stdout stay clean and pipeable — <code>curl</code>, <code>wget</code>, <code>dd</code> and <code>tar -v</code> all do it. So a message on stderr does not mean something failed. The <em>exit code</em> (B1.13) is what tells you that.</p>
+<p>The two streams can appear out of order when you combine them, and the reason is buffering rather than anything you did wrong. The C library buffers stdout in large blocks when it is <em>not</em> a terminal, while stderr is unbuffered — so a program writing alternate lines to each, with stdout going to a file or pipe, will emit all its stderr promptly and its stdout in a lump at the end. This is why interleaved output looks scrambled only after you redirect it. <code>stdbuf -oL cmd</code> forces line buffering when it matters.</p>
+<div class="k8s-link">
+<p>This is the entire contract between a container and Kubernetes for logging. A containerized program is expected to write its logs to <strong>stdout and stderr</strong> and nothing else — no log files, no syslog. The runtime captures both streams, writes them to a file on the node under <code>/var/log/pods/</code>, and that file is what <code>kubectl logs</code> reads back to you.</p>
+<p>Two consequences follow directly, and both are in <a href="w6.html#cp-6-2">W6.2 — where logs physically live</a>. First, an application configured to log into a file <em>inside</em> the container is invisible to <code>kubectl logs</code>, which is a genuinely common and genuinely baffling incident. Second, <code>kubectl logs</code> merges the two streams — so the separation you just proved exists is real on the node and gone by the time you read it, which is why exit codes rather than log content are the reliable signal for "did it fail".</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 3 stdin</code> covers all three streams and their buffering rules in one short page — the buffering paragraph is the one worth reading twice. Then <code>man 2 open</code> for where descriptors come from, and <code>man 5 proc</code> for <code>/proc/[pid]/fd</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b1-6" data-id="b1-6">
+<div class="lesson-head"><span class="cp-id">B1.6</span><h4>Redirect the three streams deliberately</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Redirection is how you decide where a program's input comes from and where each of its two outputs goes. It is a handful of symbols, it is used in essentially every script ever written, and the one piece of it that is genuinely counter-intuitive — <code>2&gt;&amp;1</code> — catches everybody exactly once. Better to be caught here, deliberately, than in a script that has been silently discarding its error messages for a month.</p>
+<h5>The concept</h5>
+<p>A redirection is not a feature of the program. It is the <em>shell</em> rewiring descriptors in the instant between forking a new process and starting your program in it. By the time the program runs, its descriptor 1 already points wherever you said, and the program has no way of knowing and no need to care. That single fact explains why redirection works uniformly on every command that has ever existed.</p>
+<table>
+<tr><th>Syntax</th><th>Does</th><th>Note</th></tr>
+<tr><td><code>&gt; file</code></td><td>stdout to <em>file</em>, replacing it</td><td>the file is emptied first — see the gotcha</td></tr>
+<tr><td><code>&gt;&gt; file</code></td><td>stdout to <em>file</em>, appending</td><td>the safe default when you are unsure</td></tr>
+<tr><td><code>2&gt; file</code></td><td>stderr only</td><td>the number is the descriptor from B1.5</td></tr>
+<tr><td><code>2&gt;&gt; file</code></td><td>stderr, appending</td><td></td></tr>
+<tr><td><code>&amp;&gt; file</code></td><td>both streams to <em>file</em></td><td>bash convenience; not portable to plain <code>sh</code></td></tr>
+<tr><td><code>2&gt;&amp;1</code></td><td>make stderr go wherever stdout points <em>right now</em></td><td>position-sensitive; the whole lesson is here</td></tr>
+<tr><td><code>&lt; file</code></td><td><em>file</em> becomes stdin</td><td>the program reads it as if typed</td></tr>
+<tr><td><code>&lt;&lt;'EOF'</code></td><td>the following lines become stdin</td><td>a "heredoc"; quoting <code>EOF</code> stops expansion</td></tr>
+<tr><td><code>&gt; /dev/null</code></td><td>discard</td><td><code>/dev/null</code> is a device that swallows writes</td></tr>
+</table>
+<p>Now the one that matters. <code>2&gt;&amp;1</code> reads as "make descriptor 2 a <em>copy of</em> descriptor 1" — and the crucial word is <em>copy</em>. It copies where descriptor 1 is pointing at the moment the shell processes it, and the shell processes redirections strictly left to right. So:</p>
+<ul>
+<li><code>cmd &gt; f 2&gt;&amp;1</code> — first stdout is pointed at <code>f</code>; <em>then</em> stderr is made a copy of stdout, which now means <code>f</code>. Both land in the file. This is what you want.</li>
+<li><code>cmd 2&gt;&amp;1 &gt; f</code> — first stderr is made a copy of stdout, which still means <em>the terminal</em>; <em>then</em> stdout alone is moved to <code>f</code>. Errors keep going to your screen. This is the bug.</li>
+</ul>
+<p>They differ by nothing but word order, and the second one is what people type when they reason "redirect errors to output, then send output to the file". The mental model that fixes it permanently: a redirection sets a descriptor's destination, and <code>2&gt;&amp;1</code> reads a destination rather than establishing a link. Rewiring stdout afterwards does not drag stderr along with it.</p>
+<p>Finally, <code>/dev/null</code> deserves a sentence of its own. It is a real character device (you listed it in B1.3) whose driver discards everything written to it and returns end-of-file to every read. It is the bin, and it is also the empty file: <code>cmd &lt; /dev/null</code> is the standard way to tell a program "you have no input, stop waiting".</p>
+<h5>Lab</h5>
+<ol>
+<li>Set up a command that reliably produces both streams, so you can watch each redirect independently.
+<pre class="cmd">cd ~
+ls /etc/hostname /nope</pre>
+<pre class="out">ls: cannot access '/nope': No such file or directory
+/etc/hostname</pre></li>
+<li>Capture both, correctly. Then read the file: everything is there.
+<pre class="cmd">ls /etc/hostname /nope &gt; both.txt 2&gt;&amp;1
+cat both.txt</pre>
+<pre class="out"><b>ls: cannot access '/nope': No such file or directory</b>
+<b>/etc/hostname</b></pre></li>
+<li>Now make the mistake on purpose, with the operators in the other order. The error escapes to your screen and the file gets only half the story — which is precisely the failure mode that hides in scripts for months.
+<pre class="cmd">ls /etc/hostname /nope 2&gt;&amp;1 &gt; wrong.txt
+cat wrong.txt</pre>
+<pre class="out"><b>ls: cannot access '/nope': No such file or directory</b>
+/etc/hostname</pre>
+<p>The error printed live from the command; only <code>/etc/hostname</code> is in <code>wrong.txt</code>. Compare the two files side by side if it has not landed yet: <code>wc -l both.txt wrong.txt</code> gives 2 and 1.</p></li>
+<li>See the difference between replacing and appending. <code>&gt;</code> starts the file over every time; <code>&gt;&gt;</code> adds to the end.
+<pre class="cmd">echo one &gt; log.txt
+echo two &gt; log.txt
+cat log.txt
+echo three &gt;&gt; log.txt
+cat log.txt</pre>
+<pre class="out"><b>two</b>
+two
+<b>three</b></pre></li>
+<li>Discard each stream in turn with <code>/dev/null</code>. This is the pair of idioms you will use most often: keep the answer and drop the noise, or keep the noise and drop the answer.
+<pre class="cmd">ls /etc/hostname /nope 2&gt;/dev/null
+ls /etc/hostname /nope &gt;/dev/null</pre>
+<pre class="out">/etc/hostname
+ls: cannot access '/nope': No such file or directory</pre></li>
+<li>Feed a program from a file instead of the keyboard. <code>sort</code> with no arguments reads stdin, and <code>&lt;</code> makes stdin be the file.
+<pre class="cmd">printf 'pear\napple\ncherry\n' &gt; fruit.txt
+sort &lt; fruit.txt</pre>
+<pre class="out"><b>apple</b>
+cherry
+pear</pre></li>
+<li>Write a multi-line block straight into a command with a heredoc. Quoting the marker (<code>'EOF'</code>) means the shell leaves the contents completely alone — the same rule as single quotes in B1.12, and the reason this is the safe way to write config files from a script.
+<pre class="cmd">cat &gt; greeting.txt &lt;&lt;'EOF'
+Hello from a heredoc.
+$HOME is not expanded here.
+EOF
+cat greeting.txt</pre>
+<pre class="out">Hello from a heredoc.
+<b>$HOME is not expanded here.</b></pre></li>
+<li>Clean up.
+<pre class="cmd">rm -f both.txt wrong.txt log.txt fruit.txt greeting.txt</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without running them, say what ends up on screen and what ends up in the file for each of <code>cmd &gt; f 2&gt;&amp;1</code> and <code>cmd 2&gt;&amp;1 &gt; f</code>, and explain the difference in one sentence using the word "copy". Then check yourself with the lab's step 2 and step 3.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The redirect happens <strong>before the command runs</strong>, and <code>&gt;</code> empties the file as part of setting it up. So <code>sort file.txt &gt; file.txt</code> does not sort a file in place — it truncates <code>file.txt</code> to nothing, and <em>then</em> starts <code>sort</code>, which reads an empty file. You have destroyed the data. Write to a different name and move it over, or use a tool with an explicit in-place flag such as <code>sed -i</code>.</p>
+<p><code>&amp;&gt;</code> and <code>&amp;&gt;&gt;</code> are bash extensions. A script with <code>#!/bin/sh</code> at the top on Ubuntu runs under <code>dash</code>, where <code>&amp;&gt;</code> means something else entirely (run in background, then redirect) and fails silently and weirdly. Write <code>&gt; file 2&gt;&amp;1</code> when portability matters, or commit to <code>#!/usr/bin/env bash</code> as B1.13 does.</p>
+<p>Redirecting to a file you lack permission to write fails <em>in the shell</em>, before the command starts — so <code>sudo echo hi &gt; /etc/protected</code> does not work: <code>sudo</code> elevates <code>echo</code>, but your unprivileged shell is the one opening the file. The fix is to elevate the thing doing the writing: <code>echo hi | sudo tee /etc/protected</code>.</p>
+<div class="k8s-link">
+<p>The truncation gotcha above has an exact analogue you will meet with <code>kubectl</code>: <code>kubectl get pod x -o yaml &gt; pod.yaml</code> is safe, but any pattern where you read and write the same file in one line is not. More directly useful, the <code>&lt;&lt;'EOF'</code> heredoc is the single most common way manifests get created on an exam machine — <code>cat &lt;&lt;'EOF' | kubectl apply -f -</code> writes a whole YAML document straight into <code>kubectl</code>'s stdin with no editor involved.</p>
+<p>That trailing <code>-f -</code> is stdin, exactly as in B1.5. See <a href="w7.html#cp-7-10">W7.10 — imperative generators</a>, where the fastest possible path to a working object is a generator's stdout piped into <code>kubectl apply -f -</code>, and the editor never gets opened at all.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code>, section <em>REDIRECTION</em> — long, but the subsections <em>Duplicating File Descriptors</em> and <em>Here Documents</em> are the two to read now. <code>man 4 null</code> for the device, <code>man 1 tee</code> for the <code>sudo</code> workaround above, and <code>man 1 stdbuf</code> if buffering bites you.</p>
+</article>
+
+<article class="lesson" id="cp-b1-7" data-id="b1-7">
+<div class="lesson-head"><span class="cp-id">B1.7</span><h4>Chain programs with <code>|</code> and build a real answer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the idea the whole shell is built around, and it is the reason a command line beats a graphical tool for anything nobody anticipated. No program on your machine can answer "which five processes are using the most memory". Three of them, joined by two vertical bars, answer it in one line — and the same three recombine tomorrow to answer a different question.</p>
+<h5>The concept</h5>
+<p>A <strong>pipe</strong> connects one program's stdout to the next program's stdin. The shell creates a small buffer inside the kernel, points the left-hand program's descriptor 1 at the writing end and the right-hand program's descriptor 0 at the reading end, and starts <em>both</em> — this is the part people get wrong — <strong>at the same time</strong>.</p>
+<p>That concurrency is not an implementation detail. <code>cat huge.log | grep error</code> does not read the whole file and then search it; <code>grep</code> is already matching the first lines while <code>cat</code> is still reading the middle. The buffer between them is finite (64 KB on Linux), and when it fills, the writer simply blocks until the reader catches up. The pipeline self-regulates with no coordination code anywhere.</p>
+<p>It also explains what happens when the reader leaves early. In <code>… | head -5</code>, <code>head</code> prints five lines and exits. The next time the left-hand program writes, there is nobody at the other end, so the kernel sends it the <code>SIGPIPE</code> signal, whose default action is to kill it. This is a feature: the pipeline stops as soon as the answer is complete, rather than computing output nobody will read. B2 covers signals properly; the observable version is that <code>yes | head -1</code> terminates instantly instead of running forever.</p>
+<p>Two more properties are worth fixing in your head now, because both cause real bugs:</p>
+<ul>
+<li><strong>Only stdout flows through a pipe.</strong> stderr is untouched and goes straight past to the terminal — which is exactly the design from B1.5 paying off, and why you can watch errors scroll by while clean data keeps moving down the pipeline.</li>
+<li><strong>A pipeline's exit code is the exit code of the <em>last</em> command.</strong> So <code>false | true</code> reports success. B1.13 and every script you write will want <code>set -o pipefail</code> to change that; bash also exposes every stage's code in the array <code>${PIPESTATUS[@]}</code>.</li>
+</ul>
+<p>The design philosophy underneath all this is that the universal interface between programs is <strong>lines of text</strong>. Nobody had to make <code>ps</code>, <code>sort</code> and <code>head</code> aware of each other; they each read lines and write lines, so they compose. That is the trade the shell makes — text is a weaker contract than a real data structure, and in exchange every tool works with every other tool, forever.</p>
+<h5>Lab</h5>
+<ol>
+<li>Build the memory-users pipeline one stage at a time, so you can see what each stage receives and emits. Start with the raw material: <code>ps aux</code> lists every process on the machine, one per line, with a header.
+<pre class="cmd">ps aux | head -3</pre>
+<pre class="out">USER  PID %CPU <b>%MEM</b>    VSZ   RSS TTY  STAT START   TIME COMMAND
+root    1  0.1  0.6 168404 12908 ?    Ss   14:01   0:02 /sbin/init
+root    2  0.0  0.0      0     0 ?     S   14:01   0:00 [kthreadd]</pre>
+<p>Column 4 is <code>%MEM</code>. That is the number to sort on.</p></li>
+<li>Add the sort. <code>-k4</code> means "key on field 4", <code>-r</code> reverses to largest-first, and <code>-n</code> is essential: without it <code>sort</code> compares text, where <code>9</code> comes after <code>10</code>.
+<pre class="cmd">ps aux | sort -k4 -rn | head -5</pre>
+<pre class="out">ubuntu  1876  0.0 <b>2.1</b> 1240104 82304 ?  Sl 14:02 0:01 /usr/bin/containerd
+root     882  0.0 <b>1.4</b>  482300 55112 ?  Ssl 14:01 0:03 /usr/lib/snapd/snapd
+root     640  0.0 <b>0.9</b>  108964 36980 ?  Ss 14:01 0:00 /usr/bin/python3
+root       1  0.1 <b>0.6</b>  168404 12908 ?  Ss 14:01 0:02 /sbin/init
+root     713  0.0 <b>0.4</b>   31532 17280 ?  Ss 14:01 0:00 /usr/bin/networkd</pre>
+<p>Say the flow out loud: <code>ps</code> emits ~120 lines → <code>sort</code> receives them, holds them, emits the same lines reordered → <code>head</code> receives them and emits the first 5, then exits.</p></li>
+<li>Make the answer readable by trimming to the columns you actually asked about. <code>awk</code> prints selected fields; <code>$4</code> is <code>%MEM</code> and <code>$11</code> the command.
+<pre class="cmd">ps aux | sort -k4 -rn | head -5 | awk '{print $4"%", $11}'</pre>
+<pre class="out"><b>2.1% /usr/bin/containerd</b>
+1.4% /usr/lib/snapd/snapd
+0.9% /usr/bin/python3
+0.6% /sbin/init
+0.4% /usr/bin/networkd</pre></li>
+<li>Watch the concurrency and <code>SIGPIPE</code> directly. <code>yes</code> prints <code>y</code> forever; it does not finish and then hand over.
+<pre class="cmd">yes | head -3</pre>
+<pre class="out"><b>y</b>
+y
+y</pre>
+<p>It returns instantly. <code>head</code> took three lines and exited, <code>yes</code> got <code>SIGPIPE</code> on its next write and died. An infinite program terminated in a finite pipeline.</p></li>
+<li>Confirm that stderr walks past the pipe. Send the error stream somewhere obvious and watch it arrive on screen even though the pipeline is capturing stdout.
+<pre class="cmd">ls /etc/hostname /nope | wc -l</pre>
+<pre class="out"><b>ls: cannot access '/nope': No such file or directory</b>
+1</pre>
+<p><code>wc -l</code> counted one line — the result — and never saw the error, which went straight to your terminal.</p></li>
+<li>See the exit-code trap and its fix. The pipeline reports the last stage's status, so a failure upstream disappears.
+<pre class="cmd">false | true; echo "pipeline says: $?"
+echo "stages were: ${PIPESTATUS[@]}"
+set -o pipefail; false | true; echo "with pipefail: $?"; set +o pipefail</pre>
+<pre class="out">pipeline says: <b>0</b>
+stages were: <b>1 0</b>
+with pipefail: <b>1</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Build, from memory, a pipeline that prints the five largest files under <code>/var/log</code>, largest first — you need <code>du</code>, <code>sort -rn</code> and <code>head</code>. One reasonable answer: <code>sudo du -a /var/log | sort -rn | head -5</code>. Then say what each stage receives and emits, and why <code>-n</code> is not optional.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Each stage of a pipeline runs in its own subshell, so variables set inside one do not survive. <code>find . | while read f; do n=$((n+1)); done; echo $n</code> prints nothing useful, because the <code>while</code> ran in a child process that has since exited with its variables. The bash fix is process substitution — <code>while read f; do …; done &lt; &lt;(find .)</code> — which keeps the loop in your shell.</p>
+<p>Buffering makes live pipelines look frozen. A program whose stdout is a pipe gets block buffering, so <code>tail -f log | grep error</code> can sit silent for a long time and then dump everything at once. <code>grep --line-buffered</code>, or <code>stdbuf -oL</code> in front of the offending stage, restores the behaviour you expected.</p>
+<p><code>sort -k4</code> does not mean what it looks like: it sorts from field 4 <em>to the end of the line</em>, not on field 4 alone. Usually harmless, occasionally the reason two lines with equal fourth fields come out in a surprising order. <code>sort -k4,4</code> is the precise version.</p>
+<div class="k8s-link">
+<p><code>kubectl</code> is a well-behaved Unix program, and it is designed to sit in exactly these pipelines. Its structured output modes exist so that the text flowing down the pipe is predictable rather than the human-formatted table: <code>kubectl get pods -o json | jq …</code>, or <code>kubectl get pods -o jsonpath=… | xargs kubectl delete pod</code>.</p>
+<p><a href="w7.html#cp-7-11">W7.11 — output surgery: jsonpath, custom-columns, sort-by</a> drills this as an exam speed skill, and the reason it is a speed skill is the one from this lesson: nobody built a "delete every pod that is not Running" button, so you compose one from parts. Note also that <code>kubectl get</code> writes its table to stdout and its warnings to stderr, so piping it never contaminates your data.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 pipe</code> for the kernel object and its capacity, <code>man 2 pipe</code> for how one is created. <code>man 1 bash</code>, section <em>Pipelines</em>, for <code>PIPESTATUS</code> and <code>pipefail</code>. Then <code>man 1 ps</code> (the <code>aux</code> column meanings) and <code>man 1 sort</code> (<code>-k</code>, <code>-n</code>, <code>-r</code>, <code>-u</code> — four flags cover almost everything).</p>
+</article>
+
+<article class="lesson" id="cp-b1-8" data-id="b1-8">
+<div class="lesson-head"><span class="cp-id">B1.8</span><h4>Globs versus regular expressions — two pattern languages, two different programs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the single most common confusion among people learning the shell, and it produces bugs that look like sorcery: a <code>grep</code> that searches for the wrong thing, a <code>find</code> that matches nothing, a script that works in one directory and not another. All of it comes from merging two separate pattern languages into one imaginary language. Separating them takes ten minutes and never has to be learned again.</p>
+<h5>The concept</h5>
+<p>There are two systems, they use some of the same characters to mean different things, and — the part that actually matters — <strong>they are expanded by different pieces of software at different times.</strong></p>
+<p>A <strong>glob</strong> is expanded by the <em>shell</em>, against filenames, <em>before your program starts</em>. When you type <code>ls *.conf</code>, <code>ls</code> never sees an asterisk. The shell looks in the current directory, finds the matching names, and replaces the word with that list, so what actually runs is <code>ls a.conf b.conf c.conf</code>. Globs only ever match filenames, because that is the only thing the shell has to match against.</p>
+<p>A <strong>regular expression</strong> is interpreted by the <em>program</em> — <code>grep</code>, <code>sed</code>, <code>awk</code> — against the text it is reading. The shell must be persuaded to keep its hands off it, which is what the quotes in <code>grep '^a.*b$'</code> are for. Regexes match anything, usually the contents of lines.</p>
+<div class="flow"><em>glob:</em><span>you type <code>*.conf</code></span><em>→</em><span class="hot">shell expands it against filenames</span><em>→</em><span>program receives <code>a.conf b.conf</code></span></div>
+<div class="flow"><em>regex:</em><span>you type <code>'^a.*b$'</code></span><em>→</em><span>shell leaves it alone (you quoted it)</span><em>→</em><span class="hot">program receives the pattern and interprets it</span></div>
+<p>Now the character collisions, which is where the confusion actually lives:</p>
+<table>
+<tr><th>Character</th><th>As a glob (shell, filenames)</th><th>As a regex (program, text)</th></tr>
+<tr><td><code>*</code></td><td>any run of characters, including none</td><td><em>zero or more of the previous item</em></td></tr>
+<tr><td><code>?</code></td><td>exactly one character</td><td>zero or one of the previous item</td></tr>
+<tr><td><code>.</code></td><td>nothing special — a literal dot</td><td>any single character</td></tr>
+<tr><td><code>[abc]</code></td><td>one of a, b, c</td><td>one of a, b, c — the same, for once</td></tr>
+<tr><td><code>^</code> <code>$</code></td><td>nothing special</td><td>start of line, end of line</td></tr>
+</table>
+<p>The row to memorise is the first one. Glob <code>*</code> stands alone and means "anything"; regex <code>*</code> is a <em>repetition operator</em> applied to whatever precedes it, so it is meaningless by itself. The regex that means what glob <code>*</code> means is <code>.*</code> — "any character, repeated zero or more times". Almost every "my grep found nothing" is this.</p>
+<p>Two more glob behaviours to know because they surprise people. First, a glob that matches nothing is, by default in bash, <strong>left alone and passed through literally</strong> — so <code>ls *.nope</code> hands <code>ls</code> the literal string <code>*.nope</code> and you get a confusing "No such file" error mentioning an asterisk. Second, globs <strong>do not match leading dots</strong>: <code>*</code> never matches <code>.bashrc</code>, which is exactly why <code>rm *</code> leaves dotfiles behind and why <code>cp -r dir/* elsewhere/</code> silently omits configuration.</p>
+<h5>Lab</h5>
+<ol>
+<li>Watch the shell expand a glob before any program sees it. <code>echo</code> just prints its arguments, so it shows you precisely what the shell handed over.
+<pre class="cmd">cd /etc
+echo *.conf</pre>
+<pre class="out"><b>adduser.conf ca-certificates.conf debconf.conf deluser.conf ... ucf.conf</b></pre>
+<p>Those words are what any command would have received. The asterisk was gone before <code>echo</code> ran.</p></li>
+<li>Prove it is the shell and not the program, by quoting the same pattern. Quotes stop expansion, so now <code>echo</code> gets the pattern itself.
+<pre class="cmd">echo '*.conf'</pre>
+<pre class="out"><b>*.conf</b></pre></li>
+<li>See the no-match behaviour that produces baffling errors.
+<pre class="cmd">ls *.nothingmatchesthis</pre>
+<pre class="out">ls: cannot access '<b>*.nothingmatchesthis</b>': No such file or directory</pre>
+<p><code>ls</code> is complaining about a file literally named with an asterisk, because that is what it was given.</p></li>
+<li>Now the regex side. <code>.</code> in a regex means "any character", so counting lines that contain one is counting non-empty lines.
+<pre class="cmd">grep -c '.' /etc/hostname</pre>
+<pre class="out"><b>1</b></pre></li>
+<li>Anchor a regex and use <code>.*</code> where a glob would have used <code>*</code>. This finds every line in <code>/etc/passwd</code> that starts with <code>r</code> and ends with <code>sh</code>.
+<pre class="cmd">grep '^r.*sh$' /etc/passwd</pre>
+<pre class="out"><b>root:x:0:0:root:/root:/bin/bash</b></pre></li>
+<li>Make the classic mistake deliberately, and watch it fail quietly rather than loudly — this is the one to remember. Unquoted, the shell expands the pattern against filenames first.
+<pre class="cmd">cd ~
+touch alpha.log beta.log
+grep error *.log</pre>
+<pre class="out">grep: beta.log: No such file... (or silence, or the wrong file searched)</pre>
+<p>What ran was <code>grep error alpha.log beta.log</code> — the shell turned your pattern into the first filename, so <code>grep</code> searched <code>beta.log</code> for the word <code>alpha.log</code>. The result is not an error; it is a wrong answer. Always quote a pattern meant for a program: <code>grep 'error' *.log</code>.</p></li>
+<li>Confirm globs skip dotfiles, which is worth seeing once so that <code>rm *</code> never surprises you.
+<pre class="cmd">mkdir -p /tmp/globtest &amp;&amp; cd /tmp/globtest
+touch visible.txt .hidden.txt
+echo *
+ls -a</pre>
+<pre class="out"><b>visible.txt</b>
+.  ..  <b>.hidden.txt</b>  visible.txt</pre></li>
+<li>Clean up.
+<pre class="cmd">cd ~; rm -f alpha.log beta.log; rm -rf /tmp/globtest</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Answer both without running them. (a) In <code>grep '*.conf' /etc/fstab</code>, what does <code>grep</code> actually search for? (A regex meaning "zero or more of nothing, then any character, then <code>conf</code>" — not what you meant.) (b) Which of <code>ls *.conf</code> and <code>grep 'x' *.conf</code> uses a glob, which uses a regex, and which uses both? (The first is a glob; the second is a regex <em>and</em> a glob, in the same line.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>find -name</code> takes a <em>glob</em>, but <code>find</code> expands it itself, against each filename it walks past. So the pattern must be quoted — <code>find /etc -name '*.conf'</code> — or the shell will expand it against your current directory first and hand <code>find</code> something nonsensical. This single quoting rule is most of the reason <code>find</code> feels unreliable to beginners.</p>
+<p>There are two regex dialects in common use and they disagree about which characters need backslashes. <code>grep</code> defaults to <em>basic</em> regular expressions, where <code>+</code>, <code>?</code>, <code>|</code> and <code>()</code> are literal and must be written <code>\+</code>, <code>\?</code> and so on. <code>grep -E</code> (or <code>egrep</code>) switches to <em>extended</em>, where they work as you would expect. When a pattern that looks right does not match, try <code>-E</code> before doubting yourself.</p>
+<p>Globs are matched by the shell against the <em>current directory's</em> contents, which is why the same script behaves differently depending on where it is run from — the same class of bug as the relative paths in B1.1, wearing a different hat.</p>
+<div class="k8s-link">
+<p>The useful thing to carry into Kubernetes is that its selectors are <strong>neither</strong> of these. A label selector like <code>-l app=web,tier!=cache</code> is an exact-match language with a small set of operators (<code>=</code>, <code>!=</code>, <code>in</code>, <code>notin</code>, <code>exists</code>) — there are no wildcards and no regexes in it at all. People type <code>-l app=web*</code>, get zero results and no error, and lose ten minutes.</p>
+<p>The place patterns <em>do</em> apply is on the client side, after <code>kubectl</code> has printed something: <code>kubectl get pods | grep web</code> is a regex against text, and <code>kubectl get pods -o name | xargs …</code> feeds a pipeline. <a href="w7.html#cp-7-11">W7.11 — output surgery</a> is where the boundary between "the API filtered this" and "I filtered this with text tools" gets drawn properly, and it matters under time pressure: server-side selection is exact and fast, client-side grep is neither.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 glob</code> — the shell's pattern language, short and complete. <code>man 7 regex</code> — the other one, including the basic/extended distinction. Then <code>man 1 grep</code>, whose <em>REGULAR EXPRESSIONS</em> section is the practical reference you will come back to, and <code>man 1 bash</code> under <em>Pathname Expansion</em> for <code>nullglob</code> and <code>dotglob</code> if you want to change the two surprising behaviours above.</p>
+</article>
+
+<article class="lesson" id="cp-b1-9" data-id="b1-9">
+<div class="lesson-head"><span class="cp-id">B1.9</span><h4>The working core of the standard toolkit</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There are eleven tools that appear in nearly every pipeline anyone writes, and the goal is not to learn them exhaustively — each has a manual page longer than this lesson — but to know the two or three flags of each that carry the weight. That is genuinely enough to build any answer you need, and the rest can be looked up in the seconds it takes to type <code>man</code>.</p>
+<h5>The concept</h5>
+<p>Every one of these reads lines of text and writes lines of text, which is what makes them interchangeable parts. Learn them by the question each one answers:</p>
+<table>
+<tr><th>Tool</th><th>Answers</th><th>The flags that matter</th></tr>
+<tr><td><code>grep</code></td><td>which lines match this pattern?</td><td><code>-i</code> ignore case · <code>-v</code> invert · <code>-c</code> count · <code>-n</code> line numbers · <code>-r</code> recurse · <code>-E</code> extended regex</td></tr>
+<tr><td><code>sed</code></td><td>replace this with that, on every line</td><td><code>s/old/new/</code> · add <code>g</code> for all on a line · <code>-i</code> edit the file in place · <code>-n '5p'</code> print one line</td></tr>
+<tr><td><code>awk</code></td><td>do something per line, using its fields</td><td><code>'{print $2}'</code> · <code>-F:</code> set the separator · <code>'$3 &gt; 100 {print}'</code> filter · <code>END{}</code> for totals</td></tr>
+<tr><td><code>cut</code></td><td>take fixed columns out</td><td><code>-d: -f1,3</code> — only useful when the separator is a single exact character</td></tr>
+<tr><td><code>sort</code></td><td>order these lines</td><td><code>-n</code> numeric · <code>-r</code> reverse · <code>-k2,2</code> by field · <code>-u</code> drop duplicates · <code>-h</code> human sizes</td></tr>
+<tr><td><code>uniq</code></td><td>collapse <em>adjacent</em> duplicates</td><td><code>-c</code> count them · <code>-d</code> only duplicates — nearly always after <code>sort</code></td></tr>
+<tr><td><code>wc</code></td><td>how many?</td><td><code>-l</code> lines · <code>-w</code> words · <code>-c</code> bytes</td></tr>
+<tr><td><code>head</code> / <code>tail</code></td><td>the first / last few</td><td><code>-n 20</code> · <code>tail -f</code> follow a growing file · <code>tail -n +2</code> skip a header</td></tr>
+<tr><td><code>find</code></td><td>which files match these properties?</td><td><code>-name '*.log'</code> · <code>-type f</code> · <code>-mtime -1</code> · <code>-size +10M</code> · <code>-exec … \;</code></td></tr>
+<tr><td><code>xargs</code></td><td>turn a list of lines into arguments</td><td><code>-n1</code> one at a time · <code>-0</code> with <code>find -print0</code> · <code>-I{}</code> place the argument</td></tr>
+</table>
+<p>Three combinations do so much of the real work that they are worth learning as single units rather than as compositions:</p>
+<ul>
+<li><strong><code>sort | uniq -c | sort -rn</code></strong> — the frequency count. Given any list of things, this tells you which occur most often. It is the answer to "which IP is hammering us", "which error is most common", "which image are most pods using".</li>
+<li><strong><code>find … -print0 | xargs -0 …</code></strong> — the safe bulk operation. <code>find</code> normally separates results with newlines, which breaks the moment a filename contains a space; <code>-print0</code> separates with a zero byte instead, which cannot appear in a filename, and <code>xargs -0</code> reads that format.</li>
+<li><strong><code>awk '{print $2}'</code></strong> — the field extractor, and the reason <code>cut</code> is less useful than it looks. <code>awk</code> treats any run of whitespace as one separator, so it handles the column-aligned output of <code>ps</code>, <code>df</code> and <code>ss</code>; <code>cut -f2</code> on the same input fails because it wants exactly one delimiter character between fields.</li>
+</ul>
+<h5>Lab</h5>
+<ol>
+<li>Build the frequency count on real data — which shells are actually in use on this machine. <code>cut -d: -f7</code> works here because <code>/etc/passwd</code> is genuinely colon-separated with no padding.
+<pre class="cmd">cut -d: -f7 /etc/passwd | sort | uniq -c | sort -rn</pre>
+<pre class="out">     <b>25 /usr/sbin/nologin</b>
+      2 /bin/sync
+      <b>1 /bin/bash</b>
+      1 /bin/false</pre></li>
+<li>Now the drill: <strong>every listening port with the program that owns it, one line each.</strong> Start by seeing the raw material. <code>ss</code> is the modern replacement for <code>netstat</code>, which is not installed on this image at all — <code>-t</code> TCP, <code>-l</code> listening only, <code>-n</code> numeric (do not resolve names), <code>-p</code> show the process.
+<pre class="cmd">sudo ss -tlnp</pre>
+<pre class="out">State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+LISTEN 0      4096       127.0.0.53%lo:53         0.0.0.0:*     users:(("systemd-resolve",pid=640,fd=14))
+LISTEN 0      128              0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=882,fd=3))
+LISTEN 0      128                 [::]:22            [::]:*     users:(("sshd",pid=882,fd=3))</pre>
+<p><code>sudo</code> matters: without it the <code>Process</code> column is empty, because reading which process owns a socket requires privilege.</p></li>
+<li>Reduce that to one clean line per port. <code>tail -n +2</code> drops the header, <code>awk</code> takes the address field and the process field, and <code>sed</code> strips the surrounding noise from the process name.
+<pre class="cmd">sudo ss -tlnp | tail -n +2 | awk '{print $4, $6}' | sed 's/users:((//; s/)).*//; s/"//g' | sort -u</pre>
+<pre class="out"><b>0.0.0.0:22 sshd,pid=882,fd=3</b>
+<b>127.0.0.53%lo:53 systemd-resolve,pid=640,fd=14</b>
+<b>[::]:22 sshd,pid=882,fd=3</b></pre>
+<p>Read the pipeline back as a sentence: list listening TCP sockets → drop the header → keep the address and process columns → strip the wrapper text → deduplicate. Five tools, one answer, none of which existed as a feature anywhere.</p></li>
+<li>Use <code>find</code> with a real question — configuration changed in the last day, which is the first thing you check after "it worked yesterday".
+<pre class="cmd">sudo find /etc -type f -mtime -1 | head -5</pre>
+<pre class="out"><b>/etc/hostname</b>
+/etc/resolv.conf
+/etc/hosts</pre></li>
+<li>Practise the space-safe pattern, on a filename designed to break the naive version. Compare the two outputs.
+<pre class="cmd">mkdir -p /tmp/spacetest &amp;&amp; cd /tmp/spacetest
+touch 'two words.txt' single.txt
+find . -type f | xargs ls -l 2&gt;&amp;1 | tail -3
+echo '--- now safely ---'
+find . -type f -print0 | xargs -0 ls -l</pre>
+<pre class="out">ls: cannot access './two': No such file or directory
+ls: cannot access 'words.txt': No such file or directory
+--- now safely ---
+-rw-rw-r-- 1 ubuntu ubuntu 0 Jul 23 15:10 <b>'./two words.txt'</b>
+-rw-rw-r-- 1 ubuntu ubuntu 0 Jul 23 15:10 ./single.txt</pre>
+<p>The first form split one filename into two arguments at the space. Note also how <code>ls</code> prints the name in single quotes — coreutils quotes any name containing a space when writing to a terminal, which is a helpful warning that the name is not what it looks like.</p></li>
+<li>Use <code>awk</code> for something <code>cut</code> cannot do: filter on a numeric field and total another. Here, filesystems over 10% full.
+<pre class="cmd">df -h | awk 'NR&gt;1 &amp;&amp; $5+0 &gt; 10 {print $6, $5}'</pre>
+<pre class="out"><b>/ 12%</b></pre>
+<p><code>NR&gt;1</code> skips the header line, <code>$5+0</code> forces the percentage string into a number, and only matching lines reach the <code>{print}</code>.</p></li>
+<li>Clean up.
+<pre class="cmd">cd ~; rm -rf /tmp/spacetest</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From memory, and without looking at step 3: produce one line per listening TCP port showing the port and the owning program. Any pipeline that gets there is correct. Then answer: why is <code>sort</code> almost always required before <code>uniq</code>, and why does <code>find … | xargs</code> need <code>-print0</code>/<code>-0</code> to be trustworthy?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>uniq</code> only collapses <strong>adjacent</strong> identical lines — it does not deduplicate a list. Running it on unsorted input appears to work and quietly leaves duplicates behind, which is worse than failing. Either sort first, or use <code>sort -u</code> when you do not need the counts.</p>
+<p>On Ubuntu, <code>/usr/bin/awk</code> is chosen by the alternatives system, and both <code>mawk</code> and <code>gawk</code> are present on this image. They agree on everything in the table above, but not on extensions — a script using <code>gensub()</code> or <code>asort()</code> is gawk-only and will fail confusingly elsewhere. <code>readlink -f "$(command -v awk)"</code> tells you which one you have; stick to the common subset in anything you share.</p>
+<p><code>sed -i</code> edits in place with no backup and no undo. Run the command without <code>-i</code> first and read the output — always. <code>sed -i.bak</code> keeps a copy, which costs nothing and has saved a great many afternoons.</p>
+<p><code>netstat</code> and <code>ifconfig</code> are not on this machine, and this is not a mistake to work around by installing <code>net-tools</code>. They have been deprecated for a decade; <code>ss</code> and <code>ip</code> are the maintained replacements, they are what Kubernetes documentation and troubleshooting guides use, and every example on this site assumes them.</p>
+<div class="k8s-link">
+<p>These eleven tools are what node-level debugging <em>is</em>. When a pod cannot reach a Service, the ladder ends in a shell on the node running <code>ss -tlnp</code> to see what is actually listening, <code>grep</code> through the kubelet journal, and <code>awk</code> over <code>iptables-save</code> output to find the rule that is or is not there.</p>
+<p><a href="w6.html#cp-6-20">W6.20 — the service-unreachable checklist</a> is that ladder in order, and its lower rungs are exactly this toolkit. The specific command from step 2 recurs constantly: "is anything actually listening on that port, and what is it" is the question that separates a misconfigured Service from a crashed application, and no <code>kubectl</code> command answers it.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">Read <code>man 1 grep</code> and <code>man 1 find</code> properly once — they repay it more than the others. Skim <code>man 1 sed</code>'s <em>Command Synopsis</em> and stop; skim <code>man 1 awk</code>'s <em>Patterns and Actions</em> and stop. Then <code>man 8 ss</code> for the socket states, <code>man 1 xargs</code> for <code>-0</code> and <code>-I</code>, and <code>man 1 sort</code>. When you cannot recall a tool's name at all, <code>apropos</code> from <a href="b0.html#cp-b0-8">B0.8</a> is still the right move.</p>
+</article>
+</div>
+
 <nav class="pager"><a href="b0.html">← B0 · Your Linux sandbox</a><a href="../beginner.html#b1">Beginner tracker →</a></nav>
 
 <footer>
