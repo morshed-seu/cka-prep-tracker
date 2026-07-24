@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B3: the user/kernel boundary, the system call as the only doorway across it, reading an strace line by line, errno triage, file descriptors as the universal handle, and /proc, /sys, sysctl, dmesg and ulimit as the kernel's live API.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B3 · Kernel space, user space, system calls — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B3 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b3">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B3 — Kernel space, user space, system calls</h1>
+  <p>There is a hard line down the middle of every Linux machine. On one side is your program: the code you wrote, the memory it was handed, the arithmetic it does. On the other side is everything real — the disk, the network card, the memory of every other process, the clock. Your program cannot touch any of it directly. When it needs something from that side, it asks, through a single narrow doorway called a <strong>system call</strong>. That is the whole architecture, and this module is about learning to see the doorway.</p>
+  <p>Why does it matter to someone who wants to run Kubernetes? Because when a container misbehaves and its logs say nothing, the logs are only the story the program chose to tell. The system calls are what it actually <em>did</em> — every file it opened, every connection it made, every permission it was denied. <code>strace</code> shows you that list, and by the end of this module you will read one the way you read a sentence. You will also stop treating <code>/proc</code> and <code>/sys</code> as mysterious folders and start using them as the live API to the kernel that they are — the same API every diagnostic tool you own is quietly built on.</p>
+  <div class="weights">
+    <span>Checkpoints<b>14</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>B2</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Name what the kernel exclusively owns, and why a program owns none of it.</li>
+<li>Explain user mode vs kernel mode as a state of the CPU itself, and why crossing between them costs.</li>
+<li>Run <code>strace</code> and pick out the handful of calls that make a simple command work.</li>
+<li>Place libc correctly: <code>printf</code>/<code>malloc</code> are your code; the syscall underneath is the kernel's.</li>
+<li>Read one <code>strace</code> line completely — call, arguments, return, and the <code>errno</code> on failure.</li>
+<li>Recognise the two dozen syscalls worth knowing on sight, grouped by what they do.</li>
+<li>Understand the file descriptor as the one handle that stands for files, pipes, sockets and terminals alike.</li>
+<li>Use <code>strace -c</code> and <code>-f</code> to make tracing practical on real, multi-process programs.</li>
+<li>Read <code>/proc</code> and <code>/sys</code> as kernel APIs — files generated at the moment you read them.</li>
+<li>Change kernel behaviour with <code>sysctl</code>, live and persistently, and know where the value lives.</li>
+<li>Read the kernel's own ring buffer with <code>dmesg</code>/<code>journalctl -k</code>, and check it reflexively.</li>
+<li>Meet per-process resource limits with <code>ulimit</code>, and make a program fail on purpose with <code>EMFILE</code>.</li>
+<li>Annotate a full <code>strace</code> of one <code>curl</code>, phase by phase, and triage an error from its <code>errno</code> alone.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B2.</strong> The syscalls you are about to read are the process lifecycle you just learned, now seen from the kernel's side of the doorway: <code>clone</code> is how <code>fork</code> is really made, <code>execve</code> is the <code>exec</code> step, <code>wait4</code> is <code>wait</code>. Every lab runs on the throwaway <code>sandbox</code> VM. Two tools are worth installing up front — <code>strace</code> is present on Ubuntu 24.04, but <code>ltrace</code> is not: <code>sudo apt install -y strace ltrace</code>. Take a snapshot (<a href="b0.html#cp-b0-9">B0.9</a>) before the drill, which deliberately starves a program of file descriptors.</p>
+</div>
+
+<!-- ---------------- The boundary ---------------- -->
+<div class="grp" id="g-boundary"><h3>The boundary</h3>
+
+<article class="lesson" id="cp-b3-1" data-id="b3-1">
+<div class="lesson-head"><span class="cp-id">B3.1</span><h4>What the kernel exclusively owns</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Before you can trace what a program does, you need to know what it is even <em>allowed</em> to do on its own. The answer is: almost nothing that matters. A program can do arithmetic and shuffle its own memory around, and that is the complete list of what it does without permission. Everything else — reading a file, sending a packet, checking the time, starting another program — belongs to the kernel, and the program has to ask. Getting this ownership boundary clear in your head is what makes the rest of the module, and most of Linux troubleshooting, make sense.</p>
+<h5>The concept</h5>
+<p>The <strong>kernel</strong> is the one program that is always running and that the hardware trusts completely. It is loaded first, at boot, and from then on it is the sole owner of five things that no ordinary program is ever allowed to touch directly:</p>
+<table>
+<tr><th>The kernel exclusively owns…</th><th>…so a program cannot, by itself</th></tr>
+<tr><td>the physical hardware — disks, network cards, the clock, the keyboard</td><td>write a byte to a disk or send a packet without asking</td></tr>
+<tr><td>the memory map of every process</td><td>read or corrupt another process's memory</td></tr>
+<tr><td>the scheduler that decides who runs on the CPU next</td><td>refuse to yield the CPU, or starve its neighbours</td></tr>
+<tr><td>the filesystems — the whole tree, and what is mounted where</td><td>see files outside what it has been given access to</td></tr>
+<tr><td>the entire network stack — addresses, routes, connections</td><td>open a socket or bind a port on its own authority</td></tr>
+</table>
+<p>Return to the hotel from <a href="b2.html#cp-b2-1">B2</a>. The kernel is the hotel's <strong>engineering staff</strong> — the only people allowed to touch the wiring, the boiler, the water mains. A guest who wants hot water does not walk into the plant room and open a valve; they file a work order at the desk, and engineering does it for them. The rule is not there to be annoying. It is there so that one confused or malicious guest cannot flood the building, cut everyone else's power, or read the mail in another guest's room. <strong>Isolation and safety are the whole point of the boundary.</strong></p>
+<p>This is why "my program crashed" almost never takes the machine down with it. When your code dereferences a bad pointer, it is only touching its own address space, which the kernel owns the map of; the kernel notices the illegal access, kills just that one process, and the rest of the hotel never notices. The kernel itself crashing — a "kernel panic" — is the rare catastrophic case precisely because the kernel is the one thing with nobody above it to catch the fall.</p>
+<div class="flow"><span>your program</span><em>owns</em><span>its own memory + arithmetic</span><em>·</em><span class="hot">the kernel</span><em>owns</em><span>hardware · other memory · scheduling · filesystems · network</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the kernel is a real, single thing you can name. <code>uname</code> reports the kernel, not the distribution — the version here is one specific build of Linux that owns this whole machine.
+<pre class="cmd">multipass shell sandbox
+uname -sr</pre>
+<pre class="out"><b>Linux 6.8.0-31-generic</b></pre></li>
+<li>Watch the boundary refuse you. Try to read the raw disk device directly — that is hardware, which the kernel owns. As an ordinary user you are simply told no.
+<pre class="cmd">head -c 16 /dev/sda</pre>
+<pre class="out">head: cannot open '/dev/sda' for reading: <b>Permission denied</b></pre></li>
+<li>See that even <em>with</em> root you are still going through the kernel, not around it — <code>sudo</code> changes who is asking, not the fact that the request is a system call the kernel adjudicates.
+<pre class="cmd">sudo head -c 16 /dev/sda | xxd | head -1</pre>
+<pre class="out">00000000: eb63 9010 8ed0 bc00 b0b8 0000 8ed8 8ec0  .c..............</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking, list the five things the kernel exclusively owns. Then answer: if your program could write directly to <code>/dev/sda</code> whenever it liked, name two other programs on the machine it could destroy and why the filesystem's permissions would not save them. (It could overwrite the partition table or another user's files at the block level, beneath the filesystem entirely — permissions are enforced by the kernel's filesystem layer, so bypassing that layer bypasses them. This is exactly why the device is kernel-owned.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"The kernel" and "the operating system" are not the same size. Ubuntu is a distribution — a kernel plus thousands of ordinary user-space programs (the shell, <code>systemd</code>, <code>apt</code>, every daemon). Only the kernel runs on the privileged side of the boundary; everything else, including the parts that feel system-y, is a normal process asking the kernel for things like any other.</p>
+<p>Root does not move you to the kernel's side. A root process is still an ordinary process making system calls — it is just one the kernel grants nearly every request. That distinction matters the moment you meet capabilities in <a href="b4.html">B4</a>: root is not "being the kernel", it is "having every permit the kernel hands out".</p>
+<div class="k8s-link">
+<p>A Kubernetes node is this boundary at scale. Every container on the node is a user-space process on one side; the single shared kernel is on the other. This is the fact behind the sentence "containers share the host kernel" — there is exactly one engineering staff for the whole building, no matter how many guests. It is why a kernel bug is a whole-node event, and why <code>securityContext</code> exists: since containers cannot be given a kernel of their own, the platform instead limits which requests each one may make of the shared kernel.</p>
+<p>You will see the node-level consequence in <a href="w6.html#cp-6-1">W6.1 — the node isn't ready</a>: when the kernel is unhappy, no amount of application-level fixing helps, because everything above it depends on the one thing below it.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 kernel</code> is thin, so the better orientation is <code>man 2 syscalls</code> (the full list of things a program is allowed to ask for) and <code>man 5 proc</code> under <code>/proc/version</code>. <code>man 1 uname</code> for the identity of the running kernel. For the conceptual split, the "user space" and "kernel space" sections of any operating-systems reference — but you will learn it faster by watching <code>strace</code> in B3.3 than by reading about it.</p>
+</article>
+
+<article class="lesson" id="cp-b3-2" data-id="b3-2">
+<div class="lesson-head"><span class="cp-id">B3.2</span><h4>User mode, kernel mode, and what crossing costs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The boundary from the last lesson is not a metaphor or a software convention — it is a state of the CPU itself, enforced by the silicon. Understanding that it is a hardware wall, and that every crossing has a real cost, is what turns a vague performance rule ("don't do too many tiny reads") into something you can reason about and measure. It is also the mechanism that makes containers possible at all.</p>
+<h5>The concept</h5>
+<p>A modern CPU can run in (at least) two privilege levels, and it is always in exactly one of them:</p>
+<ul>
+<li><strong>User mode</strong> — the restricted state. The instructions that touch hardware, change the memory map, or talk to devices are simply <em>disabled</em>. If code in user mode tries one, the CPU refuses and traps into the kernel. Your program runs here, always.</li>
+<li><strong>Kernel mode</strong> — the unrestricted state. Every instruction is available. Only the kernel runs here.</li>
+</ul>
+<p>A <strong>system call</strong> is the controlled, one-way door between them. It is emphatically <em>not</em> a function call to a library — a function call stays in user mode and just jumps to another address in your own program. A syscall executes a special CPU instruction (<code>syscall</code> on x86-64) that does something a normal jump cannot: it flips the CPU into kernel mode, but only at a fixed entry point the kernel chose in advance. The program cannot pick <em>where</em> in the kernel it lands, which is the entire safety property — you may knock, but only at the doors engineering installed.</p>
+<p>Because a crossing means saving the program's state, switching mode, running kernel code, switching back, and restoring state, it costs far more than a plain function call — on the order of hundreds of nanoseconds versus a couple. One crossing is nothing. A million of them is a performance bug you can see. This is the concrete reason "too many small reads" is slow: reading a megabyte in one <code>read</code> of a megabyte is one crossing; reading it a byte at a time is a million crossings, and the crossings, not the copying, dominate. It is why buffering exists everywhere in software — libc's <code>stdio</code>, your language's I/O library — all of it is machinery to turn many tiny would-be syscalls into a few big ones.</p>
+<div class="flow"><span>user mode</span><em>syscall instruction →</em><span class="hot">trap to fixed kernel entry</span><em>→</em><span>kernel mode does the work</span><em>→ return</em><span>user mode</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Measure the cost of crossings by forcing a lot of them. This reads a large file one byte per <code>read</code> call — the tiny block size means one syscall per byte.
+<pre class="cmd">yes | head -c 1000000 &gt; /tmp/big
+time dd if=/tmp/big of=/dev/null bs=1 2&gt;/dev/null</pre>
+<pre class="out">real	0m1.34s</pre></li>
+<li>Now read the identical data in one big block — a handful of crossings instead of a million. Same bytes moved; the only thing that changed is the number of times you knocked on the door.
+<pre class="cmd">time dd if=/tmp/big of=/dev/null bs=1M 2&gt;/dev/null</pre>
+<pre class="out">real	0m0.00s</pre></li>
+<li>Prove the difference is the syscalls themselves by counting them. <code>strace -c</code> (the subject of B3.8) tallies calls; the byte-at-a-time run makes ~a million <code>read</code>s, the block run a handful.
+<pre class="cmd">strace -c dd if=/tmp/big of=/dev/null bs=1 2&gt;&amp;1 | grep -E 'read|calls'</pre>
+<pre class="out">% time     seconds  usecs/call     calls    errors syscall
+ 51.20    1.010     1          1000001           read</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, in one sentence each, why a syscall is not a library call and why buffering makes I/O fast. Then predict: if you rewrote the byte-at-a-time program to read into a 4&nbsp;KB buffer, roughly how many <code>read</code> syscalls would a one-megabyte file take? (About 250 — one per 4&nbsp;KB block — down from a million, which is the entire reason <code>stdio</code> uses a buffer that size by default.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Not every library function is a syscall in disguise, and not every syscall is slow. A crossing is a fixed overhead, not a catastrophe — the rule is "don't make a million needless ones", not "avoid syscalls". Reading a whole file with one big <code>read</code> is one crossing and completely fine.</p>
+<p>The mode switch here is a different thing from the process <em>context</em> switch (swapping one process off the CPU for another), even though people blur them. A syscall crosses into the kernel but usually stays in the same process; a context switch changes which process is on the CPU and is more expensive again. Both are kernel-owned, which is why they get confused.</p>
+<div class="k8s-link">
+<p>This cost is why the kernel/user boundary shapes how fast software can go, and why some performance-critical paths try to minimise crossings (batching, <code>io_uring</code>, eBPF running logic inside the kernel). For your purposes as an operator, the payoff is smaller and more practical: when a container is burning CPU in "system" time (<code>%sy</code> in <code>top</code>) rather than "user" time, it is spending its life crossing the boundary — usually doing an enormous number of small syscalls — and that is a specific, findable class of problem rather than a mystery.</p>
+<p>You will meet the system-vs-user CPU split again in node troubleshooting; keep <a href="w6.html">W6</a> in mind as the place where "high sys time" becomes a diagnosis rather than a curiosity.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 syscall</code> describes the raw mechanism and the architecture-specific instruction and registers. <code>man 2 intro</code> frames what system calls are and how errors come back. <code>man 7 vdso</code> is worth a skim for the clever exception — a few "syscalls" like <code>gettimeofday</code> are answered without a real crossing at all, which is itself evidence of how much the crossing is worth avoiding.</p>
+</article>
+
+<article class="lesson" id="cp-b3-3" data-id="b3-3">
+<div class="lesson-head"><span class="cp-id">B3.3</span><h4>See the doorway: <code>strace -f echo hi</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything so far has been description. Now you watch it happen. <code>strace</code> prints every system call a program makes, in order, as it makes them — so the abstract "narrow doorway" becomes a concrete, scrolling list you can read. Once you have seen that even <code>echo hi</code> is a couple of dozen kernel requests, the boundary stops being theory. This one command is the most useful debugging tool in this entire module, and you will use it for the rest of your career.</p>
+<h5>The concept</h5>
+<p><strong><code>strace</code></strong> ("system-call trace") runs a program and reports each syscall it makes: the call's name, its arguments, and what came back. It works by asking the kernel — through the same <code>ptrace</code> mechanism a debugger uses — to stop the target every time it crosses the boundary and let <code>strace</code> peek. That is why it can see calls with no special access to the program's source: it is watching at the doorway, which the kernel controls, not inside the program.</p>
+<p>The <code>-f</code> flag means "follow children": if the program starts other programs (via the <code>clone</code>/<code>execve</code> you learned in B2), trace those too. Reach for <code>-f</code> by default — without it, tracing anything that spawns helpers shows you almost nothing, and a huge amount of real software is a parent that immediately forks.</p>
+<p>When you trace something as small as <code>echo hi</code>, the output splits into a shape you will start to recognise everywhere. The <strong>first line is always <code>execve</code></strong> — the kernel loading your program into a fresh address space (this is the B2.5 <code>exec</code> step, seen from below). Then a burst of <strong>startup</strong>: mapping the C library into memory (<code>openat</code>, <code>mmap</code>, <code>mprotect</code>), setting up the memory allocator (<code>brk</code>). Then, buried in the middle, the <strong>one line that is the actual job</strong> — for <code>echo hi</code>, a single <code>write</code> of the string. Then <code>exit_group</code>, the program ending. Nearly all of the output is ceremony; the real work is usually one or two lines, and learning to find them in the noise is the skill.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Trace the smallest useful program. It scrolls a screen or two; that is the point — an enormous amount of machinery underlies "print two characters".
+<pre class="cmd">strace -f echo hi</pre></li>
+<li>Look at the very first line. This is the kernel replacing the shell's copy with the <code>echo</code> program — the <code>exec</code> from B2, from the kernel's side. Note it lists the arguments and a count of environment variables.
+<pre class="out"><b>execve("/usr/bin/echo", ["echo", "hi"], 0x7fff... /* 73 vars */) = 0</b></pre></li>
+<li>Find the startup burst. Every one of these is the C library being wired into the process before your program's own logic runs — the same sequence in almost every binary you will ever trace.
+<pre class="out">openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+mmap(NULL, 2029760, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7...
+brk(NULL)                               = 0x63441ae4f000</pre></li>
+<li>Now find the one line that is the actual work. Out of the whole trace, this single <code>write</code> is <code>echo</code> doing its job — three bytes (<code>hi\n</code>) to file descriptor 1, standard output. Everything else was getting ready.
+<pre class="out"><b>write(1, "hi\n", 3)                     = 3</b>
+close(1)                                = 0
+close(2)                                = 0
+<b>exit_group(0)                           = ?</b>
++++ exited with 0 +++</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Run <code>strace -f echo hi</code> again and, out loud, narrate the three phases: load (<code>execve</code>), get ready (the libc/mmap/brk burst), do the job (<code>write</code>), end (<code>exit_group</code>). Then answer: which single line would still be there if you traced <code>echo goodbye</code> instead, unchanged in shape? (The <code>write</code> — same call, same fd 1, just different bytes. The whole startup is identical because it is about loading <code>echo</code>, not about what you asked it to print.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>strace</code> mixes its own output with the program's, and both go to your terminal, which is confusing at first. <code>strace</code> writes the trace to standard error and the program writes <code>hi</code> to standard output, so they interleave. To separate them, send the trace to a file with <code>-o trace.txt</code> — then the program's real output is clean on screen and the trace waits for you in the file. B3.13 relies on exactly this.</p>
+<p>Tracing slows the program down a lot — every syscall now stops the process twice. That is fine for understanding a program and a disaster for measuring its speed; never draw performance conclusions from wall-clock time <em>under</em> <code>strace</code>. Use <code>strace -c</code> (B3.8) for counts and a separate un-traced run for timing.</p>
+<p><code>strace</code> may be blocked by a hardened kernel's <code>ptrace</code> restrictions or inside a container without the right permissions, giving "Operation not permitted". That is the <code>ptrace</code> mechanism itself being fenced off — reasonable on a locked-down host, and worth recognising so you do not mistake it for a broken install.</p>
+<div class="k8s-link">
+<p>When a container crashes with an unhelpful log, <code>strace</code> is how you find out what it was really trying to do — often it is one denied <code>openat</code> (a missing config file), one failing <code>connect</code> (a service it cannot reach), or one <code>EACCES</code> (a permission it was not granted). The Kubernetes-shaped version is <code>kubectl debug</code> attaching an ephemeral container that shares the target's namespaces, so you can <code>strace</code> a running pod's process without rebuilding its image.</p>
+<p>The through-line to <a href="w6.html">W6</a> troubleshooting: application logs tell you what the program decided to say; the syscall trace tells you what it actually did. When those two disagree — the log says "connecting…" forever but the trace shows the <code>connect</code> returning <code>ECONNREFUSED</code> — the trace is the truth.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 strace</code> — long but navigable; the options that earn their keep are <code>-f</code>, <code>-o</code>, <code>-c</code>, <code>-e trace=</code> (filter to a set of calls, e.g. <code>-e trace=openat,connect</code>), <code>-p</code> (attach to a running PID), and <code>-s</code> (string length shown). <code>man 2 ptrace</code> if you want the mechanism <code>strace</code> is built on. For the "which syscalls exist" reference behind every line, <code>man 2 syscalls</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b3-4" data-id="b3-4">
+<div class="lesson-head"><span class="cp-id">B3.4</span><h4>Place libc: your code vs the kernel's, seen with <code>ltrace</code> vs <code>strace</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>People say "<code>printf</code> makes a system call" as if <code>printf</code> <em>is</em> one. It is not. <code>printf</code>, <code>fopen</code> and <code>malloc</code> are ordinary functions living inside your own process, running in user mode — they only cross the boundary sometimes, and when they do, the syscall they make has a different name than the one you called. Getting this layering right explains a whole family of confusions, including the classic "my program printed the line but the output is gone after it was killed".</p>
+<h5>The concept</h5>
+<p>Between your program and the kernel sits the <strong>C library</strong> (<code>libc</code>, on Ubuntu the GNU version, <code>glibc</code>). It is not part of the kernel; it is a library mapped into every process — you saw it load in the last lesson's startup burst. Its job is to give programs a comfortable, portable interface (<code>printf</code>, <code>fopen</code>, <code>malloc</code>, <code>getpwnam</code>…) and, underneath, to make the actual system calls on their behalf, handling the fiddly register setup and the architecture differences.</p>
+<p>So there are two layers of "calls", and two tools that see them:</p>
+<ul>
+<li><strong><code>ltrace</code></strong> shows <em>library</em> calls — the functions your program calls in user space: <code>printf("...")</code>, <code>malloc(24)</code>, <code>strlen(...)</code>. This is the layer you wrote against.</li>
+<li><strong><code>strace</code></strong> shows <em>system</em> calls — the requests that actually cross into the kernel: <code>write(1, ...)</code>, <code>brk(...)</code>, <code>mmap(...)</code>. This is the layer the kernel sees.</li>
+</ul>
+<p>The relationship between them is not one-to-one, and that gap is the whole lesson. A hundred <code>printf</code> calls may produce a <em>single</em> <code>write</code> syscall, because libc keeps an internal buffer and only flushes it to the kernel when the buffer fills, when you print a newline to a terminal, or when the program exits cleanly. Your <code>malloc</code> calls usually make no syscall at all — libc hands you memory it already has, and only occasionally asks the kernel for more with <code>brk</code> or <code>mmap</code>.</p>
+<p>This buffering explains the notorious lost-output bug. If a program <code>printf</code>s a line and is then killed with <code>SIGKILL</code> (B2), the line can vanish — because it was sitting in libc's userspace buffer, on <em>your</em> side of the boundary, and <code>SIGKILL</code> gives no chance to flush it. The text never became a <code>write</code> syscall, so it never reached the terminal. "It printed but I lost it" means "it called <code>printf</code> but never reached <code>write</code>".</p>
+<div class="flow"><span>your call: <code>printf</code> ×100</span><em>→</em><span class="hot">libc buffers in user space</span><em>→ one</em><span>syscall: <code>write</code> ×1</span><em>→</em><span>kernel</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a tiny program that prints and allocates. Nothing here is a syscall by name — it is all libc.
+<pre class="cmd">cat &gt; /tmp/hello.c &lt;&lt;'C'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+int main(void) {
+    char *p = malloc(24);
+    printf("hello\n");
+    free(p);
+    return 0;
+}
+C
+gcc -o /tmp/hello /tmp/hello.c</pre></li>
+<li>Watch the <em>library</em> layer with <code>ltrace</code>. You see the functions you actually wrote — the <code>malloc</code>, the <code>printf</code>, the <code>free</code>.
+<pre class="cmd">ltrace /tmp/hello</pre>
+<pre class="out"><b>malloc(24)</b>                             = 0x5b3f...
+<b>printf("hello\n")</b>                       = 6
+<b>free(0x5b3f...)</b>                         = &lt;void&gt;
+hello
++++ exited (status 0) +++</pre></li>
+<li>Now watch the <em>kernel</em> layer with <code>strace</code> on the same binary. The <code>printf</code> has become a <code>write</code>; the <code>malloc</code>/<code>free</code> made no syscall at all this time (libc had the memory already); a <code>brk</code> appears only where libc topped up its arena.
+<pre class="cmd">strace /tmp/hello 2&gt;&amp;1 | grep -E 'write|brk'</pre>
+<pre class="out">brk(NULL)                               = 0x63441ae4f000
+brk(0x63441ae70000)                     = 0x63441ae70000
+<b>write(1, "hello\n", 6)                  = 6</b></pre></li>
+<li>See the buffering directly. Redirect the output to a file instead of the terminal, and libc switches from line-buffered to a big block buffer — so the <code>write</code> now happens only at exit, and if the program were killed first the "hello" would be lost.
+<pre class="cmd">strace /tmp/hello &gt; /tmp/out 2&gt; /tmp/trace
+grep write /tmp/trace</pre>
+<pre class="out">write(1, "hello\n", 6)                  = 6</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State which tool you would reach for to answer "how many times did my program actually hit the disk" (<code>strace</code> — that is the kernel layer) versus "is my program calling <code>malloc</code> in a hot loop" (<code>ltrace</code> — that is the library layer). Then explain in one sentence why a program that "definitely printed the error" can show no error after a <code>SIGKILL</code>. (The line was in libc's user-space buffer and never became a <code>write</code>; <code>SIGKILL</code> gave no chance to flush it across the boundary.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>ltrace</code> is not installed by default on Ubuntu 24.04 (<code>sudo apt install -y ltrace</code>) and, unlike <code>strace</code>, it can be defeated by modern binary hardening — on some statically-linked or heavily-optimised programs it shows little or nothing. It is a teaching tool and an occasional aid, not the everyday workhorse; <code>strace</code> is the one to trust.</p>
+<p>The buffering rule depends on where output goes. To a terminal, <code>stdout</code> is line-buffered (flushes on each newline), which is why you see interactive output promptly. To a file or a pipe, it becomes fully block-buffered (flushes only when full or at exit) — the reason a long pipeline can appear to produce nothing for a while and then dump everything at once. <code>stderr</code> is unbuffered, which is precisely why error messages should go there: they survive a crash that would swallow buffered <code>stdout</code>.</p>
+<div class="k8s-link">
+<p>This is the single most common reason a crashing container's logs look truncated. A pod writing logs to <code>stdout</code> that is being captured (a pipe, not a terminal) is block-buffered; when the container is OOM-killed or <code>SIGKILL</code>ed, the last buffer never flushes and the most interesting lines — the ones just before death — are exactly the ones you lose. The standard fixes are the process-level ones you now understand: run the program with unbuffered output (<code>PYTHONUNBUFFERED=1</code>, <code>stdbuf -oL</code>, or the language's flush call), so each line crosses the boundary immediately.</p>
+<p>Keep this in view for <a href="w6.html">W6</a>: "the logs cut off right before the crash" is almost never the logging system losing data — it is user-space buffering that never got flushed, the same mechanism you just watched.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ltrace</code> for the library-call view and its filters (<code>-e</code>). <code>man 3 printf</code> and <code>man 3 malloc</code> to confirm these are library (section 3) functions, not system (section 2) calls — the manual section number itself tells you which side of the boundary a name lives on. <code>man 3 setvbuf</code> for how buffering is chosen and how to change it. <code>man 7 stdio</code> for the buffering rules in one place.</p>
+</article>
+</div><!-- /g-boundary -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B3 recall quiz</h3>
+<p>Answer out loud before revealing. If you cannot see the boundary in your head, none of the tooling on top of it will make sense.</p>
+<ol>
+<li>Name the five things the kernel exclusively owns, and what a program can do without asking.
+<details class="reveal"><summary>Answer</summary><p>Physical hardware, the memory map of every process, CPU scheduling, the filesystems, and the network stack. On its own a program can only do arithmetic and manipulate its own memory; everything else is a request across the boundary.</p></details></li>
+<li>What is a system call, and how is it different from a function call to a library?
+<details class="reveal"><summary>Answer</summary><p>A controlled switch from user mode to kernel mode via a special CPU instruction that traps to a fixed kernel entry point. A library call stays in user mode and jumps anywhere in your own program; a syscall crosses the privilege boundary and lands only where the kernel allows. That is why it costs more and why it is safe.</p></details></li>
+<li>Why is "too many small reads" a real performance bug?
+<details class="reveal"><summary>Answer</summary><p>Each read is a boundary crossing with fixed overhead. One <code>read</code> of a megabyte is one crossing; a million one-byte reads is a million crossings, and the crossings — not the data movement — dominate. Buffering exists to collapse many small would-be syscalls into a few big ones.</p></details></li>
+<li>You called <code>printf</code> a hundred times but <code>strace</code> shows one <code>write</code>. Explain.
+<details class="reveal"><summary>Answer</summary><p><code>printf</code> is a libc function running in your process; it buffers text in user space and only crosses into the kernel with a <code>write</code> syscall when the buffer flushes (full, newline to a terminal, or clean exit). A hundred <code>printf</code>s can accumulate into a single <code>write</code>.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Name what the kernel exclusively owns and explain why the boundary exists at all.</li>
+<li>Describe user mode vs kernel mode as a CPU state, and why crossing it costs.</li>
+<li>Read an <code>strace</code> and find the one or two lines that are the actual work.</li>
+<li>Place libc correctly and explain buffered-output loss after a kill.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b2.html">← B2 · Processes, threads, signals</a><a href="../beginner.html#b4">B4 · Users, groups, permissions, capabilities →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-24. Package versions referenced: strace 6.8, ltrace 0.7.91, coreutils 9.4, procps 4.0.4, gcc 13, python 3.12. Syscall names are the x86-64 set; a few differ on other architectures (e.g. <code>openat</code> vs the older <code>open</code>).
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
