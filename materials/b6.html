@@ -524,6 +524,196 @@ cat /proc/$(pgrep -n bash)/cgroup</pre>
 </article>
 </div><!-- /g-handson -->
 
+<!-- ---------------- Roots and entering ---------------- -->
+<div class="grp" id="g-roots"><h3>Roots and entering</h3>
+
+<article class="lesson" id="cp-b6-10" data-id="b6-10">
+<div class="lesson-head"><span class="cp-id">B6.10</span><h4><code>chroot</code>: changing what <code>/</code> means — and why it is not a wall</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>chroot</code> is the oldest and simplest way to give a process a different filesystem root, and it is the piece most people <em>think</em> a container is. Running it once — pointing a shell at the rootfs you built in B5 and watching <code>/</code> become that directory — makes "a container has its own filesystem" concrete. But the more important lesson is the opposite one: <code>chroot</code> is a convenience, not a security boundary, and knowing exactly why is what separates "I use containers" from "I understand them". This is where the "isolation ≠ security" warning from B6.1 gets its sharp edge.</p>
+<h5>The concept</h5>
+<p><code>chroot &lt;dir&gt; &lt;cmd&gt;</code> changes the calling process's idea of the root directory to <code>&lt;dir&gt;</code>: from then on, an absolute path like <code>/bin/sh</code> is resolved <em>relative to</em> <code>&lt;dir&gt;</code>, so the process can only name files inside that subtree. Point it at a minimal rootfs (a directory containing <code>bin/</code>, <code>lib/</code>, etc. — exactly the <code>debootstrap</code>/busybox tree from B5.17) and you get a shell that believes <code>&lt;dir&gt;</code> is the whole filesystem. That is genuinely useful: rescue environments, build sandboxes, and the first stage of container startup all use it.</p>
+<p>Now the crucial caveat. <code>chroot</code> only changes <em>path resolution starting from</em> <code>/</code>; it does not sever the process from everything else on the machine. A process that keeps enough privilege — specifically <code>CAP_SYS_CHROOT</code> and the ability to hold an open file descriptor to a directory <em>outside</em> the new root — can climb straight back out. The classic escape is only a few lines: open a directory fd before or after chrooting, <code>chroot</code> into a subdirectory, then <code>fchdir</code> back to the saved fd and <code>cd ..</code> repeatedly until you are at the real <code>/</code>. The kernel does not stop this, because <code>chroot</code> was never designed as a containment boundary — it changes a lookup base, nothing more. It also does nothing about processes, network, users, or mounts: a chrooted process still shares the host's PID list, network, and everything else you spent this module learning to isolate. <em>That</em> is why a real container is <code>chroot</code>'s job done properly by <code>pivot_root</code> (next lesson) inside a full stack of namespaces — not <code>chroot</code> alone.</p>
+<div class="flow"><span>chroot /newroot</span><em>· absolute paths resolve under</em><span class="hot">/newroot</span><em>· but same PIDs · same net · escapable with</em><span>CAP_SYS_CHROOT + an outside fd</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Point a shell at the rootfs from B5.17 (rebuild it there if you cleaned up). Inside, <code>/</code> is that directory; <code>ls /</code> shows the minimal tree, not the host's.
+<pre class="cmd">multipass shell sandbox
+ls ~/rootfs                      # bin  etc  lib  ... (from B5.17)
+sudo chroot ~/rootfs /bin/sh
+ls /                             # the rootfs, seen as /
+echo "in a chroot; PID list is still the host's:"; ls /proc | head -3</pre>
+<pre class="out">bin  dev  etc  lib  usr  var    ← "/" is now ~/rootfs
+in a chroot; PID list is still the host's:
+1
+2
+...                             ← /proc still shows host PIDs — no PID namespace here</pre></li>
+<li>Feel the not-a-wall point without a full exploit: the chroot shares the host network, so it can reach the network as the host — isolation of the filesystem is <em>not</em> isolation of anything else.
+<pre class="cmd">ip addr show 2&gt;/dev/null | grep -c 'inet ' && echo 'same interfaces as host'
+exit</pre>
+<pre class="out">2
+same interfaces as host          ← chroot changed the filesystem root and nothing else</pre></li>
+<li>Contrast with the real thing: the same rootfs under a namespace stack (a preview of B6.14) hides the host <code>/proc</code> too. Note how much more than <code>chroot</code> that takes.
+<pre class="cmd">sudo unshare --pid --mount --uts --ipc --fork --mount-proc \
+  chroot ~/rootfs /bin/sh -c 'ls /proc | head -3'</pre>
+<pre class="out">1                                ← now /proc is the container's own — three entries
+...</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Give the one-sentence definition of what <code>chroot</code> changes. (It changes the base directory that absolute path lookups resolve from — the process's idea of <code>/</code> — and nothing else.) Then: name two reasons <code>chroot</code> alone is not a container. (It does not isolate processes/network/users/mounts — a chrooted process still shares the host's PID list, network, etc.; and it is escapable by a process holding <code>CAP_SYS_CHROOT</code> and an open fd to an outside directory.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Never rely on <code>chroot</code> to contain untrusted code. The escape is well-known, requires no kernel bug, and works whenever the process keeps <code>CAP_SYS_CHROOT</code> (which a root process inside the chroot has by default). If you need real containment you need namespaces + dropped capabilities + <code>pivot_root</code>, i.e. an actual container. Treating a chroot jail as a security sandbox for hostile code is a decades-old mistake that still causes breaches.</p>
+<p>A chroot is only as functional as the files you put in it: run a binary that needs a shared library not present under the new root and it fails with a confusing "not found" even though the binary exists, because the <em>loader</em> can no longer see <code>/lib</code>. This is why a rootfs must include the binary's libraries (or the binary must be static) — the same completeness requirement that makes container base images carry their own <code>/lib</code>, and exactly what B5.17 walked through.</p>
+<div class="k8s-link">
+<p>Container runtimes use the <em>idea</em> of chroot — give the container its own root filesystem — but implement it with <code>pivot_root</code> (next lesson) precisely because <code>chroot</code> is escapable. When you see a container's root filesystem in <code>kubectl exec</code>, that private <code>/</code> is the runtime's <code>pivot_root</code> into the image's overlay, not a bare <code>chroot</code>. The security lesson matters directly: this is why running a container as root, or granting it <code>CAP_SYS_ADMIN</code>/<code>SYS_CHROOT</code>, meaningfully weakens isolation, and why <code>securityContext</code> capability-dropping (B4) is defence-in-depth on top of the namespaces.</p>
+<p>The image-as-root-filesystem story continues in <a href="w1.html">W1</a>; capability dropping and pod hardening are in <a href="w7.html">W7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 chroot</code> and <code>man 2 chroot</code> for the command and syscall, and <code>man 7 capabilities</code> for <code>CAP_SYS_CHROOT</code>. <code>man 8 debootstrap</code> (or the busybox route) builds a usable rootfs — re-read <a href="b5.html#cp-b5-17">B5.17</a>. <code>man 2 pivot_root</code> is the next lesson's safer alternative. No exam-docs entry; the concept surfaces as the container's root filesystem in kubernetes.io's pod/image material.</p>
+</article>
+
+<article class="lesson" id="cp-b6-11" data-id="b6-11">
+<div class="lesson-head"><span class="cp-id">B6.11</span><h4><code>pivot_root</code>: the real way to swap a root filesystem</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>pivot_root</code> is what container runtimes actually use where a beginner would reach for <code>chroot</code>, and the difference is exactly the escapability you just saw. Instead of merely changing where <code>/</code> points, <code>pivot_root</code> <em>swaps</em> the mount namespace's root and lets you unmount the old one entirely — so there is no old root left anywhere to climb back to. Doing it by hand, inside a mount namespace, is the last primitive you need before assembling a container in B6.14.</p>
+<h5>The concept</h5>
+<p><code>pivot_root &lt;new_root&gt; &lt;put_old&gt;</code> does two things atomically: it makes <code>&lt;new_root&gt;</code> the root of the current mount namespace, and it moves the <em>old</em> root so it is now accessible at <code>&lt;put_old&gt;</code> (a directory inside the new root). Crucially, once the old root is relocated there, you can <code>umount</code> it — and after that unmount, <strong>the old filesystem is not reachable from anywhere in the namespace</strong>. That is the whole advantage over <code>chroot</code>: <code>chroot</code> leaves the old root mounted and merely redirects lookups, so an outside fd is a ladder back; <code>pivot_root</code> plus an unmount removes the ladder.</p>
+<p>Because it rewrites the mount namespace's root, <code>pivot_root</code> has real preconditions, and hitting them is most of the learning:</p>
+<ul>
+<li>You must be in your own <strong>mount namespace</strong> (<code>unshare --mount</code>), or you would be swapping the host's root — the kernel refuses in many configurations, and you would not want to succeed.</li>
+<li><code>&lt;new_root&gt;</code> must be a <strong>mount point</strong>, not just a directory. The usual trick is to bind-mount the rootfs onto itself (<code>mount --bind newroot newroot</code>) so it qualifies.</li>
+<li>The new root (and its parent mount) must <strong>not be shared</strong> — propagation must be private/slave, or the pivot would try to propagate a root change to the host. This is the B5.12 propagation rule showing up as a hard requirement.</li>
+<li><code>&lt;put_old&gt;</code> must be a directory <em>underneath</em> <code>&lt;new_root&gt;</code>.</li>
+</ul>
+<p>Meet those four and the pivot is clean; miss one and you get a terse <code>EINVAL</code> that only makes sense once you know the list. Every one of these preconditions is a mount-namespace/propagation fact from B5 and B6.6, which is why this lesson sits where it does.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Inside a fresh mount namespace, make the rootfs a private mount point (preconditions 1–3). The self-bind turns a directory into a mount; <code>--make-private</code> stops the pivot propagating to the host.
+<pre class="cmd">multipass shell sandbox
+sudo unshare --mount bash
+NEW=~/rootfs
+mount --bind $NEW $NEW           # new_root must be a mount point
+mount --make-private $NEW        # and not shared
+mkdir -p $NEW/oldroot            # put_old, under new_root</pre>
+<pre class="out">(no output — the setup succeeds silently)</pre></li>
+<li>Pivot. After this, <code>/</code> is the rootfs and the old root hangs at <code>/oldroot</code>; <code>cd /</code> so nothing holds the old root.
+<pre class="cmd">cd $NEW
+pivot_root . oldroot
+cd /
+ls /                             # the rootfs, as the true root
+ls /oldroot | head -3            # the host's old root, still mounted here for now</pre>
+<pre class="out">bin  dev  etc  lib  oldroot  usr
+bin  boot  dev                   ← the old root, parked at /oldroot</pre></li>
+<li>Remove the ladder: unmount the old root. Now there is no path to the host filesystem anywhere in this namespace — the thing <code>chroot</code> could never guarantee.
+<pre class="cmd">mount --make-private /oldroot 2&gt;/dev/null
+umount -l /oldroot
+ls /oldroot                      # empty — the old root is gone from this namespace
+exit</pre>
+<pre class="out">(empty)                          ← host root no longer reachable from inside</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the one capability <code>pivot_root</code> gives you that <code>chroot</code> cannot. (After relocating and unmounting the old root, the previous filesystem is unreachable from anywhere in the mount namespace — there is no outside directory left to escape to, whereas <code>chroot</code> leaves the old root mounted and reachable.) Then: why must you run it inside <code>unshare --mount</code> with the new root made private? (It rewrites the mount namespace's root; without a private mount namespace you would be altering the host's root and the change could propagate out — the kernel refuses shared-propagation pivots, which is precisely the B5.12 rule.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>pivot_root</code> failing with <code>EINVAL</code> almost always means a precondition, not a typo — most often that <code>new_root</code> is a plain directory rather than a mount point (fix: bind-mount it onto itself) or that it is a <code>shared</code> mount (fix: <code>--make-private</code>). Reading the error as "one of the four preconditions is unmet" and checking them in order is far faster than guessing. This is the payoff for learning propagation in B5: the fix is always a mount-mode adjustment.</p>
+<p>Leaving the old root mounted at <code>/oldroot</code> re-introduces exactly the escape route <code>pivot_root</code> exists to remove — a process could <code>cd /oldroot</code> straight back to the host tree. The unmount in step&nbsp;3 is not optional cleanup; it is the security-relevant final step. Real runtimes always unmount (or never expose) the old root before handing the container to the workload.</p>
+<div class="k8s-link">
+<p>This is the exact sequence a container runtime (containerd/runc via the OCI runtime spec) performs to give a pod's container its root filesystem: create a mount namespace, mount the image's overlay (B5.16) as the new root, <code>pivot_root</code> into it, and unmount the old root so the container cannot reach the node's filesystem. When people say "the container is isolated from the host filesystem", <em>this</em> unmounted-old-root is the mechanism that makes the claim true — far more than <code>chroot</code> ever could. A <code>hostPath</code> volume is, in effect, deliberately mounting a piece of the node's filesystem back <em>into</em> that otherwise-severed root, which is why <code>hostPath</code> is powerful and security-sensitive.</p>
+<p>The overlay-as-root and runtime handoff continue in <a href="w1.html">W1</a>; <code>hostPath</code>'s node-filesystem access is a security topic in <a href="w5.html">W5</a> and <a href="w7.html">W7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 pivot_root</code> and <code>man 8 pivot_root</code> for the syscall/command and its exact preconditions (read the ERRORS section — every <code>EINVAL</code> cause is listed), and <code>man 7 mount_namespaces</code> for why a private mount namespace is required. Re-read <a href="b5.html#cp-b5-12">B5.12</a> (propagation) and <a href="b5.html#cp-b5-16">B5.16</a> (overlay root). In the exam docs, container root filesystem and <code>hostPath</code> volumes.</p>
+</article>
+
+<article class="lesson" id="cp-b6-12" data-id="b6-12">
+<div class="lesson-head"><span class="cp-id">B6.12</span><h4><code>nsenter</code>: joining a namespace someone else made</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>So far you have <em>created</em> namespaces. The other half of the story is <em>joining</em> one that already exists — stepping into a running container's world to look around. That operation, <code>nsenter</code>, is not an obscure tool: it is, almost exactly, what <code>kubectl exec</code> and every "get me a shell in that container" command do under the hood. Doing it by hand — entering the container you will build in B6.14 — demystifies the single most-used debugging command in Kubernetes.</p>
+<h5>The concept</h5>
+<p><code>nsenter</code> enters one or more of another process's namespaces by targeting that process's PID and naming which namespaces to join. It is the command-line face of the <code>setns(2)</code> syscall, which opens one of the <code>/proc/PID/ns/*</code> handles from B6.3 and switches the caller into that namespace. The usual invocation is <code>nsenter -t &lt;pid&gt; -m -u -i -n -p &lt;cmd&gt;</code>, where each flag selects a namespace type to join — <code>-m</code> mount, <code>-u</code> UTS, <code>-i</code> IPC, <code>-n</code> network, <code>-p</code> PID (there are flags for user and cgroup too). You give it the PID of any process already inside the target namespaces, and it runs your command <em>inside</em> them. Because you built those namespaces around a container's init process, entering that PID's namespaces drops you into the container.</p>
+<p>Two details make this click. First, you can join <em>selectively</em>: enter only the network namespace (<code>-t PID -n</code>) to debug a container's networking with host tools, while keeping your own mount and PID view — enormously useful when the container itself lacks <code>ping</code> or <code>tcpdump</code>. Second, joining a PID namespace has a wrinkle: <code>setns</code> into a PID namespace only affects <em>future children</em>, so <code>nsenter -p</code> forks your command as PID-something inside, rather than renumbering the running <code>nsenter</code> itself. This is why <code>nsenter</code> exists as a dedicated tool rather than a one-line wrapper — it handles that forking for you.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a long-lived namespaced process to enter, standing in for a container's init. Leave it running in one terminal.
+<pre class="cmd">multipass shell sandbox
+sudo unshare --uts --pid --net --fork bash -c 'hostname box-01; sleep 3600'</pre>
+<pre class="out">(this shell now holds a UTS+PID+net namespace open via the sleep)</pre></li>
+<li>From a second terminal, find that process's PID and join its namespaces. Inside, <code>hostname</code> is the one it set and the process list is the container's — you are in its world.
+<pre class="cmd">multipass shell sandbox
+PID=$(pgrep -f 'sleep 3600')
+sudo nsenter -t $PID -u -p -n bash
+hostname                         # box-01, not sandbox
+ps aux | wc -l                   # a short list — the container's PID namespace</pre>
+<pre class="out"><b>box-01</b>                          ← joined the container's UTS namespace
+3                                ← its PID namespace: just a couple of processes</pre></li>
+<li>Show the selective-entry superpower: join only the network namespace to inspect its interfaces with host tools, without leaving your own PID/mount view.
+<pre class="cmd">exit
+sudo nsenter -t $PID -n ip addr show | grep -E 'inet|state' | head</pre>
+<pre class="out">    inet 127.0.0.1/8 scope host lo   ← the container's lone loopback (see B6.13)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What does <code>nsenter -t PID -n</code> (network only) let you do that entering all namespaces would not? (Debug the target's <em>network</em> using tools from your own environment — your shell keeps its own mount/PID view, so host tools like <code>tcpdump</code> or <code>ip</code> are available even if the container lacks them.) Then connect it to Kubernetes: what everyday command is <code>nsenter</code> essentially the internals of? (<code>kubectl exec</code> — it runs your command inside the target container's namespaces, exactly as <code>nsenter</code> does by PID.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Entering another process's namespaces needs privilege (typically root, or the right capabilities in the target user namespace) — this is not an unprivileged operation, and rightly so: joining a namespace is joining someone's isolated world. If <code>nsenter</code> fails with <code>EPERM</code>, you are missing that privilege, not naming the wrong PID. On a real cluster this is why node-level debugging (entering a pod's namespaces from the host) requires node root access, which is itself a privilege boundary worth respecting.</p>
+<p>The PID-namespace forking quirk surprises people: after <code>nsenter -t PID -p</code>, tools inside see the container's PIDs, but if you also expected your own shell's <code>$$</code> to become a small number it will not — <code>nsenter</code> forks your command into the namespace rather than moving the existing process. This is the same "setns into a PID namespace affects only children" rule from B6.5, and it is correct behaviour, not a bug. Match your mental model to it rather than fighting it.</p>
+<div class="k8s-link">
+<p><code>kubectl exec -it pod -- sh</code> is, at the node level, the kubelet asking the runtime to do a <code>setns</code>/<code>nsenter</code>-equivalent into the container's namespaces and run your command there — which is why the shell you get sees the container's filesystem, hostname, and process list. The <code>kubectl debug</code> ephemeral-container feature and node-level troubleshooting (entering a pod's netns from the host to run <code>tcpdump</code> when the pod image is too minimal to contain it) are the selective-<code>nsenter</code> trick you just used, formalised. Understanding <code>nsenter</code> is understanding what "exec into the pod" physically means.</p>
+<p><code>kubectl exec</code>/<code>kubectl debug</code> and container troubleshooting are covered in <a href="w6.html">W6</a>; the container introspection view is <a href="w1.html#cp-1-21">W1.21</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 nsenter</code> for the flags (<code>-t</code>, and <code>-m -u -i -n -p -U -C</code> for each type), <code>man 2 setns</code> for the syscall it wraps, and <code>man 7 namespaces</code> for the <code>/proc/PID/ns/</code> handles it opens. Compare with <code>man 1 unshare</code> (create) — <code>nsenter</code> is its join-side counterpart. In the exam docs, <code>kubectl exec</code> and <code>kubectl debug</code>.</p>
+</article>
+</div><!-- /g-roots -->
+
+<!-- ---------------- Network namespace preview ---------------- -->
+<div class="grp" id="g-netns"><h3>Network namespace preview</h3>
+
+<article class="lesson" id="cp-b6-13" data-id="b6-13">
+<div class="lesson-head"><span class="cp-id">B6.13</span><h4>A network namespace: an empty machine with one dead loopback</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The network namespace is the biggest of the eight and gets its own module (B9) to wire up — but you should meet it here, empty, so the container you build in B6.14 has a complete set of the isolations a real one has. Seeing a freshly-created network namespace — a lone loopback interface, switched off, no routes, no way to reach anything — makes vivid what "a container starts with no network" actually means, and sets up the central question B9 answers: how does anything ever get <em>out</em> of here?</p>
+<h5>The concept</h5>
+<p>A <strong>network namespace</strong> gives a process a completely private network stack: its own set of network interfaces, its own IP addresses, its own routing table, its own firewall rules, and — importantly — its own <em>port space</em>. A brand-new network namespace is almost entirely empty. It contains exactly one interface, the <strong>loopback</strong> (<code>lo</code>), and even that starts <code>DOWN</code>; there are no other interfaces, no routes, and therefore no path to anything outside itself. It is, at birth, a machine unplugged from the network — it cannot reach the host, the host cannot reach it, and it cannot reach the internet.</p>
+<p>Two facts to carry into B9. First, the private port space is why isolation is so useful for servers: two network namespaces can <em>each</em> bind port 80, with no conflict, because "port 80" means something different in each — this is exactly how ten pods can all run a web server on port 80 on one node. Second, connecting a network namespace to anything requires deliberately building a wire: the standard tool is a <strong>veth pair</strong> (a virtual cable with two ends — put one end in the namespace, leave the other on the host or in a bridge), which is the hotel-room-phone-wire-to-the-switchboard analogy and the entire subject of B9. For now the point is the starting condition: isolated and inert. The <code>ip netns</code> command manages named network namespaces, and it works by creating the namespace and bind-mounting its <code>ns/net</code> handle under <code>/var/run/netns/</code> so it persists and can be named — the very pinning mechanism from B6.3.</p>
+<div class="flow"><span>ip netns add demo</span><em>→ contains only</em><span class="hot">lo (DOWN)</span><em>· no routes · no way out · until</em><span>a veth pair (B9)</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a named network namespace and look inside. <code>ip netns exec</code> runs a command in it; all you find is a loopback, and it is down.
+<pre class="cmd">multipass shell sandbox
+sudo ip netns add demo
+sudo ip netns exec demo ip addr</pre>
+<pre class="out">1: <b>lo:</b> &lt;LOOPBACK&gt; mtu 65536 <b>state DOWN</b> ...
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+                                     ← one interface, switched off, no address</pre></li>
+<li>Confirm there is no way out — no routes at all, so nothing is reachable.
+<pre class="cmd">sudo ip netns exec demo ip route
+sudo ip netns exec demo ping -c1 -W1 8.8.8.8 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">                                 ← empty: no routing table entries
+ping: connect: Network is unreachable   ← isolated and inert, exactly as expected</pre></li>
+<li>See the private port space: bring loopback up inside, and note the namespace has its own <code>127.0.0.1</code> independent of the host's. (Wiring it to the outside world is B9.)
+<pre class="cmd">sudo ip netns exec demo ip link set lo up
+sudo ip netns exec demo ip addr show lo | grep inet
+sudo ip netns list</pre>
+<pre class="out">    inet 127.0.0.1/8 scope host lo   ← its own loopback, now up
+demo                                 ← the named namespace persists (pinned under /var/run/netns)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>A brand-new network namespace can't reach the internet even though the host can — name the two things it is missing. (Any interface other than a down <code>lo</code>, and any route — no wire out and no routing table, so there is literally no path.) Then: why can two pods both serve on port 80 on one node without colliding? (Each pod has its own network namespace with its own port space, so "port 80" is a separate binding in each namespace — they never contend for one shared port table.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>ip netns</code>-created namespaces persist after the creating shell exits, because <code>ip netns</code> bind-mounts the namespace's handle under <code>/var/run/netns/</code> to keep it alive and nameable — so you must <code>sudo ip netns delete demo</code> to clean up, or it lingers. That persistence is a feature (you can enter it later), but it is also the exact leak mechanism in B6.15's second symptom: a bind-mounted <code>ns/net</code> handle keeps a namespace alive with no processes in it. Delete named namespaces you are done with.</p>
+<p>Do not confuse "has a loopback" with "has networking". A fresh netns has <code>lo</code> but it starts <code>DOWN</code> and, even up, loopback only talks to itself — a process can reach <code>127.0.0.1</code> inside but nothing beyond. Real connectivity needs a veth pair and routes you have not built yet. Beginners see <code>lo</code> and assume the namespace is connected; it is the opposite — <code>lo</code> is the proof of how <em>little</em> is there.</p>
+<div class="k8s-link">
+<p>This empty network namespace is precisely the starting state of every pod before the CNI plugin runs. When the kubelet creates a pod, the pause container gets a fresh network namespace exactly like <code>demo</code> — one down loopback, no routes — and then the CNI plugin (Flannel, Calico, Cilium…) does the B9 work: creates a veth pair, puts one end in the pod's namespace, assigns the pod IP, and adds routes so the pod can reach the cluster. The private port space is why every pod can use the same container port without node-level conflict, and why a Service has to map to pod IPs rather than host ports. Everything in W4 begins from this inert namespace.</p>
+<p>Pod networking, CNI, and the veth-pair wiring are the whole of <a href="w4.html#cp-4-2">W4.2</a>; you build the veth pair by hand in B9.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-netns</code> for creating, listing, entering, and deleting named network namespaces (and where it stores them under <code>/var/run/netns</code>), <code>man 7 network_namespaces</code> for the isolation semantics, and <code>man 8 ip-link</code> / <code>man 8 ip-route</code> for the interface and routing commands you will lean on in B9. In the exam docs, pod networking and CNI concepts (though the primitive itself is assumed).</p>
+</article>
+</div><!-- /g-netns -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B6 recall quiz</h3>
 <p>Answer out loud before revealing. If you can explain what a pod's shared namespaces are and what the pause container holds, this module has done its job.</p>
