@@ -832,7 +832,208 @@ cat /tmp/ov/merged/data/keep</pre>
 </article>
 </div><!-- /g-overlay -->
 
-<!-- INSERT-GROUPS-HERE -->
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b5-17" data-id="b5-17">
+<div class="lesson-head"><span class="cp-id">B5.17</span><h4>Mini project: build an "image" by hand</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You've mounted an overlay, triggered a copy-up, and found a whiteout in separate lessons. This project puts all three into one script you keep — three stacked lowerdirs under a single upper, mounted merged, then edited and deleted and reset so you watch every mechanism fire in sequence. When you're done you'll have built, by hand, the exact structure a container runtime builds for every container, and a script you'll reuse: B6 boots a shell <em>inside</em> this rootfs with <code>chroot</code>/<code>pivot_root</code>, and B14's from-scratch container builds on both.</p>
+<h5>The concept</h5>
+<p>Nothing new — this is B5.13 through B5.16 executed end to end. Three read-only <strong>lowerdirs</strong> play the role of image layers; one <strong>upperdir</strong> is the container's writable layer; <strong>merged</strong> is the container's root filesystem. You'll (1) confirm the union and the shadowing rule, (2) modify a file that exists only in the bottom layer and locate the full copy that appears in upper — <em>copy-up</em>, (3) delete a file from a lower layer and locate the 0/0 whiteout that hides it, and (4) empty the upper directory and remount, watching every original reappear untouched — the proof that the lowers were never modified and the writable layer is disposable. Keep the script; it is the seed of a container.</p>
+<h5>Lab</h5>
+<p>Snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>). Save this as <code>~/build-image.sh</code> — you'll extend it in B6 and B14.</p>
+<ol class="lab">
+<li>Write the builder. It lays out three layers, an upper and work dir, and mounts the merged view.
+<pre class="cmd">cat &gt; ~/build-image.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${1:-/tmp/handimage}
+sudo umount "$ROOT/merged" 2&gt;/dev/null || true
+rm -rf "$ROOT"; mkdir -p "$ROOT"/{low1,low2,low3,upper,work,merged}
+# three "image layers": base, runtime, app
+echo 'base OS file'      &gt; "$ROOT/low3/os-release"
+echo 'runtime v1'        &gt; "$ROOT/low2/runtime"
+echo 'from the app layer'&gt; "$ROOT/low1/app.conf"
+echo 'BASE greeting'     &gt; "$ROOT/low3/greeting"   # same name in low1+low3...
+echo 'APP greeting'      &gt; "$ROOT/low1/greeting"   # ...app layer must win
+sudo mount -t overlay overlay \
+  -o lowerdir="$ROOT/low1:$ROOT/low2:$ROOT/low3",upperdir="$ROOT/upper",workdir="$ROOT/work" \
+  "$ROOT/merged"
+echo "mounted rootfs at $ROOT/merged"
+SH
+chmod +x ~/build-image.sh
+~/build-image.sh</pre>
+<pre class="out">mounted rootfs at /tmp/handimage/merged</pre></li>
+<li>Confirm the union and shadowing: every layer's files are present, and the app layer's <code>greeting</code> wins over the base layer's.
+<pre class="cmd">ls /tmp/handimage/merged
+cat /tmp/handimage/merged/greeting</pre>
+<pre class="out">app.conf  greeting  os-release  runtime
+<b>APP greeting</b>                          ← low1 (app) shadows low3 (base)</pre></li>
+<li>Trigger a copy-up on a bottom-layer file, then find the full copy in upper.
+<pre class="cmd">echo 'patched at runtime' &gt;&gt; /tmp/handimage/merged/os-release
+ls /tmp/handimage/upper
+cat /tmp/handimage/low3/os-release</pre>
+<pre class="out"><b>os-release</b>                              ← copied up into the writable layer
+base OS file                            ← the bottom layer is untouched</pre></li>
+<li>Delete a lower-layer file and find its whiteout — the 0/0 character device in upper.
+<pre class="cmd">rm /tmp/handimage/merged/runtime
+ls -l /tmp/handimage/upper/runtime</pre>
+<pre class="out"><b>c</b>--------- 1 root root <b>0, 0</b> ... /tmp/handimage/upper/runtime</pre></li>
+<li>Reset the writable layer and remount — every original reappears, proving the lowers survived every change and the upper is disposable.
+<pre class="cmd">sudo umount /tmp/handimage/merged
+rm -rf /tmp/handimage/upper/* /tmp/handimage/work/*
+sudo mount -t overlay overlay \
+  -o lowerdir=/tmp/handimage/low1:/tmp/handimage/low2:/tmp/handimage/low3,upperdir=/tmp/handimage/upper,workdir=/tmp/handimage/work \
+  /tmp/handimage/merged
+ls /tmp/handimage/merged; cat /tmp/handimage/merged/os-release</pre>
+<pre class="out">app.conf  greeting  os-release  runtime   ← runtime is back, patch is gone
+base OS file                              ← original restored: lowers never changed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The project is complete when, from the running overlay, you can point at the copied-up file in <code>upper/</code>, point at the whiteout device, and explain why emptying <code>upper/</code> restored every original. (The copy-up is the full lower file materialised in upper on first write; the whiteout is a 0/0 char device masking a lower file; and the lowers are read-only and were never modified, so discarding the upper — the only place changes were recorded — returns the merged view to the pristine stack.) Keep <code>~/build-image.sh</code>: B6 runs a process inside <code>merged</code> as its root.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Re-running the script cleanly requires unmounting <code>merged</code> first, which the script does — but if a shell is <code>cd</code>'d into <code>merged</code> (or B6's <code>chroot</code> is still running), the unmount fails "target is busy" and the rebuild leaves a stale overlay. If <code>build-image.sh</code> errors on the <code>umount</code>, find the holder with <code>lsof /tmp/handimage/merged</code> and move out of it — the same busy-unmount discipline as B5.3.</p>
+<p>The whiteout and copy-up files in <code>upper/</code> are owned by root (the overlay was mounted with <code>sudo</code>), so you'll need <code>sudo</code> to inspect or remove some of them. That's expected: the writable layer of a real container is likewise root-owned on the node. Don't <code>chown</code> them to work around it — just use <code>sudo ls -l</code>.</p>
+<div class="k8s-link">
+<p>You have now built the storage half of a container. What's missing before <code>/tmp/handimage/merged</code> is a real container is <em>isolation</em>: a process whose root is this merged directory and which can't see the host's processes, network, or mounts. That's B6 (namespaces, <code>chroot</code>, <code>pivot_root</code>) — it takes this exact rootfs and runs a shell inside it. Kubernetes' runtime does precisely this at scale: assemble the image layers as an overlay (this project), then wrap a process in namespaces and cgroups rooted at the merged view. Every pod on a node is this script plus the isolation you'll add next.</p>
+<p>The rootfs you built feeds directly into B6's isolation labs and the from-scratch container of B14; on the cluster it's the per-container overlay under <a href="w1.html#cp-1-23">W1.23</a>'s kubelet storage.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 mount</code> under <code>-t overlay</code> and the kernel's <code>Documentation/filesystems/overlayfs.rst</code> for the mechanism you've now automated. <code>man 1 lsof</code> for the busy-unmount case. Forward pointer: <code>man 2 chroot</code> and <code>man 8 pivot_root</code> are what B6 adds on top of this rootfs.</p>
+</article>
+
+<article class="lesson drill" id="cp-b5-18" data-id="b5-18">
+<div class="lesson-head"><span class="cp-id">B5.18</span><h4>Debugging drill: the impossible-full disk, the mount that won't cross, the stale handle</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Three failures, each of which looks like something it isn't, drilled until the right command is a reflex. A disk that is 100% full holding a few megabytes of files — not a space problem at all. A mount you made that a bind-mounted peer stubbornly refuses to show — not a mount failure, a propagation setting. A "Stale file handle" error out of nowhere — not corruption, a process holding onto a filesystem that was pulled away. Each wastes an afternoon when guessed at and takes under a minute with the tool and the mechanism from this module.</p>
+<h5>The concept</h5>
+<p>You have every piece. <strong>Inode exhaustion</strong> (B5.2, B5.8): the fixed inode count set at <code>mkfs</code> time runs out, so <code>df</code> shows blocks free while <code>df -i</code> shows inodes at 100% and every new file fails with <code>ENOSPC</code>. <strong>Propagation</strong> (B5.12): a mount made under a <code>private</code> mount point doesn't appear at its peers; only <code>shared</code>/<code>slave</code> carry it across. <strong>Stale file handle</strong> (<code>ESTALE</code>): a process holds a reference (open fd or cwd) to an inode on a filesystem that has since been unmounted or detached, so the kernel can no longer resolve the reference. The discipline all three share: <strong>read the evidence — <code>df -i</code>, <code>findmnt -o PROPAGATION</code>, <code>/proc/PID/</code> — before touching the obvious-but-wrong object.</strong></p>
+<h5>Lab</h5>
+<p>Snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>). Work each symptom, name a one-sentence cause backed by a command that proves it, <em>then</em> read the reveal.</p>
+<h5 class="verify">Symptom 1 — a disk that is full with almost no data</h5>
+<ol class="lab">
+<li>Build a tiny filesystem with deliberately few inodes, then fill it with empty files until it "runs out of space".
+<pre class="cmd">fallocate -l 20M /tmp/tiny.img
+mkfs.ext4 -F -N 256 /tmp/tiny.img          # only 256 inodes
+sudo mkdir -p /mnt/tiny &amp;&amp; sudo mount -o loop /tmp/tiny.img /mnt/tiny
+i=0; while sudo touch /mnt/tiny/f$i 2&gt;/dev/null; do i=$((i+1)); done; echo "made $i files"</pre>
+<pre class="out">made 24<b>1</b>                                 ← ran out well before filling 20M</pre></li>
+<li>Look at the contradiction, then resolve it with the right view. Blocks are nearly empty; the next <code>touch</code> fails with the same error a truly full disk gives.
+<pre class="cmd">sudo touch /mnt/tiny/onemore
+df -h /mnt/tiny
+df -i /mnt/tiny</pre>
+<pre class="out">touch: cannot touch '/mnt/tiny/onemore': <b>No space left on device</b>
+Filesystem  Size Used Avail Use% Mounted on
+/dev/loop0   19M 464K   17M   <b>3%</b> /mnt/tiny     ← blocks: 3% used
+Filesystem Inodes IUsed IFree IUse% Mounted on
+/dev/loop0    256   256     0 <b>100%</b> /mnt/tiny     ← inodes: exhausted</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>Inode exhaustion, not block exhaustion.</strong> The filesystem was created with only 256 inodes; each file — however small — consumes one, so it refused new files at 3% block usage. <code>df</code> alone hides this because it shows blocks; <code>df -i</code> reveals the 100%. The fix is to delete unneeded files to free inodes, or, if the filesystem genuinely needs millions of small files, recreate it with more inodes (<code>mkfs.ext4 -N</code> or a smaller <code>-i</code> bytes-per-inode ratio) — you cannot add inodes to an existing ext4. The reflex: when <code>ENOSPC</code> hits a disk <code>df</code> says has room, run <code>df -i</code> before anything else. Clean up: <code>sudo umount /mnt/tiny; rm /tmp/tiny.img</code>.</p></details>
+
+<h5 class="verify">Symptom 2 — a mount that a bind peer won't show</h5>
+<ol class="lab">
+<li>Reproduce it: a <code>private</code> mount point, a bind peer, and a new mount underneath that fails to appear across the bind — the container-mount-not-visible scenario in miniature.
+<pre class="cmd">sudo mkdir -p /mnt/host /mnt/view
+sudo mount --bind /mnt/host /mnt/host &amp;&amp; sudo mount --make-private /mnt/host
+sudo mount --bind /mnt/host /mnt/view      # /mnt/view is a "container's" view
+sudo mkdir -p /mnt/host/disk
+sudo mount -t tmpfs tmpfs /mnt/host/disk   # "attach a disk" on the host side
+ls /mnt/view/disk; findmnt /mnt/view/disk || echo 'not visible in the view'</pre>
+<pre class="out"><b>not visible in the view</b>               ← the tmpfs didn't cross the bind</pre></li>
+<li>Diagnose from the propagation column instead of re-trying the mount. <code>private</code> is the culprit; the fix is to make the relationship carry mounts.
+<pre class="cmd">findmnt -o TARGET,PROPAGATION /mnt/host /mnt/view</pre>
+<pre class="out">TARGET     PROPAGATION
+/mnt/host  <b>private</b>                       ← nothing propagates out of here
+/mnt/view  private</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>Private propagation, not a broken mount.</strong> The mount under <code>/mnt/host</code> succeeded fine — it just didn't propagate to the bind peer because the mount point is <code>private</code>. Make the source <code>shared</code> (both directions) or, for the real container case, <code>rslave</code> on the view (host→container only): <code>sudo mount --make-shared /mnt/host</code>, then re-mount the tmpfs and it appears in <code>/mnt/view</code>. The reflex: when a mount "isn't showing up" across a bind or container boundary, check <code>findmnt -o TARGET,PROPAGATION</code> before suspecting the mount itself. Clean up: <code>sudo umount /mnt/host/disk 2&gt;/dev/null; sudo umount /mnt/view; sudo umount /mnt/host</code>.</p></details>
+
+<h5 class="verify">Symptom 3 — "Stale file handle" from nowhere</h5>
+<ol class="lab">
+<li>Reproduce it: sit inside a mounted filesystem, have it pulled out from under you with a lazy unmount, then touch your surroundings.
+<pre class="cmd">sudo mount -o loop /tmp/disk.img /mnt/data
+cd /mnt/data
+sudo umount -l /mnt/data          # lazy unmount: detaches the name now
+sudo losetup -D                   # detach the backing loop device
+ls -l .</pre>
+<pre class="out">ls: cannot open directory '.': <b>Stale file handle</b></pre></li>
+<li>Confirm what your shell is still holding — a cwd on a filesystem that no longer exists — then recover.
+<pre class="cmd">ls -l /proc/$$/cwd
+cd /; ls -l /proc/$$/cwd</pre>
+<pre class="out">lrwxrwxrwx ... /proc/NNNN/cwd -&gt; <b>/mnt/data (deleted)</b>   ← rooted in a gone fs
+lrwxrwxrwx ... /proc/NNNN/cwd -&gt; /                        ← recovered after cd /</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A reference to a detached filesystem, not corruption.</strong> Your shell's working directory was an inode on the loop-backed filesystem; the lazy unmount detached the mount from the tree and the loop teardown removed the backing, so the kernel can no longer resolve your cwd — hence <code>ESTALE</code>, "Stale file handle". Nothing is broken; the process is simply anchored to something that was pulled away. The fix is to move the process off it: <code>cd /</code> (or restart the process), then re-mount if needed. The reflex: <code>ESTALE</code> means "what I'm holding got unmounted/replaced" — check <code>/proc/PID/cwd</code> and open fds, don't run <code>fsck</code> in a panic. This is why the busy-unmount refusal in B5.3 exists — a non-lazy <code>umount</code> would have <em>prevented</em> this by refusing while you were inside.</p></details>
+<h5 class="gotcha">Gotchas</h5>
+<p>All three share the drill's recurring shape: the loud symptom names the wrong object. "No space" points at big files when the fault is inode count; "the mount failed" points at the mount when the fault is propagation; "stale file handle" points at corruption when the fault is a detached filesystem. Reading the real state — <code>df -i</code>, <code>findmnt -o PROPAGATION</code>, <code>/proc/PID/</code> — is what redirects you from the innocent-but-loud object to the guilty-but-quiet one, the same evidence-first discipline as the B2, B3, and B4 drills.</p>
+<p><code>umount -l</code> (lazy) is a trap that <em>creates</em> symptom 3. It detaches the mount name immediately but leaves the filesystem half-alive for anyone still using it, turning a clean "target is busy" refusal into a delayed <code>ESTALE</code> somewhere else. Prefer a plain <code>umount</code> and fix the busy holder (B5.3); reach for <code>-l</code> only when you understand you're deferring the problem, not solving it.</p>
+<div class="k8s-link">
+<p>All three are node incidents you'll meet through Kubernetes. Inode exhaustion triggers kubelet disk-pressure eviction with bytes to spare — a node "out of disk" that <code>df</code> says is fine until you run <code>df -i</code>. Propagation bugs are exactly why a CSI driver's mount sometimes isn't visible to an app pod, or a sidecar's mount doesn't reach the main container — <code>mountPropagation</code> is the field, and this drill is the diagnosis. And <code>ESTALE</code> shows up when a volume is detached or a node loses a network filesystem out from under a running container. The reflexes — <code>df -i</code>, propagation, <code>/proc</code> — are the same whether the filesystem is on a laptop or under a pod.</p>
+<p>These map onto the storage-failure scenarios in <a href="w6.html">W6</a> troubleshooting; the propagation case connects to <code>mountPropagation</code> in <a href="w5.html">W5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 df</code> (<code>-i</code>), <code>man 8 findmnt</code> (<code>-o PROPAGATION</code>), and <code>man 5 proc</code> (<code>/proc/[pid]/cwd</code>, <code>/proc/[pid]/fd</code>) are the three diagnostic tools. <code>man 8 mount</code> under <code>--make-shared</code>/<code>--make-rslave</code> for the propagation fix, and <code>man 8 umount</code> under <code>-l</code> for the lazy-unmount hazard. Re-read <a href="#cp-b5-8">B5.8</a> and <a href="#cp-b5-12">B5.12</a> — this drill exists to make them permanent.</p>
+</article>
+</div><!-- /g-project -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B5 recall quiz</h3>
+<p>Answer out loud before revealing. If you can explain what a container image physically is from these, the storage half of Kubernetes is yours.</p>
+<ol>
+<li>What is a "block device", and how does it differ from the filesystem that lives on it?
+<details class="reveal"><summary>Answer</summary><p>A block device is raw storage addressable only in fixed-size chunks (blocks); it knows nothing about files, names, or directories. A filesystem is a data structure — superblock, inode table, directory blocks, free-space maps — written <em>onto</em> that device by <code>mkfs</code>, which is what gives the blocks the meaning of "files". The device is dumb; the filesystem is the bookkeeping layered on top.</p></details></li>
+<li>A filesystem reports "No space left on device" but <code>df</code> shows 60% of blocks free. What happened, and which command confirms it?
+<details class="reveal"><summary>Answer</summary><p>Inode exhaustion: the fixed number of inodes chosen at <code>mkfs</code> time is used up (millions of tiny files, one inode each), so no new file can be created even though block space remains. <code>df -i</code> shows inodes at 100% while <code>df</code> shows blocks free. You can't add inodes to an existing ext4 — delete files or recreate with more.</p></details></li>
+<li>Explain what <code>mount /dev/loop0 /mnt/data</code> actually does to the directory tree, and where the directory's previous contents go.
+<details class="reveal"><summary>Answer</summary><p>It grafts the root of the filesystem on <code>/dev/loop0</code> onto <code>/mnt/data</code>, so walking into that directory now leads into the mounted filesystem. The directory's previous contents are not deleted — they're shadowed (hidden) by the mount and reappear the moment you unmount.</p></details></li>
+<li>Why is the VFS the thing that makes overlayfs (and containers) possible?
+<details class="reveal"><summary>Answer</summary><p>The VFS defines one set of operations — <code>open</code>/<code>read</code>/<code>write</code>/<code>stat</code> — that every filesystem implements, so programs call the same syscalls regardless of what's underneath. overlayfs is just another implementation behind that interface, which is why a process can be handed an overlay (or any) root filesystem and every ordinary program keeps working unchanged.</p></details></li>
+<li>A file has one inode but two names in the same directory listing, both showing link count 2. What are they, and what happens if you <code>rm</code> one?
+<details class="reveal"><summary>Answer</summary><p>They're hard links — two equal directory entries pointing at the same inode. Removing one decrements the link count to 1 and removes only that name; the file's data survives under the other name. The inode and its blocks are freed only when the link count reaches 0 and no process holds it open.</p></details></li>
+<li><code>df</code> says a disk is full; <code>du</code> finds only a few MB of files. Give the most likely cause and how to find the culprit.
+<details class="reveal"><summary>Answer</summary><p>A deleted-but-still-open file: a process deleted a file's name while holding it open, so <code>du</code>/<code>ls</code> can't see it but its blocks are still allocated (the inode outlives the name until the fd closes). Find it with <code>lsof +L1</code> or by grepping <code>/proc/*/fd</code> for <code>(deleted)</code>; fix it by restarting the holding process, not by deleting more files.</p></details></li>
+<li>You run <code>mount --bind -o ro /src /dst</code> and then successfully write a file in <code>/dst</code>. Why, and how do you actually get read-only?
+<details class="reveal"><summary>Answer</summary><p>The <code>ro</code> flag on the initial bind is ignored — read-only is a property of the underlying mount, not of the bind operation — so the bind comes up writable. To get a truly read-only view you bind first, then remount: <code>mount -o remount,ro,bind /dst</code>. Always verify a "read-only" bind with an actual write attempt.</p></details></li>
+<li>Name overlayfs's four directories and what each does.
+<details class="reveal"><summary>Answer</summary><p><strong>lowerdir</strong> — one or more read-only layers, stacked (leftmost highest priority); <strong>upperdir</strong> — the single writable layer where all changes land; <strong>workdir</strong> — empty scratch on the upper's filesystem for the kernel's atomic operations; <strong>merged</strong> — the mount point showing the combined union you read and write through.</p></details></li>
+<li>You append one line to a 2&nbsp;GB file that exists only in a lower layer of an overlay. What happens, and why might it be slow?
+<details class="reveal"><summary>Answer</summary><p>A copy-up: overlayfs can't modify the read-only lower, so it copies the <em>entire</em> 2&nbsp;GB file into the upper layer first, then applies your one-line append to the copy. The cost is proportional to the file's size, not the edit's, so the first write is slow and consumes 2&nbsp;GB in the writable layer; the lower original is left untouched.</p></details></li>
+<li>You delete a file that lives in a lower layer of an overlay. What appears in the upper layer, and is the lower file gone?
+<details class="reveal"><summary>Answer</summary><p>A whiteout appears — a character device with device number 0/0 at the deleted file's name — which masks the name so overlayfs stops descending to the lower layer. The lower file is <em>not</em> gone; it's still physically present and untouched, just hidden. This is why deleting files from an image's lower layers doesn't reclaim their space.</p></details></li>
+<li>State what a container image physically is and what a running container adds, then derive why in-container data is lost on recreate.
+<details class="reveal"><summary>Answer</summary><p>An image is a stack of read-only lowerdirs (one per layer), shared across all containers using it. A running container adds one fresh, empty writable upperdir (plus workdir), mounted as its root. Recreating the container gives it a new empty upperdir and discards the old one — and all in-container writes lived in that upper, so they're gone. A volume (a separate mount outside the overlay) is what survives.</p></details></li>
+<li>A process gets "Stale file handle" (<code>ESTALE</code>). What does that mean and what's the fix — is <code>fsck</code> the right move?
+<details class="reveal"><summary>Answer</summary><p>It means the process holds a reference (open fd or cwd) to an inode on a filesystem that was unmounted, detached, or replaced, so the kernel can no longer resolve it. It's not corruption, so <code>fsck</code> is wrong. Fix by moving the process off the dead reference — <code>cd /</code> or restart it, checking <code>/proc/PID/cwd</code> and <code>/proc/PID/fd</code> — then re-mount if needed. Lazy unmounts (<code>umount -l</code>) are a common cause.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>See a machine's storage with <code>lsblk</code>/<code>blkid</code> and explain a block device as fixed-size chunks that know nothing about files.</li>
+<li>Create a filesystem with <code>mkfs</code>, and explain that inodes/blocks are structure written into a device, with a fixed inode count.</li>
+<li>State precisely what <code>mount</code> does — graft a filesystem root onto a directory — and read the mount table with <code>findmnt</code>.</li>
+<li>Write a robust <code>/etc/fstab</code> line by UUID with <code>nofail</code>, and always test with <code>mount -a</code> before rebooting.</li>
+<li>Explain the VFS as one <code>open</code>/<code>read</code>/<code>write</code> interface every filesystem implements, and why it makes overlayfs possible.</li>
+<li>Separate an inode from its filename, and predict rename/delete behaviour from link counts.</li>
+<li>Distinguish hard links (same inode) from symlinks (a stored path), and predict which survives deleting the original.</li>
+<li>Diagnose <code>df</code>≠<code>du</code>: deleted-but-open files (<code>/proc/*/fd</code>, <code>lsof +L1</code>) and inode exhaustion (<code>df -i</code>).</li>
+<li>Mount a RAM filesystem with <code>tmpfs</code>, and explain why its space is memory and counts against limits.</li>
+<li>Use a loop device to make a file behave like a disk, and explain what <code>mount -o loop</code> does under the hood.</li>
+<li>Make a directory appear at two paths with a bind mount, and get a genuinely read-only bind with the remount two-step.</li>
+<li>Explain mount propagation (private/shared/rslave) and why a container runtime uses rslave for the host filesystem.</li>
+<li>Mount an overlay by hand, name its four parts, and predict which layer wins for a shared filename.</li>
+<li>Trigger and locate a copy-up, and explain why it costs the file's size, not the edit's.</li>
+<li>Delete a lower-layer file, locate the 0/0 whiteout, and explain why the lower bytes remain.</li>
+<li>State from first principles that an image is read-only lowers and a container adds one disposable upper.</li>
+<li>Build a layered "image" by hand and locate its copy-up and whiteout, then reset the upper and watch it revert.</li>
+<li>Diagnose inode exhaustion, a non-propagating bind mount, and a stale file handle from evidence, with <code>df -i</code>/<code>findmnt</code>/<code>/proc</code> as reflexes.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
 
 <nav class="pager"><a href="b4.html">← B4 · Users, groups, permissions, capabilities</a><a href="../beginner.html#b6">B6 · Isolation I — namespaces, chroot, pivot_root →</a></nav>
 
