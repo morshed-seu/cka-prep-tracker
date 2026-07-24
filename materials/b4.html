@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B4: identity as numbers the kernel checks (uid/gid), the account files, system vs login users and sudo; the rwx triad on files vs directories, octal, umask, and the setuid/setgid/sticky bits; and root decomposed into ~40 capabilities with permitted/effective/bounding sets and no_new_privs — the machinery behind every securityContext.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B4 · Users, groups, permissions, capabilities — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B4 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b4">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B4 — Users, groups, permissions, capabilities</h1>
+  <p>Every time anything happens on a Linux machine, the kernel silently asks one question first: <em>is whoever is asking allowed to do this?</em> That check is the subject of this module. It sounds like a dry topic — file permissions — but it is the whole of Linux security, and it is the exact machinery Kubernetes reaches for when it decides what a container may and may not do. Get it clear here, on one plain machine, and every <code>securityContext</code> field you will ever read becomes obvious rather than mysterious.</p>
+  <p>There are three layers, and this module walks up all three. First, <strong>identity</strong>: who you are is a number, and the kernel only ever compares numbers. Second, <strong>permissions</strong>: the rwx bits you have half-seen in <code>ls -l</code>, which mean one thing on a file and a subtly different thing on a directory — the source of most real "permission denied" tickets. Third, <strong>capabilities</strong>: the modern truth that "root" is not one all-or-nothing flag but roughly forty separate powers, which is the single fact that makes it safe to run a process as "root" inside a container at all.</p>
+  <div class="weights">
+    <span>Checkpoints<b>15</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>B1</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Explain that identity is numbers — uid, primary gid, supplementary groups — and map every number in <code>id</code> to a name.</li>
+<li>Read <code>/etc/passwd</code>, <code>/etc/group</code> and <code>/etc/shadow</code> field by field, and say why the password left <code>passwd</code>.</li>
+<li>Tell a system user from a login user on sight, and say what a daemon gains from having its own uid.</li>
+<li>Become another identity deliberately with <code>su</code>/<code>sudo</code>, and grant one user exactly one command via <code>sudoers</code>.</li>
+<li>Apply the file permission check as first-match owner→group→other, not a union.</li>
+<li>Explain why <code>r</code>/<code>w</code>/<code>x</code> mean something different on a directory, and prove it with a traversable-but-unlistable directory.</li>
+<li>Read and write modes in octal on sight, and know that only root may give a file away.</li>
+<li>Predict the mode of a new file and directory from <code>umask</code> before running <code>ls -l</code>.</li>
+<li>Explain setuid, setgid-on-a-directory, and the sticky bit from their real-world examples.</li>
+<li>Stop thinking of root as one flag: name the recurring capabilities and what each grants.</li>
+<li>Attach a capability to a binary with <code>setcap</code> and bind a low port as an ordinary user.</li>
+<li>Read the permitted/effective/bounding sets of a live process from <code>/proc/PID/status</code> and decode them.</li>
+<li>Explain, in your own words, why uid 0 inside a container is not root on the host.</li>
+<li>Serve port 80 as a non-root user three ways and rank their blast radius.</li>
+<li>Diagnose a permission-denied ladder and a setuid binary broken by <code>cp</code> — from evidence.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B1</strong> for paths and reading <code>ls -l</code>; <strong>B2</strong> helps, because every permission check is made against a <em>process's</em> credentials, not a person's — the uid a process carries is what the kernel actually compares. Every lab runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster. Take a snapshot (<a href="b0.html#cp-b0-9">B0.9</a>) before the drill, which deliberately breaks permissions and setuid bits. One tool is worth installing up front for the capabilities lessons: <code>sudo apt install -y libcap2-bin</code> gives you <code>getcap</code>, <code>setcap</code> and <code>capsh</code>.</p>
+</div>
+
+<!-- ---------------- Identity ---------------- -->
+<div class="grp" id="g-identity"><h3>Identity</h3>
+
+<article class="lesson" id="cp-b4-1" data-id="b4-1">
+<div class="lesson-head"><span class="cp-id">B4.1</span><h4>Identity is numbers: uid, gid, and the groups you carry</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You log in as a name — <code>ubuntu</code>, <code>root</code>, <code>www-data</code> — but the kernel has never once looked at that name when deciding whether to let you do something. It compares <em>numbers</em>. Your process carries a user id and a set of group ids, and every permission check is arithmetic on those numbers. Once you internalise that names are a convenience for humans and numbers are the reality, a whole class of confusion evaporates — including the classic "the uids don't match between the host and the container, so the file I mounted is owned by nobody".</p>
+<h5>The concept</h5>
+<p>A running process carries a small bundle of identity:</p>
+<ul>
+<li>a <strong>uid</strong> (user id) — one number saying who you are;</li>
+<li>a <strong>primary gid</strong> (group id) — the group new files you create will belong to;</li>
+<li>a list of <strong>supplementary groups</strong> — extra group memberships that also count when permissions are checked.</li>
+</ul>
+<p>The kernel knows only these numbers. The mapping from number to name — <code>1000</code> ↔ <code>ubuntu</code>, <code>0</code> ↔ <code>root</code> — lives in ordinary files (<code>/etc/passwd</code>, <code>/etc/group</code>, the subject of the next lesson) that tools consult purely so they can show <em>you</em> a name. Return to the hotel from <a href="b2.html#cp-b2-1">B2</a>: a guest is a process and their room number is the uid. The front desk keeps a book mapping room numbers to guests' names, but the plumbing and the door locks only ever deal in room numbers.</p>
+<p>There is one more subtlety you already half-met in <a href="b3.html#cp-b3-1">B3</a> and will need throughout this module: a process actually carries a <strong>real</strong> uid (who started it) and an <strong>effective</strong> uid (who it is being checked <em>as</em> right now). They are usually identical. The gap between them is the entire setuid mechanism later in this module — it is how <code>passwd</code>, launched by you, can be checked as <code>root</code> while it runs.</p>
+<div class="flow"><span>process</span><em>carries</em><span class="hot">uid</span><em>·</em><span>primary gid</span><em>·</em><span>supplementary groups</span><em>→ kernel checks</em><span>numbers only</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask the kernel who this shell is. <code>id</code> prints your uid, primary gid, and every supplementary group — names <em>and</em> the numbers behind them.
+<pre class="cmd">multipass shell sandbox
+id</pre>
+<pre class="out"><b>uid=1000(ubuntu) gid=1000(ubuntu)</b> groups=1000(ubuntu),4(adm),<b>27(sudo)</b>,100(users),...</pre></li>
+<li>Prove the number is the real thing by looking one up yourself. <code>getent</code> reads the same account database the kernel's name lookups use; ask it what user 1000 and group 27 are.
+<pre class="cmd">getent passwd 1000
+getent group 27</pre>
+<pre class="out">ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash
+<b>sudo</b>:x:27:ubuntu</pre></li>
+<li>See identity from the other direction — as a raw number with no name attached. Every membership in <code>groups=</code> is a key on your ring; <code>27(sudo)</code> is why you may run <code>sudo</code> at all.
+<pre class="cmd">id -u    # just the uid number
+id -Gn   # every group, by name</pre>
+<pre class="out">1000
+ubuntu adm sudo users ...</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Run <code>id</code> and, for every number it prints, name the thing it maps to using <code>getent</code>. Then answer: if you created a file right now, which single group would own it, and why that one and not the others? (Your <em>primary</em> gid — <code>1000(ubuntu)</code> — is the group stamped onto new files; the supplementary groups let you <em>access</em> things owned by those groups but are never the owner of what you make.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A newly added group membership does not apply to shells you already have open. Group membership is copied into a process when it starts, so after <code>sudo usermod -aG docker ubuntu</code> you must log out and back in (or start a fresh session) before <code>id</code> shows it — the running shell is carrying the old, smaller set. This trips up almost everyone the first time.</p>
+<p>Names are per-machine, numbers are universal, and that mismatch is a real operational hazard. A file owned by uid 1000 on one host shows as <code>ubuntu</code> there and as whatever local user happens to be 1000 on another host — or as a bare <code>1000</code> if no name maps to it. When you mount a directory into a container, it is the <em>numbers</em> that carry across, which is exactly why "owned by 1000" and not "owned by ubuntu" is the honest way to think about it.</p>
+<div class="k8s-link">
+<p>This is the fact under <code>runAsUser</code> and <code>fsGroup</code> in a pod's <code>securityContext</code>. When you write <code>runAsUser: 1000</code> you are setting the exact number this lesson is about — the process inside the container runs with uid 1000, and a file it writes to a mounted volume is owned by 1000 on the host, name or no name. The infamous "my mounted files are owned by nobody" is precisely the name-lookup gap from the gotcha: the host has no <code>/etc/passwd</code> entry for the uid the container chose, so <code>ls</code> shows the number.</p>
+<p>You will meet this as a deliberate control in <a href="w3.html">W3</a> (workload security context) and again where non-root containers must be given group access to a volume via <code>fsGroup</code>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 id</code> for the command, <code>man 2 getuid</code> / <code>man 2 getgid</code> for the real-vs-effective distinction at the syscall level, and <code>man 2 credentials</code> (the <em>process credentials</em> overview) for the full identity bundle a process carries. <code>man 1 getent</code> for querying the account database directly. In the exam docs the equivalent is any page mentioning <code>runAsUser</code>/<code>runAsGroup</code>/<code>fsGroup</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b4-2" data-id="b4-2">
+<div class="lesson-head"><span class="cp-id">B4.2</span><h4>The account files: <code>passwd</code>, <code>group</code>, <code>shadow</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The number-to-name mapping from the last lesson has to live somewhere, and it lives in three plain text files you can read with <code>cat</code>. There is no database server, no magic — user accounts on a Linux box are three colon-separated files. Knowing their fields by heart means you can read an account, spot a service user, or explain a login failure without any special tooling, which is exactly the situation you are in when debugging a minimal container.</p>
+<h5>The concept</h5>
+<p>Three files, each a table with colon-separated fields, one row per entry:</p>
+<table>
+<tr><th>File</th><th>Fields (in order)</th><th>Holds</th></tr>
+<tr><td><code>/etc/passwd</code></td><td>name : x : uid : gid : comment : home : shell</td><td>the account itself — world-readable</td></tr>
+<tr><td><code>/etc/group</code></td><td>name : x : gid : members</td><td>groups and who is in them — world-readable</td></tr>
+<tr><td><code>/etc/shadow</code></td><td>name : hash : lastchange : min : max : warn : …</td><td>the password hashes — root-readable only</td></tr>
+</table>
+<p>The one thing everybody asks about: the <code>x</code> in the second field of <code>/etc/passwd</code>. That field <em>used</em> to hold the password hash directly. But <code>/etc/passwd</code> has to stay world-readable — every tool that turns a uid into a name reads it — so keeping hashes there meant anyone could copy them and attack them offline. The hashes were moved out into <code>/etc/shadow</code>, which only root can read, and the <code>x</code> is the leftover placeholder meaning "the real secret is over in shadow". The file is still called <code>passwd</code> for history; it no longer holds a password.</p>
+<p>A hash in <code>/etc/shadow</code> is not the password — it is a one-way scramble of it. When you log in, the system scrambles what you typed the same way and compares; it never stores or recovers the original. On Ubuntu 24.04 the default scheme is <strong>yescrypt</strong>, which is why the hash field starts with <code>$y$</code> (older systems used <code>$6$</code> for SHA-512). The leading <code>$</code>-delimited part names the algorithm so the system knows how to re-scramble your attempt.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your own account row and name every field. This is the whole account: name, the <code>x</code> placeholder, uid, primary gid, a human comment, home directory, and login shell.
+<pre class="cmd">getent passwd ubuntu</pre>
+<pre class="out">ubuntu:<b>x</b>:1000:1000:Ubuntu:/home/ubuntu:<b>/bin/bash</b></pre></li>
+<li>Look at a group row and read its membership list — the fourth field is the supplementary members, the same names you saw in <code>id</code>.
+<pre class="cmd">getent group sudo</pre>
+<pre class="out">sudo:x:27:<b>ubuntu</b></pre></li>
+<li>Now the protected file. As an ordinary user you cannot read <code>/etc/shadow</code> at all — that is the whole point of it. With <code>sudo</code>, read one line and see the hash.
+<pre class="cmd">cat /etc/shadow            # denied — you are not root
+sudo getent shadow ubuntu</pre>
+<pre class="out">cat: /etc/shadow: <b>Permission denied</b>
+ubuntu:<b>$y$</b>j9T$F8s...long-hash...:19800:0:99999:7:::</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From memory, list the seven fields of a <code>/etc/passwd</code> line in order. Then explain, in one sentence, why moving the hash to <code>/etc/shadow</code> improved security given that <code>/etc/passwd</code> did not change permissions. (Because <code>/etc/passwd</code> must remain world-readable for name lookups, leaving the hash there exposed it to every user; <code>/etc/shadow</code> is readable only by root, so the hashes are no longer casually copyable.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Never edit these files with a plain text editor. A single mangled line in <code>/etc/passwd</code> can lock everyone out, and a race between two editors can corrupt them. Use the tools built for it — <code>useradd</code>/<code>usermod</code>/<code>userdel</code>, <code>passwd</code>, <code>vipw</code> and <code>vigr</code> (which lock the file while you edit) — for the same reason you will meet <code>visudo</code> in B4.4.</p>
+<p>A shell of <code>/usr/sbin/nologin</code> or <code>/bin/false</code> in the last field is not a broken account — it is a deliberate one. It means "this account may own files and run services but nobody may log in as it interactively", which is the subject of the next lesson and the normal state of every service account on the box.</p>
+<div class="k8s-link">
+<p>A minimal container image often has almost nothing in its <code>/etc/passwd</code> — sometimes just <code>root</code>, sometimes a single non-root user, sometimes no entry for the uid the pod runs as. That is why a process can run as uid 1000 with <em>no name</em>, and why some images ship a trick to append the running uid to <code>/etc/passwd</code> at start-up so tools that demand a username don't fail. Understanding that the file is just a lookup table, and that the kernel doesn't need it, is what lets you reason about a "user unknown" error inside a container instead of being mystified by it.</p>
+<p>Kubernetes itself never authenticates <em>humans</em> against these files — its user identities come from certificates and tokens (<a href="w7.html#cp-7-7">W7</a>). These files govern the Linux users <em>inside</em> a node and a container; keep the two planes separate in your head.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 passwd</code>, <code>man 5 group</code> and <code>man 5 shadow</code> document each file field by field — the section-5 pages are the file formats, distinct from the section-1 <code>passwd(1)</code> command. <code>man 3 crypt</code> explains the hash formats and the <code>$y$</code>/<code>$6$</code> prefixes. <code>man 8 vipw</code> for the safe way to edit them.</p>
+</article>
+
+<article class="lesson" id="cp-b4-3" data-id="b4-3">
+<div class="lesson-head"><span class="cp-id">B4.3</span><h4>System users vs login users, and why services get their own</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Run <code>getent passwd</code> on a fresh machine and you find dozens of accounts you never created — <code>daemon</code>, <code>www-data</code>, <code>systemd-network</code>, <code>_apt</code>. They are not people. Each one is a service given its own identity on purpose, and the reason is the single most important idea in practical security: <strong>blast-radius control</strong>. Understanding why every daemon gets its own uid is understanding why <code>runAsNonRoot</code> exists.</p>
+<h5>The concept</h5>
+<p>Accounts split into two kinds, distinguished by convention, not by any hard kernel rule:</p>
+<ul>
+<li><strong>Login users</strong> — real people. On Debian/Ubuntu their uids start at <strong>1000</strong>, they have a home directory, and a real login shell like <code>/bin/bash</code>.</li>
+<li><strong>System users</strong> — identities for services. Low uids (<strong>below 1000</strong>), usually no useful home, and a shell of <code>/usr/sbin/nologin</code> so nobody can log in <em>as</em> them.</li>
+</ul>
+<p>Why bother giving <code>nginx</code> its own <code>www-data</code> identity instead of just running it as root? Because a service is the thing most likely to be attacked — it faces the network — and its uid is the fence around what a successful attacker inherits. If <code>www-data</code>-owned <code>nginx</code> is compromised, the attacker can touch exactly what uid <code>www-data</code> can reach: the web files, and nothing else. They cannot read other users' data, cannot write system files, cannot touch another service's secrets, because the kernel checks their (borrowed) uid on every single operation. Run the same service as root and a compromise is a compromise of the whole machine. <strong>Least privilege</strong> — give each thing the smallest identity that lets it do its job — is the entire design principle, and a dedicated low-privilege uid per service is how Linux has always expressed it.</p>
+<div class="flow"><span>service compromised</span><em>→ attacker inherits</em><span class="hot">exactly that uid's access</span><em>vs. as root →</em><span>the whole machine</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Count the system users already on your fresh VM — everything below uid 1000. You made none of these; the base install and each package added its own.
+<pre class="cmd">awk -F: '$3 &lt; 1000 {print $1, $3}' /etc/passwd | wc -l
+awk -F: '$3 &lt; 1000 {print $1, $3, $7}' /etc/passwd | head</pre>
+<pre class="out">30
+root 0 /bin/bash
+daemon 1 /usr/sbin/nologin
+bin 2 /usr/sbin/nologin
+<b>www-data 33 /usr/sbin/nologin</b>
+systemd-network 998 /usr/sbin/nologin
+...</pre></li>
+<li>Confirm the login-users line: the accounts a human could actually log in as have a real shell and a uid ≥ 1000. Usually there is just one.
+<pre class="cmd">awk -F: '$3 &gt;= 1000 &amp;&amp; $7 ~ /bash|sh$/ {print $1, $3, $7}' /etc/passwd</pre>
+<pre class="out">ubuntu 1000 /bin/bash</pre></li>
+<li>See a service actually running as its own uid, not as root. Look at who owns the web server's worker processes if one is installed — or any daemon — and note it is a system user.
+<pre class="cmd">ps -eo user,comm | awk '$1 != "root" &amp;&amp; $1 != "ubuntu"' | sort -u | head</pre>
+<pre class="out">messagebus  dbus-daemon
+systemd+    systemd-resolve
+<b>www-data    nginx</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Point at a system user in the output and state the three tells that mark it as one (low uid, <code>nologin</code> shell, no real home). Then answer the design question in one sentence: what does the machine gain by <code>nginx</code> running as <code>www-data</code> rather than <code>root</code>? (If <code>nginx</code> is compromised the attacker is confined to what uid <code>www-data</code> can reach — the web content — rather than owning the entire host, which is what a root compromise would be.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The uid-1000 boundary is a convention set in <code>/etc/login.defs</code> (<code>UID_MIN</code>/<code>SYS_UID_MAX</code>), not a law the kernel enforces. The kernel treats uid 500 and uid 1500 identically; the split into "system" and "login" ranges is a policy that tools like <code>useradd</code> follow so the two kinds don't collide. Only <strong>uid 0</strong> is special to the kernel — that is root, and that specialness is exactly what capabilities later in this module carve up.</p>
+<p>A system user having <code>nologin</code> does not stop its service from running — services are started by <code>systemd</code>, which switches to the service's uid directly, no login involved. <code>nologin</code> only blocks the interactive path (<code>ssh</code>, <code>su</code> into an interactive shell). So "you can't log in as <code>www-data</code>" and "<code>nginx</code> runs as <code>www-data</code>" are both true at once.</p>
+<div class="k8s-link">
+<p>This is the whole argument behind <code>runAsNonRoot: true</code> and <code>runAsUser</code> in a pod's <code>securityContext</code>, and behind the base-image convention of shipping a dedicated non-root user like <code>nginx</code> (uid 101) or <code>node</code> (uid 1000). A container that runs as root is a container whose compromise hands the attacker root <em>inside</em> that container — and, absent the capability and namespace fences from later in this module, uncomfortably close to root on the node. Choosing a low-privilege uid per workload is the same least-privilege move Linux services have always made, now expressed in a pod spec.</p>
+<p>You will see the platform enforce this in <a href="w3.html">W3</a> (security context) and, cluster-wide, via Pod Security admission that can reject a pod insisting on running as root.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 login.defs</code> for the uid-range conventions (<code>UID_MIN</code>, <code>SYS_UID_MAX</code>). <code>man 8 useradd</code> under <code>--system</code> for how a service account is created. <code>man 8 nologin</code> for the shell that politely refuses logins. <code>man 5 systemd.exec</code> under <code>User=</code>/<code>DynamicUser=</code> for how a modern service is pinned to its own identity — <code>DynamicUser=</code> in particular manufactures a throwaway uid per run, least privilege taken to its logical end.</p>
+</article>
+
+<article class="lesson" id="cp-b4-4" data-id="b4-4">
+<div class="lesson-head"><span class="cp-id">B4.4</span><h4>Becoming someone else: <code>su</code>, <code>sudo</code>, and <code>sudoers</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You rarely want to <em>be</em> root; you want to run one specific command as root and go back to being yourself. <code>sudo</code> is how, and its config file is how an administrator grants exactly that — one user, one command, no more. Learning to write a single tight <code>sudoers</code> rule is the practical face of least privilege, and it is the same shape of thinking as an RBAC Role: name a subject, name what they may do, grant nothing else.</p>
+<h5>The concept</h5>
+<p>Two tools change which identity a command runs as:</p>
+<ul>
+<li><strong><code>su</code></strong> ("substitute user") starts a new shell as another user, after checking <em>their</em> password. Plain <code>su</code> keeps your current environment and directory; <code>su -</code> (with the dash) simulates a full fresh login — it resets the environment, moves to the target's home directory, and loads their shell profile and <code>PATH</code>. The dash is why <code>su -</code> "feels like" logging in as that user and plain <code>su</code> often leaves you with a confusingly half-changed environment.</li>
+<li><strong><code>sudo</code></strong> runs <em>one</em> command as another user (root by default), after checking <em>your own</em> password and consulting a policy file. <code>sudo -i</code> gives you a full interactive root login shell (like <code>su -</code> but authorised by policy, not by knowing root's password). The key difference from <code>su</code>: <code>sudo</code> is governed by a rulebook, so it can grant a narrow slice of root instead of all of it.</li>
+</ul>
+<p>That rulebook is <strong><code>/etc/sudoers</code></strong>. Its grammar reads almost as a sentence: <code>who  where=(as-whom)  what</code>. A line like</p>
+<pre class="cmd">deploy  ALL=(ALL)  /usr/bin/systemctl restart nginx</pre>
+<p>means "user <code>deploy</code>, on ALL hosts, may run, as ALL users (i.e. including root), exactly the command <code>systemctl restart nginx</code> — and nothing else." That is a keycard cut for one door. You always edit this file with <strong><code>visudo</code></strong>, never directly: <code>visudo</code> checks the syntax before saving and refuses to write a file that would break <code>sudo</code> and lock every administrator out. Modern practice is to drop small rule files into <code>/etc/sudoers.d/</code> (edited with <code>visudo -f</code>) rather than editing the main file, so one package's rule can't corrupt another's.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch the dash change everything. Plain <code>su</code> keeps your directory and environment; <code>su -</code> lands you in root's home with root's <code>PATH</code>. (Ctrl-D to exit each.)
+<pre class="cmd">sudo su       # note the working directory and $PATH
+pwd; echo $PATH; exit
+sudo su -      # a full login: home is /root, PATH includes sbin dirs
+pwd; echo $PATH; exit</pre>
+<pre class="out">/home/ubuntu          ← plain su kept your cwd
+...
+<b>/root</b>                 ← su - moved to root's home
+/usr/local/sbin:/usr/local/bin:<b>/usr/sbin</b>:...</pre></li>
+<li>Grant one user exactly one command. Create a throwaway user, then use <code>visudo -f</code> to write a single tight rule into a drop-in file.
+<pre class="cmd">sudo useradd -m -s /bin/bash deploy
+sudo visudo -f /etc/sudoers.d/deploy
+# in the editor, add exactly this line, then save:
+#   deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx</pre></li>
+<li>Prove the rule is exactly as narrow as written — the granted command works, a neighbour does not.
+<pre class="cmd">sudo -u deploy sudo -l                               # what may deploy do?
+sudo -u deploy sudo systemctl restart nginx           # allowed
+sudo -u deploy sudo systemctl stop nginx              # refused — not granted</pre>
+<pre class="out">User deploy may run the following commands:
+    (ALL) NOPASSWD: /usr/bin/systemctl restart nginx
+...
+Sorry, user deploy is not allowed to execute '/usr/bin/systemctl stop nginx' as root.</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the two things the dash in <code>su -</code> changes (environment/profile, and working directory to the target's home). Then explain why <code>sudo</code> asks for <em>your</em> password while <code>su</code> asks for the <em>target's</em> — and which of the two lets an admin grant root access without ever sharing root's password. (<code>sudo</code> authenticates you against a policy, so an admin adds a <code>sudoers</code> rule and you use your own password; <code>su</code> requires knowing the target account's password, which is why shared-root-password setups are a security smell that <code>sudo</code> exists to kill.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Always, without exception, edit <code>sudoers</code> through <code>visudo</code>. A syntax error saved directly can make <code>sudo</code> refuse to run at all — and if <code>sudo</code> is your only path to root, you have locked yourself out of your own machine with no way back short of single-user mode. <code>visudo</code>'s entire reason to exist is to check the file and reject a broken save before it can hurt you. Snapshot the VM before experimenting.</p>
+<p>A trailing wildcard in a rule is a trap. <code>deploy ALL=(ALL) /usr/bin/systemctl restart *</code> looks tighter than full root but is not — the argument freedom can often be bent into running unintended things, and any rule granting an editor, a shell, or a command with a shell-escape (<code>vi</code>, <code>less</code>, <code>find -exec</code>) is effectively a grant of full root. Grant the exact command with its exact arguments, and be suspicious of your own rules.</p>
+<div class="k8s-link">
+<p>The mental model of <code>sudoers</code> — a subject, an action, and a scope, granting the narrowest slice that does the job — is exactly the model of Kubernetes <strong>RBAC</strong>. A <code>Role</code> lists verbs (<code>get</code>, <code>list</code>, <code>create</code>) on resources; a <code>RoleBinding</code> attaches it to a subject. "user <code>deploy</code> may only <code>restart nginx</code>" and "ServiceAccount <code>ci</code> may only <code>get</code> pods in namespace <code>build</code>" are the same sentence in two dialects. The habit of granting the minimum and distrusting wildcards transfers directly.</p>
+<p>You will write these grants for real in <a href="w7.html#cp-7-7">W7.7 — imperative RBAC</a>, where <code>kubectl create role</code>/<code>rolebinding</code> is the cluster-side <code>visudo</code>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 sudo</code> for the command and its flags (<code>-i</code>, <code>-u</code>, <code>-l</code>), <code>man 5 sudoers</code> for the rule grammar (long, but the <em>EXAMPLES</em> section is the fast way in), and <code>man 8 visudo</code> for safe editing and <code>-f</code>. <code>man 1 su</code> for the substitute-user shell and what <code>-</code> changes. For the cluster analogue, anything under RBAC <code>Role</code>/<code>RoleBinding</code> in the exam docs.</p>
+</article>
+</div><!-- /g-identity -->
+
+<!-- MORE-GROUPS -->
+
+<nav class="pager"><a href="b3.html">← B3 · Kernel space, user space, system calls</a><a href="../beginner.html#b5">B5 · Files for real: VFS, storage, overlayfs →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-24. Package versions referenced: coreutils 9.4, libcap2-bin 2.66, sudo 1.9.15, util-linux 2.39. Capability set is the x86-64 Linux 6.8 set (<code>cap_last_cap</code> = 40, i.e. 41 capabilities numbered 0–40); the count grows slowly with new kernels.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
