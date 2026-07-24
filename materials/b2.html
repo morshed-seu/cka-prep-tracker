@@ -1504,6 +1504,326 @@ exit <b>137</b>  in <b>10</b>s</pre>
 <p class="docs-links"><code>man 7 signal</code> one more time for the TERM/KILL semantics the pattern relies on. <code>man 1 bash</code> under <em>SHELL BUILTIN COMMANDS</em> for <code>exec</code> and <code>trap</code> (a shell entrypoint's way of handling TERM). For the concepts, the Kubernetes "Pod Lifecycle" docs on termination are the canonical write-up — but you now know what every sentence in them means at the process level, which is the point of this module.</p>
 </article>
 </div>
+
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b2-17" data-id="b2-17">
+<div class="lesson-head"><span class="cp-id">B2.17</span><h4>A mini-supervisor — in C <em>and</em> Python</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every idea in this module meets here. A supervisor forks a child (B2.5), forwards a signal to it (B2.14), waits and reads the status to tell "exited" from "killed" (B2.8, B2.9), and restarts it with backoff when it dies badly. Written out, it is about fifty lines — and it is, structurally, a baby kubelet. When you later read that the kubelet "supervises" pods, this is the shape of the thing it does. B11 turns this same program into a real systemd unit; here you build the engine.</p>
+<h5>The concept</h5>
+<p>A supervisor is a loop around one child. Stripped to its logic:</p>
+<ol>
+<li><strong>Start</strong> the child: <code>fork</code>, and in the child <code>exec</code> the target program. Remember its PID.</li>
+<li><strong>Wait</strong> for it: block in <code>waitpid</code> until it ends, and read the status word.</li>
+<li><strong>Decide</strong> from the status: exited cleanly (0) → stop; exited with an error, or was killed → restart, unless we are shutting down.</li>
+<li><strong>Back off</strong> before restarting, so a child that crashes instantly does not become a busy-loop: wait 1s, then 2, 4, 8… capped.</li>
+<li>Meanwhile, <strong>forward SIGTERM</strong>: when the supervisor itself is asked to stop, pass that request to the child and let it shut down gracefully rather than orphaning it.</li>
+</ol>
+<p>Two subtleties are the whole reason this is a real exercise and not a toy. First, <strong>the wait can be interrupted</strong>: when SIGTERM arrives and your handler runs, the <code>waitpid</code> the supervisor was blocked in returns early with <code>EINTR</code> ("interrupted") — you must loop and retry it, or you will misread the interruption as the child ending. Second, <strong>the handler must be minimal</strong>: it forwards one signal and sets a flag (B2.14's rule), and all the real decision-making happens back in the main loop where it is safe.</p>
+<p>The exit-vs-signalled distinction from B2.8 is what makes the restart policy correct. A child that exits 0 asked to stop — respect it. A child that exits non-zero or was killed by a signal failed — restart it. And if <em>we</em> are the reason it stopped (we forwarded a TERM because we are shutting down), do not restart it at all. Those three cases are exactly what <code>WIFEXITED</code>/<code>WEXITSTATUS</code> and <code>WIFSIGNALED</code> let you tell apart.</p>
+<div class="flow"><span>fork+exec child</span><em>→</em><span>waitpid (retry on EINTR)</span><em>→</em><span class="hot">exited 0 or shutting down? stop</span><em>·</em><span>else back off &amp; restart</span></div>
+<h5>Lab</h5>
+<p>Build both versions on the sandbox. They are the same program in two languages, and writing both is the point: it shows that <code>fork</code>/<code>exec</code>/<code>waitpid</code>/<code>sigaction</code> are system calls, not a feature of any one language — Python's <code>os</code> module is a thin wrapper over the exact calls the C uses.</p>
+<ol class="lab">
+<li>Write the two side by side.
+<div class="langpair">
+<figure><figcaption>~/supervisor.py</figcaption>
+<pre class="cmd">#!/usr/bin/env python3
+import os, sys, signal, time
+
+CMD = sys.argv[1:] or ["sleep", "2"]
+child = 0
+shutting_down = False
+
+def on_term(signum, frame):
+    global shutting_down
+    shutting_down = True
+    if child:
+        os.kill(child, signal.SIGTERM)   # forward it
+
+signal.signal(signal.SIGTERM, on_term)
+signal.signal(signal.SIGINT,  on_term)
+
+backoff = 1
+while True:
+    pid = os.fork()
+    if pid == 0:                         # child
+        os.execvp(CMD[0], CMD)
+        os._exit(127)                    # only if exec fails
+    child = pid
+    print(f"sup: started {pid}", flush=True)
+
+    _, status = os.waitpid(pid, 0)       # PEP 475: auto-retries on EINTR
+    child = 0
+
+    if os.WIFEXITED(status):
+        code = os.WEXITSTATUS(status)
+        print(f"sup: exited {code}", flush=True)
+        if code == 0 or shutting_down: break
+    elif os.WIFSIGNALED(status):
+        s = os.WTERMSIG(status)
+        print(f"sup: killed by {s}", flush=True)
+        if shutting_down: break
+
+    print(f"sup: restart in {backoff}s", flush=True)
+    time.sleep(backoff)
+    backoff = min(backoff * 2, 30)
+
+print("sup: done", flush=True)</pre></figure>
+<figure><figcaption>~/supervisor.c</figcaption>
+<pre class="cmd">#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sys/wait.h&gt;
+
+static volatile sig_atomic_t child = 0;
+static volatile sig_atomic_t shutting_down = 0;
+
+static void on_term(int sig) {
+    shutting_down = 1;
+    if (child) kill(child, SIGTERM);     /* forward; async-safe */
+}
+
+int main(int argc, char **argv) {
+    char *def[] = { "sleep", "2", NULL };
+    char **cmd = (argc &gt; 1) ? &amp;argv[1] : def;
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_term;
+    sigaction(SIGTERM, &amp;sa, NULL);
+    sigaction(SIGINT,  &amp;sa, NULL);
+
+    int backoff = 1, status;
+    for (;;) {
+        pid_t pid = fork();
+        if (pid == 0) {                  /* child */
+            execvp(cmd[0], cmd);
+            _exit(127);
+        }
+        child = pid;
+        fprintf(stderr, "sup: started %d\n", pid);
+
+        while (waitpid(pid, &amp;status, 0) &lt; 0 &amp;&amp; errno == EINTR)
+            ;                            /* retry after a forwarded signal */
+        child = 0;
+
+        if (WIFEXITED(status)) {
+            int code = WEXITSTATUS(status);
+            fprintf(stderr, "sup: exited %d\n", code);
+            if (code == 0 || shutting_down) break;
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr, "sup: killed by %d\n", WTERMSIG(status));
+            if (shutting_down) break;
+        }
+        fprintf(stderr, "sup: restart in %ds\n", backoff);
+        sleep(backoff);
+        backoff = backoff * 2 &gt; 30 ? 30 : backoff * 2;
+    }
+    fprintf(stderr, "sup: done\n");
+    return 0;
+}</pre></figure>
+</div></li>
+<li>Compile the C one and make both runnable.
+<pre class="cmd">chmod +x ~/supervisor.py
+gcc -Wall -o ~/supervisor ~/supervisor.c</pre></li>
+<li>First behaviour: a child that finishes cleanly stops the supervisor. It exits 0, the supervisor respects that and does not restart.
+<pre class="cmd">~/supervisor.py sleep 1</pre>
+<pre class="out">sup: started 4210
+sup: exited 0
+<b>sup: done</b></pre></li>
+<li>Second behaviour: a child that crashes gets restarted, and the backoff grows. Watch the delays go 1, 2, 4 — that is what stops a crash-looping child from pinning a core.
+<pre class="cmd">timeout 8 ~/supervisor sh -c 'echo working; sleep 1; exit 3'</pre>
+<pre class="out">sup: started 4231
+working
+sup: exited 3
+<b>sup: restart in 1s</b>
+sup: started 4235
+working
+sup: exited 3
+<b>sup: restart in 2s</b>
+sup: started 4238
+working
+sup: exited 3
+<b>sup: restart in 4s</b>
+...</pre></li>
+<li>Third behaviour, the one that ties the module together: forward a signal. Send the supervisor SIGTERM while its child is alive, and watch it pass the signal down, see the child die <em>by signal</em>, recognise that it is shutting down, and stop — without restarting.
+<pre class="cmd">~/supervisor sleep 60 &amp; sup=$!
+sleep 1
+kill -TERM $sup
+wait $sup; echo "supervisor exit $?"</pre>
+<pre class="out">sup: started 4260
+sup: killed by 15
+sup: done
+<b>supervisor exit 0</b></pre></li>
+<li>Prove the two languages are doing the identical thing by running the C version through the same three tests — the output is the same because the system calls are the same.
+<pre class="cmd">~/supervisor sleep 1
+timeout 5 ~/supervisor false     # exits 1 forever → restarts with backoff
+~/supervisor sleep 60 &amp; kill -TERM $!; wait; echo "done"</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Your supervisor is correct when all three behaviours hold in <em>both</em> languages: a clean child (exit 0) stops it; a crashing child restarts with growing backoff; and a SIGTERM to the supervisor is forwarded to the child and stops the whole thing without a restart. As a final check, explain why the <code>waitpid</code> retry loop is not optional — what goes wrong if you delete the <code>EINTR</code> check? (The forwarded SIGTERM interrupts <code>waitpid</code>, which returns −1 before the child has actually exited; without the retry you misread that as the child ending, and the status word is garbage.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>EINTR</code> retry is the single most common thing people leave out, and it is invisible until a signal arrives at exactly the wrong moment. Python papers over it for you (PEP 475 auto-retries most syscalls), which is why the Python version has no explicit retry loop and the C version must — a genuine difference between the languages worth understanding rather than memorising.</p>
+<p>Forwarding only SIGTERM is a deliberate simplification. A production supervisor forwards the whole termination sequence — TERM, wait for the grace period, then KILL — exactly like <code>stop.sh</code> from B2.16. Adding that is the natural next step, and it is precisely what systemd does for you in B11, which is why you will not have to write it again.</p>
+<p>This supervisor does <em>not</em> reap grandchildren. It waits only for its own direct child. If that child spawns its own children and dies, they re-parent to PID 1 (or to this supervisor, if it is PID 1 in a container) — which is the B2.9 problem, and the reason a real init has a general reaping loop in addition to supervising. Know the boundary of what you built.</p>
+<p>A child that fails during <code>exec</code> (bad path, not executable) exits 127 from the <code>_exit(127)</code> line — and your supervisor will dutifully restart it forever, backing off to the 30s cap. That is correct behaviour for a transient failure and maddening for a permanent one; real supervisors add a "give up after N failures in M seconds" rule (systemd's <code>StartLimitBurst</code>). Note where you would add it.</p>
+<div class="k8s-link">
+<p>You have just written the core of a kubelet. The kubelet forks and execs containers (through the runtime), waits on them, reads their exit status to decide restart, and applies a backoff — the <code>CrashLoopBackOff</code> you will meet in <a href="w6.html#cp-6-16">W6.16</a> is this exact 1-2-4-8 backoff, capped, under a different name. The restart-policy decision (exit 0 → stop vs. non-zero → restart) is the process-level version of a pod's <code>restartPolicy</code>.</p>
+<p>The signal-forwarding half is what a container's PID 1 must do for the processes beneath it, and its absence is the PID 1 problem from B2.9. Follow this forward into <a href="w1.html#cp-1-19">W1.19 — the kubelet's syncLoop and its three pod sources</a>, which is the same loop scaled up to "which containers should exist on this node", and into B11, where this program becomes a systemd unit and stops being your job.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 waitpid</code> for the status macros and the <code>EINTR</code> behaviour. <code>man 2 sigaction</code> for the handler and the <code>SA_RESTART</code> flag (which, if set, makes the kernel retry the syscall for you — an alternative to the explicit loop worth knowing). <code>man 3 execvp</code> for the child side. <code>man 7 signal-safety</code> to confirm <code>kill()</code> is safe to call from the handler. Then <code>man 5 systemd.service</code> under <code>Restart=</code> and <code>RestartSec=</code> to see every decision you just hand-coded as a config directive — the B11 preview.</p>
+</article>
+
+<article class="lesson drill" id="cp-b2-18" data-id="b2-18">
+<div class="lesson-head"><span class="cp-id">B2.18</span><h4>Three symptoms, named from evidence</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You meet faults symptom-first, never cause-first. Each of these three is one you will genuinely hit — on a laptop, a server, or a Kubernetes node — and each has the property that the obvious reaction is the wrong one. The skill being trained is walking from what you can see to what is true, using the specific evidence this module taught you to read.</p>
+<p>Take a snapshot first (<code>snapshot.sh</code> on your host), then work each symptom without reading ahead. State a one-sentence cause backed by a command that proves it, <em>then</em> open the reveals in order.</p>
+
+<h5>Symptom 1 — the process table is filling with <code>&lt;defunct&gt;</code></h5>
+<ol class="lab">
+<li>Plant it. This starts a parent that forks many children and never reaps them.
+<pre class="cmd">cat &gt; /tmp/leaky.py &lt;&lt;'PY'
+#!/usr/bin/env python3
+import os, time
+while True:
+    for _ in range(20):
+        if os.fork() == 0:
+            os._exit(0)          # child dies immediately
+    time.sleep(2)                # parent never calls wait()
+PY
+python3 /tmp/leaky.py &amp;
+sleep 3</pre></li>
+<li>Observe, then diagnose before reading on.
+<pre class="cmd">ps -eo stat= | grep -c '^Z'
+ps -eo pid,ppid,stat,comm | grep ' Z '</pre></li>
+</ol>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p>The zombie count climbs and keeps climbing — 20, then 40, then 60. Every entry is <code>&lt;defunct&gt;</code>, all sharing one PPID. Memory is <em>not</em> moving (<code>free -m</code> is flat), which is the tell that this is not a memory leak despite looking like runaway growth. What is being consumed is PIDs, heading toward <code>/proc/sys/kernel/pid_max</code>, after which nothing new can start.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>A zombie is a dead child whose exit status was never collected (B2.9). It is a symptom whose cause is exactly one row up the tree — the <em>parent</em> that is not reaping. Find that parent by grouping the zombies: <code>ps -eo ppid=,stat= | awk '$2 ~ /^Z/ {print $1}' | sort | uniq -c | sort -rn | head</code>. One PID will own all of them.</p></details>
+<details class="reveal"><summary>Stage 3 · Fix &amp; fingerprint</summary><p>The named parent is <code>leaky.py</code>: it forks children and never calls <code>wait()</code>, so each exit leaves a zombie. Killing the zombies does nothing (they are already dead); the fix is the parent. Either fix its code to reap (add a <code>SIGCHLD</code> handler that calls <code>os.wait()</code> in a loop, or a <code>wait()</code> after each child), or, as the blunt operational fix, kill the parent so PID 1 inherits and reaps the lot:</p>
+<pre class="cmd">pkill -f leaky.py
+sleep 1; ps -eo stat= | grep -c '^Z'
+rm -f /tmp/leaky.py</pre>
+<pre class="out">0</pre>
+<p><strong>Fingerprint:</strong> <em>growing count of <code>&lt;defunct&gt;</code>, flat memory, one common PPID</em> → a parent that stopped reaping. In a container this is the PID 1 problem, and it surfaces as node <code>PIDPressure</code>.</p></details>
+
+<h5>Symptom 2 — a service takes exactly 30 seconds to stop, every time</h5>
+<ol class="lab">
+<li>Plant it. This is a "service" that does its job but was written to ignore the polite stop signal.
+<pre class="cmd">cat &gt; /tmp/stubborn-svc.py &lt;&lt;'PY'
+#!/usr/bin/env python3
+import signal, time, os
+signal.signal(signal.SIGTERM, signal.SIG_IGN)   # the bug
+print(f"service up, pid {os.getpid()}", flush=True)
+while True: time.sleep(1)
+PY
+python3 /tmp/stubborn-svc.py &amp; svc=$!
+sleep 1</pre></li>
+<li>Observe. Try to stop it the way anything reasonable would — TERM, then wait — and time it.
+<pre class="cmd">t0=$SECONDS
+kill -TERM $svc
+for _ in $(seq 5); do kill -0 $svc 2&gt;/dev/null || break; sleep 1; done
+echo "still alive after $((SECONDS-t0))s? $(kill -0 $svc 2&gt;/dev/null &amp;&amp; echo yes)"</pre></li>
+</ol>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p>SIGTERM does nothing — the process is still there after the wait, unbothered. In a real init or orchestrator this is what produces the "takes exactly the grace period to stop" complaint: the supervisor sends TERM, waits its fixed timeout (30s for both systemd and Kubernetes by default), then sends SIGKILL, and the service dies only then. The suspicious part is the <em>exactly 30s, every time</em> — a genuine slow shutdown varies, a fixed grace period is a constant.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>If a program does not respond to SIGTERM, ask whether it is listening. The <code>SigCgt</code>/<code>SigIgn</code> masks from B2.11 answer it directly: <code>grep -E '^Sig(Cgt|Ign)' /proc/$svc/status</code>. Decode bit 14 (SIGTERM, <code>0x4000</code>): if it is set in <code>SigIgn</code>, the program is <em>ignoring</em> TERM; if <code>SigCgt</code> and <code>SigIgn</code> are both zero for that bit, it is relying on the default. Here you will find TERM in the ignore mask.</p></details>
+<details class="reveal"><summary>Stage 3 · Fix &amp; fingerprint</summary><p><code>SigIgn</code> has bit 14 set (<code>0x4000</code>): the service explicitly ignores SIGTERM. It can only be stopped by SIGKILL, which is why every shutdown costs the full grace period and loses in-flight work. The operational fix is <code>kill -9</code>; the <em>real</em> fix is in the program — install a handler that drains and exits (B2.16), or if it is PID 1 in a container, ensure the handler is actually on the process receiving the signal.</p>
+<pre class="cmd">m=$(awk '/^SigIgn/{print $2}' /proc/$svc/status)
+echo "TERM ignored? $(( 0x$m &amp; 0x4000 ))   (non-zero = yes)"
+kill -KILL $svc; rm -f /tmp/stubborn-svc.py</pre>
+<pre class="out">TERM ignored? <b>16384</b>   (non-zero = yes)</pre>
+<p><strong>Fingerprint:</strong> <em>stop takes exactly the grace period, then works; exit code 137</em> → the process ignores or never handles SIGTERM, and only SIGKILL stops it.</p></details>
+
+<h5>Symptom 3 — a process won't die, and <code>kill -9</code> does nothing</h5>
+<ol class="lab">
+<li>Plant it. Sustained direct I/O keeps a process cycling through uninterruptible sleep; you will catch it in <strong>D</strong>. (A permanently-wedged D needs genuinely failed storage — a dead NFS mount — which is hard to stage safely; this reproduces the state and the reasoning, which is the transferable part.)
+<pre class="cmd">dd if=/dev/zero of=/tmp/dfile bs=1M count=4000 oflag=direct status=none &amp;
+dd_pid=$!</pre></li>
+<li>Observe. Sample its state repeatedly and try to kill it.
+<pre class="cmd">for i in $(seq 8); do ps -o pid,stat,wchan:16,comm -p $dd_pid --no-headers; sleep 0.3; done
+kill -9 $dd_pid; echo "sent SIGKILL"
+ps -o pid,stat,comm -p $dd_pid --no-headers</pre></li>
+</ol>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p>The process spends much of its time in state <strong>D</strong> (with <code>R</code> flickers between I/O operations), and <code>kill -9</code> does not make it vanish immediately — it dies only when its current I/O operation completes. On a real hung mount the I/O never completes, so the process stays in D <em>forever</em> and no signal, not even SIGKILL, will ever remove it. That is the scenario this reproduces in miniature.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>D is uninterruptible sleep (B2.7): the process is inside a kernel call that will not accept a signal until it returns. So the question is never "why won't it die" but "what is it waiting on" — and <code>WCHAN</code> answers it. The <code>wchan</code> column names the kernel function it is asleep in; anything with <code>blk</code>/<code>bio</code> is a block device, anything with <code>nfs</code>/<code>rpc</code> is a network filesystem. That name is your real culprit.</p></details>
+<details class="reveal"><summary>Stage 3 · Fix &amp; fingerprint</summary><p>You cannot fix a D-state process by signalling it — there is no safe point to deliver the signal. The only resolutions are to let the I/O complete (as it does here once <code>dd</code> finishes) or to fix the layer underneath: remount or recover the failed storage, at which point the queued signals are finally delivered and the process dies. Killing is not on the menu.</p>
+<pre class="cmd">wait $dd_pid 2&gt;/dev/null
+rm -f /tmp/dfile</pre>
+<p><strong>Fingerprint:</strong> <em>process stuck in D, immune to <code>kill -9</code>, <code>WCHAN</code> naming a storage/network function</em> → the layer beneath it is wedged; fix that, do not chase the process. A pile of D-state processes on a node is a storage incident, not a process incident, and shows up as a pod stuck <code>Terminating</code>.</p></details>
+
+<h5 class="verify">Verify</h5>
+<p>Each drill is done when you can state its fingerprint in one sentence without looking, and when you fixed it at the cause rather than the symptom. Clean up (<code>rm -f /tmp/leaky.py /tmp/stubborn-svc.py /tmp/dfile</code>) and confirm no zombies remain (<code>ps -eo stat= | grep -c '^Z'</code>).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>All three tempt you to act on the symptom: kill the zombies, <code>kill -9</code> the slow service without asking why, <code>kill -9</code> harder at the D-state process. The first does nothing, the second hides a real bug that will keep costing you the grace period, and the third cannot work by construction. Every one of them is fixed one layer away from where it hurts — the parent, the program's signal handling, the storage.</p>
+<p>The reasoning generalises to the whole rest of the site: a symptom is a starting point, not a diagnosis. W6 applies exactly this discipline at cluster scale — read the evidence the system is actually giving you (<code>ps</code> state, signal masks, <code>WCHAN</code>; later, events, conditions, logs) before reaching for a fix, because the loudest symptom is rarely at the location of the cause.</p>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ps</code> for the <code>stat</code> and <code>wchan</code> columns, <code>man 5 proc</code> under <code>/proc/[pid]/status</code> for the <code>Sig*</code> masks and <code>/proc/[pid]/wchan</code>. Re-read <a href="#cp-b2-9">B2.9</a>, <a href="#cp-b2-16">B2.16</a> and <a href="#cp-b2-7">B2.7</a> — these three drills exist to make those three lessons permanent.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B2 recall quiz</h3>
+<p>Answer out loud before revealing. Everything Kubernetes does to a workload is one of these facts about a process — if you cannot answer it here, it will not get easier wrapped in an API.</p>
+<ol>
+<li>Define a process in four parts, and name the one Linux object that a container actually is.
+<details class="reveal"><summary>Answer</summary><p>An address space (private memory), a table of open file descriptors, a set of credentials, and a PID. A container is not a distinct kernel object — it is an ordinary process with those four things adjusted (credentials, filesystem view, PID visibility, resource caps). There is nothing else there.</p></details></li>
+<li>Why is VSZ almost always far larger than RSS, and which one matters?
+<details class="reveal"><summary>Answer</summary><p>VSZ is address space <em>reserved</em>; RSS is physical memory <em>occupied</em>. Reserving costs nothing until a page is touched, so a process can map gigabytes it never uses. RSS is the number that competes for real memory — though even RSS double-counts shared pages, so it is the right per-process figure and the wrong thing to sum.</p></details></li>
+<li>What are the three system calls that create and manage a new program, and what happens in the gap between the first two?
+<details class="reveal"><summary>Answer</summary><p><code>fork</code> (copy the caller), <code>exec</code> (replace the copy's program), <code>wait</code> (collect the result). In the gap between fork and exec the child is running its own code and can adjust <em>itself</em> — redirect descriptors, drop privileges, join a cgroup, enter namespaces — before becoming the target program. That gap is where a container is made.</p></details></li>
+<li>A process is in state D and will not respond to <code>kill -9</code>. What is happening and what do you do?
+<details class="reveal"><summary>Answer</summary><p>It is in uninterruptible sleep inside a kernel I/O call that will not accept a signal until it returns — almost always storage or a network filesystem. You cannot kill it; you read <code>WCHAN</code> to find what it is waiting on and fix that layer (the disk, the mount). A pile of D processes is an incident one level down, not a process problem.</p></details></li>
+<li>What is a zombie, what does it consume, and how do you get rid of one?
+<details class="reveal"><summary>Answer</summary><p>A dead child whose exit status has not yet been collected by its parent's <code>wait()</code>. It holds no memory and no CPU — only a PID and a status record. You cannot kill it (nothing is there); it is reaped when its parent calls <code>wait</code>, or, if the parent exits, when PID 1 inherits and reaps it. Thousands of them exhaust PIDs, not memory.</p></details></li>
+<li>Decode 137, 143 and 139. Which one tells you to read the application's logs?
+<details class="reveal"><summary>Answer</summary><p>128 + N, where N is the signal. 137 = SIGKILL (9) — killed from outside, usually the OOM killer. 143 = SIGTERM (15) — a normal shutdown. 139 = SIGSEGV (11) — the program's own memory bug. Only 139 is the application failing on its own, so only 139 makes its logs the right place to look; the other two were done to it from outside.</p></details></li>
+<li>What is a thread, in the kernel's terms, and what single system call creates both threads and containers?
+<details class="reveal"><summary>Answer</summary><p>A schedulable task that shares its address space and file-descriptor table with its siblings while keeping its own stack and kernel ID. <code>clone()</code> creates it — the same call that creates processes (sharing little) and, with namespace flags, containers (sharing nothing and getting private PID/network/mount views). One dial, many settings.</p></details></li>
+<li>Name the two signals that cannot be caught, and explain the operational consequence.
+<details class="reveal"><summary>Answer</summary><p>SIGKILL (9) and SIGSTOP (19). The kernel handles both without running the target's code, so a program can never block them — which guarantees you can always stop or freeze a process. The cost is that a SIGKILLed process gets no chance to clean up, so all graceful shutdown must happen during the SIGTERM you send first.</p></details></li>
+<li>Why should a signal handler set a flag rather than do the work itself?
+<details class="reveal"><summary>Answer</summary><p>A handler runs asynchronously, interrupting the main program at an arbitrary point — possibly mid-<code>malloc</code> or holding a lock. Doing real work there risks deadlock and corruption, because almost nothing is safe to call from a handler. The safe pattern is: handler sets a flag and returns; the main loop notices the flag and does the real work at a safe point.</p></details></li>
+<li>State the four steps of graceful shutdown, and what happens to a program that ignores SIGTERM.
+<details class="reveal"><summary>Answer</summary><p>Catch SIGTERM; stop accepting new work; finish in-flight work (drain); exit 0. A program that ignores TERM does not become robust — it forces its supervisor to wait the entire grace period and then send the uncatchable SIGKILL, which drops all in-flight work and reports 137. "Ignores TERM" means "always takes the maximum time and loses data", not "tougher".</p></details></li>
+<li>Why does a container's PID 1 need special care around both reaping and signals?
+<details class="reveal"><summary>Answer</summary><p>PID 1 inherits re-parented orphans, so it must reap them or they pile up as zombies — but an ordinary application at PID 1 has no reaping loop. And the kernel suppresses default signal actions for PID 1, so an app there with no explicit SIGTERM handler <em>ignores</em> TERM entirely. Both are fixed by a proper init (<code>tini</code>, the pause container) or by writing the handler and reap loop yourself.</p></details></li>
+<li>Structurally, what is a kubelet, in the vocabulary of this module?
+<details class="reveal"><summary>Answer</summary><p>A supervisor: it forks and execs children (containers), waits on them, reads exit status to tell "asked to stop" from "failed", and restarts failures with a capped backoff (which appears as <code>CrashLoopBackOff</code>). It is the mini-supervisor from B2.17 scaled up to "which processes should exist on this node", which is exactly the program you wrote.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Define a process precisely as four things and a number, and point at each on a live one through <code>/proc</code>.</li>
+<li>Read every column of <code>ps</code>, and never again mistake a large VSZ for a memory problem.</li>
+<li>Read the process tree, trace any process to PID 1, and recognise re-parenting when it happens.</li>
+<li>X-ray a running process through <code>/proc/PID/</code> — including finding the deleted-but-open file holding a disk full.</li>
+<li>Explain process creation as <code>fork</code>/<code>exec</code>/<code>wait</code>, and say what the gap between the first two is for.</li>
+<li>Interpret every process state, and treat D and Z as the specific, different situations they are rather than "stuck".</li>
+<li>Read any exit code as a message, decoding 137, 143 and 139 on sight via 128 + signal.</li>
+<li>Explain orphans, zombies, reaping and the two duties PID 1 owes its children.</li>
+<li>Describe a thread as the kernel does, find the one hot thread in a busy process, and read the signal masks.</li>
+<li>Recall the eight-signal table, predict any signal's default action, and read <code>man 7 signal</code> fluently.</li>
+<li>Write a signal handler in C and Python, and explain why two signals can never be caught.</li>
+<li>Implement graceful shutdown and measure the difference between handling and ignoring SIGTERM.</li>
+<li>Build a mini-supervisor — a baby kubelet — that forks, forwards signals, reaps, and restarts with backoff, in two languages.</li>
+<li>Diagnose a zombie leak, an ignored-SIGTERM service, and a D-state process from evidence, and fix each at its cause.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b1.html">← B1 · Shell, files and the filesystem tree</a><a href="../beginner.html#b3">B3 · Kernel space, user space, system calls →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-24. Package versions referenced: coreutils 9.4, procps 4.0.4, gcc 13, python 3.12. Signal numbers are x86/ARM values; a few differ on other architectures, so prefer names over numbers in scripts.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
