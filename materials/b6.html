@@ -35,6 +35,7 @@
     <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
     <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
     <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
   </ul></div>
 </aside>
 
@@ -714,18 +715,191 @@ demo                                 ← the named namespace persists (pinned un
 </article>
 </div><!-- /g-netns -->
 
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b6-14" data-id="b6-14">
+<div class="lesson-head"><span class="cp-id">B6.14</span><h4>Mini project — container v0.1</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the payoff for the whole module. You now hold every primitive a container is made of — a mount namespace and <code>pivot_root</code> for the filesystem, a PID namespace with a fresh <code>/proc</code> for the process list, UTS for the hostname, IPC for shared memory — and assembling them takes about twenty-five lines of shell and installs no runtime whatsoever. The result is a shell that genuinely believes it is alone on a machine: its own root filesystem, its own short process list where it is PID&nbsp;1, its own hostname. When you finish this, "container" will never again feel like magic — it will feel like a script you wrote. B7 will add resource limits, B9 a network, and B14 will grow this into <code>minibox</code>.</p>
+<h5>The concept</h5>
+<p>Container v0.1 is the composition of everything above, in one command plus a little setup. The recipe:</p>
+<ol>
+<li><strong>A rootfs</strong> — the minimal directory tree from B5.17 (busybox or <code>debootstrap</code>), the filesystem the container will call <code>/</code>.</li>
+<li><strong>A bundle of namespaces</strong> — <code>unshare --pid --mount --uts --ipc --fork</code>: a private process list, mount table, hostname, and IPC world, with <code>--fork</code> so the shell becomes PID&nbsp;1 of the new PID namespace.</li>
+<li><strong>A pivoted root</strong> — bind-mount the rootfs onto itself, make it private, <code>pivot_root</code> into it, and unmount the old root (B6.11) so the host filesystem is unreachable.</li>
+<li><strong>A mounted <code>/proc</code></strong> — mount a fresh procfs inside so <code>ps</code> reflects the new PID namespace (B6.6). This is the <code>--mount-proc</code> job, done explicitly because we pivot first.</li>
+</ol>
+<p>That is the entire anatomy of a container's isolation. What we are deliberately <em>not</em> adding yet keeps the scope honest: no cgroup limits (B7 — so this container can still use the whole machine), no network namespace wiring (B9 — it shares the host network for now, or is isolated and inert if you add <code>--net</code>), no user namespace by default (so it runs as real root — fine on a throwaway VM, not how you would ship it), and no image format, registry, or runtime daemon. A production runtime adds those layers, but none of them change the core you are about to build. The container is the namespaces plus the pivoted root; everything else is management around it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the script. It takes a rootfs path, enters the namespace bundle, pivots into the rootfs, mounts <code>/proc</code>, and runs a shell. Read each line against the lesson it came from.
+<pre class="cmd">cat &gt; ~/container.sh &lt;&lt;'EOF'
+#!/bin/sh
+# container v0.1 — namespaces + pivot_root, no runtime. Usage: sudo ./container.sh ~/rootfs
+set -eu
+ROOTFS="$1"
+
+# Re-exec ourselves inside a fresh bundle of namespaces (B6.2, B6.5).
+# --fork makes the child PID 1 of the new PID namespace; --mount gives a
+# private mount table so the pivot below can't disturb the host (B6.6).
+if [ -z "${_IN_NS:-}" ]; then
+    export _IN_NS=1
+    exec unshare --pid --mount --uts --ipc --fork "$0" "$ROOTFS"
+fi
+
+hostname container-v0.1                       # UTS namespace (B6.4)
+
+# Make the rootfs a private mount point so pivot_root's preconditions hold (B6.11).
+mount --bind "$ROOTFS" "$ROOTFS"
+mount --make-private "$ROOTFS"
+mkdir -p "$ROOTFS/oldroot"
+
+cd "$ROOTFS"
+pivot_root . oldroot                          # swap the root (B6.11)
+cd /
+
+mount -t proc proc /proc                      # fresh /proc for the new PID ns (B6.6)
+umount -l /oldroot                            # remove the ladder back to the host
+rmdir /oldroot 2>/dev/null || true
+
+echo "== container v0.1: I am PID $$ on host '$(hostname)' =="
+exec /bin/sh
+EOF
+chmod +x ~/container.sh</pre>
+<pre class="out">(script written — about 25 meaningful lines)</pre></li>
+<li>Run it against the B5.17 rootfs. The banner shows you are PID&nbsp;1 with the container's hostname.
+<pre class="cmd">sudo ~/container.sh ~/rootfs</pre>
+<pre class="out">== container v0.1: I am PID <b>1</b> on host 'container-v0.1' ==</pre></li>
+<li>Prove it is really isolated from inside: a short process list, its own root, and no view of the host filesystem.
+<pre class="cmd">ps -ef                        # a handful of processes; you are PID 1
+ls /                          # the rootfs, not the host's /
+ls /oldroot 2&gt;/dev/null || echo 'host root unreachable'
+exit</pre>
+<pre class="out">PID   USER  ... COMMAND
+    1 root  ... /bin/sh       ← PID 1, short list — its own PID namespace
+    9 root  ... ps -ef
+bin  dev  etc  lib  proc  usr  ← its own root filesystem
+<b>host root unreachable</b>       ← old root was pivoted away and unmounted</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From inside container v0.1, run <code>echo $$</code> (expect <code>1</code>), <code>hostname</code> (expect <code>container-v0.1</code>), and <code>ls /oldroot</code> (expect empty/unreachable). If all three hold, you have built a container: private PID namespace with you as PID&nbsp;1, private UTS hostname, and a pivoted root with no path back to the host. Then, to prove the deliberate gaps, note that <code>ip addr</code> still shows the host's interfaces (no <code>--net</code> — B9's job) and nothing caps your CPU or memory (no cgroup — B7's job). Naming what is <em>missing</em> is as important as what works.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The self-re-exec (<code>_IN_NS</code> guard) trips people up: <code>unshare --fork</code> needs to run a program <em>as</em> the new PID&nbsp;1, so the script relaunches itself inside the namespaces rather than trying to become PID&nbsp;1 in place. Without the guard and the <code>exec unshare … "$0"</code>, either nothing enters a PID namespace or you get an infinite fork loop. If you adapt this script, keep that two-phase structure — "set up namespaces, then re-enter myself" is the standard shell idiom for it.</p>
+<p>This container runs as <strong>real root</strong> with the host network and no limits — it is a teaching artifact, not a secure sandbox. Anything inside can exhaust the machine's CPU/memory (no cgroup) and, running as uid&nbsp;0 without a user namespace, is far closer to host root than a real container would allow. That is fine on a disposable <code>sandbox</code> VM whose whole purpose is to be wrecked, but do not mistake v0.1 for something you would run untrusted code in. B7, B9, and B14 close these gaps one at a time.</p>
+<div class="k8s-link">
+<p>You have just built, by hand, the core of what containerd/runc do for every pod: a bundle of namespaces wrapped around a pivoted root filesystem. The pieces map one-to-one — the OCI runtime config lists exactly these namespaces, the runtime does the same <code>pivot_root</code>-and-unmount, and the pause container exists to hold the namespaces open (your <code>--fork</code> PID&nbsp;1, generalised). Everything Kubernetes adds — the image that becomes your rootfs (an overlay from B5), the cgroup limits from a pod's <code>resources</code> (B7), the CNI-wired network (B9), the security hardening (user namespaces, dropped capabilities, seccomp) — is a layer <em>around</em> this core, not a replacement for it. When you read a pod spec now, you are reading configuration for the container you just wrote.</p>
+<p>The runtime/OCI handoff and the pause container are in <a href="w1.html#cp-1-21">W1.21</a>; the layers you'll add map to <a href="w3.html">W3</a> (limits), <a href="w4.html">W4</a> (network), and <a href="w7.html">W7</a> (security).</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 unshare</code> (the whole flag bundle), <code>man 8 pivot_root</code>, <code>man 8 mount</code> (bind/make-private/proc), and <code>man 7 namespaces</code> tie together everything this script uses. For the production version of the same idea, skim the OCI Runtime Specification's <code>namespaces</code> and <code>root</code> sections (searchable as "opencontainers runtime-spec config.md"). In the exam docs, the pod spec is the declarative form of this bundle.</p>
+</article>
+
+<article class="lesson drill" id="cp-b6-15" data-id="b6-15">
+<div class="lesson-head"><span class="cp-id">B6.15</span><h4>Debugging drill — the invisible namespace and the leak that won't die</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two failures catch nearly everyone who works with namespaces, and both are cases where the loud symptom points at the wrong object — the same evidence-first discipline as the B2, B3, B4, and B5 drills. The first: a PID namespace that looks like it "didn't work" because <code>ps</code> still shows every host process. The second: a namespace that refuses to go away long after its last process exited, quietly holding resources. Reproducing both, and fixing them by reading state rather than guessing, is what turns the theory above into a debugging reflex.</p>
+<h5 class="verify">Symptom 1 — <code>ps</code> in a new PID namespace still lists every host process</h5>
+<ol class="lab">
+<li>Reproduce it: create a PID namespace <em>without</em> <code>--mount-proc</code>, so <code>/proc</code> is still the host's. <code>ps</code> shows hundreds of processes and your shell is not PID&nbsp;1 — it looks like the namespace was ignored.
+<pre class="cmd">multipass shell sandbox
+sudo unshare --pid --fork bash        # note: no --mount-proc
+echo "my PID says: $$"
+ps aux | wc -l</pre>
+<pre class="out">my PID says: <b>1</b>                       ← you ARE PID 1...
+<b>247</b>                                  ← ...yet ps lists 247 processes?!</pre></li>
+<li>Diagnose from evidence, not vibes: <code>$$</code> says 1, so the PID namespace <em>is</em> real — the lie must be in what <code>ps</code> reads. <code>ps</code> reads <code>/proc</code>, and <code>/proc</code> is a mount, still pointing at the host's.
+<pre class="cmd">readlink /proc/self/ns/pid            # a new inode — the PID ns is real
+head -1 /proc/self/mountinfo | grep -o 'proc' | head -1
+findmnt /proc                          # whose /proc is this?</pre>
+<pre class="out">pid:[4026532xxx]                      ← genuinely a new PID namespace
+TARGET SOURCE FSTYPE OPTIONS
+/proc  proc   proc   ...              ← the HOST's procfs — never remounted</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>The PID namespace worked; <code>/proc</code> was never remounted.</strong> <code>ps</code> derives the process list from <code>/proc</code>, which is an artifact of the <em>mount</em> namespace, not the PID namespace — and you did not create a mount namespace or mount a fresh procfs, so <code>ps</code> is reading the host's <code>/proc</code> and reporting host processes. The fix is to give the namespace its own <code>/proc</code>: add <code>--mount-proc</code> (which implies <code>--mount</code>) — <code>sudo unshare --pid --fork --mount-proc bash</code> — and <code>ps</code> immediately shows the short list. The reflex: when a PID namespace "shows host processes", the fault is <code>/proc</code>, not the namespace; check <code>findmnt /proc</code> before doubting <code>unshare</code>. This is the loose end from B6.5 and B6.6, made into a symptom.</p></details>
+
+<h5 class="verify">Symptom 2 — a network namespace that will not go away</h5>
+<ol class="lab">
+<li>Reproduce it: create a network namespace, then bind-mount its <code>ns/net</code> handle somewhere — pinning it open (B6.3) — and let every process using it exit. The namespace has no processes yet still exists.
+<pre class="cmd">sudo ip netns add ghost
+# simulate a leaked reference: pin the handle with a bind mount, then "lose" it
+sudo touch /root/pin
+sudo mount --bind /var/run/netns/ghost /root/pin
+sudo ip netns delete ghost            # try to delete it
+sudo lsns -t net | grep -c ghost || true
+ls /var/run/netns/</pre>
+<pre class="out">                                      ← ip netns list no longer shows it, but...
+(empty)                               ← the name is gone, yet the namespace lives on</pre></li>
+<li>Diagnose: <code>lsns</code> still lists a net namespace with <strong>0 processes</strong> — the tell-tale of a namespace kept alive by a reference, not a process. Find what is holding it: a mount.
+<pre class="cmd">sudo lsns -t net -o NS,NPROCS,PID,COMMAND | awk '$2==0'
+findmnt /root/pin</pre>
+<pre class="out">4026532xxx <b>0</b>  -  -                    ← a net namespace with zero processes: leaked
+TARGET     SOURCE                 FSTYPE OPTIONS
+/root/pin  nsfs[net:[4026532xxx]] nsfs   rw   ← a bind mount is pinning it open</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A leaked reference, not a stuck kernel.</strong> A namespace lives as long as <em>anything</em> references it — a process, an open fd, or a bind mount of its <code>/proc/PID/ns/*</code> handle (B6.3). Here a bind mount of the <code>nsfs</code> handle keeps the network namespace alive even though <code>ip netns delete</code> removed the name and no process remains, so <code>lsns</code> shows it with <code>NPROCS=0</code>. The fix is to remove the holding reference: <code>sudo umount /root/pin</code> (and <code>rm /root/pin</code>), after which the namespace is finally reaped. The reflex: a namespace with zero processes that will not die is being pinned — hunt the reference with <code>lsns</code> (look for <code>NPROCS 0</code>) and <code>findmnt</code>/<code>lsof</code> for a bind mount or open fd, rather than rebooting. This is the dark side of the same pinning mechanism <code>ip netns</code> uses on purpose (B6.13).</p></details>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both symptoms share the module's recurring shape: the loud symptom names the wrong object. "The PID namespace didn't work" is really "<code>/proc</code> wasn't remounted"; "the kernel won't delete my namespace" is really "something still holds a reference." Reading the real state — <code>findmnt /proc</code>, <code>lsns</code> for zero-process namespaces, <code>findmnt</code>/<code>lsof</code> for the pinning reference — redirects you from the innocent-but-loud object to the guilty-but-quiet one, exactly as the earlier drills trained.</p>
+<p>The pinning that causes symptom 2 is not a bug — it is the mechanism that makes named network namespaces (and CNI-managed pod namespaces) persist on purpose. The lesson is not "never bind-mount an <code>ns</code> handle" but "know that you did": every deliberate pin is a reference you are responsible for releasing. Leaks happen when a tool or script pins a handle and forgets to unmount it on cleanup — the fix is always to find and drop the reference, never to force-kill or reboot.</p>
+<div class="k8s-link">
+<p>Both are real node incidents. Symptom&nbsp;1 is why a debugging container that shows "all the node's processes" might simply be sharing the host PID namespace (<code>hostPID</code>) or lack its own <code>/proc</code> — read the mounts before concluding isolation failed. Symptom&nbsp;2 is a genuine class of node bug: leaked network namespaces from pods whose CNI teardown failed to unpin the <code>ns</code> handle, accumulating as zero-process namespaces that <code>lsns</code> reveals and that slowly consume kernel resources until found and unmounted. When a node mysteriously accrues network namespaces or won't release pod IPs, this drill is the diagnosis — <code>lsns</code>, <code>findmnt</code>, drop the reference.</p>
+<p>These map onto the node-level troubleshooting in <a href="w6.html">W6</a>; <code>hostPID</code> and shared namespaces connect back to <a href="#cp-b6-2">B6.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 lsns</code> (spot zero-process namespaces), <code>man 8 findmnt</code> and <code>man 1 lsof</code> (find the pinning reference), and <code>man 5 proc</code> for why <code>/proc</code> drives <code>ps</code>. <code>man 1 unshare</code> under <code>--mount-proc</code> for symptom 1's fix, and <code>man 8 ip-netns</code> for how the pinning in symptom 2 normally works on purpose. Re-read <a href="#cp-b6-3">B6.3</a> (namespace lifetime) and <a href="#cp-b6-6">B6.6</a> (<code>/proc</code> and mount namespaces) — this drill exists to make them permanent.</p>
+</article>
+</div><!-- /g-project -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B6 recall quiz</h3>
 <p>Answer out loud before revealing. If you can explain what a pod's shared namespaces are and what the pause container holds, this module has done its job.</p>
 <ol>
 <li>In one sentence, how does a namespace differ from a virtual machine?
 <details class="reveal"><summary>Answer</summary><p>A VM emulates a whole machine with its own kernel; a namespace is one real kernel giving a process a private copy of a single resource (process list, hostname, mounts, network…). Same kernel, same scheduler — only the bookkeeping table for one specific question is forked. That is why containers start in milliseconds and a VM in seconds.</p></details></li>
+<li>Name four of the eight namespace types and the question each one changes the answer to.
+<details class="reveal"><summary>Answer</summary><p>Any four of: <strong>mnt</strong> — what is mounted where; <strong>pid</strong> — which processes exist (and their PIDs); <strong>net</strong> — which interfaces/addresses/routes/ports exist; <strong>ipc</strong> — which System&nbsp;V shared-memory/queues exist; <strong>uts</strong> — what is my hostname; <strong>user</strong> — which uid/gid I am and what it may do; <strong>cgroup</strong> — where I sit in the resource hierarchy; <strong>time</strong> — what the boot/monotonic clocks say.</p></details></li>
+<li>How do you decide, with certainty, whether two processes share a network namespace?
+<details class="reveal"><summary>Answer</summary><p>Compare <code>readlink /proc/PID/ns/net</code> for each. The number in <code>net:[inode]</code> is the namespace's identity; identical inode ⇒ same namespace, different inode ⇒ different namespace. Membership is by inode, exactly like a file is its inode not its name (B5.6).</p></details></li>
+<li>You run <code>unshare --pid --fork bash</code>, and inside <code>echo $$</code> prints <code>1</code> but <code>ps</code> lists every host process. Explain, and give the fix.
+<details class="reveal"><summary>Answer</summary><p>The PID namespace is real (you are PID&nbsp;1), but <code>ps</code> reads <code>/proc</code>, which is a <em>mount</em>-namespace artifact — and you never remounted it, so <code>ps</code> reads the host's <code>/proc</code>. Fix: add <code>--mount-proc</code> (which implies <code>--mount</code> and mounts a fresh procfs), i.e. <code>unshare --pid --fork --mount-proc bash</code>.</p></details></li>
+<li>Why does killing PID&nbsp;1 inside a PID namespace end the whole namespace, and why does a container's app-as-PID-1 sometimes ignore <code>SIGTERM</code>?
+<details class="reveal"><summary>Answer</summary><p>When a PID namespace's PID&nbsp;1 exits, the kernel <code>SIGKILL</code>s every other process in it and tears it down — PID&nbsp;1 is the namespace's anchor. And the kernel will not deliver a default-action signal (like <code>SIGTERM</code>) to PID&nbsp;1 unless the process installed a handler, so an app as PID&nbsp;1 with no handler ignores <code>SIGTERM</code> — which is why containers need a signal-forwarding init or a handler, and why <code>terminationGracePeriodSeconds</code> exists.</p></details></li>
+<li>What does a user namespace change that no other namespace does, and why could you be uid&nbsp;0 inside it yet unable to read <code>/etc/shadow</code>?
+<details class="reveal"><summary>Answer</summary><p>It changes <em>who you are</em> — it maps uids/gids, so you can be root (uid&nbsp;0) inside while the host still sees your unprivileged uid. Your in-namespace root capabilities apply only to resources owned by the namespace; <code>/etc/shadow</code> is owned by the host's real root, against which you are still uid&nbsp;1000, so the check fails. It is also the namespace that lets an unprivileged user create the others (rootless containers).</p></details></li>
+<li>Why is <code>chroot</code> not a security boundary, and what does <code>pivot_root</code> do that fixes it?
+<details class="reveal"><summary>Answer</summary><p><code>chroot</code> only changes the base for absolute path lookups; it leaves the old root mounted and reachable, so a process with <code>CAP_SYS_CHROOT</code> and an open fd to an outside directory can climb back out, and it isolates nothing else (same PIDs, network, etc.). <code>pivot_root</code> swaps the mount namespace's root and lets you <em>unmount</em> the old root, so there is no old filesystem reachable from anywhere in the namespace — no ladder to escape on.</p></details></li>
+<li>What is <code>nsenter -t PID -n</code> doing, and which everyday Kubernetes command is it the internals of?
+<details class="reveal"><summary>Answer</summary><p>It joins only the <em>network</em> namespace of the target process (via <code>setns</code>), running your command inside that netns while keeping your own mount/PID view — so you can debug the target's network with host tools it may lack. It is essentially the internals of <code>kubectl exec</code> (which enters a container's namespaces to run a command) and node-level pod-network debugging.</p></details></li>
+<li>A freshly created network namespace can't reach the internet though the host can. What is it missing, and why can two of them both bind port 80?
+<details class="reveal"><summary>Answer</summary><p>It has only a loopback interface, which starts <code>DOWN</code>, and no routes at all — no wire out and no routing table, so there is no path anywhere. Connecting it needs a veth pair and routes (B9). Two netns each have their own private port space, so "port 80" is a separate binding in each — which is exactly how many pods run servers on the same port on one node.</p></details></li>
+<li>What are the minimum ingredients of "container v0.1", and what did you deliberately leave out?
+<details class="reveal"><summary>Answer</summary><p>Ingredients: a rootfs, a bundle of namespaces (<code>unshare --pid --mount --uts --ipc --fork</code>), a <code>pivot_root</code> into the rootfs with the old root unmounted, and a fresh <code>/proc</code> mounted for the PID namespace. Left out: cgroup resource limits (B7), network-namespace wiring (B9), a user namespace (so it runs as real root), and any image format/registry/runtime — those are layers around the core, not the core.</p></details></li>
+<li>A namespace won't go away long after its last process exited. What is happening and how do you find and fix it?
+<details class="reveal"><summary>Answer</summary><p>Something still references it — an open fd or, classically, a bind mount of its <code>/proc/PID/ns/*</code> handle — so the kernel keeps it alive with zero processes. Find it with <code>lsns</code> (look for <code>NPROCS 0</code>) and <code>findmnt</code>/<code>lsof</code> for the pin, then drop the reference (<code>umount</code> the handle / close the fd). Never reboot for it — it's a leaked reference, not a stuck kernel. This is the dark side of the same pinning <code>ip netns</code> uses on purpose.</p></details></li>
+<li>In one paragraph, what does "a pod's shared namespaces" mean, and what is the pause container for?
+<details class="reveal"><summary>Answer</summary><p>A pod is a set of containers that share a chosen bundle of Linux namespaces — always the network namespace (same IP, same <code>localhost</code>, same ports, reachable on <code>127.0.0.1</code>) and usually IPC, while each container keeps its own mount and (by default) PID view. The pause container is a near-empty container that exists solely to <em>hold those shared namespaces open</em>, so individual app containers can crash and restart without tearing down the pod's network identity. It is the real-world version of the <code>--fork</code> PID&nbsp;1 in container v0.1: the anchor that keeps the namespaces alive.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>State the core idea of a namespace and why a container is not a VM.</li>
+<li>State the core idea of a namespace — a private copy of one kernel resource — and why a container is not a VM.</li>
+<li>Name all eight namespace types and the single question each one changes the answer to.</li>
+<li>Read namespace identity by inode under <code>/proc/PID/ns</code> and decide whether two processes share one.</li>
+<li>Give a process its own hostname with a UTS namespace and prove the host's is unchanged.</li>
+<li>Enter a PID namespace as PID&nbsp;1, explain PID-1's reaping and signal semantics, and end the namespace by killing it.</li>
+<li>Get a private mount table with a mount namespace, and explain why a new PID namespace needs <code>/proc</code> remounted.</li>
+<li>Show that an IPC namespace hides System&nbsp;V shared memory, and say what it does and does not isolate.</li>
+<li>Map your uid to root in a user namespace, read <code>/proc/self/uid_map</code>, and explain Ubuntu 24.04's userns restriction and its trade-off.</li>
+<li>Re-root your cgroup view with a cgroup namespace, and distinguish a view (this) from a limit (B7).</li>
+<li>Use <code>chroot</code> to change <code>/</code>, and explain precisely why it is not a security boundary.</li>
+<li>Swap a mount namespace's root with <code>pivot_root</code>, unmount the old root, and recite its four preconditions.</li>
+<li>Join another process's namespaces with <code>nsenter</code>, and recognise it as the internals of <code>kubectl exec</code>.</li>
+<li>Create an empty network namespace, see its lone down loopback, and explain the private port space.</li>
+<li>Assemble a ~25-line container v0.1 from <code>unshare</code> + <code>pivot_root</code> + a mounted <code>/proc</code>, and name what it deliberately omits.</li>
+<li>Diagnose a PID namespace showing host processes (<code>/proc</code> not remounted) and a namespace pinned alive by a leaked reference, from evidence.</li>
 </ul>
 </div>
 
