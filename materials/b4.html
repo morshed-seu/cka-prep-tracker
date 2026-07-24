@@ -264,6 +264,240 @@ Sorry, user deploy is not allowed to execute '/usr/bin/systemctl stop nginx' as 
 </article>
 </div><!-- /g-identity -->
 
+<!-- ---------------- Permissions ---------------- -->
+<div class="grp" id="g-permissions"><h3>Permissions</h3>
+
+<article class="lesson" id="cp-b4-5" data-id="b4-5">
+<div class="lesson-head"><span class="cp-id">B4.5</span><h4>The permission check: owner, then group, then other — first match wins</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have seen <code>-rw-r--r--</code> in <code>ls -l</code> a hundred times. This lesson is the exact rule the kernel applies to those nine letters, and it contains one genuine surprise that catches nearly everyone: the check is <em>first-match</em>, not a best-of. It is entirely possible to lock the owner of a file out of their own file while a stranger can read it — and once you know why, you will never misread a permission line again.</p>
+<h5>The concept</h5>
+<p>Every file carries an owner (a uid), a group (a gid), and three sets of three bits — the <strong>triads</strong>: one for the owner, one for the group, one for everyone else ("other"). Each triad is read/write/execute. When a process tries to touch the file, the kernel picks <em>one</em> triad and uses only that one, in this order:</p>
+<ol>
+<li>If your uid is the file's owner → the <strong>owner</strong> triad decides. Stop. The group and other triads are never even looked at.</li>
+<li>Else if one of your gids matches the file's group → the <strong>group</strong> triad decides. Stop.</li>
+<li>Else → the <strong>other</strong> triad decides.</li>
+</ol>
+<p>That word "stop" is the whole lesson. It is <em>first applicable triad wins</em>, not "combine all the permissions you might qualify for". So if the owner triad is <code>---</code> (nothing) but the other triad is <code>r--</code>, then the owner cannot read the file while everyone else can — because for the owner, the check stops at the owner triad, which grants nothing. The kernel never falls through to "well, other can read it, and you're a person, so…". You are the owner; the owner triad is your answer, full stop.</p>
+<div class="flow"><span>am I the owner?</span><em>yes →</em><span class="hot">owner triad, done</span><em>· no, in the group? yes →</em><span>group triad, done</span><em>· else →</em><span>other triad</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the paradox: a file whose owner can't read it but strangers can. Set the owner triad to nothing and the other triad to read.
+<pre class="cmd">echo 'a secret' &gt; /tmp/f
+chmod 044 /tmp/f          # owner ---, group r--, other r--
+ls -l /tmp/f</pre>
+<pre class="out"><b>----r--r--</b> 1 ubuntu ubuntu 9 ... /tmp/f</pre></li>
+<li>Try to read it as yourself — the owner. Denied, because the check stopped at the empty owner triad and never considered that "other" could read it.
+<pre class="cmd">cat /tmp/f</pre>
+<pre class="out">cat: /tmp/f: <b>Permission denied</b></pre></li>
+<li>Now read the very same file as a completely unrelated user, who falls through to the "other" triad and <em>is</em> allowed. This is the first-match rule made visible.
+<pre class="cmd">sudo -u nobody cat /tmp/f</pre>
+<pre class="out"><b>a secret</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without running anything, predict: a file <code>-r--rw-r--</code> owned by <code>alice:staff</code>. If <code>alice</code> (who is also in <code>staff</code>) tries to write it, does she succeed? (No — she is the owner, so the owner triad <code>r--</code> decides and stops; the more generous group triad <code>rw-</code> is never consulted, even though she is in <code>staff</code>. This is the trap: being in the group does not help you once you match as owner.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Root ignores this entire check. A process with uid 0 (or, more precisely, one holding <code>CAP_DAC_OVERRIDE</code>, which you meet in B4.10) reads and writes regardless of any triad — the rwx bits simply do not apply to it. So "root can't read the file" is almost never a permission problem; it is nearly always something else (a read-only mount, SELinux/AppArmor, an immutable attribute). Permission bits are a wall for ordinary users and a suggestion to root.</p>
+<p>The check is per-operation, on the file as it is <em>now</em>. Changing a file's mode affects only future opens, not descriptors already held — a process that opened the file while it was readable keeps reading through its fd even after you <code>chmod 000</code> it, because the permission check happened once, at <code>open</code> time (the fd from B3.7 is the proof of a passed check). This is why "I removed the permissions but it's still being read" is not a bug.</p>
+<div class="k8s-link">
+<p>This is the rule behind most "permission denied" errors on mounted volumes in Kubernetes. A container process runs as some uid (from <code>runAsUser</code>); the files on the volume have some owner and group; the kernel applies exactly this first-match check. When a non-root container can't write a volume, the fix is to make the process match a triad that grants write — usually by setting <code>fsGroup</code> so the volume's <em>group</em> becomes one the process carries, landing it in the group triad. Knowing the check is first-match tells you which knob to reach for: change the ownership/group the process matches, not "add more permissions" blindly.</p>
+<p>You will see this concretely in <a href="w5.html">W5</a> (storage) when a <code>PersistentVolume</code> mounts with root ownership and a non-root pod can't write until <code>fsGroup</code> is set.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 path_resolution</code> and <code>man 2 access</code> for how the check is performed; <code>man 1 chmod</code> under the permission model. <code>man 2 open</code>'s <em>ERRORS</em> for the <code>EACCES</code> this produces. In the exam docs, anything about <code>fsGroup</code> and volume permissions.</p>
+</article>
+
+<article class="lesson" id="cp-b4-6" data-id="b4-6">
+<div class="lesson-head"><span class="cp-id">B4.6</span><h4>rwx on a directory means something different</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The same three letters — <code>r</code>, <code>w</code>, <code>x</code> — mean one thing on a file and a genuinely different thing on a directory, and confusing the two is behind the single most common real-world permission puzzle: a file that is perfectly readable but that you cannot reach because of a missing bit on a directory three levels up. This lesson makes that failure predictable instead of maddening.</p>
+<h5>The concept</h5>
+<p>A directory is really just a list mapping names to inodes (the on-disk file records — you will meet inodes properly in <a href="b5.html">B5</a>). The rwx bits govern what you may do with that <em>list</em>, which is why they don't mean what they mean on a file:</p>
+<table>
+<tr><th>Bit</th><th>On a file</th><th>On a directory</th></tr>
+<tr><td><code>r</code></td><td>read the contents</td><td><strong>list the names</strong> inside (what <code>ls</code> needs)</td></tr>
+<tr><td><code>w</code></td><td>modify the contents</td><td><strong>create, delete, or rename</strong> entries in it</td></tr>
+<tr><td><code>x</code></td><td>execute it as a program</td><td><strong>traverse</strong> into it — reach things by name and pass through</td></tr>
+</table>
+<p>The consequential one is <code>x</code> (traverse) versus <code>r</code> (list). They are independent. A directory with <code>x</code> but not <code>r</code> lets you reach a file <em>if you already know its name</em> — you can <code>cat dir/secret</code> — but you cannot <code>ls dir</code> to discover what is in there. The classic "secret dropbox" is exactly this: <code>x</code> so authorised programs can reach known files, no <code>r</code> so nobody can enumerate them.</p>
+<p>Two more consequences that generate real tickets. First, <strong>to open <code>/a/b/c/file</code> you need <code>x</code> on <code>/a</code>, on <code>/a/b</code>, and on <code>/a/b/c</code></strong> — every directory on the path — regardless of the file's own mode. One missing traverse bit three levels up denies a file that looks perfectly readable. Second, <strong>deleting a file needs <code>w</code> on its directory, not on the file</strong> — because delete is really "remove this name from the directory's list". This is why you can delete a file you cannot read, and cannot delete a file in a directory you may only read.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the traversable-but-unlistable directory. Create it and a file inside <em>first</em> (you need <code>w</code> to create), then strip it down to execute-only.
+<pre class="cmd">mkdir /tmp/vault
+echo 'the answer is 42' &gt; /tmp/vault/secret
+chmod 100 /tmp/vault        # --x------ : traverse only
+ls -ld /tmp/vault</pre>
+<pre class="out"><b>d--x------</b> 2 ubuntu ubuntu 4096 ... /tmp/vault</pre></li>
+<li>Reach the file by name — this works, because <code>x</code> lets you traverse in and the file itself is readable.
+<pre class="cmd">cat /tmp/vault/secret</pre>
+<pre class="out"><b>the answer is 42</b></pre></li>
+<li>Now try to <em>list</em> the directory. Denied — listing needs <code>r</code>, which you removed, even though you just read a file inside it.
+<pre class="cmd">ls /tmp/vault</pre>
+<pre class="out">ls: cannot open directory '/tmp/vault': <b>Permission denied</b></pre></li>
+<li>See the traverse rule bite from above. Remove <code>x</code> from the parent and watch the same readable file become unreachable.
+<pre class="cmd">chmod 700 /tmp/vault        # restore it, then break the path instead
+chmod a-x /tmp/vault
+cat /tmp/vault/secret</pre>
+<pre class="out">cat: /tmp/vault/secret: <b>Permission denied</b>   ← the file is fine; the directory won't let you in
+chmod 700 /tmp/vault        # put it back</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain in one sentence each: why <code>cat dir/secret</code> can work when <code>ls dir</code> fails, and why you can delete a file you have no permission to read. (Reaching a known file needs only <code>x</code> (traverse) on the directory plus read on the file, while listing needs <code>r</code> on the directory; and deletion is removing a name from the directory's list, which needs <code>w</code> on the <em>directory</em>, not any permission on the file.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The command that untangles a path problem is <code>namei -l</code> (or <code>namei -m</code>): give it a path and it prints the mode of every component from the root down, so a missing traverse bit shows up immediately as the one directory in the chain lacking <code>x</code>. Reaching for <code>namei</code> the moment a "readable" file gives <code>EACCES</code> turns a guessing game into a five-second diagnosis — it is the hero of the B4.15 drill.</p>
+<p><code>chmod -R 755 somedir</code> is a common way to make things worse. Recursively forcing <code>x</code> onto every entry sets the execute bit on <em>regular files</em> too, marking data files as programs. Use the "capital X" form — <code>chmod -R u+rwX,go+rX dir</code> — which adds <code>x</code> only to directories (and files that already had some <code>x</code>), which is almost always what you actually meant.</p>
+<div class="k8s-link">
+<p>Every volume mount, <code>subPath</code>, and projected ConfigMap in Kubernetes is a directory tree, and the same traverse rule governs whether a container process can reach a file inside it. "The file is mode 0644, why can't the container read it?" is very often a missing <code>x</code> on a parent directory in the mount, or a <code>defaultMode</code> that set the wrong bits on the directory. Reading the whole path's permissions — the <code>namei</code> habit — is exactly how you debug it, whether the tree is on a plain host or inside a pod.</p>
+<p>This directory-vs-file distinction underlies the mount mechanics you will study in <a href="b5.html">B5</a> and the projected-volume permission fields in <a href="w3.html">W3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 inode</code> for what a directory entry really is, <code>man 1 namei</code> for walking a path's permissions, and <code>man 1 chmod</code> under the symbolic <code>X</code> mode for the recursive-safe form. <code>man 2 unlink</code> confirms deletion is a directory operation.</p>
+</article>
+
+<article class="lesson" id="cp-b4-7" data-id="b4-7">
+<div class="lesson-head"><span class="cp-id">B4.7</span><h4>Octal on sight, and <code>chown</code> — who may give a file away</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Permissions are written and spoken in octal — <code>chmod 644</code>, "make it 600", "it should be 755" — and reading those three digits fluently, in both directions, is a small skill you use constantly. It is also completely mechanical once you see it, so ten minutes here buys you a lifetime of not having to think about it.</p>
+<h5>The concept</h5>
+<p>Each triad of three bits (rwx) is one octal digit. Give each bit a value — <strong>r = 4, w = 2, x = 1</strong> — and add up the ones that are set. That sum, 0 through 7, is the digit. Three triads → three digits:</p>
+<table>
+<tr><th>Octal</th><th>Bits</th><th>Means</th><th>Typical use</th></tr>
+<tr><td><code>7</code></td><td><code>rwx</code></td><td>4+2+1</td><td>full access</td></tr>
+<tr><td><code>6</code></td><td><code>rw-</code></td><td>4+2</td><td>read/write, no execute</td></tr>
+<tr><td><code>5</code></td><td><code>r-x</code></td><td>4+1</td><td>read/execute, no write</td></tr>
+<tr><td><code>4</code></td><td><code>r--</code></td><td>4</td><td>read only</td></tr>
+<tr><td><code>0</code></td><td><code>---</code></td><td>0</td><td>nothing</td></tr>
+</table>
+<p>So the four you will write in your sleep: <code>644</code> (<code>rw-r--r--</code>, a normal data file — owner edits, everyone reads), <code>755</code> (<code>rwxr-xr-x</code>, a program or a directory — owner writes, everyone runs/traverses), <code>600</code> (<code>rw-------</code>, a private file like an SSH key — owner only), and <code>700</code> (<code>rwx------</code>, a private directory). Read them right to left as owner-group-other and the pattern is instant.</p>
+<p>Ownership is changed with <strong><code>chown user:group file</code></strong> (or <code>chgrp</code> for the group alone). The rule that surprises people: <strong>only root may give a file away</strong> — an ordinary user cannot <code>chown</code> their own file to someone else. If you could, you could sidestep disk quotas by dumping files onto another user, or plant a file you own into someone's space and have it counted as theirs. You <em>can</em> change a file's <em>group</em> to another group you belong to, but handing the file to a different <em>user</em> is a root-only act.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set a mode by number and read it back both ways. <code>stat</code> shows the octal and the symbolic form side by side so you can check your translation.
+<pre class="cmd">touch /tmp/key
+chmod 600 /tmp/key
+stat -c '%a %A %U:%G' /tmp/key</pre>
+<pre class="out"><b>600 -rw------- ubuntu:ubuntu</b></pre></li>
+<li>Translate in your head, then verify. Predict the symbolic form of <code>751</code> before running it. (<code>rwxr-x--x</code>.)
+<pre class="cmd">chmod 751 /tmp/key
+stat -c '%a %A' /tmp/key</pre>
+<pre class="out">751 <b>-rwxr-x--x</b></pre></li>
+<li>Hit the "give it away" wall. Try to hand your file to root as an ordinary user — refused — then do the same with <code>sudo</code> and watch it work.
+<pre class="cmd">chown root /tmp/key            # as yourself: not allowed
+sudo chown root:root /tmp/key  # as root: fine
+stat -c '%U:%G' /tmp/key</pre>
+<pre class="out">chown: changing ownership of '/tmp/key': <b>Operation not permitted</b>
+<b>root:root</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Cover the table and translate both ways: what is <code>640</code> symbolically, and what octal is <code>rwxr-xr--</code>? (<code>640</code> = <code>rw-r-----</code>; <code>rwxr-xr--</code> = <code>754</code>.) Then say why <code>chown</code>-to-another-user failed for you but <code>chgrp</code> to a group you belong to would have worked. (Giving a file to another <em>user</em> is root-only to prevent quota evasion and planting files; changing to a group you are already a member of hands nothing to anyone new.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>Operation not permitted</code> you got from <code>chown</code> is <code>EPERM</code>, not <code>EACCES</code> — and the distinction (which you met in B3.14) matters here. It is not a file-permission problem that a <code>chmod</code> could fix; it is a <em>privileged operation</em> that requires a capability (<code>CAP_CHOWN</code>, coming in B4.10). No amount of adjusting the file's mode lets a non-root user give it away, because the file's mode was never the gatekeeper.</p>
+<p>A leading fourth digit changes the meaning — <code>chmod 4755</code> is not <code>755</code>. That extra high digit is the setuid/setgid/sticky bits of B4.9. When <code>stat</code> shows a four-digit mode or <code>ls</code> shows an <code>s</code> or <code>t</code> where you expected <code>x</code>, a special bit is set; don't ignore it.</p>
+<div class="k8s-link">
+<p>Octal is exactly how Kubernetes specifies file modes for mounted config. A <code>ConfigMap</code> or <code>Secret</code> volume takes a <code>defaultMode</code> (and per-key <code>mode</code>) written in octal — <code>0644</code> for readable config, <code>0400</code> for a secret only the owner may read. The YAML often forces you to write it as a decimal-looking <code>0644</code>, and reading it correctly (owner rw, everyone r) is the skill from this lesson. Getting a Secret's mode wrong — leaving it group- or world-readable — is a real finding in a cluster security review.</p>
+<p>You will set these modes when you mount Secrets in <a href="w3.html">W3</a>; the <code>0400</code>-for-secrets instinct comes straight from <code>600</code>-for-SSH-keys here.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 chmod</code> for both numeric and symbolic modes, <code>man 1 chown</code>/<code>man 1 chgrp</code> for ownership and the root-only rule, and <code>man 1 stat</code> for reading a mode back in either notation (<code>-c '%a %A'</code>). <code>man 2 chown</code>'s <em>ERRORS</em> for the <code>EPERM</code>/<code>CAP_CHOWN</code> connection.</p>
+</article>
+
+<article class="lesson" id="cp-b4-8" data-id="b4-8">
+<div class="lesson-head"><span class="cp-id">B4.8</span><h4>Where default permissions come from: <code>umask</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You never set the mode of most files you create — you <code>touch</code>, you redirect with <code>&gt;</code>, your editor saves — and yet they come out <code>644</code> rather than wide open. Something is choosing that default, and it is <code>umask</code>. Understanding it turns "why did my file come out with these permissions?" from a mystery into a one-line prediction, and it is the mechanism behind a whole class of "the new files have the wrong permissions" problems.</p>
+<h5>The concept</h5>
+<p>When a program creates a file it <em>requests</em> a mode — conventionally <code>666</code> (<code>rw-rw-rw-</code>) for a data file, <code>777</code> for a directory. Programs deliberately do not ask for execute on data files, which is why a fresh text file is never executable. Then the kernel subtracts the process's <strong><code>umask</code></strong> — a mask of bits to <em>remove</em>. The result is the actual mode.</p>
+<p>"A mask of bits to remove" is the whole idea, and it is why <code>umask</code> reads backwards at first. A umask of <code>022</code> means "remove write from group and other". So:</p>
+<ul>
+<li>a file: requested <code>666</code>, minus <code>022</code> → <strong><code>644</code></strong> (<code>rw-r--r--</code>);</li>
+<li>a directory: requested <code>777</code>, minus <code>022</code> → <strong><code>755</code></strong> (<code>rwxr-xr-x</code>).</li>
+</ul>
+<p>That single umask of <code>022</code> — the common default — is why practically every file you create comes out <code>644</code> and every directory <code>755</code>. Change the umask and you change the default: <code>077</code> removes all group and other bits, giving private <code>600</code> files and <code>700</code> directories, which is what you want on a shared machine where new files should be yours alone. The formula is exact: <strong>result = requested AND NOT umask</strong>, so you can always predict the outcome before you look.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your current umask, then create one of each and predict before you look. With umask <code>022</code>, the file should be <code>644</code> and the directory <code>755</code>.
+<pre class="cmd">umask
+touch /tmp/a; mkdir /tmp/d
+stat -c '%a %n' /tmp/a /tmp/d</pre>
+<pre class="out">0022
+<b>644 /tmp/a</b>
+<b>755 /tmp/d</b></pre></li>
+<li>Change the mask and watch the defaults follow the formula. A umask of <code>077</code> strips every group/other bit — new things become owner-only.
+<pre class="cmd">umask 077
+touch /tmp/a2; mkdir /tmp/d2
+stat -c '%a %n' /tmp/a2 /tmp/d2</pre>
+<pre class="out"><b>600 /tmp/a2</b>
+<b>700 /tmp/d2</b></pre></li>
+<li>Prove where the "no execute on files" default really comes from: it is the <em>program</em> requesting 666, not the umask. Even umask <code>000</code> gives a file <code>666</code>, never <code>777</code>.
+<pre class="cmd">umask 000
+touch /tmp/a3
+stat -c '%a %n' /tmp/a3
+umask 022             # put it back</pre>
+<pre class="out"><b>666 /tmp/a3</b>            ← rw-rw-rw-, still no execute</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>With a umask of <code>027</code>, predict the mode of a new file and a new directory before checking. (File: <code>666</code> − <code>027</code> = <code>640</code>, <code>rw-r-----</code>; directory: <code>777</code> − <code>027</code> = <code>750</code>, <code>rwxr-x---</code>.) Then explain why a brand-new text file is never executable no matter how permissive your umask. (Because the creating program requests <code>666</code>, which has no execute bit to begin with — the umask can only take bits away, never add them.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>umask</code> is per-process and inherited, not a global setting. It is set for a login by <code>/etc/profile</code>, PAM's <code>pam_umask</code>, or your shell's rc file, and children inherit it — so changing it in one shell affects only that shell and what it launches. If new files in some directory keep coming out with the wrong permissions, the umask of the <em>process that creates them</em> (a daemon, a cron job) is what to check, not your interactive shell's.</p>
+<p>Ubuntu with user-private groups may show a umask of <code>0002</code> rather than <code>0022</code> for regular users — group write is left on because each user has a private group of one, so "group writable" is harmless. That is why a file can come out <code>664</code> on one system and <code>644</code> on another; it is the umask differing, not a bug. Check with <code>umask</code> before assuming.</p>
+<div class="k8s-link">
+<p>The umask travels into containers too: a process in a pod inherits a umask (from the image's entrypoint or the runtime's default, commonly <code>0022</code>), and it silently shapes the mode of every file the app writes to a volume. "Files written by the app are group-readable and shouldn't be" is often a umask inherited from the base image, fixed by setting it in the entrypoint — the same per-process, inherited mechanism you just watched, one layer up. It is not something a <code>securityContext</code> field controls, which is exactly why knowing where the default comes from saves you from looking in the wrong place.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 umask</code> for the syscall and the AND-NOT formula, <code>man 1 bash</code> under <em>umask</em> for the shell builtin, and <code>man 8 pam_umask</code> plus <code>man 5 login.defs</code> (<code>UMASK</code>) for where a login's default is set. <code>man 2 open</code> under the <code>mode</code> argument for how the requested mode meets the umask.</p>
+</article>
+
+<article class="lesson" id="cp-b4-9" data-id="b4-9">
+<div class="lesson-head"><span class="cp-id">B4.9</span><h4>The special bits: setuid, setgid, and sticky</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Beyond the nine rwx bits sit three special ones, and they explain things you have seen and wondered about: how an ordinary user changes their own password (which lives in a root-only file), how a shared project directory keeps every new file in the right group automatically, and why <code>/tmp</code> lets everyone write but nobody delete each other's files. Each is a small mechanism with an outsized security footprint — setuid in particular is the reason a single buggy program can be a direct path to root, which is why the whole capabilities half of this module exists to replace it.</p>
+<h5>The concept</h5>
+<p>Three bits, set with a leading fourth octal digit or symbolically:</p>
+<ul>
+<li><strong>setuid</strong> (<code>u+s</code>, octal <code>4000</code>) on an executable: the program runs with the <em>file owner's</em> uid as its effective uid, not the caller's. This is the real-vs-effective gap from B4.1 in action. <code>passwd</code> is owned by root and setuid, so when you run it, it runs <em>as root</em> — which it must, because it has to write <code>/etc/shadow</code> (mode <code>640 root:shadow</code>, unwritable by you). <code>ls -l</code> shows the <code>x</code> in the owner triad replaced by <code>s</code>: <code>-rwsr-xr-x</code>.</li>
+<li><strong>setgid</strong> (<code>g+s</code>, octal <code>2000</code>) on a <em>directory</em>: new files created inside inherit the directory's <em>group</em> instead of the creator's primary group. This is the standard shared-folder trick — make a project directory setgid to a shared group and everything anyone drops in there is automatically group-owned correctly, no manual <code>chgrp</code>.</li>
+<li><strong>sticky</strong> (<code>+t</code>, octal <code>1000</code>) on a directory: only a file's <em>owner</em> (or root) may delete or rename it, even in a directory everyone can write. This is what makes <code>/tmp</code> safe: everyone needs to create files there (<code>w</code> on the directory), but without the sticky bit anyone could delete anyone else's, since deletion is a directory-write operation (B4.6). <code>ls -ld /tmp</code> shows the <code>t</code>: <code>drwxrwxrwt</code>.</li>
+</ul>
+<p>Setuid is powerful and dangerous in equal measure. A setuid-root program is a doorway to root that any user may walk through — and if it has a bug, that bug runs as root. That is why the number of setuid binaries on a system is kept small and audited, and why the modern answer is to grant a program the <em>one capability</em> it needs (B4.11) instead of the whole of root via setuid. When the triads and these three bits are still not expressive enough, <strong>ACLs</strong> (<code>getfacl</code>/<code>setfacl</code>) add per-user and per-group entries on top — worth knowing exist, rarely needed day to day.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the canonical setuid binary and read the <code>s</code>. This is why an ordinary user can change their password despite <code>/etc/shadow</code> being root-only.
+<pre class="cmd">ls -l /usr/bin/passwd
+ls -l /etc/shadow</pre>
+<pre class="out"><b>-rwsr-xr-x</b> 1 root root ... /usr/bin/passwd
+-rw-r----- 1 root <b>shadow</b> ... /etc/shadow</pre></li>
+<li>Watch setgid keep a shared directory's group tidy. Make a directory owned by a group, set the bit, create a file, and see the file inherit the directory's group rather than your own.
+<pre class="cmd">mkdir /tmp/shared
+sudo chgrp adm /tmp/shared
+chmod 2775 /tmp/shared        # the 2 is setgid
+touch /tmp/shared/note
+stat -c '%A %G %n' /tmp/shared /tmp/shared/note</pre>
+<pre class="out">drwxrwsr-x adm /tmp/shared          ← note the s in the group triad
+-rw-rw-r-- <b>adm</b> /tmp/shared/note    ← inherited adm, not ubuntu</pre></li>
+<li>See the sticky bit on <code>/tmp</code> — the <code>t</code> at the end — and understand it as "write to create, but delete only your own".
+<pre class="cmd">ls -ld /tmp</pre>
+<pre class="out"><b>drwxrwxrwt</b> ... /tmp</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain why <code>passwd</code> <em>must</em> be setuid given that <code>/etc/shadow</code> is <code>640 root:shadow</code>. (An ordinary user cannot write <code>/etc/shadow</code> at all, so changing their own password requires the program to run as root; setuid is what lets a specific vetted program do so.) Then say what the sticky bit on <code>/tmp</code> prevents that plain <code>rwxrwxrwx</code> would allow. (Without it, since delete is a directory-write operation, any user could delete any other user's temp files; sticky restricts deletion to each file's owner.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The Linux kernel <strong>ignores the setuid bit on scripts</strong> — a setuid <code>#!/bin/bash</code> script does <em>not</em> run as its owner, because that would be trivially exploitable. Setuid only takes effect on real compiled executables. People who set setuid on a shell script and expect elevation are quietly getting nothing; the right tool is a tiny compiled wrapper or, far better, a capability or a <code>sudoers</code> rule.</p>
+<p>Every setuid-root binary is attack surface, so audit them: <code>find / -perm -4000 -type f 2&gt;/dev/null</code> lists them all. A setuid binary you don't recognise is a red flag, and the trend is to have fewer of them — Ubuntu has been steadily replacing setuid with file capabilities (that is why <code>ping</code> no longer needs setuid on modern systems). Fewer setuid-root binaries is a smaller target.</p>
+<div class="k8s-link">
+<p>This is the machinery behind <code>allowPrivilegeEscalation: false</code> in a pod's <code>securityContext</code>. That single field sets the kernel's <code>no_new_privs</code> flag (B4.13), which tells the kernel to <em>ignore setuid and file capabilities on anything the process later execs</em> — so a compromised container cannot use a stray setuid-root binary in its image to climb to root. The <code>fsGroup</code> field, in turn, leans on setgid-style group inheritance to make a volume's contents land in the right group. Both fields are these Linux bits, surfaced as pod configuration.</p>
+<p>You will set <code>allowPrivilegeEscalation: false</code> as standard hardening in <a href="w3.html">W3</a>, and understand it here as "turn off the setuid escape hatch".</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 execve</code> under <em>set-user-ID</em> for how setuid actually takes effect (and its refusal on scripts), <code>man 7 inode</code> for the S_ISUID/S_ISGID/S_ISVTX bits, and <code>man 1 chmod</code> under the special modes. <code>man 1 setfacl</code>/<code>man 1 getfacl</code> for ACLs when the triads run out. <code>man 5 capabilities</code> is the forward door to the better answer, B4.10.</p>
+</article>
+</div><!-- /g-permissions -->
+
 <!-- MORE-GROUPS -->
 
 <nav class="pager"><a href="b3.html">← B3 · Kernel space, user space, system calls</a><a href="../beginner.html#b5">B5 · Files for real: VFS, storage, overlayfs →</a></nav>
