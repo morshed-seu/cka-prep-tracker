@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B5: what storage actually is — block devices, making a filesystem with mkfs, what mount really does, and /etc/fstab; the VFS that gives ext4, tmpfs, procfs and overlayfs one interface; inodes vs filenames, hard links vs symlinks, and df-vs-du disk mysteries; tmpfs, loop devices, bind mounts and mount propagation; and overlayfs — lowerdir/upperdir/workdir/merged, copy-up and whiteouts — so a container image stops being a metaphor and becomes a stack of directories you can build by hand.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B5 · Files for real: VFS, storage, overlayfs — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B5 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b5">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B5 — Files for real: VFS, storage, overlayfs</h1>
+  <p>You have been reading and writing files since B1 without ever asking where they physically live or what a directory <em>is</em>. This module answers both, from the metal up — and it ends somewhere that surprises most people: a container image, that thing you have heard described a hundred ways, turns out to be nothing more exotic than a stack of ordinary directories, which you will build by hand and take apart. There is no magic in a container's filesystem. There is <code>mount</code>, and there is overlayfs, and by the end of this module you will have run both yourself.</p>
+  <p>The path there has three stops. First, <strong>real storage</strong>: a disk is a dumb device that speaks fixed-size chunks and knows nothing about files; a <em>filesystem</em> is a data structure someone wrote onto it; and <code>mount</code> is the act of grafting that structure into your directory tree. Second, the <strong>VFS</strong> — the kernel layer that makes ext4, a RAM disk, <code>/proc</code>, and a network share all answer to the same <code>open</code>/<code>read</code>/<code>write</code>, which is the whole reason the next stop is even possible. Third, <strong>overlayfs</strong>: stacking read-only layers under one thin writable layer, with copy-up and whiteouts — the exact mechanism a container runtime uses to turn a shared, read-only image into a private, writable root for each container.</p>
+  <div class="weights">
+    <span>Checkpoints<b>18</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>B1, B4</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>See the storage a machine actually has with <code>lsblk</code>/<code>blkid</code>, and say what "block device" means.</li>
+<li>Make a filesystem where there was none with <code>mkfs</code>, and explain that a filesystem is written <em>into</em> a device.</li>
+<li>Explain what <code>mount</code> does — grafts a filesystem's root onto a directory — and read the live mount table.</li>
+<li>Make a mount survive reboot via <code>/etc/fstab</code>, by <code>UUID</code>, with <code>nofail</code>, tested by <code>mount -a</code>.</li>
+<li>Explain the VFS: one <code>open</code>/<code>read</code>/<code>write</code> interface that every filesystem implements.</li>
+<li>Separate a file from its name — inode vs directory entry — and prove the name is not the file.</li>
+<li>Tell a hard link from a symlink and predict which survives deleting the original.</li>
+<li>Diagnose a full disk with no big files: <code>df</code> vs <code>du</code>, deleted-but-open files, inode exhaustion.</li>
+<li>Mount memory as a filesystem with <code>tmpfs</code> and find the ones your VM already has.</li>
+<li>Use a loop device to make an ordinary file behave like a disk.</li>
+<li>Make one directory appear at a second path with a bind mount, and know why <code>ro</code> needs a remount.</li>
+<li>Explain mount propagation — private, shared, rslave — and why a container runtime cares.</li>
+<li>Mount an overlay by hand and name its four parts: lowerdir, upperdir, workdir, merged.</li>
+<li>Trigger a copy-up and find the full copy that appears in <code>upperdir</code>.</li>
+<li>Delete a lower-layer file and find the whiteout — a 0/0 character device — that hides it.</li>
+<li>State in your own words that an image is a stack of lowerdirs and a container adds one thin writable upper.</li>
+<li>Build an "image" by hand and locate the copy-up and the whiteout, then reset the upper and watch it vanish.</li>
+<li>Diagnose inode exhaustion, a bind mount that won't propagate, and a stale file handle after an unmount.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B1</strong> for paths, the filesystem tree, and reading <code>ls -l</code>; <strong>B4</strong> because every mount and every file you touch here is still subject to the ownership and permission checks you just learned — a mount does not change who may read what. Every lab runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster, and several of these commands (<code>mount</code>, <code>mkfs</code>, <code>losetup</code>) need <code>sudo</code> and can wedge a mount table if fumbled. Take a snapshot (<a href="b0.html#cp-b0-9">B0.9</a>) before the drill. No extra packages are needed — <code>util-linux</code> (which ships <code>mount</code>, <code>lsblk</code>, <code>findmnt</code>, <code>losetup</code>, <code>namei</code>) and <code>e2fsprogs</code> (<code>mkfs.ext4</code>) are already on the base image.</p>
+</div>
+
+<!-- ---------------- Devices and filesystems ---------------- -->
+<div class="grp" id="g-devices"><h3>Devices and filesystems</h3>
+
+<article class="lesson" id="cp-b5-1" data-id="b5-1">
+<div class="lesson-head"><span class="cp-id">B5.1</span><h4>The storage underneath: block devices and what <code>/dev</code> really holds</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Before you can understand a filesystem you have to see the thing a filesystem sits <em>on</em>, and it is humbler than you think. A disk — physical or virtual — is a <strong>block device</strong>: a slab of storage addressable only in fixed-size chunks (blocks, classically 512 bytes or 4&nbsp;KiB), that knows nothing about files, names, or directories. It can store block number 4,192 and hand it back later. That is the whole of its vocabulary. Everything else — files, folders, permissions — is a structure that software imposes on top. Seeing the raw device first is what stops "the disk is full" and "the filesystem is full" from blurring into one vague idea.</p>
+<h5>The concept</h5>
+<p>Linux exposes devices as special files under <code>/dev</code>. There are two flavours, and the difference is exactly the one that matters here:</p>
+<ul>
+<li>A <strong>block device</strong> (<code>ls -l</code> shows a leading <code>b</code>) speaks in fixed-size, randomly-addressable blocks and is buffered by the kernel — disks, partitions, loop devices, USB sticks. This is what a filesystem lives on.</li>
+<li>A <strong>character device</strong> (leading <code>c</code>) speaks a stream of bytes with no notion of blocks — terminals, <code>/dev/null</code>, <code>/dev/random</code>.</li>
+</ul>
+<p>The file in <code>/dev</code> is not the hardware; it is a <em>handle</em> to a kernel driver, identified by two numbers you will see in <code>ls -l</code> where a file's size would normally be: the <strong>major</strong> number (which driver) and the <strong>minor</strong> number (which specific device that driver manages). Opening <code>/dev/sda</code> doesn't open a file — it dials the block driver for major 8, minor 0. Return to the hotel from B2: the block device is the building's freight elevator, which only moves whole pallets between numbered floors; it has never heard of "the box labelled <code>report.pdf</code>". The labels are a system the front desk keeps — that system is the filesystem, and it is the next lesson.</p>
+<div class="flow"><span>block device</span><em>stores</em><span class="hot">numbered fixed-size blocks</span><em>· knows nothing about</em><span>files · names · directories</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the block devices as a tree. <code>lsblk</code> shows every disk and the partitions carved out of it, with sizes and where each is mounted.
+<pre class="cmd">multipass shell sandbox
+lsblk</pre>
+<pre class="out">NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINTS
+<b>sda</b>      8:0    0   5G  0 disk
+├─sda1   8:1    0 4.9G  0 part <b>/</b>
+├─sda14  8:14   0   4M  0 part
+└─sda15  8:15   0 106M  0 part /boot/efi</pre></li>
+<li>Ask what filesystem, if any, sits on each. <code>lsblk -f</code> adds the type and the UUID — note that the whole <em>disk</em> <code>sda</code> has no filesystem; only the <em>partitions</em> do. (Your root disk may be named <code>vda</code> instead of <code>sda</code> depending on the virtualisation backend — use whatever <code>lsblk</code> shows.)
+<pre class="cmd">lsblk -f</pre>
+<pre class="out">NAME   FSTYPE FSVER LABEL           UUID                                 MOUNTPOINTS
+sda
+├─sda1 <b>ext4</b>   1.0   cloudimg-rootfs 9f2c...-...-...                      /
+├─sda14
+└─sda15 vfat  FAT32 UEFI            1234-ABCD                            /boot/efi</pre></li>
+<li>Prove the device file is a handle, not data. <code>ls -l</code> on a block device shows a leading <code>b</code> and, where a size would be, the <strong>major, minor</strong> pair; compare with a character device to see the <code>c</code>.
+<pre class="cmd">ls -l /dev/sda /dev/null</pre>
+<pre class="out"><b>b</b>rw-rw---- 1 root disk  <b>8,   0</b> Jul 24 10:00 /dev/sda   ← block: major 8, minor 0
+<b>c</b>rw-rw-rw- 1 root root  <b>1,   3</b> Jul 24 10:00 /dev/null  ← character device</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From <code>lsblk -f</code>, answer: which object holds the filesystem your VM booted from — the disk <code>sda</code> or the partition <code>sda1</code>? (The partition. A whole disk almost never carries a filesystem directly; it is divided into partitions, and each partition is the block device a filesystem is written onto.) Then say what the two numbers in <code>ls -l /dev/sda</code> mean. (Major = which kernel driver; minor = which device that driver handles.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Device names are not stable across boots or machines. <code>/dev/sda</code> is "the first disk the kernel happened to enumerate", and plugging in a second disk, or booting on different hardware, can renumber them — yesterday's <code>sdb</code> becomes today's <code>sda</code>. This is precisely why the next lessons mount by <strong>UUID</strong> (a label baked into the filesystem itself) rather than by device name: the UUID follows the data, the name follows the enumeration order. Never hard-code <code>/dev/sdb1</code> anywhere you expect to survive a reboot.</p>
+<p>"The disk is full" and "the filesystem is full" are different sentences. A block device has a fixed capacity; a filesystem written onto it can be full while the device has room (you made the filesystem smaller than the device), or the filesystem can report full for reasons that have nothing to do with block space at all — the inode-exhaustion case in B5.8. Keep the two layers distinct in your head from the start.</p>
+<div class="k8s-link">
+<p>A Kubernetes node is a machine with exactly these block devices, and several things you will configure map straight onto them. A <code>local</code> PersistentVolume or a <code>hostPath</code> is a directory on one of these partitions; the kubelet's working area under <code>/var/lib/kubelet</code> lives on the root partition you just saw; and when a cloud provider attaches a network disk to a node, it appears as a new block device (<code>lsblk</code> shows it) that the CSI driver then formats and mounts. "The node ran out of disk and started evicting pods" is a statement about the block device you just listed — being able to <code>lsblk</code> a node is the first move in diagnosing it.</p>
+<p>You will meet node storage as a scheduling and eviction concern in <a href="w5.html#cp-5-1">W5.1</a> (ephemeral volumes) and where the kubelet's disk pressure evicts pods in <a href="w6.html">W6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 lsblk</code> for listing block devices and their filesystems (<code>-f</code>), <code>man 8 blkid</code> for reading a device's UUID and type, and <code>man 4 sd</code> for what the <code>sd*</code> names mean. <code>man 7 inode</code> touches the block-vs-character distinction; <code>cat /proc/partitions</code> is the rawest view of what the kernel sees. In the exam docs, anything about node <code>ephemeral-storage</code> and <code>local</code>/<code>hostPath</code> volumes.</p>
+</article>
+
+<article class="lesson" id="cp-b5-2" data-id="b5-2">
+<div class="lesson-head"><span class="cp-id">B5.2</span><h4>Making a filesystem: <code>mkfs</code> writes structure onto raw storage</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A brand-new disk cannot hold a single file. It holds blocks, and nothing about a block says "this is where <code>report.pdf</code> begins" or "this directory contains three names". Someone has to <em>write that bookkeeping onto the device first</em>, and that act is <code>mkfs</code> — "make filesystem". Doing it once, by hand, on a disk you created from a plain file, turns "formatting a drive" from a scary ritual into an obviously mechanical step: you are stamping an empty ledger onto blank pages.</p>
+<h5>The concept</h5>
+<p>A <strong>filesystem</strong> is a data structure laid out inside a block device. For ext4 (the Linux default) the important parts are:</p>
+<ul>
+<li>a <strong>superblock</strong> — the header describing the whole filesystem: block size, how many inodes and blocks exist, the UUID, where everything is;</li>
+<li>an <strong>inode table</strong> — a fixed array of file records (metadata + pointers to data blocks), one per file, allocated when the filesystem is created (remember that number — it is finite);</li>
+<li><strong>directory blocks</strong> — the tables mapping names to inode numbers;</li>
+<li><strong>free-space bitmaps</strong> — which blocks and inodes are in use.</li>
+</ul>
+<p>The load-bearing idea: none of this is a property the device was born with. The device is blank; <code>mkfs.ext4</code> writes all of the above onto it, deciding up front how many inodes to create (roughly one per 16&nbsp;KiB of space by default). That up-front, fixed inode count is why you can later run out of inodes with gigabytes of free space — a failure that looks impossible until you know a filesystem is a structure with fixed-size tables, not an infinitely elastic bag.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make a disk from nothing. <code>fallocate</code> creates a 128&nbsp;MiB file; we will treat this ordinary file as if it were a small disk (the loop-device trick of B5.10, which <code>mkfs</code> and <code>mount</code> can use directly).
+<pre class="cmd">fallocate -l 128M /tmp/disk.img
+ls -lh /tmp/disk.img</pre>
+<pre class="out">-rw-rw-r-- 1 ubuntu ubuntu <b>128M</b> Jul 24 10:05 /tmp/disk.img</pre></li>
+<li>Stamp an ext4 filesystem onto it. <code>-F</code> forces <code>mkfs</code> to accept a plain file rather than a block device. Read the output — it is telling you the fixed sizes it just chose.
+<pre class="cmd">mkfs.ext4 -F /tmp/disk.img</pre>
+<pre class="out">mke2fs 1.47.0 (5-Feb-2023)
+Creating filesystem with 131072 1k blocks and <b>32768 inodes</b>
+Filesystem UUID: 7b3e...-...-...
+...
+Writing superblocks and filesystem accounting information: done</pre></li>
+<li>Confirm the device now has an identity it did not have a moment ago. <code>blkid</code> reads the superblock and reports the type and UUID that <code>mkfs</code> wrote.
+<pre class="cmd">blkid /tmp/disk.img</pre>
+<pre class="out">/tmp/disk.img: UUID="7b3e...-...-..." <b>TYPE="ext4"</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>mkfs</code> reported a specific number of inodes (32768 in the run above). Explain, in one sentence, what that fixed number means for a filesystem that later fills up with tiny files. (Each file consumes one inode, and the count was fixed at creation, so a filesystem can run out of inodes — refuse to create another file — while blocks remain free; you cannot add more inodes to an ext4 filesystem without rebuilding it.) Then say why <code>blkid</code> can now identify the file when it couldn't before. (<code>mkfs</code> wrote a superblock with a type and UUID; <code>blkid</code> reads that structure.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>mkfs</code> is destructive and silent about it. It writes new bookkeeping over whatever was there, instantly making every existing file unreachable — there is no "are you sure" for a block device you name, and <code>-F</code> removes even the safety check that stops you formatting something that is mounted or looks like a whole disk. The classic disaster is running <code>mkfs</code> against <code>/dev/sda</code> instead of <code>/dev/sdb1</code>. On the <code>sandbox</code> VM this only ever touches <code>/tmp/disk.img</code>, but build the habit now: read the target device name twice before pressing enter.</p>
+<p>The filesystem type is a choice, not a given. <code>ext4</code> is the safe default, but <code>mkfs.xfs</code>, <code>mkfs.btrfs</code>, and <code>mkfs.vfat</code> all exist and lay out completely different structures on the same blocks. "Formatting" always means "choosing a filesystem and writing its structure" — there is no such thing as a neutral, typeless format.</p>
+<div class="k8s-link">
+<p>This is exactly what a CSI (Container Storage Interface) driver does to a freshly attached cloud disk before a pod can use it. When you create a PersistentVolumeClaim and the provisioner carves out a new block device, something has to <code>mkfs</code> it — the StorageClass's <code>fsType: ext4</code> (or <code>xfs</code>) parameter is literally choosing which <code>mkfs</code> runs. The first time a PV is attached to a node it is formatted; subsequent attaches skip that because the superblock already exists. Understanding that "provision a volume" includes a one-time <code>mkfs</code> explains why the very first pod to use a new PVC is a little slower and why a corrupted superblock makes a whole PV unmountable.</p>
+<p>You will see <code>fsType</code> on a StorageClass in <a href="w5.html">W5</a>, and the format-then-mount sequence is the mechanism behind dynamic provisioning there.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 mkfs</code> and <code>man 8 mkfs.ext4</code> (a.k.a. <code>mke2fs</code>) for creating a filesystem and its options (block size, inode ratio via <code>-i</code>/<code>-N</code>), <code>man 8 fallocate</code> for making the backing file, and <code>man 5 ext4</code> for the on-disk layout. <code>man 8 tune2fs</code> shows and adjusts superblock parameters after the fact. In the exam docs, the StorageClass <code>fsType</code> parameter.</p>
+</article>
+
+<article class="lesson" id="cp-b5-3" data-id="b5-3">
+<div class="lesson-head"><span class="cp-id">B5.3</span><h4>What <code>mount</code> actually does: grafting a filesystem onto a directory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Mount the disk" is one of those phrases everyone uses and few can define precisely. Here is the precise version, and it is simpler than the mystique suggests: mounting takes a filesystem's root and <em>grafts</em> it onto an existing directory, so that from then on, walking into that directory leads into the filesystem instead. Nothing is copied; a pointer in the kernel's tree is redirected. Once you have watched a directory's contents disappear behind a mount and reappear when you unmount, the entire Linux filesystem tree — which is assembled this way, from many mounts — stops being a given and becomes something you can see the seams of.</p>
+<h5>The concept</h5>
+<p>You have one tree of directories starting at <code>/</code> (B1). A filesystem also has its own internal root. <strong>Mounting</strong> connects the two: <code>mount &lt;device&gt; &lt;directory&gt;</code> says "when anyone walks into <em>directory</em>, send them into the root of the filesystem on <em>device</em> instead." That directory is now a <strong>mount point</strong>. Three consequences follow directly:</p>
+<ul>
+<li>Whatever was <em>inside</em> the directory before is not deleted — it is <strong>hidden</strong>, shadowed by the mount, and it reappears the instant you unmount.</li>
+<li>The files you now see and create in that directory live on the mounted device, not on the underlying one.</li>
+<li>The whole visible tree is a <em>graft of many filesystems</em> — <code>/</code>, <code>/boot/efi</code>, <code>/proc</code>, and every other mount, stitched into one seamless namespace. There is no single disk holding "everything".</li>
+</ul>
+<p>The kernel keeps a <strong>mount table</strong> — the live list of every graft: which device, at which directory, of which type, with which options. You read it with <code>findmnt</code> (a readable tree) or the raw <code>/proc/mounts</code>. That table, not any one disk, <em>is</em> the shape of your filesystem.</p>
+<div class="flow"><span>mount device → /mnt/data</span><em>→ walking into</em><span class="hot">/mnt/data</span><em>now leads to</em><span>the filesystem's root</span><em>· old contents</em><span>hidden until umount</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Prove the shadowing. Put a file in an ordinary directory <em>first</em>, so you can watch it vanish under the mount and return afterwards.
+<pre class="cmd">sudo mkdir -p /mnt/data
+echo 'i was here first' | sudo tee /mnt/data/original &gt;/dev/null
+ls /mnt/data</pre>
+<pre class="out">original</pre></li>
+<li>Mount the filesystem you made last lesson onto that directory. <code>-o loop</code> lets <code>mount</code> treat the image file as a disk (B5.10 is the full story). Now list it — the original file is gone, hidden behind the freshly-mounted, empty ext4.
+<pre class="cmd">sudo mount -o loop /tmp/disk.img /mnt/data
+ls /mnt/data
+echo 'lives on the new fs' | sudo tee /mnt/data/hello &gt;/dev/null
+findmnt /mnt/data</pre>
+<pre class="out">lost+found                              ← the mounted fs, not "original"
+TARGET    SOURCE      FSTYPE OPTIONS
+<b>/mnt/data /dev/loop0  ext4</b>   rw,relatime</pre></li>
+<li>Unmount and watch the graft reverse. The file that lived on the mounted device is gone from view; the original, shadowed all along, reappears untouched.
+<pre class="cmd">sudo umount /mnt/data
+ls /mnt/data</pre>
+<pre class="out"><b>original</b>                                ← back; "hello" was on the now-detached fs</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>After mounting, <code>hello</code> was visible and <code>original</code> was not; after unmounting, the reverse. Explain where <code>original</code> was during the mount. (Still on the underlying root filesystem, in the <code>/mnt/data</code> directory — never deleted, only shadowed by the mount, which is why unmounting revealed it again.) Then read your own <code>findmnt</code> and name the four facts the mount table records for a mount. (Target directory, source device, filesystem type, and options.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>umount</code> fails with "target is busy" if any process has that filesystem as its working directory or has a file open on it — the kernel will not yank a filesystem out from under a running process. The fix is to find the holder (<code>lsof /mnt/data</code> or <code>fuser -vm /mnt/data</code>) and move it, not to force the unmount; a lazy unmount (<code>umount -l</code>) detaches the name immediately but leaves the filesystem alive until the last user lets go, which can mask the real problem. This is the same "who is holding this open" question as the deleted-but-open file in B5.8.</p>
+<p>Mounting onto a non-empty directory is legal and occasionally a real bug. Nothing stops you mounting over a directory that already contains files — they simply vanish from view until unmount, and someone later wonders where their data went. It is safe (the data is fine), but "my files disappeared" is often just a filesystem mounted over the top of them; <code>findmnt</code> on the parent path tells you immediately.</p>
+<div class="k8s-link">
+<p>A Kubernetes volume is a mount, full stop. When a pod declares a volume, the kubelet performs exactly this graft: it mounts the volume's filesystem onto a directory inside the container's filesystem, so the path the container sees leads into the volume instead of into the image's own layer. This is why data written to a mounted path persists (it is on the mounted device) while data written elsewhere in the container does not (that is the throwaway upper layer of B5.16), and why an <code>emptyDir</code> mounted over a directory that had files in the image <em>hides</em> those files — the exact shadowing you just watched. Every "why is this directory empty / why did my image's files disappear under a volume" question is this lesson.</p>
+<p>You will see the kubelet's mounts concretely in <a href="w1.html#cp-1-23">W1.23</a> (the kubelet's <code>/var/lib/kubelet/pods</code> tree) and the volume-mount mechanics throughout <a href="w5.html#cp-5-1">W5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 mount</code> for mounting and its options (the <em>FILESYSTEM-INDEPENDENT MOUNT OPTIONS</em> section is the useful core), <code>man 8 umount</code> for unmounting and <code>-l</code>/<code>-f</code>, and <code>man 8 findmnt</code> for reading the mount table as a tree. <code>man 5 proc</code> under <code>/proc/mounts</code> and <code>/proc/self/mountinfo</code> for the raw form. In the exam docs, anything about pod volumes and mount paths.</p>
+</article>
+
+<article class="lesson" id="cp-b5-4" data-id="b5-4">
+<div class="lesson-head"><span class="cp-id">B5.4</span><h4>Mounts that survive reboot: <code>/etc/fstab</code>, UUIDs, and <code>nofail</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A <code>mount</code> command lasts until the next reboot and then it is gone. To make a disk come back automatically — the normal expectation for anything permanent — you write it into <code>/etc/fstab</code>, the file the system reads at boot to reassemble the filesystem tree. Getting one field wrong here is one of the few ways to make a Linux box fail to boot into a usable state, so this lesson is as much about the safe habits (mount by UUID, always <code>nofail</code>, always test with <code>mount -a</code>) as about the six fields.</p>
+<h5>The concept</h5>
+<p><code>/etc/fstab</code> is a plain table, one mount per line, six whitespace-separated fields:</p>
+<table>
+<tr><th>#</th><th>Field</th><th>What it is</th></tr>
+<tr><td>1</td><td><strong>spec</strong></td><td>what to mount — best written as <code>UUID=…</code>, not <code>/dev/sdb1</code></td></tr>
+<tr><td>2</td><td><strong>mount point</strong></td><td>the directory to graft it onto</td></tr>
+<tr><td>3</td><td><strong>type</strong></td><td><code>ext4</code>, <code>xfs</code>, <code>tmpfs</code>, …</td></tr>
+<tr><td>4</td><td><strong>options</strong></td><td>comma-separated, e.g. <code>defaults,nofail</code></td></tr>
+<tr><td>5</td><td><strong>dump</strong></td><td>ancient backup flag — almost always <code>0</code></td></tr>
+<tr><td>6</td><td><strong>pass</strong></td><td><code>fsck</code> order at boot — <code>1</code> for root, <code>2</code> for others, <code>0</code> to skip</td></tr>
+</table>
+<p>Two habits make this safe. First, <strong>mount by UUID</strong>, not device name: a UUID is baked into the filesystem's superblock (B5.2) and follows the data no matter how the kernel renumbers <code>/dev/sda</code> versus <code>/dev/sdb</code> from one boot to the next — the reordering hazard from B5.1. Second, <strong><code>nofail</code></strong>: without it, a device listed in <code>fstab</code> that is missing at boot (an unplugged USB disk, a cloud volume that failed to attach) can drop the whole boot into an emergency shell. <code>nofail</code> says "if this one isn't here, carry on without it" — which is almost always what you want for anything that isn't the root filesystem. And the golden rule: <strong>always run <code>mount -a</code> before you reboot</strong>, because it mounts everything in <code>fstab</code> exactly as boot will, surfacing a typo now, while you still have a shell, instead of after a reboot that won't complete.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Add a persistent entry. Our device is a file, so the spec field is its path plus the <code>loop</code> option; for a <em>real</em> disk you would write <code>UUID=…</code> here instead (shown in the note below). <code>nofail</code> keeps a missing image from wedging a future boot.
+<pre class="cmd">echo '/tmp/disk.img /mnt/data ext4 loop,nofail 0 2' | sudo tee -a /etc/fstab</pre></li>
+<li>Test it the safe way — <code>mount -a</code> mounts everything in <code>fstab</code> that isn't already mounted, exactly as boot will. No error means the line is good.
+<pre class="cmd">sudo mount -a
+findmnt /mnt/data</pre>
+<pre class="out">TARGET    SOURCE      FSTYPE OPTIONS
+<b>/mnt/data /dev/loop0  ext4</b>   rw,relatime,nofail</pre></li>
+<li>Clean up so you don't leave a test mount behind. Unmount, then delete the line you added.
+<pre class="cmd">sudo umount /mnt/data
+sudo sed -i '\#/tmp/disk.img /mnt/data#d' /etc/fstab
+grep -c /tmp/disk.img /etc/fstab</pre>
+<pre class="out">0                                       ← the test line is gone</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>For a real second disk whose partition is <code>/dev/sdb1</code>, write the <code>fstab</code> line that mounts it at <code>/data</code> as ext4, robustly. (Get the UUID with <code>sudo blkid /dev/sdb1</code>, then: <code>UUID=&lt;that&gt; /data ext4 defaults,nofail 0 2</code>.) Then say why the UUID form is safer than <code>/dev/sdb1</code> and what <code>mount -a</code> buys you. (The UUID follows the filesystem even if the kernel renames the device across boots; <code>mount -a</code> tests the whole file while you still have a shell, so a typo can't first reveal itself as a failed boot.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A broken <code>fstab</code> line can stop a machine booting. A wrong device, a bad option, or a missing <code>nofail</code> on an absent disk can drop boot into an emergency shell — and on a headless VM or cloud instance that can mean no way in at all. The two defences are non-negotiable: run <code>mount -a</code> after every edit (it fails loudly, now), and put <code>nofail</code> on anything that isn't the root filesystem. Snapshot before experimenting on a machine you care about.</p>
+<p>Why <code>UUID=</code> can't identify our loop image: a UUID is resolved by scanning <em>block devices</em>, and a plain file isn't one until a loop device is attached to it. That is the whole reason the lab's <code>fstab</code> line uses the file path with the <code>loop</code> option instead of a UUID — the file-backed case is the exception. For any actual disk, use the UUID.</p>
+<div class="k8s-link">
+<p>The kubelet and CSI drivers do the equivalent of <code>fstab</code> in software: when a node reboots, the volumes a pod needs must be re-mounted, and the machinery tracks each PV by a stable identifier (much like a UUID) rather than a device name, precisely because the cloud may re-attach the same disk as a different <code>/dev/</code> node. The <code>nofail</code> instinct maps too — a robust node keeps booting and running when an optional mount is absent, rather than falling over. You rarely edit <code>fstab</code> on a Kubernetes node for pod storage (the kubelet owns those mounts), but the node's <em>own</em> disks — the root filesystem, a separate <code>/var/lib/containerd</code> — are still plain <code>fstab</code> entries, and a botched one bricks the node the same way it bricks any Linux box.</p>
+<p>The re-mount-on-reboot behaviour underlies PV attach/detach in <a href="w5.html">W5</a>; the "node won't come back after reboot" failure is a <a href="w6.html">W6</a> troubleshooting scenario.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 fstab</code> for the six fields and their meanings, <code>man 8 mount</code> under <code>-a</code> and the <code>nofail</code>/<code>defaults</code> options, and <code>man 8 blkid</code> for getting the UUID to put in field one. <code>man 8 systemd.mount</code> notes how modern systems translate <code>fstab</code> into mount units. No direct exam-docs analogue — this is node-level plumbing beneath the cluster.</p>
+</article>
+</div><!-- /g-devices -->
+
+<!-- INSERT-GROUPS-HERE -->
+
+<nav class="pager"><a href="b4.html">← B4 · Users, groups, permissions, capabilities</a><a href="../beginner.html#b6">B6 · Isolation I — namespaces, chroot, pivot_root →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-24. Package versions referenced: util-linux 2.39 (<code>mount</code>, <code>lsblk</code>, <code>findmnt</code>, <code>losetup</code>, <code>namei</code>), e2fsprogs 1.47 (<code>mkfs.ext4</code>), coreutils 9.4. Overlayfs behaviour is the Linux 6.8 (kernel shipped with 24.04) driver; whiteouts are 0/0 character devices on an ext4 upper.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
