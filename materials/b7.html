@@ -265,6 +265,339 @@ sudo rmdir /sys/fs/cgroup/parent</pre>
 </article>
 </div><!-- /g-model -->
 
+<!-- ---------------- CPU ---------------- -->
+<div class="grp" id="g-cpu"><h3>CPU</h3>
+
+<article class="lesson" id="cp-b7-5" data-id="b7-5">
+<div class="lesson-head"><span class="cp-id">B7.5</span><h4>cpu.weight: a proportional share that only bites under contention</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There are two completely different ways to control CPU, and mixing them up leads to wrong expectations every time. The first, <code>cpu.weight</code>, is a <em>relative</em> priority: it decides how the CPU is <em>divided</em> when there is not enough to go around, and does nothing at all when there is plenty. Understanding "only matters under contention" up front stops you from setting a weight, seeing your process still use 100% of an idle core, and concluding the limit "didn't work" — it worked exactly as designed.</p>
+<h5>The concept</h5>
+<p><code>cpu.weight</code> assigns a cgroup a share of CPU <em>relative to its siblings</em>, on a scale from 1 to 10000 with a default of 100. When several cgroups all want CPU at the same time and there isn't enough for everyone, the kernel's scheduler divides the available CPU time in proportion to their weights: two cgroups at weights 100 and 200 get roughly a 1:2 split — the 200 one gets twice as much. But this is purely a <em>tie-break under scarcity</em>. If only one cgroup wants the CPU, it gets all of it regardless of its weight; a weight of 1 will still use an entire idle machine if nothing else is competing. Weight sets the <em>ratio</em> of a contested resource, never a ceiling.</p>
+<p>This is the "fair share" model: nobody is capped, everybody is guaranteed a proportional slice when it's crowded. It maps onto the hotel meter loosely — think of it as priority on a shared circuit: when the circuit is near capacity, the room with the higher-priority allocation draws more, but when the circuit is quiet, any room can pull as much as it likes. Weight is about <em>who yields to whom</em>, not about a hard limit. The complementary tool — an actual ceiling that applies even on an idle box — is <code>cpu.max</code>, the very next lesson; the two are meant to be used together (a guaranteed share <em>and</em> a hard cap).</p>
+<div class="flow"><span>cpu.weight 100 vs 200</span><em>· both busy →</em><span class="hot">1 : 2 split</span><em>· only one busy →</em><span>it gets 100%</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set up two sibling cgroups with a 1:2 weight ratio. First delegate the <code>cpu</code> controller, then create the leaves and set their weights.
+<pre class="cmd">multipass shell sandbox
+nproc                                    # note the core count (assume ≥2)
+sudo mkdir -p /sys/fs/cgroup/cpudemo
+echo '+cpu' | sudo tee /sys/fs/cgroup/cpudemo/cgroup.subtree_control
+sudo mkdir /sys/fs/cgroup/cpudemo/{a,b}
+echo 100 | sudo tee /sys/fs/cgroup/cpudemo/a/cpu.weight
+echo 200 | sudo tee /sys/fs/cgroup/cpudemo/b/cpu.weight</pre>
+<pre class="out">2
++cpu
+100
+200                                      ← b will get twice a's share when both compete</pre></li>
+<li>Pin both to a single CPU so they must compete (otherwise each gets its own core and there is no contention to divide). Then launch one busy loop in each cgroup and let them fight.
+<pre class="cmd"># confine the whole demo to CPU 0 so the two must share one core
+echo 0 | sudo tee /sys/fs/cgroup/cpudemo/cpuset.cpus 2&gt;/dev/null || true
+# start a hog in each leaf: move a subshell in, then spin
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/cpudemo/a/cgroup.procs; exec yes &gt;/dev/null' &amp;
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/cpudemo/b/cgroup.procs; exec yes &gt;/dev/null' &amp;
+sleep 3
+cat /sys/fs/cgroup/cpudemo/{a,b}/cpu.stat | grep usage_usec</pre>
+<pre class="out">usage_usec 1010000               ← a: ~1.0s of CPU over the window
+usage_usec 2020000               ← b: ~2.0s — twice as much, matching 100:200</pre></li>
+<li>Now prove the "only under contention" half: kill <code>a</code>'s hog and watch <code>b</code> take the whole core despite its weight being unchanged. Then clean up.
+<pre class="cmd">kill %1                            # stop a's hog
+sleep 2
+top -bn1 | grep -m1 yes           # b now near 100% of the shared core
+kill %2
+sudo rmdir /sys/fs/cgroup/cpudemo/{a,b} /sys/fs/cgroup/cpudemo</pre>
+<pre class="out">... <b>99.0</b> yes                 ← b uses everything now — weight caps nothing</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Two cgroups have <code>cpu.weight</code> 100 and 300 and both run flat-out on a one-core box — roughly how is the CPU split? (1:3 — the 300-weight cgroup gets three times the CPU of the 100-weight one, about 75% vs 25%.) Then: you give a cgroup <code>cpu.weight 1</code> and it still uses a whole idle CPU — is it broken? (No — weight only divides CPU <em>under contention</em>; with nothing else competing, even weight 1 gets everything. Weight is a ratio, not a ceiling.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The number 1 vs 300 might read like "1% vs 300%," but weights are <em>relative to the actual competitors</em>, not percentages. A weight of 100 means nothing on its own; it only means something next to its siblings' weights. Two cgroups at 50 and 100 behave identically to two at 5000 and 10000 — same 1:2 ratio. Always reason about the <em>ratio</em> between competing cgroups, never a single weight in isolation.</p>
+<p>Because weight does nothing on an idle machine, it is the wrong tool when you need a <em>guarantee that a process cannot exceed X</em> — for that you need <code>cpu.max</code> (B7.6). A classic mistake is setting only a weight to "limit" a batch job, then being shocked when it consumes the whole node at 3am because nothing else happened to be running. Weight guarantees a floor under contention; it never imposes a ceiling.</p>
+<div class="k8s-link">
+<p>This is precisely what a Kubernetes CPU <em>request</em> becomes. When you set <code>resources.requests.cpu: 500m</code>, the kubelet translates it into a <code>cpu.weight</code> proportional to that request — so under node CPU pressure, pods get CPU in proportion to their requests, exactly the 1:2 behaviour you just measured. And it explains a frequent surprise: a pod with a small CPU request can still burst to use a whole idle node, because requests set weight (a share under contention), not a cap. The cap is the <em>limit</em>, which is B7.6's <code>cpu.max</code>.</p>
+<p>CPU requests-as-weight and limits-as-quota are the heart of <a href="w3.html#cp-3-16">W3.16</a>; the QoS classes built on requests vs limits are <a href="w3.html#cp-3-17">W3.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "CPU" section documents <code>cpu.weight</code> (range 1–10000, default 100) and the weight-based proportional model. <code>man 7 cgroups</code> under "cpu" for the controller overview. <code>man 1 chrt</code> / <code>man 7 sched</code> for the underlying scheduler concepts. In the exam docs, a pod's <code>resources.requests.cpu</code> is the Kubernetes surface of weight.</p>
+</article>
+
+<article class="lesson" id="cp-b7-6" data-id="b7-6">
+<div class="lesson-head"><span class="cp-id">B7.6</span><h4>cpu.max: a hard quota per period, even on an idle box</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the CPU control most people actually want: a genuine ceiling. <code>cpu.max</code> says "this cgroup may use at most half a CPU" and means it — even if the rest of the machine is completely idle, the process is held to its quota. It is the tool behind "limit this container to 0.5 cores," and unlike weight it produces a visible, measurable cap you can watch with <code>top</code>. Seeing it work turns the abstract idea of a CPU limit into a number you can point at.</p>
+<h5>The concept</h5>
+<p><code>cpu.max</code> holds two numbers: <code>QUOTA PERIOD</code>, both in microseconds. It means "in every <code>PERIOD</code> microseconds of wall-clock time, this cgroup may run on the CPU for at most <code>QUOTA</code> microseconds." The default period is 100000 (100&nbsp;ms). So:</p>
+<ul>
+<li><code>50000 100000</code> = 50ms of CPU per 100ms = <strong>half of one CPU</strong> (50%).</li>
+<li><code>100000 100000</code> = a full single CPU.</li>
+<li><code>200000 100000</code> = up to two CPUs' worth (quota can exceed one period on a multi-core box).</li>
+<li><code>max 100000</code> = unlimited (the literal word <code>max</code> means no quota — the default).</li>
+</ul>
+<p>The enforcement is blunt and worth picturing: within each 100ms window, the cgroup's processes run until they have used their quota, and then the kernel <strong>throttles</strong> them — stops scheduling them on the CPU — until the next window begins. So a process capped at 50% that wants to run flat-out will run for ~50ms, sit frozen for ~50ms, run again, and so on. Averaged out it uses half a core; moment to moment it is being repeatedly paused. This is a <em>hard</em> ceiling and, crucially, it applies even when the machine is otherwise idle — the quota is absolute, not relative to demand. That "run, then get frozen till the window rolls over" behaviour is exactly what produces the throttling latency you will measure in B7.7.</p>
+<div class="flow"><span>cpu.max = 50000 100000</span><em>· each 100ms:</em><span class="hot">run 50ms</span><em>→</em><span>throttled 50ms</span><em>→ repeat</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a capped cgroup and set it to half a CPU. Delegate <code>cpu</code>, make a leaf, and write the quota.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/cap/leaf
+echo '+cpu' | sudo tee /sys/fs/cgroup/cap/cgroup.subtree_control
+echo '50000 100000' | sudo tee /sys/fs/cgroup/cap/leaf/cpu.max</pre>
+<pre class="out">+cpu
+<b>50000 100000</b>                   ← half of one CPU per 100ms window</pre></li>
+<li>Put a busy loop into the leaf and watch <code>top</code> pin it at ~50% — on an otherwise idle VM, which is the whole point.
+<pre class="cmd">sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/cap/leaf/cgroup.procs; exec yes &gt;/dev/null' &amp;
+sleep 2
+top -bn1 | grep -m1 yes</pre>
+<pre class="out">... <b>50.0</b> yes                 ← held to 50% even though the machine is idle</pre></li>
+<li>Contrast with no cap. Move the same hog to a leaf with <code>cpu.max = max</code> (unlimited) and it jumps to a full core. Then clean up.
+<pre class="cmd">sudo mkdir /sys/fs/cgroup/cap/free
+echo 'max 100000' | sudo tee /sys/fs/cgroup/cap/free/cpu.max
+HOG=$(cat /sys/fs/cgroup/cap/leaf/cgroup.procs)
+echo $HOG | sudo tee /sys/fs/cgroup/cap/free/cgroup.procs   # move it
+sleep 2; top -bn1 | grep -m1 yes
+kill $HOG
+sudo rmdir /sys/fs/cgroup/cap/{leaf,free} /sys/fs/cgroup/cap</pre>
+<pre class="out">... <b>99.7</b> yes                 ← uncapped: a whole core</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Translate <code>cpu.max</code> values: what fraction of a CPU is <code>25000 100000</code>, and how do you express "up to 1.5 CPUs"? (25000/100000 = a quarter of one CPU; 1.5 CPUs is <code>150000 100000</code>.) Then: why does a <code>cpu.max</code>-capped process stay at 50% even when the whole machine is idle, whereas a <code>cpu.weight</code> process would take everything? (<code>cpu.max</code> is an absolute quota per time window — throttled once spent regardless of demand — while weight only divides CPU under contention.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The order is <code>QUOTA PERIOD</code>, quota first, and both are microseconds — a very common slip is writing them backwards or in milliseconds. <code>50000 100000</code> is 50ms per 100ms; <code>100000 50000</code> would be a full two CPUs (100ms of runtime allowed every 50ms), the opposite of what you probably meant. When in doubt, read it as "quota ÷ period = fraction of one CPU" and sanity-check the fraction.</p>
+<p>A too-small quota with a normal period causes <em>severe</em> latency even at modest average CPU, because the process keeps hitting the throttle wall and freezing until the next window. A latency-sensitive service capped at, say, 10% will feel far worse than "10% slow" — it stalls for up to 90ms at a stretch. This is the single most important cause of the "throttled and mysteriously slow" symptom in B7.7 and a real Kubernetes footgun with aggressive CPU limits. The cap is honest; the <em>pauses</em> are what hurt.</p>
+<div class="k8s-link">
+<p><code>cpu.max</code> is exactly what a Kubernetes CPU <em>limit</em> sets. <code>resources.limits.cpu: 500m</code> becomes <code>cpu.max = 50000 100000</code> on the container's cgroup — a hard half-core ceiling enforced by throttling. This is why CPU limits are famous for causing latency: a spiky, latency-sensitive app that occasionally needs a burst gets throttled at the limit and stalls until the next 100ms window, showing terrible p99 latency on a node whose CPU graphs look calm. Understanding <code>cpu.max</code>'s window-and-throttle mechanic is what lets you reason about when to set a CPU limit and when to leave it off and rely on requests (weight) alone.</p>
+<p>CPU limits-as-quota and the throttling trade-off are core to <a href="w3.html#cp-3-16">W3.16</a>; you'll see the latency symptom again in troubleshooting, <a href="w6.html">W6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "CPU" section documents <code>cpu.max</code> (the <code>MAX PERIOD</code> format, default period 100000, the literal <code>max</code>). <code>man 7 cgroups</code> under "cpu". For the throttling statistics this produces, read on to <code>cpu.stat</code> in B7.7. In the exam docs, <code>resources.limits.cpu</code> is the Kubernetes surface, and the "CPU limits and throttling" discussions in the docs are worth knowing exist.</p>
+</article>
+
+<article class="lesson" id="cp-b7-7" data-id="b7-7">
+<div class="lesson-head"><span class="cp-id">B7.7</span><h4>cpu.stat: reading throttling, the "slow on an idle box" evidence</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The most baffling performance problem in a containerised world is a service that is slow while every host CPU graph says the machine is nearly idle. The cause is almost always CPU throttling — the process is capped and spends its time frozen against the quota wall — and the evidence is in one file, <code>cpu.stat</code>, that host-level tools never show you. Learning to read it turns an unfalsifiable "it feels slow" into a hard number, and it is the first half of this module's debugging drill.</p>
+<h5>The concept</h5>
+<p>Every cgroup with a CPU controller keeps a running tally in <code>cpu.stat</code>. Three lines tell the throttling story:</p>
+<ul>
+<li><code>nr_periods</code> — how many enforcement windows have elapsed for this cgroup.</li>
+<li><code>nr_throttled</code> — in how many of those windows the cgroup hit its quota and got throttled. A high ratio of <code>nr_throttled</code> to <code>nr_periods</code> means "this cgroup is constantly running out of quota."</li>
+<li><code>throttled_usec</code> — the total microseconds the cgroup spent <em>frozen</em>, waiting for a window to roll over. This is pure added latency: time the process wanted to run but wasn't allowed to.</li>
+</ul>
+<p>Here is why it explains the paradox. Host CPU metrics measure the machine's total utilisation. A single throttled cgroup can be pinned at its small quota — using very little of the machine — while its own processes stall for tens of milliseconds at a time waiting for quota. The machine is idle <em>because</em> the process is being held back, not despite it. So the symptom "low host CPU, terrible service latency" is not a contradiction; it is the exact signature of throttling, and <code>throttled_usec</code> climbing is the proof. Anyone watching only <code>top</code> or a node dashboard will never see it — you have to look inside the cgroup.</p>
+<div class="flow"><span>host CPU: 5% idle</span><em>· but</em><span class="hot">nr_throttled climbing</span><em>+</em><span>throttled_usec rising</span><em>→</em><span>the app is starving on its own quota</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Re-create a tightly capped cgroup — a small quota makes throttling obvious — and drop a busy loop in it.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/thr
+echo '+cpu' | sudo tee /sys/fs/cgroup/thr/cgroup.subtree_control &gt;/dev/null
+sudo mkdir /sys/fs/cgroup/thr/leaf
+echo '10000 100000' | sudo tee /sys/fs/cgroup/thr/leaf/cpu.max   # 10% cap — heavy throttling
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/thr/leaf/cgroup.procs; exec yes &gt;/dev/null' &amp;</pre>
+<pre class="out">10000 100000                     ← a 10% cap: the hog will spend ~90% of each window frozen</pre></li>
+<li>Read <code>cpu.stat</code> twice, a few seconds apart, and watch the throttle counters climb while the host stays nearly idle. This is the whole lesson in two reads.
+<pre class="cmd">cat /sys/fs/cgroup/thr/leaf/cpu.stat
+sleep 5
+echo '--- 5s later ---'
+cat /sys/fs/cgroup/thr/leaf/cpu.stat
+top -bn1 | grep '%Cpu'</pre>
+<pre class="out">nr_periods 40
+nr_throttled 39                  ← throttled in nearly every window
+throttled_usec 3510000
+--- 5s later ---
+nr_periods 90
+<b>nr_throttled 89</b>              ← still throttled almost every window
+<b>throttled_usec 7960000</b>      ← +4.4s of pure frozen time in 5s of wall-clock
+%Cpu(s): <b>9.8</b> us, ...        ← host barely busy — yet the app is starving</pre></li>
+<li>Confirm the fix: raise the cap and watch <code>nr_throttled</code> stop advancing. Then clean up.
+<pre class="cmd">echo '100000 100000' | sudo tee /sys/fs/cgroup/thr/leaf/cpu.max   # full core now
+sleep 3
+cat /sys/fs/cgroup/thr/leaf/cpu.stat | grep nr_throttled          # frozen count stops rising
+kill %1
+sudo rmdir /sys/fs/cgroup/thr/leaf /sys/fs/cgroup/thr</pre>
+<pre class="out">nr_throttled 89                  ← unchanged from before the sleep: no new throttling</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Which line of <code>cpu.stat</code> directly measures added latency from throttling, and what does it mean if it keeps climbing? (<code>throttled_usec</code> — the total time the cgroup's processes were frozen waiting for quota; a rising value is latency the app suffers with no host-CPU cost.) Then: explain in one sentence how a service can be slow while the node's CPU is idle. (It is CPU-throttled by its cgroup — pinned to a small quota and repeatedly frozen against the window wall — so it stalls without ever making the host busy.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>throttled_usec</code> is cumulative since the cgroup was created — a big number is not automatically alarming; what matters is whether it is <em>increasing</em>, and how fast, relative to <code>nr_periods</code>. Always read it twice with a gap (as in the lab) and look at the delta. A cgroup that was briefly throttled at startup and is now fine has a large-but-static <code>throttled_usec</code>; a cgroup throttling right now has one that climbs every second.</p>
+<p>Some throttling can be perfectly acceptable — a batch job you deliberately capped <em>should</em> be throttled, that's the point. The problem is throttling on a <em>latency-sensitive</em> workload, where the freezes show up as tail latency. So <code>cpu.stat</code> is evidence, not a verdict: pair "is it throttled?" with "does this workload care about latency?" before deciding the cap is wrong. Blindly removing every CPU limit because <code>nr_throttled &gt; 0</code> is as much a mistake as ignoring it.</p>
+<div class="k8s-link">
+<p>This is one of the most valuable node-debugging skills in Kubernetes. When someone reports "the pod is slow but the node isn't busy," the answer is almost always CPU throttling from a <code>resources.limits.cpu</code> that is too tight — and you find it in exactly this file, at the container's cgroup under the node's <code>kubepods</code> tree, or via the <code>container_cpu_cfs_throttled_periods_total</code> metric that surfaces the same <code>nr_throttled</code>. Knowing that host CPU can be idle while a container starves on its quota is the insight that resolves these tickets. The fix is usually to raise or remove the CPU limit, keeping the request (weight) for fair scheduling.</p>
+<p>CPU-throttling latency is a headline troubleshooting scenario in <a href="w6.html">W6</a>, and it ties back to how limits are set in <a href="w3.html#cp-3-16">W3.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "CPU" section documents <code>cpu.stat</code> and each field (<code>nr_periods</code>, <code>nr_throttled</code>, <code>throttled_usec</code>). <code>man 7 cgroups</code> for the controller context. In practice you will also meet these as the <code>container_cpu_cfs_*</code> Prometheus metrics; in the exam docs, throttling is discussed under CPU limits and pod resource management.</p>
+</article>
+</div><!-- /g-cpu -->
+
+<!-- ---------------- Memory, pids, io ---------------- -->
+<div class="grp" id="g-mem"><h3>Memory, pids, io</h3>
+
+<article class="lesson" id="cp-b7-8" data-id="b7-8">
+<div class="lesson-head"><span class="cp-id">B7.8</span><h4>Memory: current, high (throttle) vs max (kill)</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>CPU pressure makes things <em>slow</em>; memory pressure makes things <em>dead</em>. That asymmetry is the single most important fact about resource limits, because you can wait out a slow process but a killed one is gone with an error you have to go hunting for. The memory controller has two different ceilings — one that throttles and one that kills — and knowing which is which is the difference between a process that crawls and a process that vanishes. This lesson lays out the controls; the next one pulls the trigger.</p>
+<h5>The concept</h5>
+<p>The memory controller exposes a few files, and three of them carry the story:</p>
+<ul>
+<li><code>memory.current</code> — how much memory the cgroup is using <em>right now</em>, in bytes. Read-only; this is your live gauge.</li>
+<li><code>memory.high</code> — the <strong>soft</strong> limit. When usage climbs past it, the kernel does not kill anything; instead it aggressively <em>reclaims</em> memory from the cgroup and <em>throttles</em> the processes (slows them down, stalling them in reclaim) to force usage back under the line. A process over <code>memory.high</code> keeps running but crawls. It is a back-pressure valve, not an executioner.</li>
+<li><code>memory.max</code> — the <strong>hard</strong> limit. When the cgroup cannot be kept under this even after reclaim, the kernel invokes the <strong>OOM killer</strong> (out-of-memory killer) and kills a process in the cgroup to bring usage down. Cross <code>memory.max</code> that the kernel can't reclaim its way out of, and something dies.</li>
+</ul>
+<p>The mental model: <code>memory.high</code> is "start braking hard" and <code>memory.max</code> is "hit the wall." Unlike CPU, there is no way to "throttle" a program that genuinely needs more memory than its cap forever — you can slow its allocation for a while (high), but if it truly needs more than <code>max</code>, the only options the kernel has are to reclaim (take back caches/pages) or kill. Memory is not compressible the way CPU time is: you cannot give a process "less memory more slowly" indefinitely. That is why the memory limit is the dangerous one, and why <code>memory.max</code> being reached ends in a fatality (B7.9).</p>
+<div class="flow"><span>usage rises</span><em>→ past memory.high:</em><span class="hot">reclaim + throttle</span><em>→ past memory.max:</em><span class="hot">OOM kill</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install <code>stress-ng</code> (a load generator that can allocate memory on demand) and set up a memory-limited cgroup. Delegate the <code>memory</code> controller and set a soft and hard line.
+<pre class="cmd">multipass shell sandbox
+sudo apt-get install -y stress-ng
+sudo mkdir -p /sys/fs/cgroup/mem/leaf
+echo '+memory' | sudo tee /sys/fs/cgroup/mem/cgroup.subtree_control &gt;/dev/null
+echo 100M | sudo tee /sys/fs/cgroup/mem/leaf/memory.high      # throttle line
+echo 150M | sudo tee /sys/fs/cgroup/mem/leaf/memory.max       # kill line
+cat /sys/fs/cgroup/mem/leaf/memory.current</pre>
+<pre class="out">104857600                        ← memory.high = 100M (bytes)
+157286400                        ← memory.max  = 150M
+0                                ← nothing in the cgroup yet</pre></li>
+<li>Watch <code>memory.current</code> track a real workload staying <em>under</em> both lines. Run a 60M allocator inside the cgroup and read the gauge — it rises to ~60M and holds, no throttling, no kill.
+<pre class="cmd">sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/mem/leaf/cgroup.procs
+              exec stress-ng --vm 1 --vm-bytes 60M --vm-hang 0 -t 8s' &amp;
+sleep 3
+cat /sys/fs/cgroup/mem/leaf/memory.current</pre>
+<pre class="out"><b>63102976</b>                     ← ~60M, comfortably below high(100M) and max(150M)</pre></li>
+<li>Now cross the <em>soft</em> line only: allocate 120M — over <code>memory.high</code> (100M) but under <code>memory.max</code> (150M). It survives but is throttled into heavy reclaim; note it does <em>not</em> die.
+<pre class="cmd">wait
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/mem/leaf/cgroup.procs
+              exec stress-ng --vm 1 --vm-bytes 120M --vm-hang 0 -t 6s' &amp;
+sleep 4
+cat /sys/fs/cgroup/mem/leaf/memory.current   # pinned near high, not at 120M
+wait
+sudo rmdir /sys/fs/cgroup/mem/leaf /sys/fs/cgroup/mem</pre>
+<pre class="out"><b>104857600</b>                    ← held around 100M by reclaim — throttled, but alive</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What is the difference in the kernel's response when a cgroup exceeds <code>memory.high</code> versus <code>memory.max</code>? (<code>memory.high</code>: reclaim hard and throttle the processes — they slow but survive; <code>memory.max</code>: when reclaim can't keep it under, invoke the OOM killer and kill a process.) Then: why is there no memory equivalent of "just run slower forever" the way CPU throttling works? (Memory isn't compressible — a process that truly needs more than its cap can't be given "less, slower" indefinitely; the kernel can only reclaim reclaimable pages or, failing that, kill.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Values accept suffixes (<code>100M</code>, <code>1G</code>) on write but <code>memory.current</code> and friends always <em>read back in bytes</em> — <code>104857600</code>, not <code>100M</code>. Don't be thrown by the raw byte counts; divide by 1048576 for MiB. Also note <code>memory.max</code> can read as the literal <code>max</code> (unlimited) when unset, exactly like <code>cpu.max</code>.</p>
+<p><code>memory.current</code> includes more than your program's own allocations — it counts page cache and other kernel memory charged to the cgroup, so it can sit higher than "what my app malloc'd." That is by design (the cgroup is charged for the memory it causes to be used), but it means <code>memory.current</code> near the limit isn't always "my app is about to OOM" — some of it may be reclaimable cache the kernel will drop under pressure before killing anything. This is why <code>memory.high</code> (reclaim first) exists as a gentler stage before <code>memory.max</code>.</p>
+<div class="k8s-link">
+<p>A Kubernetes memory <em>limit</em> (<code>resources.limits.memory</code>) becomes <code>memory.max</code> on the container's cgroup — the hard, kill line. Kubernetes does <em>not</em> by default use <code>memory.high</code> for the limit (there's no "throttle my memory" request the way there is for CPU), which is exactly why exceeding a memory limit kills the container rather than slowing it: the limit is <code>max</code>, and <code>max</code> means OOM. The memory <em>request</em> influences scheduling and eviction ordering rather than setting a hard cgroup cap. Understanding that memory limit = <code>memory.max</code> = "kill on breach" is what makes the next lesson's exit-code-137 story inevitable rather than surprising.</p>
+<p>Memory requests/limits and their enforcement are <a href="w3.html#cp-3-16">W3.16</a>; node-pressure eviction, which uses memory usage to decide what to evict, is <a href="w3.html#cp-3-18">W3.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "Memory" section documents <code>memory.current</code>, <code>memory.high</code>, <code>memory.max</code>, <code>memory.min</code>/<code>memory.low</code> (protections, not covered here), and the reclaim/OOM behaviour. <code>man 7 cgroups</code> under "memory". <code>man 1 stress-ng</code> for the load generator. In the exam docs, <code>resources.limits.memory</code> and <code>resources.requests.memory</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b7-9" data-id="b7-9">
+<div class="lesson-head"><span class="cp-id">B7.9</span><h4>The OOM kill: exit 137, memory.events, and the dmesg verdict</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"My container just disappeared and there's nothing in its logs" is one of the most common and most confusing failures in production, and this lesson makes it something you can diagnose in seconds. When a cgroup blows past its hard memory limit, the kernel kills a process — and because the kill is external and instant, the application never gets to log anything. The evidence lives in three specific places, none of them the app's own output. Trigger the kill on purpose once, learn where the fingerprints are, and this failure stops being a mystery forever.</p>
+<h5>The concept</h5>
+<p>When a cgroup exceeds <code>memory.max</code> and the kernel cannot reclaim enough to get it back under, the <strong>OOM killer</strong> picks a process in that cgroup and sends it <code>SIGKILL</code> — signal 9, the un-catchable, un-ignorable signal from B2. Because it is <code>SIGKILL</code>, the process cannot run a handler, cannot flush logs, cannot clean up; it is simply stopped. This is why the app's own logs are silent about its death. Three separate pieces of evidence record what happened:</p>
+<ul>
+<li><strong>Exit code 137.</strong> By Unix convention, a process killed by signal <em>N</em> reports exit status <code>128 + N</code>. <code>SIGKILL</code> is signal 9, so <code>128 + 9 = 137</code>. Whenever you see a process or container exit <strong>137</strong>, read it as "killed by SIGKILL" — and in a memory-limited context that almost always means the OOM killer. (128+15 = 143 is the softer <code>SIGTERM</code> cousin.)</li>
+<li><strong><code>memory.events</code>.</strong> The cgroup keeps a counter file; its <code>oom_kill</code> line increments each time the OOM killer fired inside this cgroup. A non-zero <code>oom_kill</code> is the cgroup itself telling you "I killed something for memory."</li>
+<li><strong>The kernel log (<code>dmesg</code>).</strong> The kernel writes a detailed verdict: which cgroup ran out, which PID and process name it chose, and a memory accounting table. This is the authoritative record, and it is in the <em>kernel's</em> log, never the application's.</li>
+</ul>
+<p>The throughline: the app can't tell you it was OOM-killed because <code>SIGKILL</code> gives it no chance to. So you never look in the app's logs for this — you look at the exit code, the cgroup's <code>memory.events</code>, and <code>dmesg</code>. That reflex is the entire debugging drill's second half (B7.14).</p>
+<div class="flow"><span>usage &gt; memory.max</span><em>→ kernel sends</em><span class="hot">SIGKILL (9)</span><em>→ exit</em><span class="hot">137</span><em>· logged in</em><span>memory.events + dmesg, not the app</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a cgroup with a low hard limit and no soft valve, so an over-allocation goes straight to a kill. 50M max, then run a 200M hog inside it.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/oom/leaf
+echo '+memory' | sudo tee /sys/fs/cgroup/oom/cgroup.subtree_control &gt;/dev/null
+echo 50M | sudo tee /sys/fs/cgroup/oom/leaf/memory.max
+sudo dmesg -C                         # clear the kernel ring buffer for a clean read</pre>
+<pre class="out">52428800                              ← 50M hard limit, no memory.high set</pre></li>
+<li>Trigger the kill and capture the shell's exit code. Running the allocator <em>as</em> the cgrouped process, then reading <code>$?</code>, shows the 137.
+<pre class="cmd">sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/oom/leaf/cgroup.procs
+              exec stress-ng --vm 1 --vm-bytes 200M --vm-hang 0 -t 10s'
+echo "exit code: $?"</pre>
+<pre class="out">stress-ng: info:  [xxxx] ... started
+Killed
+<b>exit code: 137</b>                    ← 128 + 9 (SIGKILL) — the OOM killer fired</pre></li>
+<li>Collect the other two witnesses: the cgroup's own counter and the kernel's verdict.
+<pre class="cmd">cat /sys/fs/cgroup/oom/leaf/memory.events | grep oom
+sudo dmesg -T | grep -iE 'killed process|out of memory|oom' | tail -3
+sudo rmdir /sys/fs/cgroup/oom/leaf /sys/fs/cgroup/oom</pre>
+<pre class="out"><b>oom_kill 1</b>                        ← the cgroup counted one OOM kill
+[... noble] Memory cgroup out of memory: <b>Killed process 4821 (stress-ng-vm)</b>
+             total-vm:206...kB, anon-rss:49...kB ...   ← the kernel's authoritative record</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>A container exits with code 137 and its own logs say nothing about why. What killed it, and how do you compute 137? (It was sent <code>SIGKILL</code> — signal 9 — and Unix reports "killed by signal N" as exit <code>128 + N</code>, so <code>128 + 9 = 137</code>; in a memory-limited context that means the OOM killer.) Then: name the two places <em>other than the app's logs</em> that record an OOM kill. (The cgroup's <code>memory.events</code> <code>oom_kill</code> counter, and the kernel log via <code>dmesg</code>, which names the cgroup and the chosen process.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Exit 137 means "killed by SIGKILL," which is <em>usually</em> OOM in a memory-capped context but not always — anything that sends <code>SIGKILL</code> (a manual <code>kill -9</code>, a liveness-probe-triggered kill, a runtime forcibly stopping a container after a grace period) also yields 137. So 137 is "SIGKILL," and you confirm <em>OOM</em> specifically by checking <code>memory.events</code>/<code>dmesg</code>. Don't assume every 137 is memory — but do always check memory first, because it's the most common cause.</p>
+<p>The OOM killer chooses <em>a</em> process in the cgroup, not necessarily the one that allocated the most or the one you'd expect — it uses a heuristic (roughly, biggest memory user, adjustable via <code>oom_score_adj</code>). In a multi-process container this means a child can be killed while the parent survives in a broken state, or vice versa. This is why single-process-per-container is cleaner, and why <code>dmesg</code> naming the <em>specific</em> PID it killed matters: don't assume, read which one it actually chose.</p>
+<div class="k8s-link">
+<p>This is the mechanism behind <code>OOMKilled</code> in <code>kubectl describe pod</code>. When a container exceeds its memory limit (<code>memory.max</code>), the kernel OOM-kills it, the container exits 137, and the kubelet reports the container's <code>lastState</code> as <code>Terminated</code> with reason <code>OOMKilled</code> and exit code 137 — the exact chain you just reproduced. The fix is always one of: raise the memory limit, fix the leak, or right-size the workload. And because the app can't log its own OOM death, <code>kubectl logs</code> of the crashed container is often empty about the cause — you read the <em>reason</em> field and exit code instead, which is this lesson's evidence surfaced by Kubernetes. A tight limit that OOM-kills on every traffic spike is a classic production incident.</p>
+<p>OOMKilled, exit 137, and reading pod termination reasons are central to troubleshooting in <a href="w6.html">W6</a>; memory limits that cause it are set in <a href="w3.html#cp-3-16">W3.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "Memory" section documents <code>memory.events</code> (including <code>oom_kill</code>) and the OOM behaviour under <code>memory.max</code>. <code>man 5 proc</code> for <code>oom_score_adj</code>. <code>man 1 dmesg</code> for reading the kernel log (<code>-T</code> for human timestamps). B2 on the signals you cannot catch (<a href="b2.html#cp-b2-15">B2.15</a>) for why <code>SIGKILL</code> gives the app no chance to log, and the <code>128 + signal</code> exit convention (<a href="b2.html#cp-b2-8">B2.8</a>). In the exam docs, pod container statuses and the <code>OOMKilled</code> reason.</p>
+</article>
+
+<article class="lesson" id="cp-b7-10" data-id="b7-10">
+<div class="lesson-head"><span class="cp-id">B7.10</span><h4>pids.max and io.max: containing fork bombs and capping disk</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>CPU and memory get all the attention, but two other resources can wreck a machine just as thoroughly: the number of processes and the rate of disk I/O. A fork bomb — a process that endlessly spawns copies of itself — can exhaust the system's process table and make a box unloginnable, and a single greedy program can saturate a disk so nothing else can read or write. cgroups cap both, and seeing the fork bomb <em>contained</em> (safely, because you built the cage first) is one of the more satisfying demonstrations in the whole module.</p>
+<h5>The concept</h5>
+<p>Two more controllers, briefly:</p>
+<ul>
+<li><strong><code>pids.max</code></strong> caps the number of processes (and threads — each counts as a task) that may exist in the cgroup. Write a number; once the cgroup holds that many tasks, further <code>fork()</code>/<code>clone()</code> calls fail with <code>EAGAIN</code> ("Resource temporarily unavailable"). This is the fork-bomb containment: a runaway process trying to multiply simply <em>cannot</em> create the next child once the cap is hit, so the explosion is capped at <code>pids.max</code> processes instead of consuming the whole machine's process table. <code>pids.current</code> shows the live count.</li>
+<li><strong><code>io.max</code></strong> caps block-device I/O per device, keyed by the device's major:minor number. You can limit read/write bytes-per-second (<code>rbps</code>/<code>wbps</code>) and read/write operations-per-second (<code>riops</code>/<code>wiops</code>). The format is <code>MAJ:MIN key=value …</code>, e.g. <code>259:0 wbps=1048576</code> to cap writes to 1&nbsp;MB/s on device 259:0. This throttles a noisy-neighbour that would otherwise starve the disk for everyone.</li>
+</ul>
+<p>The unifying idea is that "resource" is broader than CPU and RAM: the kernel meters process slots and I/O bandwidth through the same cgroup filesystem, the same <code>echo &gt; file</code> interface. A container that can't be forced past N processes or M MB/s of disk is protected against two whole classes of denial-of-service — one accidental (a buggy loop), one adversarial (a fork bomb). Note that <code>io.max</code> throttling works cleanly on real block devices; on some setups (certain filesystems, or without the <code>io</code> controller fully active) it may not engage, which is why this lesson leans on <code>pids.max</code> for the hands-on proof.</p>
+<div class="flow"><span>pids.max = 20</span><em>→ 21st fork fails with</em><span class="hot">EAGAIN</span><em>· fork bomb capped at 20, machine safe</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Cap processes at 20, then release a fork bomb <em>inside</em> the cage. Because the cgroup limits the group, the bomb hits the wall at 20 and cannot bring down the VM. (Snapshot first if you haven't — this is the one lab where a mistake bites.)
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/pids/leaf
+echo '+pids' | sudo tee /sys/fs/cgroup/pids/cgroup.subtree_control &gt;/dev/null
+echo 20 | sudo tee /sys/fs/cgroup/pids/leaf/pids.max
+# run a classic fork bomb, but only INSIDE the capped cgroup, with a timeout
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/pids/leaf/cgroup.procs
+              timeout 5s bash -c ":(){ :|:& };:" 2&gt;/dev/null; true'</pre>
+<pre class="out">bash: fork: <b>retry: Resource temporarily unavailable</b>   ← EAGAIN: the cap held
+bash: fork: retry: Resource temporarily unavailable       ← the bomb can't grow past 20</pre></li>
+<li>While it's running (or right after), read the live count — it sits at the cap, not climbing to thousands.
+<pre class="cmd">cat /sys/fs/cgroup/pids/leaf/pids.current /sys/fs/cgroup/pids/leaf/pids.max</pre>
+<pre class="out"><b>20</b>                               ← pids.current pinned at the cap
+20                                   ← pids.max — the bomb is contained</pre></li>
+<li>See <code>io.max</code>'s shape (device-keyed) without depending on it engaging. Find your disk's major:minor and write a 1&nbsp;MB/s write cap; then clean up.
+<pre class="cmd">lsblk -o NAME,MAJ:MIN | grep -m1 disk        # find the device number, e.g. 259:0
+sudo mkdir -p /sys/fs/cgroup/iodemo
+echo '+io' | sudo tee /sys/fs/cgroup/iodemo/cgroup.subtree_control &gt;/dev/null
+echo '259:0 wbps=1048576' | sudo tee /sys/fs/cgroup/iodemo/io.max   # 1 MB/s writes
+cat /sys/fs/cgroup/iodemo/io.max
+sudo rmdir /sys/fs/cgroup/iodemo
+sudo rmdir /sys/fs/cgroup/pids/leaf /sys/fs/cgroup/pids</pre>
+<pre class="out">259:0    0:0    disk
+<b>259:0 wbps=1048576</b>              ← a per-device write-throughput ceiling</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What error does a process get when it tries to fork past <code>pids.max</code>, and why does this contain a fork bomb? (<code>fork()</code> fails with <code>EAGAIN</code> / "Resource temporarily unavailable"; the cgroup caps the <em>whole group's</em> task count, so once the bomb reaches <code>pids.max</code> it physically cannot create more children and stops growing.) Then: what four quantities can <code>io.max</code> limit, and what identifies the device? (Read/write bytes-per-second and read/write IOPS — <code>rbps</code>/<code>wbps</code>/<code>riops</code>/<code>wiops</code> — keyed by the block device's <code>major:minor</code> number.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Never test a fork bomb <em>outside</em> a <code>pids.max</code> cgroup — the classic <code>:(){ :|:& };:</code> will exhaust the host's process table in seconds and force you to reset the VM. The entire point of this lesson is that the cage must exist <em>first</em>; the fork bomb is only safe because it is born inside a cgroup that physically caps it. This is a good instinct generally: build the limit, then run the dangerous thing inside it.</p>
+<p><code>io.max</code> is the fussiest controller to demonstrate: it acts on real block devices and its effect can be invisible on filesystems with heavy caching (writes hit page cache first and get flushed later, so a naive test seems unthrottled), or when the underlying storage stack doesn't cooperate with the cgroup accounting. Don't conclude "io.max is broken" from a quick <code>dd</code> test — it often needs <code>oflag=direct</code> to bypass cache and a real device to show clearly. The mechanism is genuine; it's just the least beginner-friendly to observe, which is why we prove <code>pids.max</code> hands-on and only demonstrate <code>io.max</code>'s syntax.</p>
+<div class="k8s-link">
+<p>Kubernetes uses <code>pids.max</code> for pod and node PID limits — the kubelet's <code>podPidsLimit</code> and node-level PID reservation both land as <code>pids.max</code> on the relevant cgroup, protecting a node from a single pod's fork bomb or thread leak exhausting the node's process table (which would take down <em>every</em> pod, not just the offender). <code>io.max</code> underlies I/O isolation between pods, though Kubernetes' first-class I/O controls are less mature than CPU/memory. Both are the same "meter a resource through the cgroup filesystem" pattern you've now applied four times — cpu, memory, pids, io.</p>
+<p>Pod PID limits and resource isolation connect to node stability in <a href="w6.html">W6</a> and to the resource model in <a href="w3.html#cp-3-16">W3.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "PID" section documents <code>pids.max</code>/<code>pids.current</code>/<code>pids.events</code>, and its "IO" section documents <code>io.max</code>'s <code>MAJ:MIN rbps=… wbps=… riops=… wiops=…</code> format. <code>man 7 cgroups</code> under "pids" and "io". <code>man 8 lsblk</code> for finding a device's major:minor. In the exam docs, the kubelet's <code>podPidsLimit</code> and node PID/resource reservations.</p>
+</article>
+</div><!-- /g-mem -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B7 recall quiz</h3>
 <p>Answer out loud before revealing. If you can explain why a namespaced pod with no memory limit can still take down a node, this module has done its job.</p>
