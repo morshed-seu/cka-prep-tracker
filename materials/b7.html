@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B7: resource control with cgroups v2 — the distinction that everything rests on (namespaces hide, cgroups limit), why Ubuntu 24.04 is v2-only and what the unified hierarchy means, the two v2 rules that trip everyone (subtree_control delegation and the no-internal-process rule); CPU control with cpu.weight (proportional share under contention) vs cpu.max (a hard quota per period) and reading throttling evidence in cpu.stat; memory with memory.current/memory.high (throttle)/memory.max (kill), the OOM killer and exit code 137, memory.events, plus pids.max fork-bomb containment and io.max; moving a process with cgroup.procs; systemd slices and scopes and reading a service's cgroup; a mini project that caps a busy loop at 50% of one CPU and proves it, then OOM-kills a memory hog and reads dmesg; and a debugging drill for 'slow but the CPU is idle' (throttling) and 'dies with no error in its own logs' (the OOM killer).">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B7 · Isolation II: cgroups v2 — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B7 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b7">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B7 — Isolation II: cgroups v2</h1>
+  <p>In B6 you gave a process a private <em>view</em> of the machine — its own process list, hostname, mounts, network. But a process with a private view can still burn every core and eat all the RAM: hiding the rest of the machine from it does nothing to stop it <em>using</em> the whole thing. That second half — putting a ceiling on how much CPU, memory, process slots and disk I/O a group of processes may consume — is the job of <strong>cgroups</strong> (control groups). Namespaces answer "what can this process see?"; cgroups answer "how much can this process use?". A container is both at once, and this module builds the "how much" half.</p>
+  <p>We start with <strong>the model</strong>: why "limit" and "hide" are genuinely different powers, why Ubuntu 24.04 ships only cgroups <em>v2</em> and what its single unified hierarchy under <code>/sys/fs/cgroup</code> looks like, and the two v2 rules that snag everyone. Then <strong>CPU</strong>: the difference between a <em>relative</em> share (<code>cpu.weight</code>, which only bites under contention) and a <em>hard</em> quota (<code>cpu.max</code>), and how to read the throttling counters that explain a service being slow on an idle box. Then <strong>memory, pids and io</strong>: the crucial gap between <code>memory.high</code> (throttle) and <code>memory.max</code> (kill), the OOM killer and the <strong>exit code 137</strong> it leaves behind, plus fork-bomb containment. Finally, <strong>in practice</strong>: moving a live process into a cgroup by writing one number to one file, and seeing that systemd has been doing exactly this to every service all along. You finish by measuring a cage you built yourself.</p>
+  <div class="weights">
+    <span>Checkpoints<b>14</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>B2, B6</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>State the difference that everything rests on: <strong>namespaces hide, cgroups limit</strong> — and why a container needs both.</li>
+<li>Explain what cgroups v2 is, why Ubuntu 24.04 is v2-only, and how the unified hierarchy differs from v1's tree-per-controller.</li>
+<li>Navigate <code>/sys/fs/cgroup</code> as a filesystem where a directory <em>is</em> a cgroup, and read its control files.</li>
+<li>Apply the two v2 rules — hand a controller down with <code>cgroup.subtree_control</code>, and obey the no-internal-process rule — recognising each error on sight.</li>
+<li>Distinguish <code>cpu.weight</code> (a proportional share under contention) from <code>cpu.max</code> (a hard quota per period), and set each.</li>
+<li>Read throttling evidence in <code>cpu.stat</code> and explain why a throttled process is "slow for no reason" on an idle machine.</li>
+<li>Distinguish <code>memory.high</code> (throttle and reclaim) from <code>memory.max</code> (kill), and read <code>memory.current</code> and <code>memory.events</code>.</li>
+<li>Trigger an OOM kill deliberately and collect all three pieces of evidence: exit code <strong>137</strong>, <code>memory.events</code>, and the <code>dmesg</code> verdict.</li>
+<li>Contain a fork bomb with <code>pids.max</code>, and cap disk throughput with <code>io.max</code>.</li>
+<li>Move a running process into a cgroup by writing its PID to <code>cgroup.procs</code>, and confirm membership from <code>/proc/PID/cgroup</code>.</li>
+<li>Find a service's cgroup in <code>systemctl status</code>, explain slices and scopes, and set a live limit with <code>systemctl set-property</code>.</li>
+<li>Measure a self-built CPU cage with <code>time</code> + <code>cpu.stat</code>, and capture an OOM kill in <code>dmesg</code> alongside the shell's 137.</li>
+<li>Diagnose "slow but the CPU is idle" (throttling) and "dies with no error in its own logs" (the OOM killer) from evidence, not guesswork.</li>
+<li>Connect all of this forward to Kubernetes requests, limits, QoS classes, and node-pressure eviction.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B2</strong> for processes, PIDs and signals — a cgroup is a set of processes, moving one means writing a PID, and the OOM killer works by sending <code>SIGKILL</code> (the un-catchable signal, hence exit 137); <strong>B6</strong> because this module is the other half of what makes a container: B6 hid the machine, B7 rations it, and the mini project bolts a cgroup onto the container v0.1 script you wrote in <a href="b6.html#cp-b6-14">B6.14</a>. Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster — you will deliberately OOM-kill things and run a (contained) fork bomb, so take a snapshot (<a href="b0.html#cp-b0-9">B0.9</a>) first. Nothing extra to install: the cgroup filesystem is mounted at <code>/sys/fs/cgroup</code> by systemd on boot, and <code>stress-ng</code> (used for a couple of load tests) is one <code>apt install</code> away, noted where it is first needed.</p>
+</div>
+
+<!-- ---------------- The model ---------------- -->
+<div class="grp" id="g-model"><h3>The model</h3>
+
+<article class="lesson" id="cp-b7-1" data-id="b7-1">
+<div class="lesson-head"><span class="cp-id">B7.1</span><h4>Namespaces hide, cgroups limit — the distinction everything rests on</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>If you take one idea from this whole module, take this one, because every later detail hangs off it. A namespace and a cgroup sound similar — both are "container plumbing" — but they grant two completely different powers, and confusing them is why people are surprised when a namespaced process still crashes the host. Get the distinction crisp now and the rest of the module is just filling in mechanism.</p>
+<h5>The concept</h5>
+<p>A <abbr title="a Linux kernel feature giving a process a private copy of one global resource">namespace</abbr> (B6) changes what a process can <strong>see</strong>. A <abbr title="control group — a kernel mechanism that meters and caps a set of processes' resource use">cgroup</abbr> changes what a process can <strong>use</strong>. Those are orthogonal:</p>
+<ul>
+<li>A process in its own PID namespace <em>cannot see</em> the other processes on the machine — but nothing stops it spawning a thousand threads and pinning every core. Hiding the machine did not ration it.</li>
+<li>A process in a CPU-capped cgroup <em>cannot use</em> more than, say, half a core — but if it shares the host's PID namespace it can still <em>see</em> and signal every process on the box. Rationing it did not hide anything.</li>
+</ul>
+<p>Neither implies the other, and a real container is deliberately <strong>both</strong>: a bundle of namespaces (the private view) wrapped around a cgroup (the resource ceiling). B6 built the first half; this module builds the second. Keep the pair as two independent dials — "what do I see?" and "how much may I use?" — and Kubernetes' resource model will read as obvious later.</p>
+<p>Back in the hotel (one hotel = one Linux machine): a namespace was giving a room its own private guest list, so it can't see the rest of the hotel. A cgroup is the room's <strong>metered power and water</strong> — the front desk sets a cap on how many kilowatts and litres that room may draw, no matter what it plugs in. A room can have a private guest list and no meter (sees little, can still overload the building's supply), or a meter and no privacy (capped draw, but reads everyone's guest list). A proper guest room has both. The meter is the cgroup.</p>
+<div class="flow"><span>namespace</span><em>= what you <b>see</b></em><span>process list · hostname · net · mounts</span><em>·</em><span>cgroup</span><em>= what you <b>use</b></em><span class="hot">CPU · memory · pids · io</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Prove the gap directly: a private PID namespace (B6.5) that can still try to eat the machine. Enter one, then start a busy loop — nothing about the namespace caps it.
+<pre class="cmd">multipass shell sandbox
+sudo unshare --pid --fork --mount-proc bash
+echo "I am PID $$ and I can see $(ps -e --no-headers | wc -l) processes"
+# start a CPU hog in the background — the namespace does nothing to stop it
+yes &gt; /dev/null &amp;
+top -bn1 | grep '%Cpu'</pre>
+<pre class="out">I am PID 1 and I can see <b>3</b> processes     ← hidden: a private, tiny process list
+%Cpu(s): <b>99.7</b> us,  0.3 sy, ...            ← unlimited: one core pinned anyway</pre></li>
+<li>Clean up that hog, leave the namespace, and note what just happened: isolation of <em>view</em> gave zero protection of <em>resources</em>.
+<pre class="cmd">kill %1
+exit</pre>
+<pre class="out">(back on the host — the CPU hog is gone)</pre></li>
+<li>Preview the other dial. A cgroup with no namespace at all still caps CPU — you will build this properly in B7.6, but see the shape now: one file, one limit.
+<pre class="cmd">sudo mkdir /sys/fs/cgroup/demo
+echo '20000 100000' | sudo tee /sys/fs/cgroup/demo/cpu.max   # 20% of one CPU
+cat /sys/fs/cgroup/demo/cpu.max
+sudo rmdir /sys/fs/cgroup/demo</pre>
+<pre class="out">20000 100000                                 ← a hard ceiling, no namespace involved</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>In one sentence each, state what a namespace controls and what a cgroup controls. (Namespace: what a process can <em>see</em> — its private view of one kernel resource. Cgroup: how much a set of processes can <em>use</em> — a metered cap on CPU/memory/pids/io.) Then: in the lab, why did being PID&nbsp;1 in a private namespace do nothing to stop the CPU hog? (The PID namespace only hid the process list; it placed no limit on CPU, so the busy loop pinned a core regardless — isolation of view is not rationing of resources.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The word "isolation" gets used for both, which is where the confusion breeds. Say "namespace isolation" (hiding) and "resource isolation" (limiting) and you will stay clear. Many real incidents are exactly this mix-up: a pod that is perfectly namespaced but has no memory limit will still trigger a node-wide out-of-memory event and take neighbours down with it — the isolation people assumed was there (resource) was never configured, only the isolation they weren't thinking about (namespace).</p>
+<p>A cgroup limits a <em>group</em>, not a single process — that is the whole point of the name. Every process in the cgroup, and every child they fork, counts against the same ceiling. This is why a CPU cap on a container applies to <em>all</em> the threads and subprocesses inside it together, not per-process, and why a fork bomb is contained by a <em>pids</em> cap on the group rather than a per-process limit.</p>
+<div class="k8s-link">
+<p>This is the exact split behind a pod spec. The namespaces you met in B6 are what make a pod's containers a private world; the <code>resources</code> block — <code>requests</code> and <code>limits</code> for <code>cpu</code> and <code>memory</code> — is what this module builds, and it becomes cgroup settings on the node. When you write <code>resources.limits.memory: 256Mi</code>, the kubelet creates a cgroup with <code>memory.max</code> set to 256Mi around your container. "Namespaces hide, cgroups limit" is literally "the pod's isolation vs. the pod's <code>resources</code>." A pod with no limits is namespaced but un-rationed — the noisy-neighbour and node-OOM problems trace straight back to this lesson.</p>
+<p>Requests, limits, and their cgroup enforcement are <a href="w3.html#cp-3-16">W3.16</a>; the QoS classes that follow from them are <a href="w3.html#cp-3-17">W3.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 cgroups</code> is the master page — read its opening sections on what a cgroup and a controller are. <code>man 7 namespaces</code> for the other dial, to keep the two straight. The kernel's own <code>Documentation/admin-guide/cgroup-v2.rst</code> (online as <code>docs.kernel.org/admin-guide/cgroup-v2.html</code>) is the authoritative reference you will return to all module. In the exam docs, the Pod spec's <code>resources</code> field is the Kubernetes surface of the "limit" dial.</p>
+</article>
+
+<article class="lesson" id="cp-b7-2" data-id="b7-2">
+<div class="lesson-head"><span class="cp-id">B7.2</span><h4>cgroups v2: one unified hierarchy, and why 24.04 is v2-only</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Search the web for "how to limit CPU with cgroups" and most of what you find will not work on your machine — the paths do not exist. That is not a broken tutorial; it is a version gap. cgroups exist in two incompatible generations, <strong>v1</strong> and <strong>v2</strong>, and Ubuntu 24.04 ships v2 only. Knowing which one you are on, and why the file layout looks the way it does, saves you hours of chasing paths that were removed years ago.</p>
+<h5>The concept</h5>
+<p>cgroups v1 (2008) gave <em>each controller its own separate hierarchy</em>: one tree of directories for CPU, a different tree for memory, another for pids, and so on. A process could sit in one place in the CPU tree and a completely different place in the memory tree. It was flexible and, in practice, a confusing mess — a process's "cgroup" was really a dozen unrelated memberships, and controllers couldn't cooperate.</p>
+<p>cgroups <strong>v2</strong> (stabilised around 2016) replaces all of that with <strong>one unified hierarchy</strong>: a single tree of directories under <code>/sys/fs/cgroup</code>, and a process lives at exactly <em>one</em> node in it. Every controller — cpu, memory, pids, io — acts at that same location. So "which cgroup is this process in?" finally has one answer, and controllers can coordinate (memory pressure can inform I/O decisions, etc.). Ubuntu 24.04, like every current mainstream distro, boots with v2 and no v1 hierarchy at all — this is called the "unified" setup. The single filesystem mounted at <code>/sys/fs/cgroup</code> is of type <code>cgroup2fs</code>, and that type string is how you confirm which world you are in.</p>
+<p>The practical upshot for reading tutorials: any instruction that mentions paths like <code>/sys/fs/cgroup/cpu/</code> or <code>/sys/fs/cgroup/memory/</code> (a controller name as a top-level directory) is <strong>v1</strong> and simply has nowhere to land here. In v2 the controllers are not directories — they are <em>features enabled within</em> each directory, exposed as files named <code>cpu.max</code>, <code>memory.max</code>, and so on, right inside whatever cgroup you are looking at.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm you are on v2. The filesystem type <code>cgroup2fs</code> is the definitive tell — if you see this, every v1 tutorial path is a dead end.
+<pre class="cmd">multipass shell sandbox
+stat -fc %T /sys/fs/cgroup</pre>
+<pre class="out"><b>cgroup2fs</b>                       ← v2 unified hierarchy (v1 would say tmpfs/cgroup)</pre></li>
+<li>Look at the top of the single tree. There is no <code>cpu/</code> or <code>memory/</code> directory — instead every cgroup directory carries control files directly, and the top level lists which controllers exist.
+<pre class="cmd">ls /sys/fs/cgroup | head
+cat /sys/fs/cgroup/cgroup.controllers</pre>
+<pre class="out">cgroup.controllers  cgroup.procs  cgroup.subtree_control  ...
+init.scope  system.slice  user.slice   ← systemd's carved-up tree (B7.12)
+<b>cpuset cpu io memory pids</b>          ← the controllers available on this box</pre></li>
+<li>See that there is exactly one hierarchy by reading your own membership. The line is short — one path — not one-per-controller as v1 would give.
+<pre class="cmd">cat /proc/self/cgroup</pre>
+<pre class="out"><b>0::/user.slice/user-1000.slice/session-3.scope</b>
+# the leading "0::" means v2 unified; a single path, one place in one tree</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What single command proves you are on cgroups v2, and what output confirms it? (<code>stat -fc %T /sys/fs/cgroup</code> returning <code>cgroup2fs</code>.) Then: a blog says to write to <code>/sys/fs/cgroup/cpu/mygroup/cpu.cfs_quota_us</code>. Why will that fail on 24.04, and what is the v2 equivalent? (That is a v1 path — a per-controller top-level directory — which does not exist under the unified hierarchy; the v2 way is a <code>cpu.max</code> file inside a cgroup directory you make yourself.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>0::</code> prefix in <code>/proc/self/cgroup</code> is the v2 marker. On a v1 or hybrid system you would see many numbered lines, one per controller (<code>1:name=systemd:…</code>, <code>2:cpu:…</code>). One <code>0::</code> line means pure unified v2 — which is what you have. If you ever see the multi-line form on some other machine, you are on a different (older) setup and this module's paths need translating.</p>
+<p>Do not go looking for a way to "switch back to v1" to follow an old guide — you would have to reboot with a kernel parameter (<code>systemd.unified_cgroup_hierarchy=0</code>) and you would be fighting the entire modern container stack, which assumes v2. Everything you actually care about (containerd, runc, Kubernetes) is v2-native now. Learn v2; treat v1 as history you only need to recognise in stale documentation.</p>
+<div class="k8s-link">
+<p>Kubernetes moved to cgroups v2 as the default and containerd/runc drive it directly, so the node your pods run on looks exactly like this <code>sandbox</code>: a single <code>cgroup2fs</code> hierarchy under <code>/sys/fs/cgroup</code>, with the kubelet carving out a subtree for pods. When you later inspect a running pod's limits on a node, you will <code>cat</code> the very same <code>cpu.max</code> / <code>memory.max</code> files this lesson introduces, just deeper in the tree under something like <code>kubepods.slice</code>. The v1-vs-v2 distinction also explains real upgrade notes: features like proper memory-limit accounting and pod-level PSI depend on the node being v2.</p>
+<p>The kubelet's cgroup layout underlies node-pressure eviction in <a href="w3.html#cp-3-18">W3.18</a> and the node internals in <a href="w6.html">W6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 cgroups</code> under "Cgroups version 2" contrasts the two generations. The kernel's <code>cgroup-v2.rst</code> (<code>docs.kernel.org/admin-guide/cgroup-v2.html</code>) is the reference for the unified hierarchy and every control file. <code>man 5 proc</code> documents <code>/proc/[pid]/cgroup</code> and the <code>0::</code> format. No exam-docs entry — the node's cgroup version is assumed, though the Kubernetes docs' "About cgroup v2" page is worth a skim.</p>
+</article>
+
+<article class="lesson" id="cp-b7-3" data-id="b7-3">
+<div class="lesson-head"><span class="cp-id">B7.3</span><h4>The tree is a filesystem: a directory <em>is</em> a cgroup</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>cgroups have a reputation for being arcane, but the interface is something you already know cold: it is just files and directories. There is no special <code>cgroup</code> command you must learn — you create a cgroup with <code>mkdir</code>, set a limit with <code>echo &gt; file</code>, and read usage with <code>cat</code>. Seeing this once dissolves most of the mystery: the kernel exposes the entire mechanism as a filesystem, and everything else in this module is just knowing which file does what.</p>
+<h5>The concept</h5>
+<p><code>/sys/fs/cgroup</code> is a <em>pseudo-filesystem</em> (like <code>/proc</code> from B3 — files backed by kernel data structures, not disk). In it, <strong>a directory is a cgroup</strong>. When you <code>mkdir</code> a new directory anywhere in the tree, the kernel instantly creates a cgroup and populates the directory with a standard set of <em>control files</em> — you do not create those files; they appear because the directory <em>is</em> a cgroup. The important ones you will meet:</p>
+<ul>
+<li><code>cgroup.procs</code> — the membership list: read it to see which PIDs are in this cgroup; write a PID to it to move a process in (B7.11).</li>
+<li><code>cgroup.controllers</code> — which controllers are available <em>here</em> (handed down from the parent).</li>
+<li><code>cgroup.subtree_control</code> — which controllers this cgroup passes <em>down</em> to its children (B7.4).</li>
+<li>Per-controller files that appear once a controller is enabled: <code>cpu.max</code>, <code>cpu.weight</code>, <code>cpu.stat</code>, <code>memory.current</code>, <code>memory.max</code>, <code>pids.max</code>, and so on.</li>
+</ul>
+<p>Nesting is just subdirectories: a cgroup inside a cgroup is a child that inherits and can be limited more tightly than its parent, never more loosely. To destroy a cgroup you <code>rmdir</code> its directory — which only works once it is empty of processes and children. That "directories all the way down, control files at every level" shape <em>is</em> the unified hierarchy from B7.2; there is nothing else to it.</p>
+<div class="flow"><span>mkdir /sys/fs/cgroup/demo</span><em>→ kernel creates</em><span class="hot">a cgroup</span><em>· populated with</em><span>cgroup.procs · cgroup.controllers · …</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a cgroup by making a directory, and watch the control files appear on their own. You wrote none of these — the kernel did, because the directory is a cgroup.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir /sys/fs/cgroup/demo
+ls /sys/fs/cgroup/demo</pre>
+<pre class="out">cgroup.controllers  cgroup.events  cgroup.procs
+cgroup.subtree_control  cgroup.threads  cpu.stat  ...   ← all auto-created</pre></li>
+<li>Read the two files that matter most now: who is in it (nobody yet) and what controllers it has available (inherited from the root).
+<pre class="cmd">cat /sys/fs/cgroup/demo/cgroup.procs        # membership — empty
+cat /sys/fs/cgroup/demo/cgroup.controllers  # what's available here</pre>
+<pre class="out">
+cpuset cpu io memory pids                    ← available, not yet enabled for children</pre></li>
+<li>Destroy it with <code>rmdir</code> — allowed because it is empty. (Try it while a process is inside and it refuses; that is the natural check.)
+<pre class="cmd">sudo rmdir /sys/fs/cgroup/demo
+ls /sys/fs/cgroup/demo 2&gt;&amp;1 || echo 'gone'</pre>
+<pre class="out">ls: cannot access '/sys/fs/cgroup/demo': No such file or directory
+<b>gone</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>How do you create a cgroup, and how do you delete one? (<code>mkdir</code> a directory under <code>/sys/fs/cgroup</code> to create; <code>rmdir</code> it to delete, which only succeeds when it holds no processes and no child cgroups.) Then: you never ran a command to create <code>cgroup.procs</code> inside <code>demo</code> — where did it come from? (The directory <em>is</em> a cgroup, so the kernel populates it with the standard control files automatically; the files are the kernel's interface, not something you author.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>These are not ordinary files and normal file intuitions can mislead. You cannot <code>rm</code> a control file, sizes are meaningless, and writes are validated by the kernel — write a malformed value and you get <code>EINVAL</code> ("write error: Invalid argument") rather than a file quietly holding junk. Treat every write as a syscall to the kernel (which it is), not as editing text: the file is a control knob with a strict accepted format, documented per-controller in <code>cgroup-v2.rst</code>.</p>
+<p><code>rmdir</code> on a non-empty cgroup fails with <code>EBUSY</code> ("Device or resource busy"), and beginners read that as "permission problem" and reach for more <code>sudo</code>. It is not permissions — it is that the cgroup still contains processes or child cgroups. Move the processes out (or let them exit) and remove the children first; then <code>rmdir</code> succeeds. This is the same "a cgroup must be empty to delete" rule you will hit when a leftover container cgroup won't clean up.</p>
+<div class="k8s-link">
+<p>Every tool that manages container resources — runc, containerd, the kubelet, systemd — is ultimately doing <code>mkdir</code>/<code>echo</code>/<code>rmdir</code> against this filesystem on your behalf. When a pod starts, the kubelet (via the runtime) <code>mkdir</code>s a cgroup for it and writes its limits into these files; when the pod is deleted, the cgroup is <code>rmdir</code>'d — and the "cgroup busy, won't delete" failure you just saw is a real class of node bug where a leftover process keeps a pod's cgroup alive after the pod is gone. Being able to walk <code>/sys/fs/cgroup</code> by hand is exactly how you debug those on a node.</p>
+<p>You will read a live pod's cgroup files when inspecting node internals in <a href="w6.html">W6</a>; the kubelet's cgroup management sits under <a href="w3.html#cp-3-16">W3.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 cgroups</code> under "Creating cgroups and moving processes" for the filesystem interface. The kernel <code>cgroup-v2.rst</code> "Core Interface Files" section documents <code>cgroup.procs</code>, <code>cgroup.controllers</code>, and friends precisely. <code>man 8 mount</code> shows how <code>cgroup2</code> is mounted (systemd does it at boot). No exam-docs entry — this is pure Linux mechanism the runtimes automate.</p>
+</article>
+
+<article class="lesson" id="cp-b7-4" data-id="b7-4">
+<div class="lesson-head"><span class="cp-id">B7.4</span><h4>The two v2 rules that trip everyone: subtree_control and no-internal-process</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two rules in cgroups v2 produce error messages that look like the kernel is broken, and everyone hits them the first time they try to set a limit on a nested cgroup. They are not bugs — they are the design that keeps the unified hierarchy coherent. Triggering both deliberately, and understanding <em>why</em> the kernel refuses, means you will recognise them instantly instead of losing an afternoon to "write error: No such file or directory" on a file that plainly exists.</p>
+<h5>The concept</h5>
+<p>Two rules govern how controllers and processes may be arranged in the v2 tree:</p>
+<ul>
+<li><strong>Controllers must be handed down explicitly.</strong> A controller being <em>available</em> in a cgroup (listed in <code>cgroup.controllers</code>) does not mean its files exist in the <em>children</em>. To give children a controller — so a child can have a <code>cpu.max</code> — the parent must enable it by writing <code>+cpu</code> to the parent's <code>cgroup.subtree_control</code>. Until you do, a child directory has <em>no</em> <code>cpu.max</code> file, and writing to the path fails with "No such file or directory" even though the cgroup exists. This is called <strong>delegation</strong>: a controller flows down the tree only where you route it.</li>
+<li><strong>The no-internal-process rule.</strong> A cgroup that has child cgroups <em>and</em> has controllers enabled for those children may <strong>not</strong> itself contain processes. Processes may live only in <em>leaf</em> cgroups (or in cgroups that have not enabled any child controllers). The reason is arithmetic fairness: a controller can't sanely divide CPU between "the processes sitting directly in this node" and "the child cgroups below it" at the same level — so v2 forbids the ambiguous arrangement. In practice you make a parent purely for structure and put processes only in its leaves.</li>
+</ul>
+<p>Put together, the normal shape is: enable controllers on a parent with <code>+cpu +memory</code> in its <code>subtree_control</code>, create leaf children, and place processes in the leaves. Fight either rule and the kernel stops you with a terse error — which, once you know these two rules, is self-explanatory.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Hit rule 1: make a parent and a child, then try to set a CPU limit on the child <em>before</em> delegating the controller. It fails because the child has no <code>cpu.max</code> yet.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/parent/child
+ls /sys/fs/cgroup/parent/child | grep cpu.max || echo 'no cpu.max yet'
+echo '50000 100000' | sudo tee /sys/fs/cgroup/parent/child/cpu.max</pre>
+<pre class="out">no cpu.max yet
+tee: /sys/fs/cgroup/parent/child/cpu.max: <b>No such file or directory</b></pre></li>
+<li>Fix it by delegating: enable <code>cpu</code> for the parent's children. Now the child grows a <code>cpu.max</code> and the same write succeeds.
+<pre class="cmd">echo '+cpu' | sudo tee /sys/fs/cgroup/parent/cgroup.subtree_control
+ls /sys/fs/cgroup/parent/child | grep cpu.max        # it exists now
+echo '50000 100000' | sudo tee /sys/fs/cgroup/parent/child/cpu.max</pre>
+<pre class="out">cpu.max
+<b>50000 100000</b>                    ← accepted, because the controller was handed down</pre></li>
+<li>Hit rule 2: try to put a process directly in the <em>parent</em>, which now has a controller-enabled child. The kernel refuses — the parent may not hold processes.
+<pre class="cmd">echo $$ | sudo tee /sys/fs/cgroup/parent/cgroup.procs</pre>
+<pre class="out">tee: /sys/fs/cgroup/parent/cgroup.procs: <b>Device or resource busy</b>
+# processes may only sit in a leaf — move it into child instead:
+# echo $$ | sudo tee /sys/fs/cgroup/parent/child/cgroup.procs   (would succeed)</pre></li>
+<li>Clean up (empty the leaf first, then remove bottom-up).
+<pre class="cmd">sudo rmdir /sys/fs/cgroup/parent/child
+sudo rmdir /sys/fs/cgroup/parent</pre>
+<pre class="out">(both removed)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You made a child cgroup and writing to its <code>cpu.max</code> failed with "No such file or directory" — what is missing, and how do you fix it? (The parent has not delegated the <code>cpu</code> controller; write <code>+cpu</code> to the parent's <code>cgroup.subtree_control</code> and the child's <code>cpu.max</code> appears.) Then: why can't a cgroup that has controller-enabled children also hold processes directly? (The no-internal-process rule — a controller can't fairly split a resource between processes at a node and that node's child cgroups simultaneously, so processes are only allowed in leaves.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The error for rule 1 — "No such file or directory" on <code>cpu.max</code> — is maddening because the <em>cgroup</em> directory clearly exists; it is the <em>control file</em> that doesn't, because the controller was never delegated. Train yourself to read that specific error as "the controller isn't enabled for children here" and check <code>cat …/cgroup.subtree_control</code> on the parent before anything else. It is the single most common first stumble with v2.</p>
+<p>The error for rule 2 — "Device or resource busy" when writing a PID to a non-leaf's <code>cgroup.procs</code> — is the <em>same</em> <code>EBUSY</code> you saw for a non-empty <code>rmdir</code>, which can mislead. Here it means "this cgroup has controller-enabled children, so it may not contain processes." The fix is always the same: put processes in a leaf. systemd's whole slice/scope layout (B7.12) exists precisely to obey these two rules automatically, which is why you rarely see them once systemd is doing the arranging.</p>
+<div class="k8s-link">
+<p>The kubelet builds its cgroup tree in exactly this shape and for exactly these reasons: a structural parent like <code>kubepods.slice</code> with controllers delegated down, and leaf cgroups per-pod and per-container where the processes actually live. The no-internal-process rule is why there is always that extra layer of nesting — you can't hang a container's processes directly off a node that also has child cgroups. When you read a node's cgroup tree and wonder why it is so deep, these two rules are the answer. Delegation is also how the kubelet hands controllers down to pods without letting a pod re-configure the node's.</p>
+<p>The pod/container cgroup nesting shows up when you trace resource enforcement in <a href="w3.html#cp-3-16">W3.16</a> and node internals in <a href="w6.html">W6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> is essential here: "Enabling and Disabling" documents <code>cgroup.subtree_control</code> and the <code>+cpu</code>/<code>-cpu</code> syntax, and "No Internal Process Constraint" states rule 2 exactly. <code>man 7 cgroups</code> under "Cgroups v2 delegation" covers handing subtrees to a less-privileged manager. No exam-docs entry; this is the mechanism the kubelet automates.</p>
+</article>
+</div><!-- /g-model -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B7 recall quiz</h3>
+<p>Answer out loud before revealing. If you can explain why a namespaced pod with no memory limit can still take down a node, this module has done its job.</p>
+<ol>
+<li>In one sentence each, what does a namespace control and what does a cgroup control?
+<details class="reveal"><summary>Answer</summary><p>A namespace controls what a process can <em>see</em> — a private copy of one kernel resource (process list, hostname, network, mounts). A cgroup controls how much a set of processes can <em>use</em> — a metered cap on CPU, memory, process slots, and disk I/O. Hiding is not rationing; a container is deliberately both.</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="b6.html">← B6 · Isolation I: namespaces, chroot, pivot_root</a><a href="../beginner.html#b8">B8 · Networking I — the real network →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-24. cgroups v2 unified hierarchy on the Linux 6.8 kernel shipped with 24.04; controllers cpu/memory/pids/io as exposed under <code>/sys/fs/cgroup</code>. Package versions referenced: util-linux 2.39, stress-ng 0.17, systemd 255.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
