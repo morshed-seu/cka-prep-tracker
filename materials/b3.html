@@ -626,6 +626,138 @@ sandbox</pre></li>
 </article>
 </div><!-- /g-interfaces -->
 
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b3-13" data-id="b3-13">
+<div class="lesson-head"><span class="cp-id">B3.13</span><h4>Annotate one <code>curl</code>, and write "hello" three ways</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every idea in this module meets in one trace. A single <code>curl http://example.com</code> loads a program, resolves a name, opens a socket, connects, writes a request, reads a response, and exits — the file, process, memory and network groups all in one story. If you can take that raw trace and narrate it phase by phase, you can read <em>any</em> program's trace, because they are all the same handful of phases in different proportions. The second half — the same "hello" written three ways — makes the boundary vivid: three wildly different programs that all end in the identical single <code>write</code> syscall.</p>
+<h5>The concept</h5>
+<p>A network fetch decomposes into seven phases, and every syscall in the trace belongs to exactly one:</p>
+<table>
+<tr><th>Phase</th><th>Tell-tale syscalls</th><th>What is happening</th></tr>
+<tr><td><strong>Load</strong></td><td><code>execve</code>, then the libc <code>openat</code>/<code>mmap</code> burst</td><td>the kernel loads <code>curl</code> and its libraries</td></tr>
+<tr><td><strong>Resolve</strong></td><td><code>openat("/etc/resolv.conf")</code>, <code>clone3</code>, <code>socket</code>+<code>sendto</code> to port 53</td><td>turning <code>example.com</code> into an IP via DNS</td></tr>
+<tr><td><strong>Socket</strong></td><td><code>socket(AF_INET, SOCK_STREAM, …)</code></td><td>creating the TCP endpoint (a new fd)</td></tr>
+<tr><td><strong>Connect</strong></td><td><code>connect(…, htons(80), …)</code></td><td>the TCP handshake to the server</td></tr>
+<tr><td><strong>Write</strong></td><td><code>sendto</code>/<code>write</code> of <code>GET / HTTP/1.1…</code></td><td>sending the request</td></tr>
+<tr><td><strong>Read</strong></td><td><code>recvfrom</code>/<code>read</code> of <code>HTTP/1.1 200 OK…</code></td><td>receiving the response</td></tr>
+<tr><td><strong>Exit</strong></td><td><code>close</code>, <code>exit_group</code></td><td>tearing down and ending</td></tr>
+</table>
+<p>The second exercise isolates the boundary itself. Print "hello" three ways — a shell <code>echo</code>, a C program calling <code>write(2)</code> directly, and Python calling <code>os.write</code> — and count syscalls with <code>strace -c</code>. All three produce the <em>same</em> single <code>write(1, "hello\n", 6)</code>, because that one syscall is the only way to get bytes to the terminal. What differs enormously is everything <em>around</em> it: the C program drags in almost nothing (~30 calls total), the shell more (~117), Python a whole interpreter (~360, most of them <code>openat</code>s loading modules). Same destination, three very different journeys to the doorway — a concrete picture of "the syscall is the narrow part; the runtime above it is where the weight is".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Capture the full trace to a file so the request's own output stays out of the way. <code>-f</code> catches the resolver thread; <code>-o</code> keeps it readable.
+<pre class="cmd">multipass shell sandbox
+strace -f -o /tmp/trace.txt curl -s http://example.com -o /dev/null
+wc -l /tmp/trace.txt</pre>
+<pre class="out">   412 /tmp/trace.txt</pre></li>
+<li>Find each phase and label it. Work through these greps in order — each pulls out one phase's tell-tale calls, and your job is one sentence per phase in your own notes.
+<pre class="cmd">grep -n 'execve'                 /tmp/trace.txt | head -1   # load
+grep -n 'resolv.conf\|htons(53)' /tmp/trace.txt | head -2   # resolve
+grep -n 'socket('                /tmp/trace.txt | head -1   # socket
+grep -n 'htons(80)'              /tmp/trace.txt | head -1   # connect
+grep -n 'sendto\|"GET '          /tmp/trace.txt | head -1   # write
+grep -n 'recvfrom\|200 OK'       /tmp/trace.txt | head -1   # read
+grep -n 'exit_group'             /tmp/trace.txt | tail -1   # exit</pre>
+<pre class="out">1:execve("/usr/bin/curl", ...) = 0
+...:openat(AT_FDCWD, "/etc/resolv.conf", O_RDONLY|O_CLOEXEC) = ...
+...:<b>connect(5, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("104.20.23.154")}, 16) = 0</b>
+...:exit_group(0) = ?</pre></li>
+<li>Now the boundary demo. Write "hello" three ways.
+<div class="langpair">
+<figure><figcaption>/tmp/hw.c — C, direct <code>write(2)</code></figcaption>
+<pre class="cmd">#include &lt;unistd.h&gt;
+int main(void){
+    write(1, "hello\n", 6);
+    return 0;
+}</pre></figure>
+<figure><figcaption>/tmp/hw.py — Python <code>os.write</code></figcaption>
+<pre class="cmd">import os
+os.write(1, b"hello\n")</pre></figure>
+</div>
+<pre class="cmd">gcc -o /tmp/hw /tmp/hw.c</pre></li>
+<li>Count syscalls for all three. Look past the totals to the bottom line: every one of them made exactly one <code>write</code>.
+<pre class="cmd">for p in "/tmp/hw" "bash -c 'echo hello'" "python3 /tmp/hw.py"; do
+  echo "== $p =="; eval strace -c $p 2&gt;&amp;1 &gt;/dev/null | awk '/write|total/'
+done</pre>
+<pre class="out">== /tmp/hw ==
+  0.58    ...    1    write
+100.00   ...   30    total
+== bash -c 'echo hello' ==
+  0.84    ...    1    write
+100.00   ...  117    total
+== python3 /tmp/hw.py ==
+  0.68    ...    1    write
+100.00   ...  361    total</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The project is done when you can narrate the <code>curl</code> trace's seven phases from your notes without the file open, and when you can state — in one sentence — why three programs with call totals of 30, 117 and 361 all did the same single <code>write</code>. (Because <code>write</code> is the only doorway to the terminal; the totals differ only in how much runtime each program loads to <em>reach</em> that one call — libc alone, a shell, or a whole Python interpreter.) Clean up: <code>rm -f /tmp/trace.txt /tmp/hw /tmp/hw.c /tmp/hw.py</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The resolve phase can look different or nearly vanish depending on the system: if the name is cached, in <code>/etc/hosts</code>, or handled by a local <code>systemd-resolved</code> stub, you may see a connect to <code>127.0.0.53:53</code> or a Unix socket rather than a public DNS server — and if <code>curl</code> was given an IP directly, the phase disappears entirely. That variability is itself the lesson: the trace shows what actually happened on <em>this</em> machine, not a textbook diagram.</p>
+<p>Line numbers in your trace will not match these exactly — every run differs slightly in address values and ordering, and <code>-f</code> interleaves the resolver thread's lines with the main thread's (each prefixed by its PID). Follow the <em>shape</em> — load, resolve, socket, connect, write, read, exit — not the specific line numbers.</p>
+<div class="k8s-link">
+<p>This is precisely the skill you use when a pod "can't reach a service". You <code>strace</code> the process and read the phases: a failure in <em>resolve</em> (no answer, or <code>connect</code> to the DNS service refused) points at CoreDNS or the pod's <code>/etc/resolv.conf</code>; a failure at <em>connect</em> (<code>ECONNREFUSED</code> or a hang to a ClusterIP) points at the Service, its endpoints, or network policy; a clean connect that then reads nothing points at the far-side application. The same seven phases, now spread across a cluster — and knowing which phase failed tells you which Kubernetes object to inspect.</p>
+<p>You will do this concretely against <a href="w4.html">W4</a> networking and <a href="w6.html">W6</a> troubleshooting, where "which phase broke" maps directly onto "which layer to check".</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 strace</code> for <code>-f</code>/<code>-o</code>/<code>-c</code> and <code>-e trace=%network</code> to isolate the network phases. <code>man 2 write</code> and <code>man 3 os.write</code> (or the Python <code>os</code> docs) for the one call all three programs share. <code>man 5 resolv.conf</code> for what the resolve phase reads. <code>man 8 curl</code> for <code>-v</code>, which narrates the same phases from <code>curl</code>'s own point of view — a useful cross-check against the trace.</p>
+</article>
+
+<article class="lesson drill" id="cp-b3-14" data-id="b3-14">
+<div class="lesson-head"><span class="cp-id">B3.14</span><h4>Descriptor exhaustion, and the errno ladder</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two skills, drilled until they are reflexes. First: recognise file-descriptor exhaustion — the "worked for a while, then couldn't open anything" failure — and prove it from evidence rather than guessing. Second: name an error from its <code>errno</code> alone, before you reach for <code>strace</code>, because in a real incident the errno is often all you have and the four common ones point at four completely different fixes. Get these two into your fingers and a whole class of production mysteries becomes a thirty-second diagnosis.</p>
+<h5>The concept</h5>
+<p>You met the pieces already: descriptors are finite per process (B3.7), the cap is <code>ulimit -n</code> (B3.12), and exceeding it yields <code>EMFILE</code> (B3.5). This drill wires them together under time pressure. Then the <strong>errno ladder</strong> — four failures that all look like "can't open the file" to a user but are four different truths:</p>
+<table>
+<tr><th><code>errno</code></th><th>Symptom in plain words</th><th>The one-line fix</th></tr>
+<tr><td><code>ENOENT</code></td><td>the path isn't there at all</td><td>fix the path, or create the file</td></tr>
+<tr><td><code>EACCES</code></td><td>it's there, you're not allowed</td><td>fix permissions / run as the right user</td></tr>
+<tr><td><code>EPERM</code></td><td>the <em>operation</em> is forbidden regardless of file perms</td><td>you need a capability/privilege (B4), not a mode bit</td></tr>
+<tr><td><code>EISDIR</code></td><td>it's a directory, you treated it as a file</td><td>point at a file, not the folder</td></tr>
+</table>
+<p>The <code>EACCES</code> vs <code>EPERM</code> distinction is the subtle, valuable one. <code>EACCES</code> is "the file's permission bits say no" — fixable with <code>chmod</code>/<code>chown</code> or the right user. <code>EPERM</code> is "this action is privileged no matter what the file allows" — binding to port 80, changing another user's file ownership, loading a kernel module — and no amount of <code>chmod</code> helps; you need a <em>capability</em>, which is the entire subject of B4. Confusing them sends people down the wrong fix for hours.</p>
+<h5>Lab</h5>
+<p>Snapshot first. Work each symptom, state a one-sentence cause backed by a command that proves it, <em>then</em> read the reveal.</p>
+<h5 class="verify">Symptom 1 — a program that opens fine, then suddenly can't</h5>
+<ol class="lab">
+<li>Reproduce exhaustion deterministically by capping descriptors low, then asking for more than the cap.
+<pre class="cmd">bash -c 'ulimit -Sn 6; for i in $(seq 1 10); do exec {fd}&lt;/etc/hostname || { echo "failed at open #$i"; break; }; done'</pre>
+<pre class="out"><b>failed at open #4</b>: Too many open files</pre></li>
+<li>Prove it is the limit, not the file. The file opens fine on its own; only under the low cap, after a few opens, does it fail — and <code>strace</code> names the errno.
+<pre class="cmd">bash -c 'ulimit -Sn 4; strace -e trace=openat cat /etc/hostname /etc/hostname /etc/hostname 2&gt;&amp;1 | grep EMFILE | head -1'</pre>
+<pre class="out">openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = <b>-1 EMFILE (Too many open files)</b></pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>Descriptor exhaustion.</strong> The process hit its <code>RLIMIT_NOFILE</code> soft cap; every further <code>openat</code>/<code>socket</code> returns <code>EMFILE</code>. In real life, decide between the two causes by watching <code>ls /proc/PID/fd | wc -l</code>: climbing without bound is a <em>leak</em> (fix the code — it opens without closing); pinned at a low ceiling on a busy server is a <em>limit too low</em> (raise <code>-n</code>, via the systemd unit or runtime config, not interactive <code>ulimit</code>). Raising the limit on a leak only delays the crash.</p></details>
+
+<h5 class="verify">Symptom 2 — four "can't open" errors, four different fixes</h5>
+<ol class="lab">
+<li>Generate all four errnos and read each one. Do not fix by trial and error — name the errno, then apply its specific fix.
+<pre class="cmd">strace cat /no/such/path 2&gt;&amp;1 | grep -m1 'no/such'      # ENOENT
+strace cat /etc/shadow   2&gt;&amp;1 | grep -m1 shadow         # EACCES
+strace cat /etc          2&gt;&amp;1 | grep -m1 EISDIR         # EISDIR
+strace -f nc -l 80       2&gt;&amp;1 | grep -m1 EACCES          # EACCES/EPERM binding low port as non-root</pre>
+<pre class="out">openat(..., "/no/such/path", O_RDONLY) = -1 <b>ENOENT</b> (No such file or directory)
+openat(..., "/etc/shadow", O_RDONLY)   = -1 <b>EACCES</b> (Permission denied)
+read(3, ...)                           = -1 <b>EISDIR</b> (Is a directory)
+bind(3, {..., sin_port=htons(80)}, ...) = -1 <b>EACCES</b> (Permission denied)</pre></li>
+<li>Confirm the port-80 case is about a <em>capability</em>, not the file. As root — or with the one capability that grants it — the same bind succeeds, proving no file permission was ever involved. (B4 is the whole story.)
+<pre class="cmd">sudo nc -l 80 &amp; sleep 1; sudo kill %1 2&gt;/dev/null; echo "root could bind :80"</pre>
+<pre class="out">root could bind :80</pre></li>
+</ol>
+<details class="reveal"><summary>The ladder, named</summary><p><code>ENOENT</code> → the path is wrong or missing (fix the path). <code>EACCES</code> on a file → the permission bits deny you (fix perms / user). <code>EISDIR</code> → you handed a directory to something expecting a file. The low-port <code>bind</code> failing for a non-root user is the <code>EACCES</code>/<code>EPERM</code> family that is <em>not</em> a file-permission problem at all — it is a missing capability (<code>CAP_NET_BIND_SERVICE</code>), which is why <code>chmod</code> would never fix it and B4 exists.</p></details>
+<h5 class="gotcha">Gotchas</h5>
+<p>The tempting wrong move in Symptom 1 is to raise the limit and move on. If the count is climbing, you have hidden a leak that will exhaust any limit eventually — the fix is the program. And in Symptom 2, the trap is treating every "permission denied" as a <code>chmod</code> problem; when the errno is really <code>EPERM</code> on a privileged <em>operation</em>, file permissions are a dead end and the answer is a capability. Reading the exact errno, not the English message, is what keeps you on the right ladder.</p>
+<p>Both drills reward the same discipline as B2's: work from evidence to cause, not from symptom to reflex. The errno is the evidence; the fix follows from which errno, not from how loud the failure is.</p>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 3 errno</code> for the full ladder — reread the entries for <code>ENOENT</code>, <code>EACCES</code>, <code>EPERM</code>, <code>EISDIR</code>, <code>EMFILE</code>. <code>man 2 open</code> and <code>man 2 bind</code> under <em>ERRORS</em> for exactly which errno each returns and when. <code>man 7 capabilities</code> as the forward pointer for the <code>EPERM</code>/<code>CAP_NET_BIND_SERVICE</code> case — the doorway into B4. Re-run <a href="#cp-b3-5">B3.5</a> and <a href="#cp-b3-12">B3.12</a>; these drills exist to make those two lessons permanent.</p>
+</article>
+</div><!-- /g-project -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B3 recall quiz</h3>
 <p>Answer out loud before revealing. If you cannot see the boundary in your head, none of the tooling on top of it will make sense.</p>
@@ -637,16 +769,41 @@ sandbox</pre></li>
 <li>Why is "too many small reads" a real performance bug?
 <details class="reveal"><summary>Answer</summary><p>Each read is a boundary crossing with fixed overhead. One <code>read</code> of a megabyte is one crossing; a million one-byte reads is a million crossings, and the crossings — not the data movement — dominate. Buffering exists to collapse many small would-be syscalls into a few big ones.</p></details></li>
 <li>You called <code>printf</code> a hundred times but <code>strace</code> shows one <code>write</code>. Explain.
-<details class="reveal"><summary>Answer</summary><p><code>printf</code> is a libc function running in your process; it buffers text in user space and only crosses into the kernel with a <code>write</code> syscall when the buffer flushes (full, newline to a terminal, or clean exit). A hundred <code>printf</code>s can accumulate into a single <code>write</code>.</p></details></li>
+<details class="reveal"><summary>Answer</summary><p><code>printf</code> is a libc function running in your process; it buffers text in user space and only crosses into the kernel with a <code>write</code> syscall when the buffer flushes (full, newline to a terminal, or clean exit). A hundred <code>printf</code>s can accumulate into a single <code>write</code>. It is also why output can be lost on <code>SIGKILL</code> — it never reached the kernel.</p></details></li>
+<li>Read this line: <code>connect(5, {sa_family=AF_INET, sin_port=htons(443), ...}) = -1 ECONNREFUSED</code>. What happened and what do you check?
+<details class="reveal"><summary>Answer</summary><p>The program made a socket (fd 5) and tried to connect to something on port 443, and nothing was listening there — <code>ECONNREFUSED</code> means the port is reachable but closed. Check that the target service is actually running and bound to that address/port; it is not a DNS or routing problem (those fail differently), it is "nobody home".</p></details></li>
+<li>What is a file descriptor, and why do the first files a program opens get numbers 3, 4, 5…?
+<details class="reveal"><summary>Answer</summary><p>A small integer indexing a per-process table of open things (files, pipes, sockets, terminals), all sharing one read/write/close interface. 0, 1, 2 are already stdin/stdout/stderr, and the kernel always hands out the lowest free number — so the next open is 3. That "lowest free" rule is also how shell redirection lands a file in slot 1.</p></details></li>
+<li>Why does <code>ls -l /proc/meminfo</code> show 0 bytes, and what does that tell you about <code>/proc</code>?
+<details class="reveal"><summary>Answer</summary><p>Because there is nothing stored — the content is generated by the kernel at the moment you read it. <code>/proc</code> is a filesystem-shaped API onto live kernel state, not disk storage. It is why <code>ps</code>/<code>free</code>/<code>ss</code> have no special powers (they just read these files) and why you can diagnose a toolless container by reading <code>/proc</code> directly.</p></details></li>
+<li>A colleague's <code>sysctl -w net.ipv4.ip_forward=1</code> fix disappeared after a reboot. Why, and what is the complete fix?
+<details class="reveal"><summary>Answer</summary><p><code>sysctl -w</code> writes a generated <code>/proc/sys</code> file that lives only in kernel memory and is lost on reboot. The complete procedure is two parts: set it live with <code>-w</code> for now, <em>and</em> write <code>net.ipv4.ip_forward = 1</code> into <code>/etc/sysctl.d/</code> so <code>systemd-sysctl</code> re-applies it at every boot.</p></details></li>
+<li>A container exits 137, its app log ends mid-request with no error, and <code>kubectl describe</code> says <code>OOMKilled</code>. Where is the real story, and why isn't it in the app's log?
+<details class="reveal"><summary>Answer</summary><p>In the node's kernel ring buffer — <code>dmesg -T</code> / <code>journalctl -k</code> — where the OOM killer logged which process it killed, its memory, and its cgroup. The app's log has nothing because 137 is 128+9 (SIGKILL from outside); the process was shot without a chance to flush or log. The kernel is the only witness.</p></details></li>
+<li>Distinguish <code>EACCES</code> from <code>EPERM</code> on an operation, and why the difference changes the fix.
+<details class="reveal"><summary>Answer</summary><p><code>EACCES</code> means a file's permission bits denied you — fixable with <code>chmod</code>/<code>chown</code> or the right user. <code>EPERM</code> means the <em>operation</em> is privileged regardless of any file (binding port 80, chowning another user's file) — no <code>chmod</code> helps; you need a capability. Chasing an <code>EPERM</code> with file permissions wastes hours, which is why reading the exact errno matters.</p></details></li>
+<li>A program "can't open files" after running for hours; <code>ls /proc/PID/fd | wc -l</code> has been climbing all day. Leak or limit-too-low, and what is the fix?
+<details class="reveal"><summary>Answer</summary><p>A descriptor leak — an ever-climbing count means it opens without closing. The fix is in the code; raising <code>ulimit -n</code> only postpones the same <code>EMFILE</code>. A count pinned at a low ceiling (not climbing) would instead be a limit set too low for the workload, fixed by raising it in the service/runtime config.</p></details></li>
+<li>You have <code>strace -c</code> output for a slow command and one syscall dominates the <code>calls</code> column with tens of thousands of entries and many errors. How do you turn that into a diagnosis?
+<details class="reveal"><summary>Answer</summary><p>Read the dominant call and its error count as a category: masses of <code>openat</code> with <code>ENOENT</code> = a path/search-list problem; masses of <code>read</code> = tiny-I/O or a data firehose; masses of <code>futex</code> = lock contention; masses of <code>connect</code> with errors = failing to reach a dependency. The one hot call with its errno names the class of problem before you read a single detailed line.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>Name what the kernel exclusively owns and explain why the boundary exists at all.</li>
-<li>Describe user mode vs kernel mode as a CPU state, and why crossing it costs.</li>
-<li>Read an <code>strace</code> and find the one or two lines that are the actual work.</li>
-<li>Place libc correctly and explain buffered-output loss after a kill.</li>
+<li>Name what the kernel exclusively owns, and explain why the boundary exists and why a crashing process rarely takes the machine down.</li>
+<li>Describe user mode vs kernel mode as a CPU state, and why crossing it costs — and why buffering exists to minimise crossings.</li>
+<li>Run <code>strace</code> on any command and find the one or two lines that are the actual work amid the startup ceremony.</li>
+<li>Place libc correctly, and explain buffered-output loss after a <code>SIGKILL</code> — the truncated-logs failure at the process level.</li>
+<li>Read any <code>strace</code> line completely — call, arguments, return, errno — and name the fix from the errno symbol alone.</li>
+<li>Recognise the two dozen syscalls worth knowing on sight, grouped as files / processes / memory / network / everything-else.</li>
+<li>Follow a file descriptor through a trace, and explain why one small integer stands for files, pipes, sockets and terminals alike.</li>
+<li>Use <code>strace -c</code> and <code>-f</code> to turn a firehose into a diagnosis on real, multi-process programs.</li>
+<li>Read <code>/proc</code> and <code>/sys</code> as kernel APIs, and diagnose a process from <code>/proc</code> even in a container with no tools.</li>
+<li>Change a kernel tunable with <code>sysctl</code>, live and persistently, and never again lose a fix to a reboot.</li>
+<li>Check the kernel ring buffer reflexively with <code>dmesg -T</code>/<code>journalctl -k</code>, and find an OOM-kill verdict that exists nowhere else.</li>
+<li>Read and set per-process limits, tell a descriptor leak from a limit-too-low, and trigger <code>EMFILE</code> on purpose.</li>
+<li>Annotate a complete <code>curl</code> trace by its seven phases, and triage an error from its errno before reaching for a tool.</li>
 </ul>
 </div>
 
