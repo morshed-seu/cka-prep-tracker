@@ -73,7 +73,8 @@ Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0
 | B-S6 | `materials/b1.html` — shell, files, filesystem tree (16 cp) | ✅ done |
 | B-S7 | `materials/b2.html` — processes, threads, signals (18 cp) | ✅ done |
 | B-S8 | `materials/b3.html` — kernel space, user space, system calls (14 cp) | ✅ done |
-| B-S9…B-S18 | `materials/b4.html` … `materials/b13.html`, one module per session | ⬜ next (B-S9 = `b4.html`) |
+| B-S9 | `materials/b4.html` — users, groups, permissions, capabilities (15 cp) | ✅ done |
+| B-S10…B-S18 | `materials/b5.html` … `materials/b13.html`, one module per session | ⬜ next (B-S10 = `b5.html`) |
 | B-S19 | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA | ⬜ |
 
 **Resume recipe for any beginner-track session:** read this table → read the target module's section in `docs/BEGINNER-TRACK.md` → `git log --oneline -8` (what actually landed, vs. just marked done) → run the three checkers for a green baseline → do the work → checkers → commit → tick the row here and update the `cka-materials-plan` memory.
