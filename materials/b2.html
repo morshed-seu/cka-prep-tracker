@@ -1056,6 +1056,454 @@ pkill sleep</pre>
 <p class="docs-links"><code>man 1 top</code> under <em>SUMMARY Display</em> and the <kbd>H</kbd> command; also <em>2c. TASK Areas</em> for what each field means. <code>man 5 proc</code> under <code>/proc/[pid]/status</code> for the <code>Sig*</code> masks. <code>man 7 signal</code> under <em>Signal masks and threads</em> for the delivery rule. <code>man 3 pthread_sigmask</code> for how a program chooses one thread to receive signals.</p>
 </article>
 </div>
+
+<!-- ---------------- Signals ---------------- -->
+<div class="grp" id="g-signals"><h3>Signals</h3>
+
+<article class="lesson" id="cp-b2-12" data-id="b2-12">
+<div class="lesson-head"><span class="cp-id">B2.12</span><h4>The signal table worth memorizing</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every time you stop a program, reload a daemon's config, press Ctrl-C, or see a container get killed, a signal did it. There are a few dozen signals and you need to <em>know</em> about eight of them — the rest you can look up. Knowing those eight cold means that "the pod got SIGTERM then SIGKILL" reads as a sentence rather than a puzzle, and that you reach for the right one instead of reflexively typing <code>kill -9</code> at everything.</p>
+<h5>The concept</h5>
+<p>A signal is <strong>a knock on the door with a standard meaning</strong> — the hotel analogy this track uses. It is not a message: there is no body, no payload, no way to attach information. The process gets a number and nothing else, and everything the number "means" is convention agreed between programs, not something the kernel enforces. That is the single most clarifying fact about signals: <code>SIGHUP</code> means "reload your config" only because daemons decided it would, and the kernel has no opinion.</p>
+<p>The eight to memorize, with their numbers, because you will type the numbers:</p>
+<table>
+<tr><th>Signal</th><th>No.</th><th>Knock that means</th></tr>
+<tr><td><strong>SIGTERM</strong></td><td>15</td><td>"please stop" — the polite, catchable request. The default for <code>kill</code>.</td></tr>
+<tr><td><strong>SIGKILL</strong></td><td>9</td><td>"stop now, no discussion" — uncatchable, handled entirely by the kernel.</td></tr>
+<tr><td><strong>SIGINT</strong></td><td>2</td><td>"interrupt" — what Ctrl-C sends.</td></tr>
+<tr><td><strong>SIGHUP</strong></td><td>1</td><td>originally "the terminal went away"; by convention now "reload config".</td></tr>
+<tr><td><strong>SIGSTOP</strong></td><td>19</td><td>"freeze" — uncatchable pause; the process goes to state T.</td></tr>
+<tr><td><strong>SIGCONT</strong></td><td>18</td><td>"resume" — undoes STOP.</td></tr>
+<tr><td><strong>SIGCHLD</strong></td><td>17</td><td>"a child of yours changed state" — the nudge that drives a reaper (B2.9).</td></tr>
+<tr><td><strong>SIGSEGV</strong></td><td>11</td><td>"you touched memory you do not own" — a bug, produces the 139 from B2.8.</td></tr>
+</table>
+<p>Three groupings make them easier to hold. <strong>The stoppers</strong> — TERM, KILL, INT — all end a process, differing only in politeness and whether the program gets a say. <strong>The job-control pair</strong> — STOP and CONT — pause and resume without ending anything, and are what your shell's Ctrl-Z and <code>fg</code> are built on. <strong>The notifiers</strong> — HUP, CHLD, and the two user-defined signals USR1/USR2 — carry no fatal intent at all; a program that wants to be told something without being killed uses these.</p>
+<p>The numbers are not arbitrary trivia, because of B2.8: an exit code above 128 is 128 + the signal number, so knowing 9, 15 and 11 is what lets you read 137, 143 and 139 on sight. The two you must never forget are 9 and 15 — the hard kill and the polite ask — because the entire shutdown story of every container is those two in sequence.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See the whole catalogue once. <code>kill -l</code> lists every signal your system knows, number to name.
+<pre class="cmd">kill -l | head -4</pre>
+<pre class="out"> 1) SIGHUP   2) SIGINT   3) SIGQUIT   4) SIGILL   5) SIGTRAP
+ 6) SIGABRT  7) SIGBUS   8) SIGFPE    9) SIGKILL  10) SIGUSR1
+11) SIGSEGV 12) SIGUSR2 13) SIGPIPE  14) SIGALRM  15) SIGTERM
+16) SIGSTKFLT 17) SIGCHLD 18) SIGCONT 19) SIGSTOP 20) SIGTSTP</pre></li>
+<li>Translate in both directions, because you will need both: a name from a number when reading an exit code, and a number from a name when sending one.
+<pre class="cmd">kill -l 9
+kill -l TERM
+kill -l 11</pre>
+<pre class="out">KILL
+15
+SEGV</pre></li>
+<li>Send the polite one and watch the shell name it. <code>kill</code> with no signal is <code>kill -TERM</code> — that default is the whole reason TERM is the "normal" way to stop things.
+<pre class="cmd">sleep 300 &amp;
+kill %1
+sleep 0.5; jobs</pre>
+<pre class="out">[1]+  Terminated              sleep 300</pre></li>
+<li>Now the notifier group: send a signal that a program can receive without dying. Ctrl-Z is exactly SIGTSTP, and <code>fg</code> is exactly SIGCONT — spell them out to see it.
+<pre class="cmd">sleep 300 &amp;
+kill -STOP %1; sleep 0.3; ps -o stat= -p $!
+kill -CONT %1; sleep 0.3; ps -o stat= -p $!
+kill %1</pre>
+<pre class="out"><b>T</b>
+<b>S</b></pre></li>
+<li>See SIGCHLD arrive for real — this is the signal your reaper in B2.17 will wait on. <code>trap … CHLD</code> installs a shell handler, and each background child that exits delivers one.
+<pre class="cmd">cat &gt; /tmp/chld.sh &lt;&lt;'SH'
+#!/bin/bash
+count=0
+trap 'count=$((count+1)); echo "SIGCHLD: a child changed state (total $count)"' CHLD
+sleep 1 &amp;
+sleep 2 &amp;
+wait
+echo "saw $count SIGCHLD"
+SH
+bash /tmp/chld.sh; rm -f /tmp/chld.sh</pre>
+<pre class="out">SIGCHLD: a child changed state (total 1)
+SIGCHLD: a child changed state (total 2)
+<b>saw 2 SIGCHLD</b></pre>
+<p>Two children exited, two SIGCHLDs arrived. That signal is exactly the nudge a reaper waits for — "a child of yours is done, come collect it" — and handling it is how an init reaps without polling.</p></li>
+<li>Finally, connect a signal to an exit code, closing the loop with B2.8. Send SIGSEGV by hand and read the 139 it produces.
+<pre class="cmd">sleep 300 &amp;
+kill -SEGV %1
+wait %1; echo "128 + 11 = $?"</pre>
+<pre class="out">128 + 11 = <b>139</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From memory, write the eight signals with their numbers, and group them into stoppers, the job-control pair, and notifiers. Then, given only the numbers 130, 137, 139 and 143, name each signal without looking — this is B2.8 and this lesson meeting in the middle.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Reflexive <code>kill -9</code> is a bad habit with real costs. SIGKILL gives the program no chance to flush its buffers, remove its lock file, or finish a request — so you get corrupted output, stale lock files that block the next start, and half-written data. Send SIGTERM first, wait, and use SIGKILL only when TERM was ignored. The one exception is a D-state process, which no signal reaches anyway (B2.7).</p>
+<p>Signal numbers above 31 are the "real-time" signals and they behave differently — they queue rather than coalesce. You will almost never send them by hand, but they explain why <code>kill -l</code> runs to 64. Everything worth knowing for operations is in the first 31.</p>
+<p>Names are portable; numbers are mostly portable but not perfectly. SIGTERM is 15, SIGKILL is 9 and SIGINT is 2 everywhere Linux runs, but a few signals (SIGUSR1/SIGUSR2, the SIGSTKFLT slot) differ on other architectures. Prefer names in scripts — <code>kill -TERM</code>, not <code>kill -15</code> — and keep the numbers in your head only for reading exit codes.</p>
+<p>SIGHUP's "reload config" meaning is pure convention, and not every program honours it. Sending SIGHUP to something that never implemented the convention triggers the <em>default</em> action, which is to terminate (you will prove this in B2.13). Check the program's docs before assuming HUP means reload.</p>
+<div class="k8s-link">
+<p>The entire pod shutdown sequence is two of these signals in order: the kubelet sends <strong>SIGTERM</strong> to the container's PID 1, waits <code>terminationGracePeriodSeconds</code> (30 by default), then sends <strong>SIGKILL</strong>. That is the whole story, and it is why a container that handles TERM shuts down in a second while one that ignores it always takes the full grace period and reports 137.</p>
+<p>SIGHUP-as-reload shows up too: many Kubernetes components and sidecars reload their configuration on SIGHUP rather than restarting, which is how a config change can take effect without dropping connections. The pod-side contract is in <a href="w3.html#cp-3-5">W3.5 — graceful termination: SIGTERM, the grace period, and SIGKILL</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 signal</code> is the authoritative table — read the <em>Standard signals</em> section, which lists every signal, its number, its default action, and its portability. <code>man 1 kill</code> for <code>-l</code> and how to specify a signal. <code>man 2 kill</code> for the system call underneath, and the rule that signal 0 tests existence without sending anything (B2.15 uses it).</p>
+</article>
+
+<article class="lesson" id="cp-b2-13" data-id="b2-13">
+<div class="lesson-head"><span class="cp-id">B2.13</span><h4>Every signal has a default action</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A program that has never heard of signals still responds to them, because the kernel has a default action for each one. Knowing the defaults lets you predict what a signal will do <em>before</em> you send it — which is the difference between "I'll send HUP to reload it" and accidentally killing a daemon that never implemented HUP. It also explains the otherwise-baffling behaviour where the same signal kills one program silently and dumps a core file for another.</p>
+<h5>The concept</h5>
+<p>When a signal arrives, the process does one of exactly five things, and if the program has not installed a handler, the kernel picks the signal's default:</p>
+<table>
+<tr><th>Default</th><th>Code</th><th>Meaning</th><th>Examples</th></tr>
+<tr><td><strong>Terminate</strong></td><td>Term</td><td>process ends, no core file</td><td>TERM, INT, HUP, ALRM</td></tr>
+<tr><td><strong>Core</strong></td><td>Core</td><td>process ends and dumps memory to a core file for debugging</td><td>SEGV, ABRT, QUIT, ILL</td></tr>
+<tr><td><strong>Ignore</strong></td><td>Ign</td><td>signal is discarded, process continues</td><td>CHLD, URG, WINCH</td></tr>
+<tr><td><strong>Stop</strong></td><td>Stop</td><td>process is paused (state T)</td><td>STOP, TSTP, TTIN, TTOU</td></tr>
+<tr><td><strong>Continue</strong></td><td>Cont</td><td>a stopped process resumes</td><td>CONT</td></tr>
+</table>
+<p>Two things fall straight out of this table. First, the reason a segfault leaves a <code>core</code> file while a Ctrl-C does not is simply that SEGV's default is <em>Core</em> and INT's is <em>Terminate</em> — same "the process ends", different default, different debris. Second, the reason SIGCHLD seems to "do nothing" is that its default is genuinely <em>Ignore</em>: a parent that installs no handler still has its children turn into zombies (the kernel keeps the exit status), but it is never interrupted to notice, which is exactly the reaping problem from B2.9.</p>
+<p>A program changes a signal's disposition in one of three ways: install a <strong>handler</strong> (run my function instead of the default), set it to <strong>ignore</strong>, or reset it to <strong>default</strong>. Those dispositions are what the <code>SigIgn</code> and <code>SigCgt</code> masks from B2.11 record. And two signals — KILL and STOP — cannot have their disposition changed at all, which is B2.15's subject and the reason they always win.</p>
+<p>The practical skill is prediction. Given a program that installed no handlers, you can state what any signal will do to it by reading the default column of <code>man 7 signal</code>. Send HUP to such a program and it terminates — not because HUP is fatal, but because HUP's default is Terminate and nobody overrode it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Predict, then test. <code>sleep</code> installs no signal handlers (you saw its all-zero <code>SigCgt</code> in B2.11). So what does SIGHUP do to it? Read the default first: <em>Term</em>. Now confirm.
+<pre class="cmd">sleep 300 &amp;
+kill -HUP %1
+wait %1; echo "HUP to a handler-less program -&gt; $?"</pre>
+<pre class="out">[1]+  Hangup                  sleep 300
+HUP to a handler-less program -&gt; <b>129</b></pre>
+<p>129 is 128 + 1 — terminated by signal 1, SIGHUP, via its default action. Nothing "reloaded", because there was nothing there to implement reloading.</p></li>
+<li>See the <em>Core</em> default produce actual debris. First enable core files for this shell (they are often disabled by a zero size limit), then crash something.
+<pre class="cmd">ulimit -c unlimited
+cd /tmp
+printf 'int main(void){ int *p = 0; *p = 1; }\n' &gt; boom.c
+gcc -o boom boom.c
+./boom; echo "exit $?"
+ls -l core* 2&gt;/dev/null || echo "(no ./core — routed to a crash handler, see gotchas)"</pre>
+<pre class="out">Segmentation fault (core dumped)
+exit <b>139</b>
+<b>(no ./core — routed to a crash handler, see gotchas)</b></pre></li>
+<li>Contrast with a <em>Terminate</em> default, which ends the process the same way but leaves no core. Same fatal outcome, different debris, entirely because of the default column.
+<pre class="cmd">sleep 300 &amp;
+kill -INT %1
+wait %1; echo "INT -&gt; $?  (no core file — INT's default is Term, not Core)"</pre>
+<pre class="out">INT -&gt; <b>130</b>  (no core file — INT's default is Term, not Core)</pre></li>
+<li>Prove the <em>Ignore</em> default is real: a signal whose default is Ignore does nothing to a handler-less process. SIGWINCH (window-size change) is the safe one to test — send it and the process carries on.
+<pre class="cmd">sleep 300 &amp;
+kill -WINCH %1; sleep 0.3
+ps -o pid,stat,comm -p $!; echo "still here — WINCH default is Ignore"
+kill %1</pre>
+<pre class="out">  PID STAT COMMAND
+ 3902 S    sleep
+still here — WINCH default is Ignore</pre></li>
+<li>Read the defaults straight from the manual, which is where you will actually look them up in the exam or an incident. The disposition table's <em>Action</em> column is the one that answers "what will this do?" (the <em>Standard</em> column just records which POSIX version standardised the signal — the numeric values are in a separate table above).
+<pre class="cmd">man 7 signal | grep -E 'SIG(TERM|KILL|HUP|CHLD|SEGV|CONT|STOP)\s' | head -8</pre>
+<pre class="out">       SIGCHLD      P1990      Ign     Child stopped or terminated
+       SIGCONT      P1990      Cont    Continue if stopped
+       SIGHUP       P1990      Term    Hangup detected on controlling terminal
+       SIGKILL      P1990      Term    Kill signal
+       SIGSEGV      P1990      <b>Core</b>    Invalid memory reference
+       SIGSTOP      P1990      <b>Stop</b>    Stop process
+       SIGTERM      P1990      <b>Term</b>    Termination signal</pre>
+<pre class="cmd">rm -f /tmp/boom /tmp/boom.c /tmp/core*</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without sending anything, predict what each of SIGHUP, SIGWINCH and SIGSEGV does to a program that installed no handlers (Term → dies with 129; Ign → nothing; Core → dies with 139 and a core file). Then explain why a segfault leaves a <code>core</code> file but Ctrl-C does not, in one sentence about the default column.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Core files frequently do not appear where you expect, and it is not because the default failed. Two things intercept them: a <code>ulimit -c</code> of 0 (common default) suppresses them entirely, and <code>/proc/sys/kernel/core_pattern</code> often pipes them to a crash handler like <code>systemd-coredump</code> instead of writing <code>./core</code>. If <code>ls core*</code> is empty after a "(core dumped)" message, check <code>coredumpctl list</code> before concluding anything is wrong.</p>
+<p>"HUP reloads config" is true for daemons that chose to implement it and false — fatally — for everything else. The default is Terminate. Never send HUP to reload a process you have not confirmed supports it; on the ones that do not, you just killed it.</p>
+<p>The default action of SIGCHLD being <em>Ignore</em> is a subtle trap: it means a parent is not obligated to do anything, and a lazy parent's children still become zombies. "Ignore" here means "the parent is not interrupted", not "the exit status is discarded" — the kernel still holds the zombie until someone calls <code>wait</code>. This is the exact gap B2.9's reapers close.</p>
+<div class="k8s-link">
+<p>The default-action table is why base images matter for shutdown behaviour. If your container's entrypoint is a program with no SIGTERM handler, the default action <em>would</em> be Terminate — fine — except when that program is PID 1, where B2.9's special rule suppresses the default and the signal is discarded instead. So "no handler" is safe for a normal process and dangerous for a container's PID 1: the same program, the same signal, opposite outcomes depending only on the PID.</p>
+<p>This is the mechanism underneath the advice to use an init or a proper signal-handling entrypoint, and it feeds directly into <a href="w3.html#cp-3-5">W3.5 — graceful termination</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 signal</code> — the <em>Standard signals</em> table's <em>Action</em> column is the whole lesson; memorise the five action codes (Term, Core, Ign, Stop, Cont). <code>man 5 core</code> for where core files go and why they sometimes do not appear. <code>man 1 coredumpctl</code> for retrieving them on systemd systems. <code>man 2 sigaction</code> for how a program overrides a default — the subject of B2.14.</p>
+</article>
+
+<article class="lesson" id="cp-b2-14" data-id="b2-14">
+<div class="lesson-head"><span class="cp-id">B2.14</span><h4>Catch a signal yourself</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything so far has been about signals sent <em>to</em> programs. This is where you sit on the other side and write the code that receives one — because "handle SIGTERM gracefully", the single most repeated piece of advice about running software in containers, is a handler, and until you have written one it is just words. It is also only about six lines, in either language.</p>
+<h5>The concept</h5>
+<p>Installing a handler tells the kernel: when this signal arrives, do not take the default action — run my function instead. The function is called a <strong>signal handler</strong>, and the kernel arranges for it to run by interrupting whatever the program was doing, calling your function, and then resuming. That interruption is the source of both the power and the sharp edges.</p>
+<p>In C the call is <code>sigaction()</code> (the older <code>signal()</code> still works but has portability quirks — prefer <code>sigaction</code>). In Python it is the <code>signal</code> module, which hides the machinery. Both do the same thing: associate a signal number with a function.</p>
+<p>The sharp edge is worth stating up front, because it is the source of every subtle signal bug: a handler runs <strong>asynchronously</strong>, interrupting the main program at an arbitrary point — possibly in the middle of a <code>malloc</code>, a <code>printf</code>, or an update to a data structure. So a handler may only safely do a very short list of things. The classic-correct pattern is: the handler sets a single flag and returns; the main loop notices the flag and does the real work. Trying to do the shutdown <em>inside</em> the handler — closing files, writing logs — is how you get deadlocks and corrupted output. In C that flag must be of type <code>volatile sig_atomic_t</code>, which is the only kind of variable it is safe to touch from both places.</p>
+<p>There is one more rule from B2.6 that lands here: signal <em>handlers</em> do not survive <code>exec</code>. A handler is code, and <code>exec</code> replaces the code, so the new program starts with default dispositions (except for signals that were set to <em>ignore</em>, which stay ignored). This is why the handler has to be installed by whatever program is actually running when the signal arrives — you cannot set it up in a wrapper and expect the exec'd program to inherit it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the Python version first, because it is the shortest honest example. The handler just prints and returns; the program keeps running.
+<pre class="cmd">cat &gt; /tmp/catcher.py &lt;&lt;'PY'
+#!/usr/bin/env python3
+import signal, time, os
+
+def on_signal(signum, frame):
+    name = signal.Signals(signum).name
+    print(f"caught {name} — staying alive", flush=True)
+
+signal.signal(signal.SIGTERM, on_signal)
+signal.signal(signal.SIGINT,  on_signal)
+
+print(f"pid {os.getpid()}, send me TERM or INT", flush=True)
+while True:
+    time.sleep(1)
+PY
+chmod +x /tmp/catcher.py
+/tmp/catcher.py &amp; p=$!
+sleep 1</pre>
+<pre class="out">pid 3951, send me TERM or INT</pre></li>
+<li>Send it the two signals it now catches. A program that would normally die on TERM instead prints and carries on — you have overridden the default from B2.13.
+<pre class="cmd">kill -TERM $p; sleep 0.4
+kill -INT  $p; sleep 0.4
+ps -o pid,stat,comm -p $p</pre>
+<pre class="out">caught SIGTERM — staying alive
+caught SIGINT — staying alive
+  PID STAT COMMAND
+ 3951 <b>S</b>    python3   ← still here</pre></li>
+<li>Confirm the override is visible from outside — this is the <code>SigCgt</code> field from B2.11, now non-zero because handlers are installed. Then stop it (KILL, because it is ignoring the polite signals — foreshadowing B2.15).
+<pre class="cmd">grep SigCgt /proc/$p/status
+kill -KILL $p</pre>
+<pre class="out">SigCgt: <b>0000000000004002</b></pre>
+<p>Bits 2 (INT) and 15 (TERM) are set: <code>0x4000 | 0x2 = 0x4002</code>. The mask is the kernel's record of exactly which signals this process has handlers for.</p></li>
+<li>Now the C version, so you see the real machinery and the <code>volatile sig_atomic_t</code> flag pattern. The handler sets a flag; <code>main</code> does the work.
+<pre class="cmd">cat &gt; /tmp/catcher.c &lt;&lt;'C'
+#include &lt;stdio.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;unistd.h&gt;
+
+static volatile sig_atomic_t got_term = 0;
+
+void on_term(int sig) {
+    got_term = sig;          /* the ONLY safe thing to do here */
+}
+
+int main(void) {
+    struct sigaction sa = {0};
+    sa.sa_handler = on_term;
+    sigaction(SIGTERM, &amp;sa, NULL);
+
+    printf("pid %d waiting\n", getpid());
+    fflush(stdout);
+
+    while (!got_term)
+        pause();             /* sleep until any signal arrives */
+
+    printf("main loop saw signal %d — cleaning up now\n", got_term);
+    return 0;
+}
+C
+gcc -Wall -o /tmp/catcher /tmp/catcher.c
+/tmp/catcher &amp; p=$!
+sleep 0.5
+kill -TERM $p
+wait $p; echo "exited $?"</pre>
+<pre class="out">pid 3980 waiting
+main loop saw signal 15 — cleaning up now
+exited <b>0</b></pre></li>
+<li>Read what that proves: the handler ran (set the flag), <code>pause()</code> returned, the main loop noticed the flag and did the cleanup <em>in the main flow</em>, and the program exited 0 — a clean, chosen exit rather than a kill. That structure is the whole graceful-shutdown pattern, which B2.16 completes.
+<pre class="cmd">rm -f /tmp/catcher /tmp/catcher.c /tmp/catcher.py</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Write, from scratch, a program in either language that catches SIGTERM, prints a line, and keeps running; confirm with <code>kill -TERM</code> that it survives and with <code>SigCgt</code> that the handler is registered. Then explain why the handler should set a flag rather than do the cleanup itself.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Doing real work inside a handler is the most common signal bug there is. A handler that calls <code>printf</code>, <code>malloc</code> or anything touching shared state can deadlock, because it may have interrupted the main program <em>while it held that same lock</em>. The list of functions guaranteed safe to call from a handler (async-signal-safe functions) is short — <code>write</code> is on it, <code>printf</code> is not. Set a flag; do the work in the main loop.</p>
+<p>In C, an ordinary global variable is not safe to share with a handler — the compiler may cache it in a register and never see the handler's change. <code>volatile sig_atomic_t</code> is the one type the standard guarantees you can read and write atomically from both sides. Using a plain <code>int</code> works until an optimiser decides otherwise, which is the worst kind of bug.</p>
+<p>A handler installed before <code>exec</code> is gone after it (B2.6): <code>exec</code> replaces the code the handler lived in. So a shell wrapper that traps SIGTERM and then <code>exec</code>s your program does <em>not</em> pass its handler through — the exec'd program must install its own. Signals set to <em>ignore</em> are the sole exception that survives exec.</p>
+<p>Catching a signal does not make you immune to being stopped. Even a program that handles TERM, INT and HUP can still be paused by STOP and killed by KILL, because those two cannot be caught — which is the entire point of the next lesson.</p>
+<div class="k8s-link">
+<p>This handler is the literal implementation of what Kubernetes documentation means by "handle SIGTERM". When the kubelet sends SIGTERM at the start of pod termination, the code that decides whether shutdown is graceful or violent is a handler exactly like the one you just wrote — set a flag, stop accepting new work, drain, exit. A container whose main process has no such handler falls through to the default action, or, if it is PID 1, to the discard-the-signal rule from B2.9.</p>
+<p>The full pattern, with the drain step, is B2.16, and its Kubernetes counterpart is <a href="w3.html#cp-3-5">W3.5 — graceful termination</a>, including the <code>preStop</code> hook that runs alongside the signal.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 sigaction</code> — the reference for installing handlers in C, including the <code>sa_flags</code> that control restart behaviour. <code>man 7 signal-safety</code> is the list of functions safe to call from a handler — short, and worth reading once so you know why <code>printf</code> is not on it. <code>man 3 signal</code> for the simpler-but-quirkier older call. Python's own <code>signal</code> module docs for the high-level version and its main-thread-only rule.</p>
+</article>
+
+<article class="lesson" id="cp-b2-15" data-id="b2-15">
+<div class="lesson-head"><span class="cp-id">B2.15</span><h4>The two you cannot catch, and the tools that deliver signals</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You just learned to catch signals, so the obvious question is: can a program make itself unkillable? The answer — no, because two signals refuse to be caught — is what keeps the system controllable, and it is the reason <code>kill -9</code> is the thing everyone reaches for when a process stops cooperating. This lesson pins down that guarantee and rounds out the small family of commands that send signals.</p>
+<h5>The concept</h5>
+<p>Two signals cannot be caught, ignored, or blocked, no matter what a program does: <strong>SIGKILL (9)</strong> and <strong>SIGSTOP (19)</strong>. A program cannot install a handler for them, cannot set them to ignore, and cannot block them for even an instant. The kernel handles both entirely on its own, without ever running a line of the target's code — which is exactly why they always work.</p>
+<p>This is a deliberate design decision, not an oversight. The system needs at least one way to remove a process that has stopped cooperating and at least one way to freeze one, and those levers must not be something a runaway or a malicious program can disable. So the kernel reserves two signals it will always honour. In the hotel: SIGKILL is security removing a guest — there is no conversation, the guest does not get to argue, and it is not a knock they can decline to answer.</p>
+<p>The cost of that guarantee is the flip side of B2.14: because SIGKILL never runs the program's code, the program gets <strong>no chance to clean up</strong>. No flushing buffers, no removing lock files, no finishing the in-flight request. Everything graceful has to happen during the SIGTERM that you send <em>first</em>; SIGKILL is what you fall back to when TERM was ignored, and it always costs you whatever the program had not yet saved. "TERM then, only if needed, KILL" is not politeness for its own sake — it is the only sequence that gives the program a chance to exit cleanly while guaranteeing it exits.</p>
+<p>The tools that send signals, as a family:</p>
+<table>
+<tr><th>Command</th><th>Sends to</th><th>Notes</th></tr>
+<tr><td><code>kill PID</code></td><td>one process by PID</td><td>defaults to TERM; <code>kill -9 PID</code> for KILL</td></tr>
+<tr><td><code>kill -l</code></td><td>—</td><td>lists signal names/numbers (B2.12)</td></tr>
+<tr><td><code>pkill pattern</code></td><td>every process matching a name/pattern</td><td>powerful and dangerous — matches broadly</td></tr>
+<tr><td><code>killall name</code></td><td>every process with exactly that name</td><td>stricter match than <code>pkill</code></td></tr>
+<tr><td><code>kill -0 PID</code></td><td>nothing</td><td>sends no signal; just checks whether you <em>could</em> — an existence/permission test</td></tr>
+</table>
+<p><code>kill -0</code> deserves a second look because it is the tool for the PID-reuse problem from B2.1: it performs all the checks of sending a signal — does this PID exist, am I allowed to signal it — but delivers nothing. It is how a script asks "is my child still alive?" without disturbing it, and your supervisor in B2.17 will use it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a program that tries as hard as it can to be unkillable — catches TERM and INT, ignores HUP — and set it running.
+<pre class="cmd">cat &gt; /tmp/stubborn.py &lt;&lt;'PY'
+#!/usr/bin/env python3
+import signal, time, os
+signal.signal(signal.SIGTERM, lambda s, f: print("ha, caught TERM", flush=True))
+signal.signal(signal.SIGINT,  lambda s, f: print("ha, caught INT", flush=True))
+signal.signal(signal.SIGHUP,  signal.SIG_IGN)
+print(f"pid {os.getpid()} — try to kill me", flush=True)
+while True: time.sleep(1)
+PY
+chmod +x /tmp/stubborn.py
+/tmp/stubborn.py &amp; p=$!
+sleep 1</pre></li>
+<li>Throw the catchable signals at it and watch it shrug them off. This is a program successfully refusing to die.
+<pre class="cmd">kill -TERM $p; sleep 0.3
+kill -INT  $p; sleep 0.3
+kill -HUP  $p; sleep 0.3
+ps -o pid,stat,comm -p $p</pre>
+<pre class="out">ha, caught TERM
+ha, caught INT
+  PID STAT COMMAND
+ 4021 S    python3</pre></li>
+<li>Now use SIGSTOP, which it cannot block, and confirm it is frozen — state T — no matter what handlers it installed.
+<pre class="cmd">kill -STOP $p; sleep 0.3
+ps -o pid,stat,comm -p $p
+kill -CONT $p</pre>
+<pre class="out">  PID STAT COMMAND
+ 4021 <b>T</b>    python3</pre></li>
+<li>And SIGKILL, which ends it instantly with no chance to print anything. Note the silence — no "caught" line, because its code never ran.
+<pre class="cmd">kill -KILL $p; sleep 0.3
+ps -o pid= -p $p 2&gt;/dev/null &amp;&amp; echo alive || echo "gone — KILL cannot be caught"</pre>
+<pre class="out">gone — KILL cannot be caught</pre></li>
+<li>Use <code>kill -0</code> as the existence check it is meant to be — the safe way to ask "is this PID still mine and alive?" without touching it.
+<pre class="cmd">sleep 60 &amp; p=$!
+kill -0 $p &amp;&amp; echo "$p is alive"
+kill $p; sleep 0.3
+kill -0 $p 2&gt;/dev/null &amp;&amp; echo "alive" || echo "$p is gone"</pre>
+<pre class="out"><b>4055 is alive</b>
+<b>4055 is gone</b></pre></li>
+<li>Finally, feel why <code>pkill</code> is dangerous by being specific. <code>pkill -f</code> matches against the whole command line, so a loose pattern can hit far more than you meant — always dry-run with <code>pgrep</code> first.
+<pre class="cmd">sleep 200 &amp; sleep 201 &amp; sleep 202 &amp;
+pgrep -af 'sleep 20'          # LOOK before you kill: what would match?
+pkill -f 'sleep 20'          # now do it
+pgrep -af 'sleep 20' || echo "all matched sleepers gone"</pre>
+<pre class="out">4071 sleep 200
+4072 sleep 201
+4073 sleep 202
+all matched sleepers gone</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the two uncatchable signals and their numbers, and say in one sentence why the kernel refuses to let a program handle them. Then explain what <code>kill -0</code> does and why it is the right tool for checking whether a PID you remembered is still the process you think it is.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>kill -9</code> as a first resort is the habit this whole group exists to break. It denies the program any chance to shut down cleanly, so you inherit corrupted files, stale locks and lost work. It is the right tool for exactly two situations: a program that ignored SIGTERM, and nothing else. (And it does not even work on a D-state process — B2.7.)</p>
+<p><code>pkill</code> and <code>killall</code> match by name or pattern, and a broad pattern is a foot-gun. <code>pkill -f python</code> on a machine running several Python services kills all of them. Always <code>pgrep -af</code> the same pattern first to see the exact list you are about to signal — the two commands take identical arguments precisely so you can preview.</p>
+<p><code>killall</code> means "kill every process with this name" on Linux, but on some other Unixes it historically meant "kill <em>all</em> processes" (a shutdown tool). If you ever work across systems, this is a genuinely dangerous ambiguity; on Linux you are safe, but the name is a bad one.</p>
+<p>SIGSTOP is not a way to safely pause a service you depend on. A stopped process still holds all its resources — its locks, its open files, its network connections — it simply stops servicing them, so everything waiting on it hangs. Freezing a database mid-transaction with SIGSTOP can wedge every client. Use it for inspection, briefly, not as a control mechanism.</p>
+<div class="k8s-link">
+<p>SIGKILL's uncatchability is the hard backstop of pod termination: after the grace period, the kubelet sends SIGKILL, and because nothing can catch it, termination is <em>guaranteed</em> to complete (unless the process is wedged in D on dead storage — the one true exception, B2.7). This is why <code>terminationGracePeriodSeconds</code> is a deadline, not a request: it is precisely how long you have before the uncatchable signal arrives.</p>
+<p>The consequence — losing in-flight work on SIGKILL — is the entire reason for the graceful-shutdown contract in <a href="w3.html#cp-3-5">W3.5 — graceful termination</a>, and for setting the grace period long enough that a well-behaved app finishes draining during the TERM phase and never meets the KILL.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 signal</code> under the note that SIGKILL and SIGSTOP "cannot be caught, blocked, or ignored" — the one sentence this lesson rests on. <code>man 1 kill</code>, <code>man 1 pkill</code> (shared with <code>pgrep</code>), <code>man 1 killall</code> for the delivery tools. <code>man 2 kill</code> for signal 0 as an existence test. Preview destructive matches with <code>pgrep</code> before every <code>pkill</code> — the manpage even recommends it.</p>
+</article>
+
+<article class="lesson" id="cp-b2-16" data-id="b2-16">
+<div class="lesson-head"><span class="cp-id">B2.16</span><h4>The graceful-shutdown pattern, end to end</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the lesson everything in the signals group was building toward, and it is the single most valuable thing in this module for running software anywhere — Kubernetes or not. A program that shuts down gracefully loses nothing when it is asked to stop; one that does not loses whatever it was holding and takes the maximum possible time to do it. The gap between the two is one signal handler and a drain loop, and here you build both and measure the difference.</p>
+<h5>The concept</h5>
+<p>Graceful shutdown is a four-step contract, and every step maps to something you already have:</p>
+<ol>
+<li><strong>Catch SIGTERM</strong> — the handler from B2.14. This is the "please stop" knock, and catching it is what turns a violent stop into an orderly one.</li>
+<li><strong>Stop accepting new work</strong> — the moment TERM arrives, refuse new requests, connections, or jobs. Nothing new comes in.</li>
+<li><strong>Finish what is in flight</strong> — let the requests already being handled complete. This is the <em>drain</em>, and it is why graceful shutdown takes a moment rather than being instant.</li>
+<li><strong>Exit 0</strong> — a clean, chosen exit (B2.8), signalling "I stopped because I was asked, and I finished everything".</li>
+</ol>
+<p>The alternative — ignore TERM — does not make a program robust. It makes every shutdown take the <em>full grace period</em>, because whatever is stopping it waits the whole timeout for a graceful exit that never comes, then sends the uncatchable SIGKILL (B2.15), which drops all in-flight work and reports 137. So "handles TERM" and "ignores TERM" are not "graceful vs. slightly-less-graceful"; they are "one second, nothing lost" versus "the entire timeout, everything in flight lost". That is the measurement this lab makes concrete.</p>
+<p>The structure from B2.14 is exactly what implements this: the handler sets a flag and returns; the main loop checks the flag, stops taking new work, drains, and exits. The handler never does the draining — it only flips the switch that tells the main loop to begin.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a worker that does the full pattern. It processes "items"; on SIGTERM it sets a flag, finishes the current item, and exits cleanly.
+<pre class="cmd">cat &gt; /tmp/worker.py &lt;&lt;'PY'
+#!/usr/bin/env python3
+import signal, sys, time
+
+running = True
+def on_term(signum, frame):
+    global running
+    print("SIGTERM — no new work, finishing current item", flush=True)
+    running = False                      # step 1+2: flag set, stop taking new
+
+signal.signal(signal.SIGTERM, on_term)
+
+item = 0
+while running:
+    item += 1
+    print(f"item {item}: working", flush=True)
+    time.sleep(2)                        # simulate an in-flight request
+    print(f"item {item}: committed", flush=True)   # step 3: it finishes
+print("clean exit", flush=True)
+sys.exit(0)                              # step 4
+PY
+chmod +x /tmp/worker.py</pre></li>
+<li>Write a stopper that behaves exactly like the kubelet: send TERM, wait a grace period, and only then escalate to KILL. This is the other half of the contract, and worth having as a habit.
+<pre class="cmd">cat &gt; /tmp/stop.sh &lt;&lt;'SH'
+#!/bin/bash
+pid=$1; grace=${2:-10}
+kill -TERM "$pid" 2&gt;/dev/null
+for _ in $(seq "$grace"); do
+  kill -0 "$pid" 2&gt;/dev/null || { echo "stopped gracefully"; return 0 2&gt;/dev/null || exit 0; }
+  sleep 1
+done
+echo "grace expired — SIGKILL"
+kill -KILL "$pid"
+SH
+chmod +x /tmp/stop.sh</pre></li>
+<li>Run the graceful worker and stop it mid-item. Watch it finish the item it was on, then exit 0 — in about a second, not the full grace period.
+<pre class="cmd">/tmp/worker.py &amp; w=$!
+sleep 3
+t0=$SECONDS
+/tmp/stop.sh $w 10
+wait $w; echo "exit $?  in $((SECONDS - t0))s"</pre>
+<pre class="out">item 1: working
+item 1: committed
+item 2: working
+SIGTERM — no new work, finishing current item
+item 2: committed
+clean exit
+stopped gracefully
+exit <b>0</b>  in <b>2</b>s</pre></li>
+<li>Now break it on purpose: make the same worker <em>ignore</em> TERM, and stop it the identical way. This is the only change — one disposition — and it changes everything.
+<pre class="cmd">sed 's/signal.signal(signal.SIGTERM, on_term)/signal.signal(signal.SIGTERM, signal.SIG_IGN)/' \
+    /tmp/worker.py &gt; /tmp/worker-bad.py
+chmod +x /tmp/worker-bad.py
+/tmp/worker-bad.py &amp; w=$!
+sleep 3
+t0=$SECONDS
+/tmp/stop.sh $w 10
+wait $w; echo "exit $?  in $((SECONDS - t0))s"</pre>
+<pre class="out">item 1: working
+item 1: committed
+item 2: working
+... (keeps going, ignoring TERM) ...
+item 6: working
+grace expired — SIGKILL
+exit <b>137</b>  in <b>10</b>s</pre>
+<p>Note what is <em>missing</em> from that output: there is no "clean exit" line, because SIGKILL gave the program no chance to print it. The item it was working on when the kill landed is simply gone.</p></li>
+<li>Read the two results side by side, because this contrast is the entire lesson: <strong>graceful → exit 0 in ~2s, current item committed. Ignoring → exit 137 in the full 10s, the in-flight item lost.</strong> Same program, same stopper; the only difference is whether it caught one signal.
+<pre class="cmd">rm -f /tmp/worker.py /tmp/worker-bad.py /tmp/stop.sh</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the four steps of graceful shutdown and which B2 lesson each comes from. Then, from memory, write a worker that catches TERM and drains, and a stopper that escalates TERM→KILL after a timeout, and measure that the graceful path exits 0 quickly while an ignore-TERM version exits 137 at the timeout.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Draining is not the same as ignoring. A correct shutdown handler finishes <em>in-flight</em> work and refuses <em>new</em> work; a program that keeps accepting new work after TERM never drains and will always hit the KILL. The distinction is step 2 — stop accepting — and it is the one people leave out.</p>
+<p>An unbounded drain is its own bug. If "finish in-flight work" can take longer than the grace period, SIGKILL arrives mid-drain and you lose the very work you were trying to protect. A real handler caps the drain at something shorter than the grace period, so it always finishes on its own terms. Match the two numbers deliberately.</p>
+<p>The PID 1 trap from B2.9 undoes all of this silently. If your carefully-written TERM handler is in a program running as PID 1 with no handler <em>actually installed at the kernel level</em> — for instance because a shell script entrypoint is PID 1 and it, not your app, receives the signal — the signal is discarded and none of your shutdown code runs. Make sure the process with the handler is the one receiving the signal, via <code>exec</code> in the entrypoint or a real init.</p>
+<p>A shell entrypoint that runs your app <em>without</em> <code>exec</code> (just <code>myapp</code>, not <code>exec myapp</code>) makes the shell PID 1 and your app its child. The shell receives TERM, does not forward it, and your app never hears it. <code>exec myapp</code> replaces the shell so your app becomes PID 1 and receives the signal directly — this one keyword is the difference between a graceful and a violent shutdown for a huge fraction of real containers.</p>
+<div class="k8s-link">
+<p>This lab <em>is</em> pod termination, built by hand. The kubelet is your <code>stop.sh</code>: it sends SIGTERM to the container's PID 1, waits <code>terminationGracePeriodSeconds</code>, and sends SIGKILL. Your worker is the container's main process. The exit-0-in-1s versus exit-137-in-10s contrast is exactly what you see in a pod's <code>lastState.terminated</code> depending on whether the image handles TERM — and it is why a well-behaved deployment rolls in seconds while a badly-behaved one takes <code>grace × replicas</code> worth of thirty-second waits.</p>
+<p>Everything here maps onto <a href="w3.html#cp-3-5">W3.5 — graceful termination: SIGTERM, the grace period, and SIGKILL</a>, including the <code>preStop</code> hook (a way to run drain logic even for an app you cannot modify) and the interaction with readiness probes that stops new traffic — the Kubernetes spelling of step 2.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 signal</code> one more time for the TERM/KILL semantics the pattern relies on. <code>man 1 bash</code> under <em>SHELL BUILTIN COMMANDS</em> for <code>exec</code> and <code>trap</code> (a shell entrypoint's way of handling TERM). For the concepts, the Kubernetes "Pod Lifecycle" docs on termination are the canonical write-up — but you now know what every sentence in them means at the process level, which is the point of this module.</p>
+</article>
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
