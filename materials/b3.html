@@ -260,6 +260,196 @@ grep write /tmp/trace</pre>
 </article>
 </div><!-- /g-boundary -->
 
+<!-- ---------------- Reading syscalls ---------------- -->
+<div class="grp" id="g-reading"><h3>Reading syscalls</h3>
+
+<article class="lesson" id="cp-b3-5" data-id="b3-5">
+<div class="lesson-head"><span class="cp-id">B3.5</span><h4>Read one <code>strace</code> line completely — including <code>errno</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A trace is only useful if you can read a single line of it with confidence. The good news is that every line has the same four-part grammar, and once you know it, the most valuable line in any trace — the failing one — tells you exactly what went wrong and why. Ninety percent of "why won't this work" ends at one red line in an <code>strace</code>, and reading it is a five-minute skill that pays out forever.</p>
+<h5>The concept</h5>
+<p>Every <code>strace</code> line is one syscall, written in the same shape:</p>
+<div class="flow"><span class="hot">call name</span><em>(</em><span>arguments</span><em>)</em><em>=</em><span>return value</span><em>then, on failure</em><span>ERRNO (message)</span></div>
+<p>Read left to right: the <strong>call name</strong> (<code>openat</code>, <code>read</code>, <code>connect</code>), the <strong>arguments</strong> in parentheses (which <code>strace</code> helpfully decodes — turning raw numbers into readable flags and strings), an <code>=</code>, and the <strong>return value</strong>. A non-negative return usually means success (often it is the useful result — a new file descriptor, or a byte count). A return of <strong><code>-1</code></strong> means failure, and then <code>strace</code> prints the crucial extra: the <strong><code>errno</code></strong>.</p>
+<p><code>errno</code> ("error number") is the kernel's standard vocabulary for <em>why</em> a call failed. There are only about 130 of them, they are shared across every syscall, and each has a short symbolic name and a one-line meaning. <code>strace</code> shows both — the symbol and, in parentheses, the human sentence. This is the single most useful thing in the tool, because the symbol is a precise diagnosis:</p>
+<table>
+<tr><th><code>errno</code></th><th>Means</th><th>Typical cause</th></tr>
+<tr><td><code>ENOENT</code></td><td>No such file or directory</td><td>the path is wrong or the file is missing</td></tr>
+<tr><td><code>EACCES</code></td><td>Permission denied</td><td>the file exists but your credentials aren't allowed</td></tr>
+<tr><td><code>ECONNREFUSED</code></td><td>Connection refused</td><td>nothing is listening on that address/port</td></tr>
+<tr><td><code>EMFILE</code></td><td>Too many open files</td><td>you hit the per-process descriptor limit (B3.12)</td></tr>
+<tr><td><code>EISDIR</code></td><td>Is a directory</td><td>you tried to read a directory as if it were a file</td></tr>
+</table>
+<p>The reason this matters so much operationally: an application's own error message is often vague ("could not start", "connection error"), but the <code>errno</code> beneath it is exact. "Could not read config" plus <code>openat(...) = -1 ENOENT</code> means the file is missing; the same message plus <code>-1 EACCES</code> means it is there but unreadable. Those are different fixes, and only the trace distinguishes them.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make a call fail on purpose and read the failing line in full. <code>cat</code> a file that does not exist; the interesting line is the <code>openat</code> that returns <code>-1</code>.
+<pre class="cmd">strace cat /nonexistent 2&gt;&amp;1 | grep nonexistent</pre>
+<pre class="out">openat(AT_FDCWD, "/nonexistent", O_RDONLY) = <b>-1 ENOENT (No such file or directory)</b></pre></li>
+<li>Name each part of that line out loud: call <code>openat</code>; arguments the directory-relative marker <code>AT_FDCWD</code>, the path, and the read-only flag; return <code>-1</code>; errno <code>ENOENT</code> with its message. That is the whole grammar.</li>
+<li>Change one thing — the reason — and watch the errno change while the call stays the same. Reading a file you are not allowed to read gives <code>EACCES</code>, not <code>ENOENT</code>: the file is <em>there</em>, you simply can't.
+<pre class="cmd">strace cat /etc/shadow 2&gt;&amp;1 | grep shadow</pre>
+<pre class="out">openat(AT_FDCWD, "/etc/shadow", O_RDONLY) = <b>-1 EACCES (Permission denied)</b></pre></li>
+<li>Now a third reason — a directory where a file was expected. The <code>openat</code> succeeds, but the <code>read</code> fails with <code>EISDIR</code>, which is how you learn the failure is one call later than you thought.
+<pre class="cmd">strace cat /etc 2&gt;&amp;1 | grep -E 'EISDIR'</pre>
+<pre class="out">read(3, 0x704774647000, 131072)         = <b>-1 EISDIR (Is a directory)</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Cover the errno column and, from the symbol alone, say the fix: <code>ENOENT</code>, <code>EACCES</code>, <code>ECONNREFUSED</code>. (Fix the path / create the file; fix permissions or run as the right user; start the thing that should be listening or fix the address.) Then explain why <code>EISDIR</code> appeared on <code>read</code> rather than on <code>openat</code>. (Opening a directory read-only is legal; it is <em>reading</em> it as a byte stream that the kernel refuses — so the error surfaces at the next call, which is a common source of "but the file opened fine" confusion.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Not every <code>-1</code> is a real problem. Programs routinely probe for optional files and expect the <code>ENOENT</code> — the very first thing in most traces is <code>access("/etc/ld.so.preload", R_OK) = -1 ENOENT</code>, which is the loader checking for a file that normally doesn't exist. A red line matters only when it is on the path the program actually needs; learn to tell a hopeful probe from a fatal failure by whether the program carries on afterwards.</p>
+<p>The <code>errno</code> symbol is stable; its <em>number</em> is not always what you expect and differs on some architectures. Always speak and script in symbols (<code>ENOENT</code>), never numbers. When a program's own logs print a bare "errno 13", <code>errno 13</code> at the shell (from the <code>moreutils</code> package) or the table in <code>man 3 errno</code> translates it back to <code>EACCES</code>.</p>
+<div class="k8s-link">
+<p>The errno vocabulary is exactly what turns an opaque container failure into a one-line diagnosis. "CreateContainerError" with <code>openat("/var/lib/.../config") = -1 ENOENT</code> underneath is a missing mounted file; the same with <code>EACCES</code> is a permissions/<code>fsGroup</code> problem; a probe failing with <code>connect(...) = -1 ECONNREFUSED</code> is "the process isn't listening yet", not "the network is broken". The Kubernetes error strings are summaries; the errno is the cause.</p>
+<p>This is the vocabulary <a href="w6.html">W6</a> troubleshooting runs on. Every "permission denied", "no such file", "connection refused" you will read in pod events is one of these kernel errnos, surfaced up through several layers — and knowing the original makes the summary readable.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 3 errno</code> lists every symbol with its meaning — read it once, end to end, it is short and it is the whole vocabulary. <code>man 2 intro</code> explains how errors are returned from syscalls. <code>man 2 open</code>'s <em>ERRORS</em> section is a good model: every syscall's manpage lists exactly which errnos it can return and why, so when a line confuses you, that call's <em>ERRORS</em> section is the answer key.</p>
+</article>
+
+<article class="lesson" id="cp-b3-6" data-id="b3-6">
+<div class="lesson-head"><span class="cp-id">B3.6</span><h4>The syscalls worth knowing on sight</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A trace of a real program has hundreds of lines and dozens of distinct calls, and you will never memorise all ~350 syscalls — nor should you. But about two dozen of them account for nearly everything you will ever care about, and they cluster into five plain-language groups. Learn the groups and you can skim any trace and instantly know "this is the file part, this is the network part, here is where it starts a child" without reading every line.</p>
+<h5>The concept</h5>
+<p>Here is the working set, grouped by what the program is trying to do. You are learning to <em>recognise</em> these, not to write them:</p>
+<table>
+<tr><th>Group</th><th>Syscalls</th><th>What the program is doing</th></tr>
+<tr><td><strong>Files</strong></td><td><code>openat read write close</code>, <code>lseek</code>, <code>stat</code>/<code>fstat</code></td><td>opening, reading, writing, and inspecting files</td></tr>
+<tr><td><strong>Processes</strong></td><td><code>execve clone wait4 exit_group</code></td><td>becoming a program, starting children, waiting, ending — the whole of B2</td></tr>
+<tr><td><strong>Memory</strong></td><td><code>mmap brk mprotect munmap</code></td><td>getting memory from the kernel and setting its permissions</td></tr>
+<tr><td><strong>Network</strong></td><td><code>socket connect sendto recvfrom</code>, <code>bind listen accept</code></td><td>making and using network connections</td></tr>
+<tr><td><strong>Everything else</strong></td><td><code>ioctl</code></td><td>the catch-all device/terminal control call — when you don't recognise it, it's often this</td></tr>
+</table>
+<p>A few notes that save confusion. It is <strong><code>openat</code>, not <code>open</code></strong> — modern glibc uses the newer call that takes a directory reference (<code>AT_FDCWD</code> meaning "relative to the current directory"); they do the same job. <code>clone</code> is the real engine behind <code>fork</code> (B2 told you this); <code>clone3</code> is its current form. <code>mmap</code> shows up constantly not because programs love memory-mapping but because that is how libraries and large allocations are loaded. And <code>ioctl</code> is the junk drawer — a single syscall that carries thousands of device-specific commands, so when a trace has an <code>ioctl</code> you don't recognise, it is usually a program poking at the terminal or a device and you can skim past it.</p>
+<p>The payoff is pattern recognition. A program that opens files is doing file I/O; one full of <code>socket</code>/<code>connect</code>/<code>sendto</code> is talking to the network; a burst of <code>clone</code>+<code>execve</code> is starting a child process. You read the <em>shape</em> of the trace before you read the details.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Trace something that touches every group at once — <code>curl</code> fetching a page does files, memory, a child, and the network. Send the trace to a file so it is readable.
+<pre class="cmd">strace -f -o /tmp/curl.txt curl -s http://example.com -o /dev/null</pre></li>
+<li>Find the <strong>process</strong> group: the first <code>execve</code> loading <code>curl</code>, and a <code>clone3</code> where it spins off a helper thread for name resolution.
+<pre class="cmd">grep -E 'execve|clone' /tmp/curl.txt | head</pre>
+<pre class="out">execve("/usr/bin/curl", ["curl", "-s", ...], ...) = 0
+clone3({flags=CLONE_VM|CLONE_FS|..., ...}) = <b>...</b></pre></li>
+<li>Find the <strong>network</strong> group — this is the actual point of <code>curl</code>. A <code>socket</code> is created, then <code>connect</code>ed to the server's IP on port 80, then bytes are <code>sendto</code>/<code>recvfrom</code>'d.
+<pre class="cmd">grep -E 'socket|connect.*htons\(80\)|sendto|recvfrom' /tmp/curl.txt | head</pre>
+<pre class="out">socket(AF_INET, SOCK_STREAM, ...)       = 5
+<b>connect(5, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("104.20.23.154")}, 16) = 0</b>
+sendto(5, "GET / HTTP/1.1\r\n"..., ...)  = ...
+recvfrom(5, "HTTP/1.1 200 OK\r\n"..., ...) = ...</pre></li>
+<li>Find the <strong>files</strong> group — even a network tool reads plenty of files: its libraries, the CA certificates, <code>/etc/resolv.conf</code> to know which DNS server to ask.
+<pre class="cmd">grep -E 'openat.*(resolv.conf|ca-cert|hosts)' /tmp/curl.txt | head</pre>
+<pre class="out"><b>openat(AT_FDCWD, "/etc/resolv.conf", O_RDONLY|O_CLOEXEC) = ...</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From memory, put each of these in its group: <code>write</code>, <code>connect</code>, <code>execve</code>, <code>mmap</code>, <code>close</code>, <code>socket</code>, <code>clone</code>. Then, given only "the trace is almost entirely <code>openat</code>/<code>read</code>/<code>close</code> in a loop", say what the program is doing without seeing anything else. (Walking and reading a lot of files — a backup, a search, a config scan; there is no network and no child-spawning, so it is a pure file-I/O workload.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The exact names drift with libc and kernel versions and can surprise you: <code>open</code>→<code>openat</code>, <code>fork</code>→<code>clone</code>/<code>clone3</code>, <code>stat</code>→<code>newfstatat</code>/<code>statx</code>, <code>select</code>→<code>pselect6</code>/<code>epoll_wait</code>. Recognise the <em>family</em>, not the exact spelling — <code>strace</code>'s <code>-e trace=</code> filters even understand shorthand groups like <code>-e trace=%file</code>, <code>%network</code>, <code>%process</code>, which is the faster way to answer "show me only the network calls".</p>
+<p><code>ioctl</code> lines look alarming and are almost always boring — a program asking the terminal its window size, or setting a device mode. Do not spend time decoding an <code>ioctl</code> unless the trace clearly hangs or fails on one; treat it as the catch-all it is.</p>
+<div class="k8s-link">
+<p>These same groups are what a <strong>seccomp</strong> profile (B12) allows or forbids. seccomp does not ask "may this program open this file" — that is the permission system. It asks the blunter question "may this program even <em>call</em> <code>openat</code> at all", filtering at the syscall level. Kubernetes ships a <code>RuntimeDefault</code> seccomp profile that blocks the couple of dozen dangerous syscalls a normal workload never needs, and understanding these groups is what lets you read such a profile and predict what it will break.</p>
+<p>Forward pointer: when B12 shows you a seccomp profile as a list of allowed syscall names, it will be this exact vocabulary — <code>openat</code>, <code>read</code>, <code>write</code>, <code>connect</code> — and you will already know which group each belongs to.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 syscalls</code> is the complete list with the section-2 page for each. The five you should be able to summon a one-line purpose for on demand: <code>man 2 openat</code>, <code>man 2 read</code>, <code>man 2 execve</code>, <code>man 2 clone</code>, <code>man 2 connect</code>. <code>man 1 strace</code> under <em>-e trace=</em> for the <code>%file</code>/<code>%network</code>/<code>%process</code> shorthand groups.</p>
+</article>
+
+<article class="lesson" id="cp-b3-7" data-id="b3-7">
+<div class="lesson-head"><span class="cp-id">B3.7</span><h4>The file descriptor: one handle for everything</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You keep seeing small integers in traces — <code>openat(...) = 3</code>, then <code>read(3, ...)</code>, then <code>close(3)</code>. That integer is a <strong>file descriptor</strong>, and it is one of the most elegant ideas in Unix: the same little number, and the same three calls (<code>read</code>, <code>write</code>, <code>close</code>), work on a file, a pipe, a network socket, a terminal, or a device. Learn to follow one descriptor through a trace and you can read the plot of almost any program: it opens some things, does <code>read</code>/<code>write</code> on their numbers, and closes them.</p>
+<h5>The concept</h5>
+<p>A <strong>file descriptor</strong> (fd) is an index into a per-process table the kernel keeps. When a program opens something, the kernel does the real work — finds the file, checks permissions, sets up its internal bookkeeping — and hands back the smallest unused integer as a ticket. From then on the program uses that number; the kernel looks up what it really refers to. The program never touches the underlying object directly, only its number, which is the boundary from B3.1 in miniature.</p>
+<p>The beautiful part is <strong>uniformity</strong>. The kernel arranges that files, pipes, sockets, terminals and devices all present the same read/write interface, so a program can <code>write(fd, ...)</code> without caring whether <code>fd</code> is a file on disk, a pipe to another process, or a TCP connection to the other side of the world. This is why Unix tools compose: <code>grep</code> does not know whether its input is a file, a pipe, or your keyboard — it just reads fd 0.</p>
+<p>Which is the other half: <strong>0, 1, 2 are already open</strong> when your program starts — standard input, standard output, standard error, the three streams from <a href="b1.html#cp-b1-5">B1.5</a>. And because the kernel always hands out the <em>lowest free</em> number, the very first thing you open is almost always fd 3, the next fd 4, and so on. That "lowest free" rule is not trivia — it is the exact mechanism behind shell redirection. When you write <code>command &gt; file</code>, the shell closes fd 1 and then opens <code>file</code>; since 1 is now the lowest free number, the file lands in slot 1, and the program writes to the file while believing it is writing to standard output. It never knows anything changed.</p>
+<div class="flow"><span>fd 0</span><em>=</em><span>stdin</span><em>·</em><span>fd 1</span><em>=</em><span>stdout</span><em>·</em><span>fd 2</span><em>=</em><span>stderr</span><em>·</em><span class="hot">fd 3+</span><em>=</em><span>whatever you open next</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Follow one descriptor from birth to death. Trace <code>cat</code> reading a real file and watch a single fd's whole life — <code>openat</code> returns it, <code>read</code> uses it, <code>close</code> ends it.
+<pre class="cmd">echo hello &gt; /tmp/f
+strace cat /tmp/f 2&gt;&amp;1 | grep -E '/tmp/f|read\(3|close\(3'</pre>
+<pre class="out">openat(AT_FDCWD, "/tmp/f", O_RDONLY) = <b>3</b>
+read(<b>3</b>, "hello\n", 131072)          = 6
+read(<b>3</b>, "", 131072)                 = 0
+close(<b>3</b>)                            = 0</pre></li>
+<li>See the three inherited descriptors on a live process. Start a <code>sleep</code>, look at its <code>fd</code> directory — 0, 1, 2 all point at your terminal, inherited from the shell (this is <a href="b2.html#cp-b2-1">B2.1</a>, from the fd angle).
+<pre class="cmd">sleep 300 &amp; ls -l /proc/$!/fd</pre>
+<pre class="out">lrwx------ 1 ubuntu ubuntu 64 Jul 24 10:02 <b>0 -&gt; /dev/pts/0</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 24 10:02 <b>1 -&gt; /dev/pts/0</b>
+lrwx------ 1 ubuntu ubuntu 64 Jul 24 10:02 <b>2 -&gt; /dev/pts/0</b></pre></li>
+<li>Watch the same fd number stand for utterly different things. A pipe end, a socket, and a file all show up in <code>/proc/PID/fd</code> as fds — and all accept <code>read</code>/<code>write</code>. Here fd 3 of a background <code>nc</code> is a socket, not a file.
+<pre class="cmd">kill %1
+{ sleep 60 | cat &gt;/dev/null; } &amp;
+ls -l /proc/$!/fd 2&gt;/dev/null | grep -E 'pipe|socket' | head -2</pre>
+<pre class="out">l-wx------ 1 ubuntu ubuntu 64 Jul 24 10:03 1 -&gt; <b>pipe:[ined]</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain why <code>grep pattern file</code> and <code>cat file | grep pattern</code> both work even though <code>grep</code> is reading from different kinds of source. (In the first, <code>grep</code> opens the file as fd 3; in the second it reads fd 0, which the shell wired to a pipe — but <code>read</code> on a descriptor is identical either way, so <code>grep</code> needs no special case.) Then predict which fd number the first <code>openat</code> in a fresh program returns, and why. (3 — because 0, 1, 2 are already taken and the kernel hands out the lowest free number.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>File descriptors are a finite, per-process resource, and leaking them is a classic bug: a program that opens things in a loop and forgets to <code>close</code> them climbs toward its limit and then every new <code>openat</code> fails with <code>EMFILE</code> (B3.12). The symptom looks like "it works for an hour then can't open anything" — and <code>ls /proc/PID/fd | wc -l</code> climbing without bound is the proof. The fix is always in the program, not the limit.</p>
+<p>Descriptors are inherited across <code>fork</code> and survive <code>exec</code> unless marked close-on-exec (the <code>O_CLOEXEC</code> flag you keep seeing, and <code>FD_CLOEXEC</code>). This is deliberate — it is how a shell hands a pipe to a child — but it is also how a descriptor accidentally leaks into a program that should never have had it. When a child mysteriously "already has" a connection open, an un-<code>CLOEXEC</code>'d fd is usually why.</p>
+<div class="k8s-link">
+<p>The uniform read/write-on-a-number model is why a container can log to "stdout" without knowing or caring what stdout is wired to. Inside the container, the app writes fd 1; the container runtime has arranged that fd 1 is a pipe it is reading; the kubelet reads that pipe and writes the bytes to a file under <code>/var/log/pods</code>; <code>kubectl logs</code> reads that file. Four different consumers, one unbroken chain of read/write on descriptors — the app is oblivious to all of it, exactly as <code>grep</code> is oblivious to whether its input is a file or a pipe.</p>
+<p>The fd-exhaustion failure mode also scales up: nodes set <code>fs.file-max</code> and per-process limits precisely because leaked descriptors on one busy pod could otherwise starve the whole node — the sysctl side of this is B3.10 and the limit side is B3.12.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 open</code> for how a descriptor is created and the flags (<code>O_RDONLY</code>, <code>O_CLOEXEC</code>). <code>man 5 proc</code> under <code>/proc/[pid]/fd</code> for the live view you used. <code>man 2 dup2</code> for the redirection primitive underneath <code>&gt;</code> and <code>2&gt;&amp;1</code>. <code>man 8 lsof</code> ("list open files") is the friendlier, cross-process way to ask "who has this file/socket open" — it is entirely a reader of <code>/proc/*/fd</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b3-8" data-id="b3-8">
+<div class="lesson-head"><span class="cp-id">B3.8</span><h4>Make <code>strace</code> practical: <code>-c</code> and <code>-f</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A full line-by-line trace of a real program is thousands of lines and overwhelming. Two flags turn <code>strace</code> from a firehose into a diagnostic instrument: <code>-c</code> collapses the whole run into a summary table — which calls, how many, how long, how many errors — and <code>-f</code> makes it follow child processes so that tracing anything realistic actually shows you something. Knowing just these two is the difference between <code>strace</code> being a curiosity and being your first move on a slow or stuck program.</p>
+<h5>The concept</h5>
+<p><strong><code>-c</code> (count)</strong> suppresses the per-line output and instead prints one summary table when the program finishes: each syscall the program made, the total time spent in it, the number of calls, and — the column to look at first — the number that returned an error. This answers the two questions you most often have about a misbehaving program without reading a single trace line: <em>what is it spending its time doing</em>, and <em>what is failing</em>. A program that is slow because it makes a million <code>read</code>s, or failing because it makes ten thousand <code>openat</code>s that all return <code>ENOENT</code>, confesses immediately in this table.</p>
+<p><strong><code>-f</code> (follow forks)</strong> tells <code>strace</code> to also trace any process the target starts. This matters far more than it sounds, because a great deal of software is a small parent that immediately forks the real work into children — a shell script, a server that forks per connection, anything that shells out. Without <code>-f</code>, you trace the parent, see it <code>clone</code> away the interesting part, and then watch it do nothing while all the action happens in a child you're not following. With <code>-f</code>, each line is prefixed with the PID it came from (<code>[pid 1234]</code>), so you can tell the processes apart.</p>
+<p>The two combine: <code>strace -f -c</code> gives you a summary that <em>includes</em> the children, which is usually what you want for "why is this whole command slow". Add <code>-o file</code> to any of them when the output is large or the program's own output would otherwise get tangled in.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Get a summary of a light command. <code>-c</code> replaces the scroll with a table sorted by time. Note the <code>errors</code> column — a couple of expected <code>access</code> probes fail, which is normal.
+<pre class="cmd">strace -c ls / &gt;/dev/null</pre>
+<pre class="out">% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 44.08    0.000670         670         1           execve
+ 18.62    0.000283          15        18           mmap
+  5.92    0.000090          12         7           openat
+  5.20    0.000079           8         9           close
+  4.34    0.000066           8         8           fstat
+  1.51    0.000023          11         2         2 access</pre></li>
+<li>Make the workload heavier and watch the shape change. A recursive listing does far more <code>getdents64</code> (directory reads) and <code>openat</code>/<code>newfstatat</code> — the table now points straight at "this is a lot of directory walking".
+<pre class="cmd">strace -c ls -R /etc &gt;/dev/null</pre>
+<pre class="out">% time     seconds  usecs/call     calls    errors syscall
+ 31.7     0.004     4              930           newfstatat
+ 24.1     0.003     6              520           getdents64
+ 12.0     0.002     3              260           openat</pre></li>
+<li>See why <code>-f</code> is not optional on a script. First trace a shell one-liner <em>without</em> <code>-f</code> — you see the shell start a child and then almost nothing, because the real work moved into a process you are not following.
+<pre class="cmd">strace -c sh -c 'ls / | wc -l' 2&gt;&amp;1 | tail -4</pre>
+<pre class="out">  0.00    0.000000           0         1           clone
+... (the ls and wc did their work invisibly)</pre></li>
+<li>Now add <code>-f</code> and get the whole story — the counts now include the <code>ls</code> and the <code>wc</code> children, and each line (in non-<code>-c</code> mode) would carry its own <code>[pid N]</code>.
+<pre class="cmd">strace -f -c sh -c 'ls / | wc -l' 2&gt;&amp;1 | grep -E 'getdents|execve|calls'</pre>
+<pre class="out">% time     seconds  usecs/call     calls    errors syscall
+  ...                                3           execve   &lt;- sh, ls AND wc
+  ...                                2           getdents64</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Given a <code>strace -c</code> table where <code>openat</code> shows 40,000 calls and 39,000 errors, say what the program is almost certainly doing and where to look. (Searching a long list of paths for a file that mostly isn't there — a <code>PATH</code> or plugin/library search gone wrong; the 39,000 <code>ENOENT</code>s are the probes that missed, and the fix is the search list, not the file.) Then explain in one sentence why tracing a shell script without <code>-f</code> is nearly useless.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>%time</code> column is time spent <em>in the kernel for that call</em>, not wall-clock time, and it is badly distorted by <code>strace</code>'s own overhead — so use the table to compare calls against each other ("<code>read</code> dominates"), never as a true benchmark of the program. For real timing, run the program without <code>strace</code>.</p>
+<p><code>-f</code> can produce a torrent on a program that forks heavily (a build, a busy server). Combine it with <code>-e trace=</code> to narrow the calls (<code>strace -f -e trace=openat,connect …</code>) or <code>-c</code> to collapse to counts, and always prefer <code>-o file</code> so the flood lands somewhere you can search rather than scrolling past.</p>
+<div class="k8s-link">
+<p><code>-f</code> is essential in container-land precisely because a container's entrypoint is so often a wrapper — a shell script, an <code>exec</code> chain, an init that forks the real server. Trace the PID 1 of a pod without <code>-f</code> and you watch the wrapper do nothing while the real process runs unobserved. And <code>strace -c -f -p &lt;pid&gt;</code> attached to a running, slow container is one of the fastest ways to answer "what is it actually doing" — a wall of <code>futex</code> means lock contention, a wall of <code>read</code>/<code>write</code> means I/O, a wall of <code>connect</code> with errors means it is failing to reach a dependency.</p>
+<p>This is a direct tool for <a href="w6.html">W6</a>: when a pod is "running but doing nothing useful", attaching <code>strace -f -c</code> to its process turns a mystery into a category in about ten seconds.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 strace</code> under <em>-c</em>, <em>-f</em>/<em>-ff</em>, <em>-e trace=</em>, <em>-p</em> and <em>-o</em> — these five options cover the vast majority of real use. For the deeper "trace only failing calls" trick, <em>-e trace=</em> combined with <em>-Z</em> (fault filtering) is worth a look once the basics are reflex. <code>man 2 clone</code> to remember why <code>-f</code> is what stitches a child back into the story.</p>
+</article>
+</div><!-- /g-reading -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B3 recall quiz</h3>
 <p>Answer out loud before revealing. If you cannot see the boundary in your head, none of the tooling on top of it will make sense.</p>
