@@ -653,6 +653,185 @@ findmnt /mnt/b/sub || echo 'no propagation — private'</pre>
 </article>
 </div><!-- /g-special -->
 
+<!-- ---------------- Overlayfs ---------------- -->
+<div class="grp" id="g-overlay"><h3>Overlayfs</h3>
+
+<article class="lesson" id="cp-b5-13" data-id="b5-13">
+<div class="lesson-head"><span class="cp-id">B5.13</span><h4>Overlayfs by hand: lowerdir, upperdir, workdir, merged</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the lesson the whole module has been climbing toward. <strong>Overlayfs</strong> stacks several directories so they appear as one, with the lower ones read-only and a single upper one absorbing all writes. Mount one by hand, with your own directories, and the phrase "container image layer" loses every ounce of mystery — because a container image is precisely this stack, and you are about to build one. Everything from here (copy-up, whiteouts, "why does my data vanish on restart") is just consequences of the four directories you're about to name.</p>
+<h5>The concept</h5>
+<p><strong>overlayfs</strong> is a VFS filesystem (B5.5) that presents a <em>union</em> of other directories. Mounting one takes four roles:</p>
+<ul>
+<li><strong>lowerdir</strong> — one or more read-only directories, stacked. Written as a colon-separated list, <em>leftmost is highest priority</em>. These are never modified.</li>
+<li><strong>upperdir</strong> — the single writable directory. Every change — new files, edits, deletions — is recorded here, never in the lowers.</li>
+<li><strong>workdir</strong> — an empty scratch directory on the same filesystem as upperdir, which the kernel needs for internal atomic operations (like preparing a copy-up). You never touch it; it just has to exist and be empty.</li>
+<li><strong>merged</strong> — the mount point: the combined view you actually read and write through.</li>
+</ul>
+<p>The merge rule is simple: to find a name, overlayfs looks in upperdir first, then each lowerdir left to right, and the first hit wins. So a file present in two layers shows the <em>upper</em> one (higher layers shadow lower), and the merged view is the union of every name across all layers. Reads come from wherever the file lives; writes all land in upperdir (the next two lessons are exactly <em>how</em> writes to lower-layer files are handled). Think of the lowers as a stack of transparent sheets with writing on them, and upperdir as the top sheet you're allowed to draw on: you read down through the whole stack, but your pen only marks the top.</p>
+<div class="flow"><span>upperdir (writable)</span><em>over</em><span>lower1</span><em>over</em><span>lower2</span><em>over</em><span>lower3</span><em>=</em><span class="hot">merged (the union)</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build three read-only lowers, an upper, and a workdir. Give each lower a distinct file, and put the <em>same</em> filename in two of them with different contents so you can see which wins.
+<pre class="cmd">cd /tmp &amp;&amp; rm -rf ov &amp;&amp; mkdir -p ov/{low1,low2,low3,upper,work,merged}
+echo 'from low1 (highest)' &gt; ov/low1/shared
+echo 'from low2 (hidden)'  &gt; ov/low2/shared
+echo 'only in low2' &gt; ov/low2/b
+echo 'only in low3' &gt; ov/low3/c</pre></li>
+<li>Mount the overlay. The <code>lowerdir</code> list is high-to-low left to right; <code>merged</code> is where the union appears.
+<pre class="cmd">sudo mount -t overlay overlay \
+  -o lowerdir=ov/low1:ov/low2:ov/low3,upperdir=ov/upper,workdir=ov/work \
+  ov/merged
+findmnt ov/merged</pre>
+<pre class="out">TARGET     SOURCE  FSTYPE  OPTIONS
+<b>/tmp/ov/merged overlay overlay</b> rw,relatime,lowerdir=...,upperdir=...,workdir=...</pre></li>
+<li>Read the merged view. Every file from every layer is present, and for the name in two layers the higher one (low1) wins.
+<pre class="cmd">ls ov/merged
+cat ov/merged/shared</pre>
+<pre class="out">b  c  shared
+<b>from low1 (highest)</b>                   ← low1 shadows low2's "shared"</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the four directories in an overlay mount and say, in a few words, what each is for. (lowerdir — read-only stacked layers; upperdir — the one writable layer where all changes go; workdir — empty kernel scratch on the upper's filesystem; merged — the combined view you use.) Then explain why <code>cat ov/merged/shared</code> printed low1's version and not low2's. (overlayfs resolves a name top-down — upperdir, then lowerdirs left to right — and takes the first hit; low1 is leftmost/highest, so it shadows low2's file of the same name.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>workdir and upperdir must live on the same filesystem, and workdir must be empty and unshared. The kernel uses workdir to stage operations atomically (a copy-up is prepared there, then moved into upperdir), which only works if both are on one filesystem — try to put upperdir on ext4 and workdir on tmpfs and the mount fails. Give each overlay its own workdir; reusing one across two overlays corrupts them. These aren't arbitrary rules — they're what makes overlay writes crash-safe.</p>
+<p>The lowerdir order is the opposite of what many expect. Leftmost is <em>highest</em> priority (closest to the top), so in <code>lowerdir=A:B:C</code>, A shadows B shadows C. When container images are stacked, the topmost image layer is the leftmost lowerdir. Get this backwards and you'll predict the wrong file winning; the merged view always shows the leftmost occurrence of a name.</p>
+<div class="k8s-link">
+<p>This is, almost exactly, how a container's root filesystem is assembled. A container image is a series of layers; the runtime uses each image layer as a lowerdir (topmost image layer leftmost), adds a fresh empty upperdir and workdir for the container, and mounts the result as the container's <code>/</code> — the merged view. When you run <code>mount | grep overlay</code> on a Kubernetes node running containers, you see exactly the mount you just built by hand, with a long colon-separated lowerdir of image-layer paths under <code>/var/lib/containerd</code> (or <code>/var/lib/docker</code>). Every container on the node shares those read-only lower layers (one copy of the image, many containers) and each gets its own tiny upper — which is the efficiency that makes containers cheap and the fact behind the next three lessons.</p>
+<p>This directly underlies the image-layer material of the Intermediate track and the kubelet/runtime storage under <a href="w1.html#cp-1-23">W1.23</a>; the shared-lowers, private-upper design is why images pull once and containers start fast.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 mount</code> under <code>-t overlay</code> for the mount options, and the kernel's <code>Documentation/filesystems/overlayfs.rst</code> (the authoritative reference for lowerdir/upperdir/workdir semantics and the merge rules). <code>man 8 findmnt</code> shows the overlay's options. No exam-docs page — this is the runtime plumbing beneath every pod.</p>
+</article>
+
+<article class="lesson" id="cp-b5-14" data-id="b5-14">
+<div class="lesson-head"><span class="cp-id">B5.14</span><h4>Copy-up: what happens when you write to a lower-layer file</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The lowers are read-only, yet through the merged view you can happily edit a file that only exists in a lower layer. Something has to give, and what gives is <strong>copy-up</strong>: the moment you write, overlayfs copies the whole file up into the writable upper layer and edits the copy, leaving the lower untouched. This single mechanism explains a surprising performance cliff — editing one byte of a large file in a container can be slow and can consume real disk — and it is the direct reason a container's writable layer grows the way it does.</p>
+<h5>The concept</h5>
+<p>When you open a lower-layer file for writing through the merged view, overlayfs cannot modify the lower (it's read-only), so it performs a <strong>copy-up</strong>: it copies the entire file — all its data and metadata — from the lowerdir into the upperdir, then applies your write to that upper copy. From then on the merged view shows the upper copy (upper shadows lower, per B5.13's merge rule), and the lower original sits there unchanged, still shared with every other overlay using that layer.</p>
+<p>Two facts fall straight out and both bite in practice. First, <strong>the cost is paid on first write and is proportional to the file's size, not your edit's</strong>: appending one line to a 2&nbsp;GB log triggers a 2&nbsp;GB copy the first time, because the whole file must be materialised in the upper layer before it can be modified. Second, <strong>the upper layer grows by the full size of every lower file you touch</strong> — a container that edits large files from its image inflates its writable layer accordingly, even if each edit is tiny. Copy-up is why "just change one config value" inside a big image file is not always free.</p>
+<div class="flow"><span>write to a lower-only file</span><em>→ copy WHOLE file →</em><span class="hot">upperdir</span><em>→ edit the copy · lower stays</em><span>untouched &amp; shared</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the starting state: the file <code>b</code> lives only in <code>low2</code>, and <code>upper</code> is empty. (Uses the overlay from B5.13 — remount it if you unmounted.)
+<pre class="cmd">ls /tmp/ov/upper
+cat /tmp/ov/merged/b</pre>
+<pre class="out">                                        ← upper is empty
+only in low2</pre></li>
+<li>Modify <code>b</code> through the merged view. It's a lower-only file, so this write triggers a copy-up — the full file materialises in <code>upper</code>.
+<pre class="cmd">echo 'appended in the overlay' &gt;&gt; /tmp/ov/merged/b
+ls /tmp/ov/upper
+cat /tmp/ov/upper/b</pre>
+<pre class="out"><b>b</b>                                       ← b now exists in upper: copied up
+only in low2
+appended in the overlay</pre></li>
+<li>Prove the lower original is untouched — the copy-up left <code>low2</code>'s version exactly as it was, still shareable by any other overlay.
+<pre class="cmd">cat /tmp/ov/low2/b</pre>
+<pre class="out"><b>only in low2</b>                           ← the lower layer never changed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>After appending one line to <code>merged/b</code>, the file appeared in <code>upper</code> containing <em>both</em> the original content and your addition. Explain why the whole file showed up in upper rather than just your one line. (Because overlayfs copies the entire lower-layer file into upperdir before modifying it — copy-up materialises the full file, then applies the edit — so the upper copy holds the original data plus your change.) Then answer: why can appending a single line to a huge file inside a container be slow the first time? (The first write triggers a copy-up of the whole file, so the cost is proportional to the file's size, not the edit's; subsequent writes hit the upper copy and are fast.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Copy-up happens on the first <em>write-open</em>, and even some metadata changes can trigger it. Opening a lower file for writing, changing its permissions or owner, or truncating it can all cause a copy-up — it is not only content edits. This is why a container image built to be "read-mostly" can still balloon its writable layer if it chmods or touches many files from lower layers at startup. If a container's upper layer is growing unexpectedly, look for processes that open-for-write or modify metadata on large image files.</p>
+<p>Copy-up breaks the sharing that makes overlays cheap. Before the write, one lower file was shared by every container using that image; after copy-up, the writing container has its own full private copy in its upper layer, consuming that much extra disk. The design assumes writes are rare and localised; a workload that rewrites large chunks of its image is fighting the model and should use a volume (B5.16) for that data instead of the container's writable layer.</p>
+<div class="k8s-link">
+<p>Copy-up is behind two real Kubernetes behaviours. First, the "container writable layer" that counts against a pod's <code>ephemeral-storage</code> and can trigger eviction grows exactly by these copy-ups plus genuinely new files — a pod that rewrites large files from its image can be evicted for ephemeral-storage pressure even though the image itself is modest. Second, it's a core argument for mounting a <em>volume</em> over any path a container writes heavily: a volume is a separate mount (not part of the overlay), so writes to it skip copy-up entirely and don't inflate the throwaway upper layer. "Write your data to a mounted volume, not into the container filesystem" is copy-up avoidance stated as a best practice.</p>
+<p>Ephemeral-storage limits and eviction appear in <a href="w5.html#cp-5-1">W5.1</a> and <a href="w6.html">W6</a>; the volume-over-writable-path pattern is the practical takeaway there.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel's <code>Documentation/filesystems/overlayfs.rst</code> under <em>Non-directories</em> and <em>copy_up</em> is the authoritative description of when and how copy-up happens (including the <code>metacopy</code> optimisation for metadata-only changes). <code>man 8 mount</code> under <code>-t overlay</code> for the options that affect it. Re-read <a href="#cp-b5-13">B5.13</a> — copy-up only makes sense once the four-directory model is solid.</p>
+</article>
+
+<article class="lesson" id="cp-b5-15" data-id="b5-15">
+<div class="lesson-head"><span class="cp-id">B5.15</span><h4>Whiteouts: deleting a file that lives in a read-only layer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Copy-up handled editing a lower-layer file. But what about <em>deleting</em> one? You can't remove it from the read-only lower, yet <code>rm</code> through the merged view clearly has to make it disappear. The trick is a <strong>whiteout</strong>: overlayfs drops a special marker in the upper layer that says "hide the thing below". It's a small, elegant hack, and seeing it directly — a phantom device file standing in for a deletion — is the last piece you need before the "an image is just layers" conclusion clicks fully into place.</p>
+<h5>The concept</h5>
+<p>Deleting a lower-layer file can't actually remove it (the lower is read-only and shared with other overlays), so overlayfs instead records the deletion in the upper layer as a <strong>whiteout</strong>: a <em>character device with device number 0/0</em>, created in upperdir at the deleted file's name. When overlayfs resolves that name and finds a 0/0 character device in the upper layer, it treats the name as deleted and stops looking down the stack — so the lower file, though still physically present, vanishes from the merged view. The lower copy is completely untouched; only the merged view is affected, and only because the whiteout masks it.</p>
+<p>This is the deletion counterpart to copy-up's edit: writes to a lower file copy it up, deletes of a lower file white it out, and in both cases the read-only lower is preserved and the change is recorded entirely in the writable upper. A whole-directory deletion uses a related marker (an "opaque" directory) with the same idea — record in upper that the lower should be hidden. The upshot: the upper layer holds not just new and edited files but also a set of "tombstones" for everything the container deleted from its image.</p>
+<div class="flow"><span>rm a lower-only file</span><em>→ upperdir gets a</em><span class="hot">0/0 char device (whiteout)</span><em>→ merged view hides it · lower</em><span>untouched</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Delete a lower-only file through the merged view. <code>c</code> exists only in <code>low3</code>; removing it via <code>merged</code> makes it disappear from the union.
+<pre class="cmd">ls /tmp/ov/merged
+rm /tmp/ov/merged/c
+ls /tmp/ov/merged</pre>
+<pre class="out">b  c  shared
+b  shared                               ← c is gone from the merged view</pre></li>
+<li>Find the whiteout in the upper layer. It's a character device with major/minor <b>0, 0</b> at the deleted name — the tombstone overlayfs left behind. (<code>ls -l</code> shows the leading <code>c</code> and the 0,0 where a size would be.)
+<pre class="cmd">ls -l /tmp/ov/upper/c
+stat -c '%F  %t,%T' /tmp/ov/upper/c</pre>
+<pre class="out"><b>c</b>--------- 1 root root <b>0, 0</b> ... /tmp/ov/upper/c
+character special file  <b>0,0</b>            ← this is the whiteout</pre></li>
+<li>Prove the lower layer is untouched — the real file still sits in <code>low3</code>, hidden only by the whiteout above it. Remove the whiteout and it would reappear.
+<pre class="cmd">cat /tmp/ov/low3/c</pre>
+<pre class="out"><b>only in low3</b>                           ← still there; the deletion was only a mask</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You <code>rm</code>'d <code>c</code> from the merged view and it vanished, yet <code>low3/c</code> still contains its data. Explain what overlayfs actually created and how that hides the file. (It created a whiteout — a 0/0 character device named <code>c</code> in upperdir — and when overlayfs sees that marker while resolving the name, it treats the name as deleted and doesn't descend to the lower layer, so the still-present <code>low3/c</code> is masked from the merged view.) Then say, in one sentence, how a whiteout is the deletion analogue of copy-up. (Both preserve the read-only lower and record the change only in the writable upper — copy-up for edits, whiteout for deletions.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A whiteout does not reclaim the lower file's space, and that surprises people auditing disk use. The lower layer still holds the "deleted" file in full; the whiteout is a tiny marker. So deleting files inside a container to free space in the <em>image's</em> layers accomplishes nothing — the bytes are still in the read-only lowers, shared and immutable. This is the container analogue of the Docker-image lesson "you can't shrink a layer by deleting files in a later layer"; the deletion is recorded, not applied downward.</p>
+<p>The 0/0 character-device representation is the classic default, but not the only one. With certain mount options (e.g. <code>userxattr</code>, used for rootless/unprivileged overlays) whiteouts are recorded as extended attributes instead of device files, because an unprivileged process can't create device nodes. On the standard privileged overlay over ext4 you'll see the 0/0 device this lab shows; if you ever find a deletion that <em>didn't</em> leave a visible whiteout device, suspect an xattr-based one and check with <code>getfattr</code>.</p>
+<div class="k8s-link">
+<p>Whiteouts explain a persistent source of container-image confusion and a real security nuance. Deleting a secret file in a later image layer does <em>not</em> remove it from the image — the whiteout hides it from the running container's view, but the file is still present in the lower layer and recoverable by anyone who can read the image layers, which is why "we deleted the credentials in a cleanup layer" is not a real remediation (you must avoid adding them to a layer in the first place). At runtime, the whiteouts and copy-ups together are the entire content of a container's writable layer, and understanding that lets you reason precisely about what a container has changed relative to its image — the basis of tools that diff a running container against its image.</p>
+<p>The "can't delete secrets from a lower layer" fact underlies image-hardening guidance in the Intermediate track and the supply-chain/secret-handling concerns touched in <a href="w7.html">W7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel's <code>Documentation/filesystems/overlayfs.rst</code> under <em>Whiteouts and opaque directories</em> is the definitive description (including the 0/0 device and the opaque-directory marker). <code>man 1 stat</code> reads the device numbers (<code>%t</code>/<code>%T</code> for major/minor), and <code>man 1 getfattr</code> reveals xattr-based whiteouts. Re-read <a href="#cp-b5-14">B5.14</a> — copy-up and whiteout are the two halves of "how a read-only stack absorbs writes".</p>
+</article>
+
+<article class="lesson" id="cp-b5-16" data-id="b5-16">
+<div class="lesson-head"><span class="cp-id">B5.16</span><h4>The conclusion: an image is layers, a container is layers plus a thin writable top</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything in this module converges here, into a sentence you can now defend from first principles rather than accept on faith: <strong>a container image is a stack of read-only lowerdirs, and a running container is that stack plus one thin writable upperdir that is discarded when the container exits.</strong> That single fact explains — with no hand-waving — why data written inside a container disappears on restart, why a volume fixes it, why many containers from one image are cheap, and why deleting a file from an image doesn't shrink it. If you can derive those four from the sentence, you understand container storage.</p>
+<h5>The concept</h5>
+<p>Assemble what you've built. An <strong>image</strong> is a series of layers, each just a directory of files — the base OS, then a layer that added a runtime, then one that added your app. The container runtime stacks them as overlayfs lowerdirs (topmost layer leftmost, B5.13), all read-only and <em>shared</em> across every container made from that image. To <em>run</em> a container it adds one fresh, empty <strong>upperdir</strong> (and workdir), mounts the merged view as the container's <code>/</code>, and starts the process. Reads come from the shared lowers; every write — new files, copy-ups (B5.14), whiteouts (B5.15) — lands in that private upper. When the container is removed, its upperdir is deleted. That's the entire storage model. Four consequences follow with no extra machinery:</p>
+<ul>
+<li><strong>Data written in a container vanishes on restart</strong> — because "restart" often means a new container with a new, empty upperdir; the old upper (with all your writes) was thrown away.</li>
+<li><strong>A volume fixes it</strong> — a volume is a <em>separate mount</em> grafted over a path (B5.3), outside the overlay entirely, so its data lives on its own persistent filesystem and is untouched by the upper layer being discarded.</li>
+<li><strong>Many containers from one image are cheap</strong> — they all share the same read-only lowerdirs; only the tiny per-container upper is duplicated.</li>
+<li><strong>Deleting a file from an image doesn't shrink it</strong> — a deletion is a whiteout in an upper layer, and the lower bytes remain (B5.15).</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Demonstrate the "restart loses data" fact directly on your hand-built overlay. Write a file into the merged view, then simulate a container restart by unmounting and wiping the upper — the equivalent of discarding the writable layer and starting fresh.
+<pre class="cmd">echo 'work done inside the container' &gt; /tmp/ov/merged/runtime-data
+sudo umount /tmp/ov/merged
+rm -rf /tmp/ov/upper/* /tmp/ov/work/*          # discard the writable layer
+sudo mount -t overlay overlay \
+  -o lowerdir=ov/low1:ov/low2:ov/low3,upperdir=ov/upper,workdir=ov/work \
+  /tmp/ov/merged 2&gt;/dev/null; cd /tmp
+ls /tmp/ov/merged/runtime-data</pre>
+<pre class="out">ls: cannot access '/tmp/ov/merged/runtime-data': <b>No such file or directory</b>
+                                        ← the write was in the discarded upper: gone</pre></li>
+<li>Now show a "volume" surviving the same restart. Bind-mount a separate directory over a path in the merged view (a volume is a mount outside the overlay), write to it, and it persists across the upper being wiped.
+<pre class="cmd">mkdir -p /tmp/ov/merged/data /tmp/volume
+echo 'this is on a volume' &gt; /tmp/volume/keep
+sudo mount --bind /tmp/volume /tmp/ov/merged/data
+cat /tmp/ov/merged/data/keep</pre>
+<pre class="out"><b>this is on a volume</b>                    ← lives on /tmp/volume, not in the upper layer</pre></li>
+<li>Clean up the overlay and its bind.
+<pre class="cmd">sudo umount /tmp/ov/merged/data; sudo umount /tmp/ov/merged</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the conclusion sentence from memory (image = read-only lowerdirs; running container = that stack + one thin writable upperdir, discarded on exit). Then, using <em>only</em> that sentence, explain to yourself why (a) a file written to a container's own filesystem is gone after the container is recreated, and (b) a file written to a mounted volume survives. (a) The write went to the upperdir, which is deleted with the container and recreated empty; (b) the volume is a separate mount outside the overlay, so discarding the upper layer doesn't touch it.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Restart" is ambiguous, and the difference decides whether data survives. A process <em>restarting inside the same container</em> keeps the same upperdir, so its writes persist; a container being <em>recreated</em> (a new container object, as happens when a pod is rescheduled or its image changes) gets a brand-new empty upperdir, so its writes are gone. This is exactly why "my data survived a crash but vanished after I redeployed" is not a contradiction — the first kept the upper, the second replaced it. When reasoning about container data, always ask "same container, or new one?"</p>
+<p>The writable layer is not durable storage, even while it exists. It's on the node's local disk, it counts against ephemeral-storage limits, it's lost if the container moves to another node, and it offers none of the guarantees (replication, snapshots, backup) real storage does. Treating the container filesystem as a place to keep anything you care about is the single most common storage mistake; the upper layer is scratch space with the lifetime of one container instance, and anything valuable belongs on a volume.</p>
+<div class="k8s-link">
+<p>This <em>is</em> the Kubernetes storage story, stated at the layer beneath the API. A pod's container filesystem is the overlay you built; its writes go to a throwaway upper that dies with the container, which is why every stateful workload needs a <code>volume</code> (an <code>emptyDir</code> for pod-lifetime scratch, a <code>PersistentVolume</code> for real durability) mounted over the paths it writes. It's why a rescheduled pod starts with a clean filesystem, why <code>kubectl exec</code> changes don't survive a pod restart, and why "just write it to a file in the container" is the classic beginner bug that loses data on the first reschedule. Every volume type in W5 exists to put data <em>outside</em> this disposable upper layer.</p>
+<p>You'll choose among <code>emptyDir</code>, <code>hostPath</code>, and <code>PersistentVolume</code> for exactly this reason in <a href="w5.html#cp-5-1">W5.1</a> onward; the ephemeral-vs-persistent distinction there is this lesson's upper-vs-volume distinction in cluster terms.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel's <code>Documentation/filesystems/overlayfs.rst</code> for the full model you've now built end to end, and <code>man 8 mount</code> under <code>-t overlay</code>. For the cluster picture, the exam docs on pod volumes, <code>emptyDir</code>, and PersistentVolumes are where this reasoning is applied. Re-read <a href="#cp-b5-13">B5.13</a>–<a href="#cp-b5-15">B5.15</a> as one arc — this lesson is their sum.</p>
+</article>
+</div><!-- /g-overlay -->
+
 <!-- INSERT-GROUPS-HERE -->
 
 <nav class="pager"><a href="b4.html">← B4 · Users, groups, permissions, capabilities</a><a href="../beginner.html#b6">B6 · Isolation I — namespaces, chroot, pivot_root →</a></nav>
