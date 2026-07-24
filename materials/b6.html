@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B6: isolation from the metal up — a namespace is your own copy of one kernel resource, not a VM; the eight types (mnt, pid, net, ipc, uts, user, cgroup, time) and the question each one changes the answer to; reading namespace identity by inode under /proc/PID/ns; creating each one by hand with unshare (UTS hostname, PID and its PID-1 semantics, mount and --mount-proc, IPC, the user namespace and Ubuntu 24.04's apparmor_restrict_unprivileged_userns, cgroup); chroot and why it is not a security boundary; pivot_root, the real thing runtimes use; nsenter to join someone else's namespaces; a lone network namespace; and a ~25-line container v0.1 built from unshare + pivot_root that genuinely believes it is alone on a machine.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B6 · Isolation I: namespaces, chroot, pivot_root — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B6 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b6">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B6 — Isolation I: namespaces, chroot, pivot_root</h1>
+  <p>Everything you have run so far has shared one view of the machine: the same process list, the same hostname, the same filesystem, the same network. This module is where that stops being a law of nature. A Linux <strong>namespace</strong> lets one process — and its children — get a private answer to one specific question about the machine ("which processes exist?", "what is my hostname?", "which network interfaces are there?") while every other process keeps the old answer. Stack a handful of these together, wrap them around a private root filesystem, and you have built the thing the industry calls a container. Not a metaphor for one — an actual one, about twenty-five lines of shell, with no runtime installed. By the end of this module you will have done exactly that.</p>
+  <p>The word "container" hides how humble the pieces are, so we take them one at a time. First <strong>the idea</strong>: a namespace is your own copy of one kernel resource, and you can see its identity as an inode number under <code>/proc</code>. Then <strong>one namespace at a time</strong> with the <code>unshare</code> command — a new hostname, a new process list where your shell is PID&nbsp;1, a private mount table, an empty IPC world, a remapped user id, a re-rooted cgroup view — feeling exactly what each one hides. Then <strong>roots and entering</strong>: <code>chroot</code> and why it is a convenience rather than a wall, <code>pivot_root</code> which is the real thing runtimes use, and <code>nsenter</code> — which is, quite literally, what <code>kubectl exec</code> does. A lone <strong>network namespace</strong> gets created here and wired up in B9. Then you assemble <strong>container v0.1</strong>.</p>
+  <div class="weights">
+    <span>Checkpoints<b>15</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>B2, B3, B5</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>State the core idea: a namespace is a private copy of <em>one</em> kernel resource, not a VM and not a sandbox.</li>
+<li>Name all eight namespace types and the single question each one changes the answer to.</li>
+<li>Read namespace identity directly — the inode symlinks under <code>/proc/PID/ns</code> — and tell whether two processes share one.</li>
+<li>Give a process its own hostname with a UTS namespace and prove the host's is unchanged.</li>
+<li>Enter a PID namespace where your shell is PID&nbsp;1, explain what that means, and end the namespace by killing it.</li>
+<li>Get a private mount table with a mount namespace, and explain why a new PID namespace needs <code>/proc</code> remounted.</li>
+<li>Show that an IPC namespace hides System&nbsp;V shared memory, and say why that matters between containers.</li>
+<li>Map your uid to root inside a user namespace, read <code>/proc/self/uid_map</code>, and explain Ubuntu 24.04's userns restriction.</li>
+<li>Re-root your cgroup view with a cgroup namespace and see why the tree looks different from inside.</li>
+<li>Use <code>chroot</code> to change what a process calls <code>/</code>, then explain why it is not a security boundary.</li>
+<li>Swap a mount namespace's root with <code>pivot_root</code>, unmount the old root, and state its preconditions.</li>
+<li>Join another process's namespaces with <code>nsenter</code>, and recognise this as what <code>kubectl exec</code> does.</li>
+<li>Create an empty network namespace, see its lone loopback, and know why two of them can both bind port 80.</li>
+<li>Assemble a ~25-line <strong>container v0.1</strong> from <code>unshare</code> + <code>pivot_root</code> + a mounted <code>/proc</code>.</li>
+<li>Diagnose a PID namespace still showing host processes, and a namespace that will not go away after its last process exits.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B2</strong> for processes, PIDs, and signals — a PID namespace is a private process list and killing PID&nbsp;1 in it is a signal story; <strong>B3</strong> because <code>unshare</code>, <code>setns</code>, and <code>clone</code> are system calls and the whole mechanism lives in the kernel you met there; <strong>B5</strong> because a mount namespace is a private copy of the mount table, <code>pivot_root</code> is a mount operation with propagation preconditions, and container v0.1 boots on the rootfs you built in <a href="b5.html#cp-b5-17">B5.17</a>. Every lab runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster — several of these commands hold or detach namespaces and can leave stray mounts if fumbled, so take a snapshot (<a href="b0.html#cp-b0-9">B0.9</a>) first. Everything here ships in <code>util-linux</code> (<code>unshare</code>, <code>nsenter</code>, <code>lsns</code>) and <code>iproute2</code> (<code>ip netns</code>), already on the base image; the user-namespace lesson notes one Ubuntu 24.04 default you will have to understand before it will work unprivileged.</p>
+</div>
+
+<!-- ---------------- The idea ---------------- -->
+<div class="grp" id="g-idea"><h3>The idea</h3>
+
+<article class="lesson" id="cp-b6-1" data-id="b6-1">
+<div class="lesson-head"><span class="cp-id">B6.1</span><h4>What a namespace actually is: your own copy of one kernel resource</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Container" sounds like it must be a small virtual machine, and almost every beginner carries that wrong picture for far too long. Getting the real idea early — before any command — saves you from that mistake and makes everything downstream obvious. A container is not a machine at all. It is an ordinary process on your ordinary kernel, which has simply been handed <em>private answers to a few specific questions</em>. The mechanism that hands out those private answers is the <strong>namespace</strong>, and it is much smaller and less magical than "virtual machine" suggests.</p>
+<h5>The concept</h5>
+<p>A <abbr title="a kernel feature giving a process a private, isolated instance of one global resource">namespace</abbr> is <strong>a private copy of exactly one kernel-managed resource</strong>. Normally the kernel keeps one global version of each such resource — one list of all processes, one hostname, one set of network interfaces, one mount table — and every process sees the same one. A namespace splits one of those globals into an isolated instance: the processes inside it see and change <em>their</em> copy, and processes outside are untouched. Crucially, it is still the same kernel, the same CPU scheduler, the same memory manager, the same clock ticking. Nothing is being emulated or virtualised. Only the <em>bookkeeping tables</em> the kernel consults to answer a specific question have been forked in two.</p>
+<p>Back to the hotel from B2, where one hotel is one Linux machine: the building has one of many registers — a guest list, a directory of room phones, a hostname on the front sign. A namespace is the moment the front desk gives one room <strong>its own copy of one of those registers</strong>. The room writes in its guest list, reads from its guest list, and genuinely cannot tell that the rest of the hotel exists — yet it is the same building, the same plumbing, the same staff. It is not a separate hotel (that would be a virtual machine, with its own engineering crew and boiler). It is one room that has been handed a private ledger.</p>
+<p>Three things follow, and they are the whole reason the rest of this module works:</p>
+<ul>
+<li><strong>Each type is independent.</strong> You can give a process a private process list but leave it sharing the host's network, or a private hostname but the host's filesystem. A container is just a particular <em>bundle</em> of namespaces chosen together; there is nothing atomic about "a container".</li>
+<li><strong>Children inherit, by default.</strong> When a process in a namespace forks, the child is in the same namespaces — which is how one <code>unshare</code> at the top gives a whole tree of processes the same private view.</li>
+<li><strong>It is cheap.</strong> There is no second kernel to boot, no memory to pre-allocate. Creating a namespace is a single system call; this is exactly why containers start in milliseconds and a VM starts in seconds.</li>
+</ul>
+<div class="flow"><span>one kernel</span><em>· one global</em><span>process list · hostname · mounts · network</span><em>→ namespace forks</em><span class="hot">one of them</span><em>·</em><span>everything else stays shared</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch the idea happen once, so the definition has something concrete under it. <code>unshare --uts</code> gives the new shell a private copy of just the hostname register; change it inside and the host is unmoved. (The full UTS lesson is B6.4 — here it is only a first sighting.)
+<pre class="cmd">multipass shell sandbox
+hostname                       # the machine's one global name
+sudo unshare --uts bash        # this shell now has a private copy of that one register
+hostname isolated              # change it — only in here
+hostname                       # in here: isolated</pre>
+<pre class="out">sandbox
+<b>isolated</b></pre></li>
+<li>In a <em>second</em> terminal (another <code>multipass shell sandbox</code>), confirm the global is untouched — the private copy changed, the shared one did not.
+<pre class="cmd">hostname</pre>
+<pre class="out"><b>sandbox</b>                          ← the host never saw the change</pre></li>
+<li>Prove it is the same kernel, not a VM. Inside the <code>unshare</code> shell, the kernel version is identical because there is only one kernel.
+<pre class="cmd">uname -r        # inside the unshare shell
+exit
+uname -r        # back on the host</pre>
+<pre class="out">6.8.0-31-generic
+6.8.0-31-generic               ← one kernel, two hostnames</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Say, in one sentence, the difference between a namespace and a virtual machine. (A VM emulates a whole machine with its own kernel; a namespace is one real kernel giving a process a private copy of a <em>single</em> resource — same kernel, forked bookkeeping.) Then: you changed the hostname inside <code>unshare --uts</code> but the host's stayed <code>sandbox</code>. Which register was copied, and which were still shared? (Only the UTS/hostname register was private; the process list, mounts, and network were all still the host's.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Namespace" is one of the most overloaded words in computing — Kubernetes <em>Namespaces</em>, C++ namespaces, XML namespaces, DNS namespaces. This module means exactly one thing: a <strong>Linux kernel namespace</strong>, the process-isolation primitive. A Kubernetes Namespace (a label that groups API objects) is completely unrelated and does not create a single Linux namespace. Keep the two in separate mental drawers; the collision trips up nearly everyone once.</p>
+<p>Isolation is not security by itself. A namespace changes what a process can <em>see</em>, not automatically what it can <em>do</em> — a process with the right capabilities can often create, enter, or escape namespaces. Real container isolation stacks namespaces together <em>with</em> capabilities (B4), cgroups (B7), and seccomp/AppArmor. Treating a bare namespace as a security wall is a classic and dangerous mistake; we hit its sharpest edge in the <code>chroot</code> lesson (B6.10).</p>
+<div class="k8s-link">
+<p>This is the single most clarifying fact for reading Kubernetes: a pod is not a small VM, it is a set of processes sharing a chosen bundle of Linux namespaces. The containers in one pod share a network namespace (same IP, same localhost, same ports — which is why they reach each other on <code>127.0.0.1</code>) and usually the IPC namespace, but each has its own mount and PID view. The near-empty <em>pause</em> container you will meet exists precisely to <em>hold</em> those shared namespaces open so individual containers can come and go without tearing them down. Everything about "what a pod shares" is a statement about the namespaces on this page.</p>
+<p>You will see the pause container and the pod's shared namespaces in <a href="w1.html#cp-1-21">W1.21</a>, and pod-to-pod networking builds on the shared net namespace in <a href="w4.html#cp-4-2">W4.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 namespaces</code> is the master page — read its opening paragraphs now and the per-type detail as you meet each one. <code>man 1 unshare</code> for the command you just used, <code>man 2 unshare</code> and <code>man 2 clone</code> for the system calls underneath, and <code>man 8 lsns</code> to list namespaces on the system. In the exam docs, nothing indexes under "namespace" for this sense — the Linux primitive is assumed, not documented, on kubernetes.io.</p>
+</article>
+
+<article class="lesson" id="cp-b6-2" data-id="b6-2">
+<div class="lesson-head"><span class="cp-id">B6.2</span><h4>The eight types, and the one question each answers</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There is not one kind of namespace; there are eight, one per resource the kernel was willing to make private. You do not need to memorise them as trivia, but you do need the <em>mental table</em> — because "what does a container isolate?" is answered type by type, and because when something leaks between containers that should not, the fix is always "which namespace was shared that shouldn't have been?". Learning them as "each one changes the answer to exactly one question" turns eight facts into one pattern.</p>
+<h5>The concept</h5>
+<p>Every namespace type isolates one specific kernel-maintained answer. Here is the full set, each framed as the question it privatises:</p>
+<table>
+<thead><tr><th>Type</th><th><code>unshare</code> flag</th><th>The question it changes the answer to</th></tr></thead>
+<tbody>
+<tr><td><strong>mnt</strong></td><td><code>--mount</code></td><td>What is mounted, and where? (a private copy of the mount table from B5)</td></tr>
+<tr><td><strong>pid</strong></td><td><code>--pid</code></td><td>Which processes exist, and what are their PIDs? (your shell can become PID&nbsp;1)</td></tr>
+<tr><td><strong>net</strong></td><td><code>--net</code></td><td>Which interfaces, addresses, routes, and ports are there? (own <code>lo</code>, own port space)</td></tr>
+<tr><td><strong>ipc</strong></td><td><code>--ipc</code></td><td>Which System&nbsp;V shared-memory segments and message queues exist?</td></tr>
+<tr><td><strong>uts</strong></td><td><code>--uts</code></td><td>What is my hostname (and NIS domain)? (UTS = Unix Time-sharing System)</td></tr>
+<tr><td><strong>user</strong></td><td><code>--user</code></td><td>Which uid/gid am I, and what may that identity do? (uid mapping, rootless)</td></tr>
+<tr><td><strong>cgroup</strong></td><td><code>--cgroup</code></td><td>What does my cgroup tree look like — where do I sit in it? (B7's subject)</td></tr>
+<tr><td><strong>time</strong></td><td><code>--time</code></td><td>What do the monotonic and boot-time clocks say? (rarely used by hand)</td></tr>
+</tbody>
+</table>
+<p>Read that column top to bottom and it is a decent one-line summary of "what is a machine, from a process's point of view": its files, its neighbours, its network, its shared memory, its name, its identity, its resource accounting, its clock. A container is a process for which several of these answers have been quietly replaced. Two notes worth carrying forward: the <strong>user</strong> namespace is special because it is the one that changes not what you <em>see</em> but who you <em>are</em>, which is why rootless containers are built on it and why it has extra guardrails (B6.8); and the <strong>time</strong> namespace is the newest and least used — you will almost never create one by hand, but it exists so a checkpoint/restore can restore a process's sense of uptime.</p>
+<p>One more distinction that saves confusion later: creating a namespace with <code>unshare</code> puts the <em>calling</em> process (and its future children) into a fresh one; the flags simply select which of the eight to fork. You can combine them freely — <code>unshare --uts --pid --mount</code> forks three at once — and that combining is exactly what a container runtime does in a single <code>clone()</code> call.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the list against the kernel's own documentation, so the table is not just this page's claim. <code>man 7 namespaces</code> enumerates the same types under "Namespace types".
+<pre class="cmd">man 7 namespaces | sed -n '/Namespace types/,/Namespace/p' | head -20</pre>
+<pre class="out">   Namespace   Flag             Isolates
+   Cgroup      CLONE_NEWCGROUP  Cgroup root directory
+   IPC         CLONE_NEWIPC     System V IPC, POSIX message queues
+   Network     CLONE_NEWNET     Network devices, stacks, ports, etc.
+   Mount       CLONE_NEWNS      Mount points
+   PID         CLONE_NEWPID     Process IDs
+   Time        CLONE_NEWTIME    Boot and monotonic clocks
+   User        CLONE_NEWUSER    User and group IDs
+   UTS         CLONE_NEWUTS     Hostname and NIS domain name</pre></li>
+<li>See which types already have namespaces alive on your VM. <code>lsns</code> lists every namespace currently in use, one line per instance, with the type and the processes in it — even a quiet VM has many.
+<pre class="cmd">sudo lsns --output NS,TYPE,NPROCS,PID,COMMAND | head -12</pre>
+<pre class="out">        NS TYPE   NPROCS   PID COMMAND
+4026531834 <b>time</b>       98     1 /sbin/init
+4026531835 <b>cgroup</b>     98     1 /sbin/init
+4026531836 <b>pid</b>        98     1 /sbin/init
+4026531837 <b>user</b>       98     1 /sbin/init
+4026531838 <b>uts</b>        98     1 /sbin/init
+4026531839 <b>ipc</b>        98     1 /sbin/init
+4026531840 <b>mnt</b>        95     1 /sbin/init
+4026531992 <b>net</b>        98     1 /sbin/init</pre></li>
+<li>Fork two at once and watch <code>lsns</code> gain new rows. Inside the new shell, <code>lsns</code> against your own PID shows fresh UTS and PID namespace ids distinct from the host's.
+<pre class="cmd">sudo unshare --uts --pid --fork bash
+readlink /proc/self/ns/uts /proc/self/ns/pid
+exit</pre>
+<pre class="out">uts:[4026532210]               ← a new UTS namespace (not ...838)
+pid:[4026532211]               ← a new PID namespace (not ...836)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking, name the question answered by <strong>net</strong>, by <strong>mnt</strong>, and by <strong>user</strong>. (net: which interfaces/addresses/routes/ports exist; mnt: what is mounted where; user: which uid/gid I am and what it may do.) Then: in the first lab, every default namespace was owned by PID&nbsp;1 (<code>/sbin/init</code>) — why does that make sense? (Everything on the machine descends from PID&nbsp;1 and inherits its namespaces, so absent any <code>unshare</code>, all 98 processes share init's eight.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The flag names and the <code>CLONE_*</code> constants do not always match the type name, and the mount one is the trap: the mount namespace's constant is <code>CLONE_NEWNS</code> (not <code>CLONE_NEWMNT</code>), because it was the <em>first</em> namespace Linux ever had — back in 2002 there was only one kind, so it was just "NEW NamespaceS". Every other type got a descriptive suffix later. When you read kernel or runtime source and see <code>CLONE_NEWNS</code>, that is the mount namespace.</p>
+<p>Not every type is equally load-bearing for containers. In practice mnt, pid, net, ipc, uts, and user do the heavy lifting; cgroup mostly tidies what a process sees of B7's hierarchy; and time is a specialist tool for checkpoint/restore. Do not over-index on time and cgroup when reasoning about "what isolates a container" — but know they exist so the count of eight is not a mystery.</p>
+<div class="k8s-link">
+<p>Kubernetes lets you selectively <em>un</em>-isolate some of these, and now you can read those knobs precisely. A pod's <code>hostNetwork: true</code> means "do not give me a net namespace, share the node's" — same interfaces, same ports, which is why a <code>hostNetwork</code> pod can clash with the node on a port. <code>hostPID: true</code> shares the pid namespace so the pod sees every process on the node; <code>hostIPC: true</code> shares System&nbsp;V IPC. Each of those fields toggles exactly one row of the table above. When a security review says "this pod runs with hostPID", the risk is the pid row: it can see and signal node processes.</p>
+<p>These <code>host*</code> pod fields appear in <a href="w1.html#cp-1-21">W1.21</a> (pod internals) and as a security concern in <a href="w7.html">W7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 namespaces</code> "Namespace types" for the authoritative list and per-type cross-references (<code>man 7 pid_namespaces</code>, <code>man 7 user_namespaces</code>, <code>man 7 mount_namespaces</code>, <code>man 7 network_namespaces</code>). <code>man 8 lsns</code> for enumerating live namespaces. In the exam docs, the Pod spec's <code>hostNetwork</code>, <code>hostPID</code>, and <code>hostIPC</code> fields are the Kubernetes surface of this table.</p>
+</article>
+
+<article class="lesson" id="cp-b6-3" data-id="b6-3">
+<div class="lesson-head"><span class="cp-id">B6.3</span><h4>Namespace identity: reading membership by inode under <code>/proc</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Namespaces feel abstract until you find the handle the kernel gives you for each one — and it does give you a handle, in a place you already know how to read. Every namespace shows up as a file under <code>/proc/PID/ns/</code>, and each file's <strong>inode number</strong> is that namespace's identity. This turns "are these two processes in the same namespace?" from a vague question into an exact one you answer by comparing two numbers. It is also the mechanism that makes <code>nsenter</code> (B6.12) possible, so it is worth seeing directly.</p>
+<h5>The concept</h5>
+<p>For every process, the kernel exposes a directory <code>/proc/PID/ns/</code> containing one magic symlink per namespace type: <code>uts</code>, <code>pid</code>, <code>net</code>, <code>mnt</code>, and so on. These are not ordinary symlinks to a path — they point at a special <code>nsfs</code> node, and the text you read from each is <code>type:[inode]</code>. That <strong>inode number is the namespace's unique id</strong>. The rule is exact and worth stating flatly:</p>
+<p style="text-align:center"><strong>Two processes are in the same namespace of some type ⇔ that type's inode number matches.</strong></p>
+<p>So membership is not a name or a label — it is identity by inode, the same "an inode <em>is</em> the file, the name is just a pointer" idea you learned for the filesystem in <a href="b5.html#cp-b5-6">B5.6</a>, reused for namespaces. Holding one of these <code>/proc/PID/ns/*</code> files open also keeps the namespace <em>alive</em> even after every process in it has exited — a fact that is useful (it is how you pin a network namespace) and dangerous (it is how you leak one that will not go away, the second half of this module's debugging drill, B6.15).</p>
+<div class="flow"><span>/proc/PID/ns/net</span><em>→ readlink →</em><span class="hot">net:[4026531992]</span><em>· same inode ⇒</em><span>same namespace</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at your shell's eight namespace links. Each names its type and an inode; these are the host's defaults, shared with PID&nbsp;1.
+<pre class="cmd">ls -l /proc/$$/ns</pre>
+<pre class="out">lrwxrwxrwx 1 ubuntu ubuntu 0 Jul 24 10:00 cgroup -&gt; 'cgroup:[4026531835]'
+lrwxrwxrwx 1 ubuntu ubuntu 0 Jul 24 10:00 ipc -&gt; 'ipc:[4026531839]'
+lrwxrwxrwx 1 ubuntu ubuntu 0 Jul 24 10:00 mnt -&gt; 'mnt:[4026531840]'
+lrwxrwxrwx 1 ubuntu ubuntu 0 Jul 24 10:00 net -&gt; 'net:[4026531992]'
+lrwxrwxrwx 1 ubuntu ubuntu 0 Jul 24 10:00 pid -&gt; 'pid:[4026531836]'
+...</pre></li>
+<li>Prove membership by matching inodes: compare your shell with PID&nbsp;1. Every number is identical, because your shell inherited init's namespaces — you are all in the same eight.
+<pre class="cmd">readlink /proc/$$/ns/pid /proc/1/ns/pid</pre>
+<pre class="out">pid:[4026531836]
+pid:[4026531836]               ← identical ⇒ same PID namespace as init</pre></li>
+<li>Now make one differ. Fork a new UTS namespace and compare only that link — the <code>uts</code> inode changes while <code>net</code> (which you did not unshare) still matches the host.
+<pre class="cmd">sudo unshare --uts bash
+readlink /proc/self/ns/uts        # inside: a new number
+readlink /proc/self/ns/net        # inside: still the host's
+exit</pre>
+<pre class="out">uts:[4026532210]                  ← different from the host's ...838
+net:[4026531992]                  ← unchanged: net was never unshared</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Given two shells, how do you decide — with certainty, not guessing — whether they share a network namespace? (Compare <code>readlink /proc/PID/ns/net</code> for each; identical inode ⇒ same namespace.) Then explain why, in the last step, the <code>net</code> inode still matched the host after <code>unshare --uts</code>. (You only forked the UTS namespace; every other type, including net, remained the inherited host one.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>These inode numbers are <em>not</em> stable or meaningful across reboots, and they are not sequential ids you should parse for meaning — they are allocations from the <code>nsfs</code> filesystem, reused over time. Compare them for <em>equality</em> only; never assume "4026531840 is always the root mount namespace" or that a smaller number is older. The identity is real within one running kernel; the specific value is not a constant.</p>
+<p>Reading <code>/proc/PID/ns/*</code> for a process you do not own can be restricted, and the more subtle trap is lifetime: <code>ls -l</code> is harmless, but a <em>bind mount</em> of one of these links (<code>mount --bind /proc/PID/ns/net /somewhere</code>) pins the namespace open forever, even after the process dies. That is the intended way to keep a network namespace around (it is exactly what <code>ip netns</code> does under the hood), but do it by accident and you have a namespace with no processes that <code>lsns</code> still lists and nothing will reap — the leak in B6.15.</p>
+<div class="k8s-link">
+<p>This inode-identity mechanism is how every node-level debugging tool finds "the pod's namespace". When you run <code>crictl inspect</code> on a container, the network namespace path it prints is one of these <code>nsfs</code> handles; when a CNI plugin is asked to wire up a pod, it is handed the pod's network-namespace path and it operates inside that inode. <code>kubectl exec</code> ultimately resolves to entering the container's namespaces by these handles (B6.12). Being able to <code>readlink /proc/PID/ns/net</code> and compare is the raw version of everything those tools automate.</p>
+<p>This underpins the container introspection you will do in <a href="w1.html#cp-1-21">W1.21</a> and the CNI wiring in <a href="w4.html#cp-4-2">W4.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 namespaces</code> under "The /proc/[pid]/ns/ directory" for the symlink semantics and lifetime rules, <code>man 5 proc</code> for <code>/proc/[pid]/ns</code> generally, and <code>man 2 setns</code> for how a program opens one of these files to <em>join</em> the namespace (the syscall behind <code>nsenter</code>). <code>man 8 lsns</code> lists namespaces by their inode ids. No exam-docs equivalent — this is pure Linux mechanism.</p>
+</article>
+</div><!-- /g-idea -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B6 recall quiz</h3>
+<p>Answer out loud before revealing. If you can explain what a pod's shared namespaces are and what the pause container holds, this module has done its job.</p>
+<ol>
+<li>In one sentence, how does a namespace differ from a virtual machine?
+<details class="reveal"><summary>Answer</summary><p>A VM emulates a whole machine with its own kernel; a namespace is one real kernel giving a process a private copy of a single resource (process list, hostname, mounts, network…). Same kernel, same scheduler — only the bookkeeping table for one specific question is forked. That is why containers start in milliseconds and a VM in seconds.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>State the core idea of a namespace and why a container is not a VM.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b5.html">← B5 · Files for real: VFS, storage, overlayfs</a><a href="../beginner.html#b7">B7 · Isolation II — cgroups v2 →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-24. Package versions referenced: util-linux 2.39 (<code>unshare</code>, <code>nsenter</code>, <code>lsns</code>), iproute2 6.1 (<code>ip netns</code>). Namespace behaviour is the Linux 6.8 kernel shipped with 24.04; unprivileged user namespaces are gated by <code>kernel.apparmor_restrict_unprivileged_userns=1</code> on this release.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
