@@ -525,12 +525,12 @@ cat /proc/sys/kernel/cap_last_cap</pre>
 <pre class="out"><b>40</b>          ← capabilities are numbered 0–40, so 41 of them</pre></li>
 <li>Look at what your ordinary shell holds. <code>capsh --print</code> shows the current sets; as a non-root user, the <em>Current</em> (effective) set is empty — you hold no permits at all.
 <pre class="cmd">capsh --print | head -3</pre>
-<pre class="out">Current: =
+<pre class="out">Current: <b>=</b>          ← the empty effective set: you hold no permits
 Bounding set =cap_chown,cap_dac_override,...,cap_checkpoint_restore
-<b>Current IAB: </b></pre></li>
-<li>Now look at root's full keyring for contrast — every permit at once. This is what "root" really is: the whole set held effective.
+Ambient set =</pre></li>
+<li>Now look at root's full keyring for contrast — every permit at once. The compact <code>=ep</code> with no list means "all capabilities, effective and permitted". This is what "root" really is.
 <pre class="cmd">sudo capsh --print | head -1</pre>
-<pre class="out">Current: <b>=ep</b> cap_chown,cap_dac_override,cap_fowner,...,cap_sys_admin,...  (all 41)</pre></li>
+<pre class="out">Current: <b>=ep</b>          ← every capability, held and switched on</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
 <p>Name, from memory, the one capability a web server needs to bind port 80, and the one that lets a process ignore file permission bits. (<code>CAP_NET_BIND_SERVICE</code> and <code>CAP_DAC_OVERRIDE</code>.) Then explain in one sentence why granting <code>CAP_SYS_ADMIN</code> is nearly as dangerous as granting full root. (It gates such a large and varied set of privileged operations — mounting, namespace tricks, and more — that holding it is close to holding everything, so it defeats the point of splitting root up in the first place.)</p>
@@ -654,19 +654,19 @@ cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,...</pre></li>
 <div class="flow"><span>uid 0 in container</span><em>+ trimmed bounding</em><span>can't gain dangerous caps</span><em>+ no_new_privs</em><span>can't climb via setuid</span><em>=</em><span class="hot">root in name, harmless on the host</span></div>
 <h5>Lab</h5>
 <ol class="lab">
-<li>Confirm your normal shell does <em>not</em> have <code>no_new_privs</code> set — the escape hatch is open here.
+<li>Confirm your normal shell does <em>not</em> have <code>no_new_privs</code> set — the setuid escape hatch is open here.
 <pre class="cmd">grep NoNewPrivs /proc/self/status</pre>
 <pre class="out">NoNewPrivs:	<b>0</b></pre></li>
-<li>Simulate a container's defanged root: become root, but with <code>CAP_SYS_ADMIN</code> dropped from the bounding set. <code>capsh</code> shows the ceiling now missing it.
-<pre class="cmd">sudo capsh --drop=cap_sys_admin --print | grep -i 'bounding' | head -1</pre>
-<pre class="out">Bounding set =cap_chown,cap_dac_override,...  <b>(no cap_sys_admin)</b></pre></li>
-<li>Prove the defang bites. As uid 0 — actual root — try to mount a filesystem with <code>CAP_SYS_ADMIN</code> gone. It fails: this is exactly "root in a container that still can't mount".
-<pre class="cmd">sudo capsh --drop=cap_sys_admin -- -c 'mount -t tmpfs none /mnt || echo "DENIED even as root"'</pre>
-<pre class="out">mount: /mnt: permission denied.
-<b>DENIED even as root</b></pre></li>
-<li>For contrast, the same mount with the full set works — proving it was the missing capability, not anything about uid, that blocked it.
-<pre class="cmd">sudo mount -t tmpfs none /mnt &amp;&amp; echo "mounted with full caps" &amp;&amp; sudo umount /mnt</pre>
-<pre class="out"><b>mounted with full caps</b></pre></li>
+<li>Set the switch on a child process and watch it take. <code>setpriv --no-new-privs</code> flips the one-way flag before running its command — exactly what a container runtime does to your container's PID 1.
+<pre class="cmd">setpriv --no-new-privs -- grep NoNewPrivs /proc/self/status</pre>
+<pre class="out">NoNewPrivs:	<b>1</b>          ← set, and it can never be unset for this process or its children</pre></li>
+<li>Watch it slam the setuid door. <code>sudo</code> is setuid-root, but under <code>no_new_privs</code> the kernel refuses to honour the setuid bit — so even the classic escalation tool cannot climb. This is the escape hatch nailed shut.
+<pre class="cmd">setpriv --no-new-privs -- sudo -n true</pre>
+<pre class="out">sudo: The "no new privileges" flag is set, which prevents sudo from running as root.
+sudo: If sudo is running in a container, you may need to adjust the container configuration to disable the flag.</pre></li>
+<li>Now the bounding-set half of the fence: lower the ceiling so a capability can never be gained again. <code>capsh --drop</code> removes <code>CAP_SYS_ADMIN</code> from the bounding set — from here, no exec of any setuid or file-capability program could ever raise it into effect.
+<pre class="cmd">capsh --drop=cap_sys_admin --print | grep -i 'bounding'</pre>
+<pre class="out">Bounding set =cap_chown,cap_dac_override,cap_fowner,...  <b>(cap_sys_admin absent)</b></pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
 <p>Explain "root in the container, harmless on the host" in your own words, naming both mechanisms. (The runtime removes the dangerous capabilities from the process's bounding ceiling so uid 0 can never gain them, and <code>no_new_privs</code> stops it climbing back via any setuid binary — so it is uid 0 with none of root's host-level powers.) Then say what the user namespace of B6 adds on top. (It maps the container's uid 0 to an unprivileged uid on the host, so even the identity itself is powerless outside the container, not merely capability-limited.)</p>
@@ -682,7 +682,197 @@ cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,...</pre></li>
 </article>
 </div><!-- /g-capabilities -->
 
-<!-- MORE-GROUPS -->
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b4-14" data-id="b4-14">
+<div class="lesson-head"><span class="cp-id">B4.14</span><h4>Port 80 without root, three ways — and their blast radius</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every idea in this module meets in one concrete engineering problem: <em>serve HTTP on port 80 without running the app as root</em>. Binding a port below 1024 is privileged, so the naive answer is "run it as root" — and that answer is exactly what good security spends its effort avoiding. There are three real ways to solve it, and they are not equivalent: they leave wildly different amounts of power in the hands of an attacker who compromises the server. Building all three and ranking their blast radius is the whole of practical privilege thinking, and it is precisely the decision behind every hardened pod spec.</p>
+<h5>The concept</h5>
+<p>One privileged act — <code>bind()</code> on port 80 — three ways to grant just enough to do it:</p>
+<table>
+<tr><th>Way</th><th>How the bind is allowed</th><th>The server process runs as…</th><th>Blast radius if compromised</th></tr>
+<tr><td><strong>1. setuid root</strong></td><td>the binary is owned by root and setuid, so it runs as root</td><td>uid 0 — <em>full root</em></td><td>everything: the attacker owns the host</td></tr>
+<tr><td><strong>2. file capability</strong></td><td><code>cap_net_bind_service</code> on the binary</td><td>your unprivileged uid + one permit</td><td>the ability to bind low ports — nothing else</td></tr>
+<tr><td><strong>3. high port + DNAT</strong></td><td>server binds 8080 (unprivileged); the kernel redirects 80→8080</td><td>your unprivileged uid, <em>no</em> capabilities</td><td>nothing privileged — the redirect lives in the kernel, out of the process's reach</td></tr>
+</table>
+<p>The ranking is the lesson. Way 1 solves the problem and hands an attacker the entire machine — the worst trade in security, "elevate everything to do one small thing". Way 2 grants the single permit the job needs, so a compromise yields only the power to bind low ports. Way 3 grants the server <em>no</em> privilege at all: it binds an ordinary high port like any other program, and a completely separate, kernel-level rule (a DNAT/REDIRECT, from the packet-mangling you'll meet in <a href="b9.html">B9</a>) sends port-80 traffic to it. An attacker who owns the process has escaped nothing, because the process never held anything. Smallest blast radius wins, and it is almost always way 2 or way 3.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build one tiny HTTP server you'll use for all three ways. It takes the port as an argument and reports the uid it's running as.
+<pre class="cmd">multipass shell sandbox
+cat &gt; /tmp/httpd.c &lt;&lt;'C'
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;sys/socket.h&gt;
+int main(int argc, char **argv){
+    int port = argc &gt; 1 ? atoi(argv[1]) : 80;
+    int s = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &amp;one, sizeof one);
+    struct sockaddr_in a = { .sin_family=AF_INET, .sin_port=htons(port) };
+    if (bind(s, (struct sockaddr*)&amp;a, sizeof a) &lt; 0){ perror("bind"); return 1; }
+    listen(s, 8);
+    printf("serving on :%d as uid %d\n", port, getuid());
+    for(;;){ int c = accept(s,0,0);
+        char *r = "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n";
+        write(c, r, strlen(r)); close(c); }
+}
+C
+gcc -o /tmp/httpd /tmp/httpd.c</pre></li>
+<li><strong>Way 1 — setuid root.</strong> Give the binary to root and set the setuid bit; now anyone runs it as root. Serve, and note the uid.
+<pre class="cmd">sudo chown root:root /tmp/httpd
+sudo chmod u+s /tmp/httpd            # -rwsr-xr-x
+/tmp/httpd 80 &amp;
+curl -s localhost:80; ps -o user,comm -p $!; kill %1</pre>
+<pre class="out">serving on :80 as uid <b>0</b>            ← running as full root
+hello
+<b>root</b>     httpd                       ← an attacker here owns the box</pre></li>
+<li><strong>Way 2 — file capability.</strong> Strip setuid and root ownership, grant only the one capability, and serve — now as your own uid.
+<pre class="cmd">sudo chmod u-s /tmp/httpd; sudo chown $USER:$USER /tmp/httpd
+sudo setcap cap_net_bind_service=+ep /tmp/httpd
+/tmp/httpd 80 &amp;
+curl -s localhost:80; ps -o user,comm -p $!; kill %1</pre>
+<pre class="out">serving on :80 as uid <b>1000</b>         ← unprivileged, holding one permit
+hello
+<b>ubuntu</b>   httpd                       ← a compromise gets only "bind low ports"</pre></li>
+<li><strong>Way 3 — high port + DNAT.</strong> Remove the capability, bind an ordinary high port with zero privilege, and let the kernel redirect 80→8080. (The <code>OUTPUT</code> rule makes the local <code>curl</code> test work; <code>PREROUTING</code> is what handles traffic arriving from other hosts.)
+<pre class="cmd">sudo setcap -r /tmp/httpd            # no capabilities at all now
+/tmp/httpd 8080 &amp;
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8080
+sudo iptables -t nat -A OUTPUT -o lo -p tcp --dport 80 -j REDIRECT --to-ports 8080
+curl -s localhost:80; ps -o user,comm -p $!; kill %1</pre>
+<pre class="out">serving on :8080 as uid <b>1000</b>       ← no capability, no setuid, nothing
+hello                                 ← yet port 80 works, via the kernel redirect</pre></li>
+<li>Write down, in your own notes, the blast-radius sentence for each way — what an attacker who fully compromises the server process can do next. Then clean up.
+<pre class="cmd">sudo iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8080
+sudo iptables -t nat -D OUTPUT -o lo -p tcp --dport 80 -j REDIRECT --to-ports 8080
+rm -f /tmp/httpd /tmp/httpd.c</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>The project is done when you can rank the three ways by blast radius from memory and justify the order in one sentence each. (Way 1 gives an attacker full host root; way 2 gives only the power to bind low ports; way 3 gives no privilege at all, because the process never held any — the redirect is kernel-side. Smaller is better, so 3 ≤ 2 ≪ 1.) Then answer: which way most resembles what a well-configured Kubernetes pod does, and why? (Way 2 or way 3 — the pod runs as a non-root uid with either a single added capability or an unprivileged port remapped by a Service, never as setuid root.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The DNAT in way 3 has a subtlety worth internalising: a <code>REDIRECT</code> in <code>nat/PREROUTING</code> only fires for packets <em>arriving</em> on an interface, and traffic you originate to <code>localhost</code> never traverses <code>PREROUTING</code> — it goes through <code>OUTPUT</code>. That is why the lab adds the <code>OUTPUT</code> rule to make a same-host <code>curl</code> work, while <code>PREROUTING</code> is the rule that actually matters for real clients on the network. Miss this and you'll wrongly conclude the redirect is broken.</p>
+<p>Way 1 also silently disables itself the moment you copy the binary — <code>cp</code> drops both the setuid bit and root ownership (the B4.15 drill), so a "working" setuid deployment breaks on the next build that copies files around. This fragility is a feature: it is one more reason setuid is the worst of the three, not just the most powerful.</p>
+<div class="k8s-link">
+<p>This project is the blast-radius reasoning behind every field in a pod's <code>securityContext</code>. Running a container as root to bind port 80 is way 1 — the trade the platform pushes you hard to avoid. Adding <code>capabilities.add: ["NET_BIND_SERVICE"]</code> to a non-root container is way 2. Binding a high container port and exposing it as port 80 through a <code>Service</code> is way 3 — the process holds nothing, and the port mapping lives in the cluster's networking, exactly like the kernel DNAT. When you choose how a workload gets its privileged port, you are choosing a blast radius, and this lab is why you'll reach for 2 or 3.</p>
+<p>You'll implement way 2 (added capability) and way 3 (Service remapping) in <a href="w3.html">W3</a> and <a href="w4.html">W4</a>; the ranking you just built is the reason those are the recommended patterns and <code>privileged: true</code> is not.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 setcap</code> and <code>man 7 capabilities</code> for way 2, <code>man 8 iptables</code> (or <code>man 8 nft</code>) under the <code>REDIRECT</code>/<code>nat</code> table for way 3, and <code>man 2 execve</code> under <em>set-user-ID</em> for way 1. In the exam docs, <code>securityContext.capabilities</code> and Service port mapping are the two you'll actually reach for.</p>
+</article>
+
+<article class="lesson drill" id="cp-b4-15" data-id="b4-15">
+<div class="lesson-head"><span class="cp-id">B4.15</span><h4>Debugging drill: the traverse ladder and the copied setuid binary</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two failures drilled until they are reflexes, because both look like something they aren't. First: a file that is provably readable but that you cannot open — because a traverse bit is missing on a directory somewhere <em>above</em> it, not on the file. Second: a setuid program that worked yesterday and fails today because someone copied it, silently dropping the very bits that made it work. Both waste hours when guessed at and take thirty seconds when you know the tool and the mechanism.</p>
+<h5>The concept</h5>
+<p>You have every piece already. The <strong>traverse ladder</strong>: opening <code>/a/b/c/file</code> needs <code>x</code> on every directory in the path (B4.6), so a readable file can be unreachable because of a directory three levels up — and <code>namei -l</code> prints the mode of every component at once, making the culprit obvious. The <strong>copied setuid binary</strong>: setuid depends on both the <code>s</code> bit <em>and</em> root ownership (B4.9), and <code>cp</code> preserves neither by default — the copy is owned by whoever ran <code>cp</code> and has an ordinary <code>x</code> where the <code>s</code> was, so it runs with no elevation and fails on its first privileged act. The discipline both share: <strong>work from evidence to cause</strong> — read the actual permissions and ownership, don't guess at the fix.</p>
+<h5>Lab</h5>
+<p>Snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>). Work each symptom, state a one-sentence cause backed by a command that proves it, <em>then</em> read the reveal.</p>
+<h5 class="verify">Symptom 1 — a readable file you cannot open</h5>
+<ol class="lab">
+<li>Set up a file that is unambiguously readable, buried under a directory that isn't traversable by you.
+<pre class="cmd">sudo mkdir -p /srv/data/reports
+echo 'Q3 numbers' | sudo tee /srv/data/reports/q3.txt &gt;/dev/null
+sudo chmod 644 /srv/data/reports/q3.txt      # the file itself: world-readable
+sudo chmod 750 /srv/data                     # but this dir: no x for "other" (you)</pre></li>
+<li>Hit the wall, then diagnose it properly instead of guessing. The file is mode 644 — yet you're denied. <code>namei -l</code> walks the whole path and shows exactly which component blocks you.
+<pre class="cmd">cat /srv/data/reports/q3.txt
+namei -l /srv/data/reports/q3.txt</pre>
+<pre class="out">cat: /srv/data/reports/q3.txt: <b>Permission denied</b>
+f: /srv/data/reports/q3.txt
+ drwxr-xr-x root root /
+ drwxr-xr-x root root srv
+ <b>drwxr-x--- root root data</b>      ← no x for "other": the traverse stops here
+ drwxr-xr-x root root reports
+ -rw-r--r-- root root q3.txt        ← the file was readable all along</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A missing traverse bit, not a file problem.</strong> <code>/srv/data</code> is <code>drwxr-x---</code> — owner and group may traverse, "other" (you) may not, so the path is severed two levels above the file. The file's own <code>644</code> was never the issue. Fix by restoring traverse for the path: <code>sudo chmod o+x /srv/data</code> (or, better on a real system, add yourself to the owning group so you don't widen access to everyone). The reflex: when a "readable" file gives <code>EACCES</code>, run <code>namei -l</code> before touching the file's own mode.</p></details>
+
+<h5 class="verify">Symptom 2 — the setuid binary that broke after a copy</h5>
+<ol class="lab">
+<li>Make a working setuid-root helper (reuse the project's <code>httpd</code>, or any small binary), confirm it elevates, then copy it the way a careless deploy script would.
+<pre class="cmd">gcc -o /tmp/svc /tmp/httpd.c 2&gt;/dev/null || printf 'int main(){return 0;}' | gcc -x c -o /tmp/svc -
+sudo chown root:root /tmp/svc; sudo chmod u+s /tmp/svc
+cp /tmp/svc /tmp/svc.deployed
+ls -l /tmp/svc /tmp/svc.deployed</pre>
+<pre class="out">-rwsr-xr-x 1 <b>root</b> root ... /tmp/svc            ← original: setuid, root-owned
+-rwxr-xr-x 1 <b>ubuntu</b> ubuntu ... /tmp/svc.deployed  ← copy: no s, owned by you</pre></li>
+<li>Read the evidence, don't guess. The copy lost two things at once — the <code>s</code> became a plain <code>x</code>, and ownership went from <code>root</code> to you — so it can no longer run as root and fails on its first privileged act.
+<pre class="cmd">/tmp/svc.deployed 80        # if it needs root, it now fails; runs as your uid</pre>
+<pre class="out">bind: <b>Permission denied</b>        ← no elevation: it's just your uid now</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong><code>cp</code> preserved neither the setuid bit nor the root ownership.</strong> A plain <code>cp</code> creates a new file owned by the copier with a default mode, dropping the <code>4000</code> setuid bit and the <code>root</code> owner that setuid depends on. Even <code>cp -p</code> (or <code>--preserve=mode,ownership</code>) cannot restore root ownership when run by a non-root user — only root can give a file to root (B4.7). The real fix is to re-apply after the copy, as root: <code>sudo chown root:root /tmp/svc.deployed &amp;&amp; sudo chmod u+s /tmp/svc.deployed</code>. The deeper lesson: setuid is fragile precisely because it rides on bits and ownership that ordinary file operations quietly discard — which is one more argument for the file capabilities of B4.11, that fail the same way for the same reason and are equally worth checking after a copy.</p></details>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both traps share a shape: the symptom points at the wrong object. Symptom 1 screams "the file!" when the fault is a directory above it; symptom 2 screams "the program is broken!" when the fault is lost metadata from a copy. Reading the real state — <code>namei -l</code> for the path, <code>ls -l</code> for owner-and-bits — is what redirects you from the loud-but-innocent object to the quiet-but-guilty one. Work from evidence to cause, the same discipline as the B2 and B3 drills.</p>
+<p>File capabilities fail identically to setuid after a copy and are easier to overlook because there's no visible <code>s</code> in <code>ls -l</code> — only <code>getcap</code> shows them. If a capability-based binary stops working after a build or deploy, <code>getcap</code> it before anything else; the capability almost certainly didn't survive the copy.</p>
+<div class="k8s-link">
+<p>The traverse ladder is a routine pod failure: a volume mounted with a restrictive mode on a parent directory, or a <code>subPath</code> whose intermediate directory lacks <code>x</code> for the container's uid, produces exactly this "the file is 0644, why can't the container read it" symptom — and the fix is the same reasoning about the whole path, not the file. The copied-setuid failure maps onto image builds: a <code>COPY</code> in a Dockerfile can drop setuid bits and file capabilities just as <code>cp</code> does, so a binary that relied on them is inert in the built image until the layer re-applies them. Both are "metadata didn't survive the copy", one layer up.</p>
+<p>These are the permission-shaped incidents you'll meet in <a href="w6.html">W6</a> troubleshooting; the <code>namei</code>/<code>getcap</code> reflexes transfer directly to debugging them in a pod.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 namei</code> for walking a path's permissions (<code>-l</code>, <code>-m</code>), <code>man 1 cp</code> under <code>--preserve</code> for what a copy does and doesn't keep, and <code>man 8 getcap</code> for checking capabilities after a copy. Re-read <a href="#cp-b4-6">B4.6</a> (traverse) and <a href="#cp-b4-9">B4.9</a> (setuid) — this drill exists to make those two permanent.</p>
+</article>
+</div><!-- /g-project -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B4 recall quiz</h3>
+<p>Answer out loud before revealing. If you can predict the outcome of a permission check in your head, every <code>securityContext</code> becomes readable.</p>
+<ol>
+<li>The kernel is about to check whether a process may read a file. What does it actually compare, and what role do the names <code>ubuntu</code>/<code>root</code> play?
+<details class="reveal"><summary>Answer</summary><p>It compares numbers — the process's uid and gids against the file's owner uid and group gid. Names are a human convenience looked up from <code>/etc/passwd</code>/<code>/etc/group</code>; the kernel never consults them. This is why a uid with no name still works and why mounted files show as "1000" rather than a username on a host that lacks that entry.</p></details></li>
+<li>Why did the password hash move from <code>/etc/passwd</code> to <code>/etc/shadow</code> when <code>/etc/passwd</code>'s permissions never changed?
+<details class="reveal"><summary>Answer</summary><p><code>/etc/passwd</code> must stay world-readable for name lookups, so leaving hashes there let any user copy and attack them offline. <code>/etc/shadow</code> is readable only by root, so the hashes are no longer exposed. The <code>x</code> in the password field is the leftover placeholder meaning "the secret is in shadow".</p></details></li>
+<li>A file is <code>----r--r--</code>, owned by you. Can you read it? Can a stranger?
+<details class="reveal"><summary>Answer</summary><p>You cannot; a stranger can. The check is first-match: you are the owner, so the owner triad (<code>---</code>) decides and stops — the more generous "other" triad is never consulted for you. A stranger matches "other" (<code>r--</code>) and reads it. Matching as owner is not always an advantage.</p></details></li>
+<li>A file is mode 0644 but <code>cat</code> gives "Permission denied". What's the most likely cause and the one command to confirm it?
+<details class="reveal"><summary>Answer</summary><p>A missing traverse (<code>x</code>) bit on a directory somewhere in the path — opening a file needs <code>x</code> on every directory above it, whatever the file's mode. Confirm with <code>namei -l /path/to/file</code>, which prints every component's mode and shows the one directory lacking <code>x</code>.</p></details></li>
+<li>Your umask is <code>027</code>. What mode does a new file get, and a new directory, and why is the file never executable?
+<details class="reveal"><summary>Answer</summary><p>File: <code>666</code> − <code>027</code> = <code>640</code> (<code>rw-r-----</code>); directory: <code>777</code> − <code>027</code> = <code>750</code> (<code>rwxr-x---</code>). The file is never executable because programs request <code>666</code> (no execute) for data files, and the umask can only remove bits, never add them.</p></details></li>
+<li>Why must <code>/usr/bin/passwd</code> be setuid, and why does the kernel ignore the setuid bit on a shell script?
+<details class="reveal"><summary>Answer</summary><p><code>passwd</code> must write <code>/etc/shadow</code>, which is <code>640 root:shadow</code> and unwritable by an ordinary user, so it needs to run as root — setuid provides that. The kernel ignores setuid on scripts because a setuid interpreter reading an attacker-controlled script would be trivially exploitable; only compiled executables honour setuid.</p></details></li>
+<li>"Root is one all-powerful flag." Correct it, and give the one capability that lets a process ignore file permission bits.
+<details class="reveal"><summary>Answer</summary><p>Root is roughly forty separate capabilities (41 on Linux 6.8), each a specific power, and a process can hold any subset. The capability to ignore the rwx bits entirely is <code>CAP_DAC_OVERRIDE</code> — it, not "being uid 0" per se, is why root can read any file.</p></details></li>
+<li>You gave a binary <code>cap_net_bind_service=+ep</code> and it binds port 80 as an unprivileged user. Why is this safer than making it setuid-root?
+<details class="reveal"><summary>Answer</summary><p>The file capability grants only the single power to bind low ports, so a compromise of the program yields just that. Setuid-root would run the program with the entire capability set, so any bug in it is a path to full root. Least privilege: hand over one permit, not the whole keyring.</p></details></li>
+<li>Your non-root shell shows <code>CapEff: 0000000000000000</code> but <code>CapBnd: 000001ffffffffff</code>. Explain, and say what that combination permits.
+<details class="reveal"><summary>Answer</summary><p>You currently hold no capabilities (empty effective set), but the bounding ceiling is full. Because the capabilities are within your ceiling, exec'ing a setuid-root binary can raise them into your effective set — which is exactly how <code>sudo</code>/<code>passwd</code> give you elevated power. Trimming the bounding set would remove that possibility permanently.</p></details></li>
+<li>Explain "root in the container, harmless on the host" naming the two mechanisms that make it true.
+<details class="reveal"><summary>Answer</summary><p>The runtime starts the container's uid-0 process with a <em>trimmed bounding set</em>, so it can never gain the dangerous capabilities (mount, net-admin, sys-admin) even by exec; and <code>no_new_privs</code> makes the kernel ignore setuid/file-caps on anything it execs, closing the escalation hatch. It is uid 0 with none of root's host powers. A user namespace (B6) additionally maps that uid 0 to an unprivileged host uid.</p></details></li>
+<li>A setuid-root helper worked, then stopped after a deploy script copied it. What did the copy break, and can you fix it with <code>cp -p</code> as a normal user?
+<details class="reveal"><summary>Answer</summary><p><code>cp</code> dropped both the setuid bit and the root ownership; the copy is owned by the copier with a plain <code>x</code>, so it no longer elevates. <code>cp -p</code> as a non-root user can restore the mode but <em>not</em> root ownership — only root may give a file to root — so the real fix is <code>sudo chown root:root</code> plus <code>sudo chmod u+s</code> after the copy.</p></details></li>
+<li>You must serve port 80 without running the app as root. Rank setuid-root, a file capability, and a high-port-plus-DNAT by blast radius, best first.
+<details class="reveal"><summary>Answer</summary><p>Best (smallest): high port + DNAT — the process holds no privilege at all; the redirect is kernel-side. Then the file capability — the process holds only "bind low ports". Worst (largest): setuid-root — the process is full root, so a compromise owns the host. The right instinct is DNAT or capability, never setuid.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Explain that identity is numbers the kernel compares, map every field of <code>id</code>, and predict which group owns a new file.</li>
+<li>Read <code>/etc/passwd</code>, <code>/etc/group</code> and <code>/etc/shadow</code> field by field, and say why the hash lives in shadow.</li>
+<li>Tell a system user from a login user on sight, and articulate the blast-radius reason each daemon gets its own uid.</li>
+<li>Use <code>su</code>/<code>sudo</code> deliberately and grant one user exactly one command via a safe <code>visudo</code> edit.</li>
+<li>Apply the permission check as first-match owner→group→other, and explain the owner-locked-out paradox.</li>
+<li>Distinguish rwx on a file from rwx on a directory, and diagnose a traverse-bit failure with <code>namei -l</code>.</li>
+<li>Read and write octal modes on sight, and explain why only root may give a file away (<code>EPERM</code>/<code>CAP_CHOWN</code>).</li>
+<li>Predict a new file's and directory's mode from <code>umask</code> using the AND-NOT formula.</li>
+<li>Explain setuid, setgid-on-a-directory and sticky from their real examples, and why setuid on scripts is ignored.</li>
+<li>State that root is ~40 capabilities, name the recurring ones, and read them from <code>capsh</code>/<code>/proc</code>.</li>
+<li>Attach a capability with <code>setcap</code>, bind a low port unprivileged, and know why it beats setuid.</li>
+<li>Read permitted/effective/bounding from <code>/proc/PID/status</code>, decode a mask, and explain the bounding ceiling.</li>
+<li>Explain precisely why uid 0 in a container is not host root, naming the trimmed bounding set and <code>no_new_privs</code>.</li>
+<li>Serve a privileged port three ways, rank their blast radius, and map each to a <code>securityContext</code> choice.</li>
+<li>Diagnose a traverse ladder and a copy-broken setuid binary from evidence, with <code>namei</code> and <code>getcap</code> as reflexes.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
 
 <nav class="pager"><a href="b3.html">← B3 · Kernel space, user space, system calls</a><a href="../beginner.html#b5">B5 · Files for real: VFS, storage, overlayfs →</a></nav>
 
