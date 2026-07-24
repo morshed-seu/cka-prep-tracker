@@ -888,6 +888,174 @@ all children reaped</pre></li>
 <p class="docs-links"><code>man 2 wait</code> — the <em>NOTES</em> section states the zombie rule and the PID 1 reaping obligation directly. <code>man 7 signal</code> under <em>Signal dispositions</em> for the special treatment of PID 1. <code>man 5 proc</code> under <code>/proc/sys/kernel/pid_max</code> for the ceiling. <code>man 1 bash</code> under <em>SHELL BUILTIN COMMANDS</em> for <code>wait -n</code>. For the container-specific framing, the <code>tini</code> project's README is the clearest short write-up of why a one-purpose init exists.</p>
 </article>
 </div>
+
+<!-- ---------------- Threads ---------------- -->
+<div class="grp" id="g-threads"><h3>Threads</h3>
+
+<article class="lesson" id="cp-b2-10" data-id="b2-10">
+<div class="lesson-head"><span class="cp-id">B2.10</span><h4>What a thread actually is on Linux</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Most explanations of threading start from a language runtime and describe threads as a feature of the program. Linux's view is simpler and more useful: a thread is just another schedulable task, created by the same call that creates processes, with more of its parent shared. Holding the kernel's view means <code>ps</code>, <code>top</code> and <code>/proc</code> stop surprising you — a "single process" showing 40 entries under <code>/proc/PID/task</code> is not a bug, and the machinery you are looking at is the same machinery that makes containers.</p>
+<h5>The concept</h5>
+<p>Go back to B2.1's four-part definition. A thread is a schedulable task that <strong>shares</strong> its address space and its file-descriptor table with its siblings, while having its own stack, its own registers, and its own kernel-visible ID. Two threads in one program see exactly the same memory at exactly the same addresses — which is what makes them fast to communicate between, and exactly what makes them dangerous to get wrong.</p>
+<p>In the hotel: a process is a guest with a room. Threads are several people sharing one room. They all have the same key and the same wardrobe, so passing something between them is instant — and if two of them rearrange the wardrobe simultaneously, nobody can say afterwards what happened.</p>
+<p>Here is the part that matters for the rest of this track. The kernel does <em>not</em> have two different objects for "process" and "thread". Both are created by one system call, <code>clone()</code>, and the flags passed to it decide how much of the parent is shared rather than copied. <code>fork()</code> is a thin wrapper over <code>clone()</code> that shares almost nothing; creating a thread is the same call sharing almost everything. It is one dial, not two mechanisms.</p>
+<p>And <code>clone()</code> is also how namespaces are created — the flags <code>CLONE_NEWPID</code>, <code>CLONE_NEWNET</code>, <code>CLONE_NEWNS</code> and their siblings are more positions on that same dial, saying "give the new task its own PID numbering / network stack / mount table". So the machinery behind threading and the machinery behind containers are literally the same system call with different arguments. B6 turns those flags one at a time.</p>
+<p>Vocabulary, because the tools use it inconsistently: the kernel calls each schedulable task a <strong>task</strong> and gives it a <abbr title="thread ID — the kernel's per-task identifier">TID</abbr>. All threads of one program share a <abbr title="thread group ID — what userspace calls the PID">TGID</abbr>, and the TGID is what everything in userspace calls "the PID". The first thread's TID equals the TGID, which is why a single-threaded process looks like it has a PID and nothing else.</p>
+<div class="flow"><span>clone()</span><em>→</em><span>share nothing = <code>fork</code></span><em>·</em><span class="hot">share memory + fds = a thread</span><em>·</em><span>new namespace flags = a container</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a program with several threads — one busy, three idle — so there is something to look at.
+<pre class="cmd">python3 -c '
+import threading, time
+def spin():
+    end = time.time() + 60
+    while time.time() &lt; end: pass
+def idle():
+    time.sleep(60)
+threading.Thread(target=spin, daemon=True).start()
+for _ in range(3):
+    threading.Thread(target=idle, daemon=True).start()
+time.sleep(60)' &amp;
+p=$!
+sleep 2</pre></li>
+<li>Ask how many threads it has. <code>ps</code> reports one process; <code>status</code> tells the truth.
+<pre class="cmd">ps -o pid,nlwp,comm -p $p
+grep -E '^(Name|Threads)' /proc/$p/status</pre>
+<pre class="out">  PID NLWP COMMAND
+ 3652    <b>5</b> python3
+Name:   python3
+Threads:        <b>5</b></pre></li>
+<li>Now see them individually. Each has its own directory under <code>task/</code>, named by its TID — and notice that one of them has the same number as the process itself.
+<pre class="cmd">ls /proc/$p/task</pre>
+<pre class="out"><b>3652</b>
+3654
+3655
+3656
+3657</pre></li>
+<li>Get the same list from <code>ps</code>, with the per-thread detail that makes it useful: <code>-L</code> switches to one row per thread, <code>tid</code> is the thread's own ID, <code>psr</code> is the CPU it last ran on.
+<pre class="cmd">ps -L -p $p -o pid,tid,psr,pcpu,stat,comm</pre>
+<pre class="out">  PID   TID PSR %CPU STAT COMMAND
+ 3652  3652   0  0.0 <b>Sl</b>   python3
+ 3652  3654   1  <b>103</b>  <b>Rl</b>   python3
+ 3652  3655   0  0.0 Sl   python3
+ 3652  3656   1  0.0 Sl   python3
+ 3652  3657   0  0.0 Sl   python3</pre></li>
+<li>Read that carefully, because it is the whole lesson in one table. Five rows, one PID: they are one process. The <code>l</code> in each <code>STAT</code> is the multi-threaded modifier from B2.7. One thread is <strong>R</strong> and burning a full core; the other four are <strong>S</strong>. And the process as a whole has no single state — the states belong to the threads.
+<pre class="cmd">for t in /proc/$p/task/*/; do
+  printf '%s ' "$(basename "$t")"; grep '^State' "$t/status"
+done</pre>
+<pre class="out">3652 State:  S (sleeping)
+3654 State:  <b>R (running)</b>
+3655 State:  S (sleeping)
+3656 State:  S (sleeping)
+3657 State:  S (sleeping)</pre></li>
+<li>Prove the sharing claim from the outside: every thread's <code>fd/</code> and address space is one and the same, because there is only one of each.
+<pre class="cmd">ls /proc/$p/task/3654/fd | head -3
+readlink /proc/$p/task/3654/cwd
+grep -c . /proc/$p/task/3654/maps /proc/$p/maps</pre>
+<pre class="out">0
+1
+2
+/home/ubuntu
+/proc/3652/task/3654/maps:<b>96</b>
+/proc/3652/maps:<b>96</b></pre></li>
+<li>Clean up.
+<pre class="cmd">kill $p</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State in one sentence what a thread shares and what it keeps to itself. Then say which system call creates both processes and threads, and name one other thing that same call creates (namespaces — the basis of containers). Finally: on a process with 5 threads, how many entries are in <code>/proc/PID/task</code>, and what is special about one of them?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>ps</code> without <code>-L</code> shows one row per process, so a program with 200 threads looks like one modest entry. This is usually what you want and occasionally very misleading — a machine can be entirely out of scheduling capacity while <code>ps</code> shows twenty processes. <code>ps -eLf | wc -l</code> gives the honest task count.</p>
+<p>The <code>Threads:</code> count in <code>status</code> includes the main thread, so a program that "started 4 threads" reports 5. Off-by-one confusion here is universal and harmless once you expect it.</p>
+<p>Threads are not a way to get around a memory limit. They share the address space, so they share the memory accounting — 100 threads in one process are charged once for the heap they all use. Conversely, each thread does get its own stack (8 MB of address space by default on Linux), which is why a runaway thread count inflates VSZ enormously and RSS barely at all. B2.2's distinction again.</p>
+<p>Kernel threads (the bracketed entries from B2.2) are tasks with no address space at all. They show up in task counts and PID accounting but have no <code>maps</code>, no <code>fd/</code>, and no user-space code — do not try to reason about them as programs.</p>
+<div class="k8s-link">
+<p>The direct link is that <code>clone()</code> with namespace flags is how a container is created — which means when you later read that a pod's containers "share a network namespace", you are reading about the same dial, set differently. B6 turns each flag by hand, and the result is exactly the pod model.</p>
+<p>The practical link is CPU limits. A container's CPU limit is enforced against the <em>sum</em> of its threads, so a Java or Go program that sizes its thread pool from the node's core count will happily create 64 threads inside a container limited to one core, and then spend most of its time context-switching. That is the mechanism behind the throttling described in <a href="w3.html#cp-3-16">W3.16 — requests vs limits</a>, and B7 is where you watch the throttle counter increment.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 clone</code> — the flags table is the single most useful page in this whole module; skim every <code>CLONE_NEW*</code> entry now and you will recognise them in B6. <code>man 7 pthreads</code> for the userspace view and the TID/TGID distinction. <code>man 1 ps</code> under <code>-L</code> and the <code>nlwp</code>/<code>tid</code> format specifiers. <code>man 5 proc</code> under <code>/proc/[pid]/task</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b2-11" data-id="b2-11">
+<div class="lesson-head"><span class="cp-id">B2.11</span><h4>When the thread distinction changes your diagnosis</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Most of the time you can ignore threads entirely. Three situations where ignoring them costs you an hour: a process that looks mildly busy but has one thread pinned at 100%; a process that looks stuck when only one of its threads is; and a signal that appears to be handled by the wrong part of a program. All three are invisible at process granularity and obvious one level down.</p>
+<h5>The concept</h5>
+<p>The core mismatch is that <strong>the tools report per-process by default and the kernel schedules per-thread</strong>. A process's <code>%CPU</code> is the sum across its threads, so on an 8-core machine a process showing 12.5% might be entirely idle except for one thread consuming a whole core. The average hides the exact thing you are looking for, and the fix is to stop averaging: <code>top -H</code> and <code>ps -L</code> both switch to per-thread rows.</p>
+<p>The same applies to state. There is no such thing as "the process is in D" when the process has 40 threads — some are in D, some are in S, and which ones matter. Per-thread <code>State</code> in <code>/proc/PID/task/*/status</code> is the honest reading, and a program that appears wedged is often one thread wedged on I/O while the rest wait on it.</p>
+<p>Signals are the third case, and the rule is worth stating precisely because it is genuinely surprising. A signal sent to a <em>PID</em> is delivered to <strong>any one thread</strong> that has not blocked it — the kernel chooses, and you do not get to know which. Multi-threaded programs deal with this by having all threads block the signals they care about and dedicating one thread to receiving them. The consequence for you as an operator: "I sent SIGTERM and a different part of the program reacted than I expected" is not a bug you can fix from outside, and reading <code>SigBlk</code>/<code>SigCgt</code> per thread is how you find out who was actually listening.</p>
+<p>Those fields are worth knowing how to read. <code>/proc/PID/status</code> has four signal masks as hexadecimal bitmaps — <code>SigPnd</code> (pending), <code>SigBlk</code> (blocked), <code>SigIgn</code> (ignored), <code>SigCgt</code> (caught, i.e. a handler is installed). Bit <em>N−1</em> corresponds to signal <em>N</em>, so SIGTERM (15) is bit 14, which is <code>0x4000</code>. An all-zero <code>SigCgt</code> means the program installed no handlers at all — which, as B2.9 warned, is a very interesting fact about a container's PID 1.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start the same one-busy-thread program as before, and look at it the way most people would.
+<pre class="cmd">python3 -c '
+import threading, time
+def spin():
+    end = time.time() + 90
+    while time.time() &lt; end: pass
+def idle():
+    time.sleep(90)
+threading.Thread(target=spin, daemon=True).start()
+for _ in range(3):
+    threading.Thread(target=idle, daemon=True).start()
+time.sleep(90)' &amp;
+p=$!
+sleep 6
+ps -o pid,pcpu,nlwp,comm -p $p</pre>
+<pre class="out">  PID %CPU NLWP COMMAND
+ 3701 <b>98.7</b>    5 python3</pre>
+<p>Give it a few seconds before measuring: <code>ps</code>'s <code>%CPU</code> is CPU-used over lifetime, so immediately after launch the busy thread has not yet run long enough to dominate, and the sort can briefly rank the main thread first.</p></li>
+<li>That tells you the process is busy but not <em>what</em> is busy. Drop one level and the answer is a single row.
+<pre class="cmd">ps -L -p $p -o tid,pcpu,stat --sort=-pcpu | head -3</pre>
+<pre class="out">  TID %CPU STAT
+ <b>3703 98.4</b> Rl
+ 3701  0.2 Sl
+ 3704  0.0 Sl</pre></li>
+<li>Do the same thing live with <code>top</code>. <kbd>H</kbd> toggles thread mode inside an interactive <code>top</code>; <code>-H</code> sets it from the command line, and <code>-b -n1</code> makes it print once and exit so you can pipe it.
+<pre class="cmd">top -H -b -n1 -p $p | tail -7</pre>
+<pre class="out">    PID USER      PR  NI    VIRT    RES  %CPU  %MEM     TIME+ COMMAND
+   <b>3703</b> ubuntu    20   0  310524  12180  <b>99.3</b>   0.3   0:12.44 python3
+   3701 ubuntu    20   0  310524  12180   0.0   0.3   0:00.09 python3
+   3704 ubuntu    20   0  310524  12180   0.0   0.3   0:00.00 python3
+   3705 ubuntu    20   0  310524  12180   0.0   0.3   0:00.00 python3
+   3706 ubuntu    20   0  310524  12180   0.0   0.3   0:00.00 python3</pre></li>
+<li>Note what is <em>not</em> per-thread: <code>VIRT</code> and <code>RES</code> are identical on every row, because there is one address space. Per-thread CPU, shared memory — exactly the definition from B2.10, visible in a tool.</li>
+<li>Now read the signal masks. A process with no handlers installed has an all-zero <code>SigCgt</code>.
+<pre class="cmd">grep -E '^Sig(Pnd|Blk|Ign|Cgt)' /proc/$p/status
+kill $p</pre>
+<pre class="out">SigPnd: 0000000000000000
+SigBlk: 0000000000000000
+SigIgn: 0000000000001000
+SigCgt: <b>0000000180014a03</b></pre></li>
+<li>Compare with something that plainly installs nothing, so the contrast is unmistakable — this is the check you will want on a suspicious container PID 1.
+<pre class="cmd">sleep 300 &amp;
+grep -E '^Sig(Ign|Cgt)' /proc/$!/status</pre>
+<pre class="out">SigIgn: 0000000000000000
+SigCgt: <b>0000000000000000</b></pre></li>
+<li>Decode a mask by hand once, so the hex stops being opaque. Bit <em>N−1</em> is signal <em>N</em>, so testing for SIGTERM means testing bit 14 — <code>0x4000</code>.
+<pre class="cmd">m=$(awk '/^SigCgt/{print $2}' /proc/$!/status)
+echo "SIGTERM caught? $(( 0x$m &amp; 0x4000 ))   (0 = no handler)"
+pkill sleep</pre>
+<pre class="out">SIGTERM caught? <b>0</b>   (0 = no handler)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Start any multi-threaded program and, in under a minute, name the single hottest thread by TID and say what fraction of the process's total CPU it accounts for. Then check whether a running program has a SIGTERM handler installed, using <code>SigCgt</code> and bit 14, and say why that is the first thing worth checking about a container that refuses to shut down promptly.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>top</code>'s <code>%CPU</code> is relative to <em>one</em> core, so a well-threaded program legitimately shows 400% on four cores. This is not an error and not a bug in <code>top</code>; it is the only sane way to report it. <kbd>Shift</kbd>+<kbd>I</kbd> toggles "Irix mode" off if you would rather see it divided by the core count.</p>
+<p>In thread mode <code>top</code> labels the column <code>PID</code> even though it is showing TIDs. Do not paste those numbers into a <code>kill</code> without thinking: signalling a TID directly (which requires <code>tgkill</code>, not <code>kill</code>) is almost never what you want, and <code>kill &lt;TID&gt;</code> from the shell will either fail or hit an unrelated process whose PID happens to match.</p>
+<p>An all-zero <code>SigCgt</code> is not automatically a problem — <code>sleep</code> has no handlers and dies on SIGTERM perfectly well, because the <em>default action</em> does the job. It only becomes a problem when the program needs to do something before exiting, or when it is PID 1 and the default action is therefore suppressed (B2.9). Read the field together with the process's role.</p>
+<div class="k8s-link">
+<p>The hot-thread case is what makes CPU throttling confusing in Kubernetes. A container hitting its CPU limit shows as a pod that is slow rather than a pod that is broken, and <code>kubectl top pod</code> reports a single aggregated number that looks comfortably under the limit — because the limit is enforced against the sum, over a short window, and one saturated thread with periodic bursts averages down. Getting to the node and running <code>top -H</code> against the container's PID is the move that finds it.</p>
+<p>The signal-mask check is the fast answer to a pod stuck in <code>Terminating</code> for the full grace period: if the container's PID 1 has an all-zero <code>SigCgt</code>, it never installed a SIGTERM handler, and the PID 1 rule from B2.9 means the signal is being discarded. That is the mechanism behind <a href="w3.html#cp-3-5">W3.5 — graceful termination</a>, and the diagnosis path in <a href="w6.html#cp-6-18">W6.18 — the quiet failures</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 top</code> under <em>SUMMARY Display</em> and the <kbd>H</kbd> command; also <em>2c. TASK Areas</em> for what each field means. <code>man 5 proc</code> under <code>/proc/[pid]/status</code> for the <code>Sig*</code> masks. <code>man 7 signal</code> under <em>Signal masks and threads</em> for the delivery rule. <code>man 3 pthread_sigmask</code> for how a program chooses one thread to receive signals.</p>
+</article>
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
