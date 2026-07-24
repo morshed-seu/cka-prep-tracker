@@ -598,14 +598,295 @@ sudo rmdir /sys/fs/cgroup/pids/leaf /sys/fs/cgroup/pids</pre>
 </article>
 </div><!-- /g-mem -->
 
+<!-- ---------------- In practice ---------------- -->
+<div class="grp" id="g-practice"><h3>In practice</h3>
+
+<article class="lesson" id="cp-b7-11" data-id="b7-11">
+<div class="lesson-head"><span class="cp-id">B7.11</span><h4>Moving a process: one PID, one file, cgroup.procs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>So far you've been putting <em>new</em> processes into cgroups as you launch them. But cgroups also let you move an <em>already-running</em> process into a cgroup — and the mechanism is startlingly simple: write its PID into one file, and every limit in that cgroup instantly applies. Seeing this makes cgroup membership concrete (it's just a number in a file) and gives you a real operational tool: caging a misbehaving process that's already live, without restarting it.</p>
+<h5>The concept</h5>
+<p>Membership in a cgroup is nothing more than a PID listed in that cgroup's <code>cgroup.procs</code> file. To move a process, you <strong>write its PID to the destination cgroup's <code>cgroup.procs</code></strong> — the kernel removes it from wherever it was (a process is always in exactly one cgroup in the unified v2 hierarchy) and adds it here, and from that instant the destination's <code>cpu.max</code>, <code>memory.max</code>, and everything else govern it. There is no separate "remove" step; writing the PID to a new cgroup <em>is</em> the move. You can confirm from either direction: read the destination's <code>cgroup.procs</code> to see the PID listed, or read the process's own <code>/proc/PID/cgroup</code> to see which cgroup it now names.</p>
+<p>One important detail from B7.4's rules: you can only move a process into a <em>leaf</em> (a cgroup with no controller-enabled children), because of the no-internal-process constraint. And moving a multi-threaded process moves all its threads together by default (<code>cgroup.procs</code> operates on the whole process; there's a separate <code>cgroup.threads</code> for thread-level placement, rarely needed). This "write a PID to move it" is precisely how every tool — systemd, runc, the kubelet — places processes into the cgroups it created; you're now doing by hand what they automate.</p>
+<div class="flow"><span>echo PID &gt; dest/cgroup.procs</span><em>→ kernel moves it · limits apply now · confirm via</em><span class="hot">/proc/PID/cgroup</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start an <em>uncapped</em> busy loop in the ordinary shell and note it using a whole core. This is a running process, not yet in any special cgroup.
+<pre class="cmd">multipass shell sandbox
+yes &gt; /dev/null &amp;
+HOG=$!
+top -bn1 | grep -m1 yes            # ~100% — uncapped
+cat /proc/$HOG/cgroup              # where it lives now (your session's cgroup)</pre>
+<pre class="out">... <b>99.7</b> yes
+0::/user.slice/user-1000.slice/session-3.scope   ← the process's current cgroup</pre></li>
+<li>Make a capped cgroup and move the <em>live</em> process into it by writing its PID. The cap takes effect immediately — no restart.
+<pre class="cmd">sudo mkdir -p /sys/fs/cgroup/move/leaf
+echo '+cpu' | sudo tee /sys/fs/cgroup/move/cgroup.subtree_control &gt;/dev/null
+echo '30000 100000' | sudo tee /sys/fs/cgroup/move/leaf/cpu.max     # 30% cap
+echo $HOG | sudo tee /sys/fs/cgroup/move/leaf/cgroup.procs          # the move
+sleep 2
+top -bn1 | grep -m1 yes            # now throttled to 30%</pre>
+<pre class="out"><b>30.0</b> yes                       ← the running process is now capped</pre></li>
+<li>Confirm membership from both directions, then stop the hog and clean up.
+<pre class="cmd">cat /sys/fs/cgroup/move/leaf/cgroup.procs    # destination lists the PID
+cat /proc/$HOG/cgroup                          # the process names the new cgroup
+kill $HOG
+sudo rmdir /sys/fs/cgroup/move/leaf /sys/fs/cgroup/move</pre>
+<pre class="out">4933                                 ← the PID is here now
+0::<b>/move/leaf</b>                    ← and the process agrees</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>How do you move a running process into a cgroup, and how do you remove it from its old one? (Write its PID to the destination cgroup's <code>cgroup.procs</code>; there is no separate removal — a process is in exactly one cgroup, so the write moves it.) Then: after moving, name the two files that confirm the new membership. (The destination's <code>cgroup.procs</code> lists the PID; the process's <code>/proc/PID/cgroup</code> names the destination cgroup.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>You must write to a <em>leaf</em> cgroup — writing a PID to a cgroup that has controller-enabled children fails with <code>EBUSY</code> ("Device or resource busy"), the no-internal-process rule from B7.4 again. If a move is unexpectedly refused, check whether the target actually has child cgroups with controllers on; the fix is to target a leaf. This is the most common surprise when moving processes by hand.</p>
+<p>Writing a PID to <code>cgroup.procs</code> moves that process and, going forward, its <em>new</em> children — but processes it already forked are wherever they already were unless you move them too. To move a whole existing tree you'd write each PID (or, more practically, move the parent before it forks the workers). Also: only privileged users (or the delegated owner of a subtree) can move a process into a cgroup, which is why these labs use <code>sudo</code> — an unprivileged process can't cage another into arbitrary limits.</p>
+<div class="k8s-link">
+<p>This one-file mechanism is the last piece of "how a container gets its limits." When the kubelet (via runc) starts a container, it <code>mkdir</code>s the container's cgroup, writes the pod's <code>resources</code> into <code>cpu.max</code>/<code>memory.max</code>, and writes the container's init-process PID into that cgroup's <code>cgroup.procs</code> — the exact three steps you've now done by hand. Every process the container forks inherits the cgroup, so the whole container is governed by the limits. When you later read <code>/proc/PID/cgroup</code> for a container process on a node and see a <code>kubepods.slice/...</code> path, you're reading the result of this write. "Move a PID into a cgroup" is the atom of container resource management.</p>
+<p>The runtime's container-creation steps sit under <a href="w1.html#cp-1-21">W1.21</a> (pod internals) and <a href="w3.html#cp-3-16">W3.16</a> (resource enforcement).</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> "Organizing Processes and Threads" documents writing to <code>cgroup.procs</code> and the single-cgroup rule; <code>man 7 cgroups</code> under "Moving a process to a cgroup." <code>man 5 proc</code> for <code>/proc/[pid]/cgroup</code>. No exam-docs entry — this is the mechanism runc/kubelet automate for every container.</p>
+</article>
+
+<article class="lesson" id="cp-b7-12" data-id="b7-12">
+<div class="lesson-head"><span class="cp-id">B7.12</span><h4>systemd was doing this all along: slices, scopes, and set-property</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything you've built by hand this module, systemd has been doing automatically since the machine booted. Every service, every user session, every scope lives in its own cgroup, arranged into a tidy tree — which is why <code>/sys/fs/cgroup</code> already had <code>system.slice</code> and <code>user.slice</code> in it before you made a single directory. Seeing that the "real" user of cgroups on your box is systemd, and learning to read and set a service's limits through it, connects this low-level mechanism to the tool you'll actually use to manage it in production.</p>
+<h5>The concept</h5>
+<p>systemd organises the cgroup tree with two unit types, plus a grouping concept:</p>
+<ul>
+<li>A <strong>slice</strong> is a <em>structural</em> cgroup — a branch used only to group and apportion resources, holding no processes itself (obeying the no-internal-process rule). The tree has a few top-level slices: <code>system.slice</code> (system services), <code>user.slice</code> (logged-in users, further split into per-user slices), and the root. Slices nest with a <code>-</code> naming convention: <code>user-1000.slice</code> lives under <code>user.slice</code>.</li>
+<li>A <strong>scope</strong> is a cgroup wrapping a set of processes systemd did <em>not</em> itself fork but is asked to manage — a login session (<code>session-3.scope</code>), for instance. Services get a <code>.service</code> cgroup; scopes are the "externally created, systemd-managed" cousin.</li>
+</ul>
+<p>So the path you saw earlier — <code>/user.slice/user-1000.slice/session-3.scope</code> — reads left to right as "the user slice → user 1000's slice → this login session's scope," a fully systemd-built cgroup hierarchy. Every <code>.service</code> runs in <code>system.slice/&lt;name&gt;.service</code>, and <code>systemctl status</code> prints that cgroup path and the processes in it. Best of all, you don't have to touch <code>/sys/fs/cgroup</code> to set a limit on a service: <code>systemctl set-property &lt;unit&gt; CPUQuota=20% MemoryMax=200M</code> writes the corresponding <code>cpu.max</code>/<code>memory.max</code> into the service's cgroup for you, live, and persists it. This is the production-grade front-end to everything this module taught: the same knobs, managed as unit properties instead of raw files.</p>
+<div class="flow"><span>system.slice</span><em>→</em><span>ssh.service</span><em>· systemctl set-property →</em><span class="hot">CPUQuota / MemoryMax</span><em>→ writes cpu.max / memory.max</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read a real service's cgroup straight out of <code>systemctl status</code>. The <code>CGroup:</code> line names the path under <code>/sys/fs/cgroup</code> and lists the processes.
+<pre class="cmd">multipass shell sandbox
+systemctl status ssh | sed -n '/CGroup/,/^$/p' | head</pre>
+<pre class="out">     CGroup: <b>/system.slice/ssh.service</b>
+             └─789 "sshd: /usr/sbin/sshd -D [listener] ..."</pre></li>
+<li>Explore that same cgroup directly — it's an ordinary directory in the tree you've been using, with the control files you now recognise.
+<pre class="cmd">ls /sys/fs/cgroup/system.slice/ssh.service | grep -E 'cpu.max|memory.max|cgroup.procs'
+cat /sys/fs/cgroup/system.slice/ssh.service/cgroup.procs</pre>
+<pre class="out">cgroup.procs
+cpu.max
+memory.max
+789                                  ← sshd's PID — the same one systemctl showed</pre></li>
+<li>Set a live limit through systemd and watch it land in the raw file. Use a disposable service to avoid touching ssh; here we cap it and read back <code>cpu.max</code>.
+<pre class="cmd"># start a throwaway managed service running a busy loop
+sudo systemd-run --unit=demo-hog --slice=system.slice bash -c 'yes &gt;/dev/null'
+sudo systemctl set-property demo-hog CPUQuota=20%          # → cpu.max = 20000 100000
+cat /sys/fs/cgroup/system.slice/demo-hog.service/cpu.max
+top -bn1 | grep -m1 yes
+sudo systemctl stop demo-hog</pre>
+<pre class="out"><b>20000 100000</b>                    ← CPUQuota=20% became a raw cpu.max
+... <b>20.0</b> yes                    ← the service is capped, set via systemd</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What is the difference between a systemd <em>slice</em> and a <em>scope</em>? (A slice is a structural, process-free cgroup used to group and apportion resources — <code>system.slice</code>, <code>user.slice</code>; a scope is a cgroup wrapping externally-created processes that systemd manages, like a login <code>session-N.scope</code>.) Then: without editing any file under <code>/sys/fs/cgroup</code>, how do you cap a service at 20% of one CPU, and what raw file does that write? (<code>systemctl set-property &lt;unit&gt; CPUQuota=20%</code>, which writes <code>cpu.max = 20000 100000</code> into the service's cgroup.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Editing a service's <code>cpu.max</code> by hand under <code>/sys/fs/cgroup</code> works for a moment but does <em>not</em> persist and can be overwritten by systemd — systemd considers itself the owner of the slices/scopes/services it manages, and will reassert its own view. For anything systemd manages, set limits <em>through</em> systemd (<code>set-property</code>, or <code>CPUQuota=</code>/<code>MemoryMax=</code> in the unit file), not by poking the files directly. Hand-editing the filesystem is for cgroups <em>you</em> created (as in the earlier labs), not systemd's.</p>
+<p><code>CPUQuota=</code> is a percentage that can exceed 100% (<code>CPUQuota=200%</code> = two cores), while <code>CPUWeight=</code> (1–10000, default 100) is the proportional-share knob mapping to <code>cpu.weight</code>, and <code>MemoryMax=</code>/<code>MemoryHigh=</code> map to the two memory lines. The property names are systemd's friendlier spelling of the raw controls you learned — knowing the mapping (<code>CPUQuota</code>→<code>cpu.max</code>, <code>CPUWeight</code>→<code>cpu.weight</code>, <code>MemoryMax</code>→<code>memory.max</code>) lets you move between the systemd view and the <code>/sys/fs/cgroup</code> view fluently, which is exactly what node debugging requires.</p>
+<div class="k8s-link">
+<p>The kubelet can run in a systemd-managed cgroup layout (the <code>systemd</code> cgroup driver, the recommended default), meaning pod and container cgroups are created <em>as</em> systemd slices and scopes — you'll see <code>kubepods.slice</code> and per-pod scopes in the tree, managed by the same machinery you just used. This is why matching cgroup drivers between the kubelet and the container runtime matters (a mismatch causes pods to fail to start): both must agree on whether systemd or cgroupfs owns the tree. Reading a service's cgroup from <code>systemctl status</code> is exactly how you'd inspect the kubelet's own resource limits or a static-pod's cgroup on a node.</p>
+<p>The kubelet/runtime cgroup-driver setup appears in cluster bring-up (<a href="w2.html">W2</a>) and node troubleshooting (<a href="w6.html">W6</a>).</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.slice</code> and <code>man 5 systemd.scope</code> for the unit types, <code>man 5 systemd.resource-control</code> for <code>CPUQuota</code>/<code>CPUWeight</code>/<code>MemoryMax</code>/<code>MemoryHigh</code> and their cgroup mappings, and <code>man 1 systemctl</code> under <code>set-property</code> and <code>status</code>. <code>man 1 systemd-run</code> for the throwaway-unit trick. In the exam docs, the container runtime / kubelet cgroup driver configuration.</p>
+</article>
+</div><!-- /g-practice -->
+
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b7-13" data-id="b7-13">
+<div class="lesson-head"><span class="cp-id">B7.13</span><h4>Mini project — measure the cage</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Reading that a cap "limits CPU to 50%" is one thing; <em>measuring</em> it — proving with a stopwatch and a counter that a task which should take 10 seconds of CPU instead takes 20 seconds of wall-clock because it spent half its life throttled — is what makes the mechanism real. This project ties CPU and memory together into one evidence-gathering exercise, and then does the thing that makes the whole beginner track cumulative: it bolts a cgroup onto the container v0.1 you built in B6, so your hand-made container is now both isolated <em>and</em> rationed. That's a real container.</p>
+<h5>The concept</h5>
+<p>Three parts, each proving something you learned:</p>
+<ol>
+<li><strong>Prove a CPU cap with <code>time</code> + <code>cpu.stat</code>.</strong> Run a fixed amount of CPU work (say, hashing) inside a 50%-capped cgroup. It needs a roughly fixed amount of <em>CPU time</em>, but because it's throttled to half a core, it takes about <em>twice</em> the wall-clock time — and <code>cpu.stat</code>'s <code>throttled_usec</code> accounts for the difference. <code>time</code> shows wall &gt; CPU; <code>cpu.stat</code> shows where the missing time went.</li>
+<li><strong>Capture an OOM kill.</strong> Run a memory hog in a low <code>memory.max</code> cgroup, and collect the trio from B7.9: the shell's <code>137</code>, the <code>oom_kill</code> counter, and the <code>dmesg</code> line.</li>
+<li><strong>Limit container v0.1.</strong> Wrap the B6.14 container in a cgroup so it starts life capped — the missing "how much" dial from that lesson's deliberate gaps.</li>
+</ol>
+<p>The point of measuring rather than trusting is the same discipline as the debugging drills: evidence over assertion. When you can <em>show</em> the throttle time and the OOM record, you understand the cage; when you've only read that it exists, you don't yet.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>CPU cap, measured.</strong> Cap at 50% and time a fixed hashing workload. Wall-clock is ~2× the CPU time, and <code>throttled_usec</code> explains the gap.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/proj
+echo '+cpu' | sudo tee /sys/fs/cgroup/proj/cgroup.subtree_control &gt;/dev/null
+sudo mkdir /sys/fs/cgroup/proj/cpu50
+echo '50000 100000' | sudo tee /sys/fs/cgroup/proj/cpu50/cpu.max
+# run a fixed CPU workload inside the cap, timed
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/proj/cpu50/cgroup.procs
+              time openssl speed -seconds 4 sha256 2&gt;/dev/null'
+cat /sys/fs/cgroup/proj/cpu50/cpu.stat | grep -E 'nr_throttled|throttled_usec'</pre>
+<pre class="out">real  0m8.0s          ← ~8s wall clock...
+user  0m4.0s          ← ...for ~4s of actual CPU: throttled to half a core
+nr_throttled 78
+<b>throttled_usec 3900000</b>          ← ~3.9s frozen — the missing wall-clock time</pre></li>
+<li><strong>OOM kill, captured.</strong> The B7.9 trio in one go: 137, the counter, the kernel line.
+<pre class="cmd">sudo mkdir /sys/fs/cgroup/proj/mem50
+echo '+memory' | sudo tee /sys/fs/cgroup/proj/cgroup.subtree_control &gt;/dev/null
+echo 50M | sudo tee /sys/fs/cgroup/proj/mem50/memory.max
+sudo dmesg -C
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/proj/mem50/cgroup.procs
+              exec stress-ng --vm 1 --vm-bytes 200M -t 8s'; echo "exit: $?"
+cat /sys/fs/cgroup/proj/mem50/memory.events | grep oom_kill
+sudo dmesg -T | grep -i 'killed process' | tail -1</pre>
+<pre class="out">Killed
+<b>exit: 137</b>
+<b>oom_kill 1</b>
+[... noble] Memory cgroup out of memory: Killed process 5140 (stress-ng-vm) ...</pre></li>
+<li><strong>Limit the container.</strong> Create a cgroup, then have B6.14's <code>container.sh</code> place its own PID into it at startup so the whole container is capped. Add two lines to the script (or wrap it):
+<pre class="cmd"># make a capped cgroup for the container
+sudo mkdir -p /sys/fs/cgroup/proj/box
+echo '+cpu +memory' | sudo tee /sys/fs/cgroup/proj/cgroup.subtree_control &gt;/dev/null
+echo '50000 100000' | sudo tee /sys/fs/cgroup/proj/box/cpu.max
+echo 128M | sudo tee /sys/fs/cgroup/proj/box/memory.max
+# launch B6.14's container, but drop its launching PID into the cgroup first:
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/proj/box/cgroup.procs; exec ~/container.sh ~/rootfs'</pre>
+<pre class="out">== container v0.1: I am PID 1 on host 'container-v0.1' ==
+# inside: same isolation as B6, now also capped at 0.5 CPU / 128M — a real container
+# (exit, then clean up)</pre></li>
+<li>Clean up the whole project tree (leaves first).
+<pre class="cmd">sudo rmdir /sys/fs/cgroup/proj/{cpu50,mem50,box} 2&gt;/dev/null
+sudo rmdir /sys/fs/cgroup/proj</pre>
+<pre class="out">(removed)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>In part 1, <code>time</code> showed ~8s real but ~4s user for a fixed workload under a 50% cap — reconcile the two numbers. (The work needs ~4s of actual CPU; capped at half a core it can only run half the time, so it takes ~8s of wall-clock, and <code>throttled_usec</code> ≈ the ~4s difference spent frozen.) Then: after part 3, name one thing your container now has that B6.14's version lacked, and one it still lacks. (Now: cgroup CPU/memory limits — the "how much" dial. Still lacks: its own network namespace, B9, and a user namespace / dropped capabilities for real security.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The wall-clock-vs-CPU-time gap only appears cleanly on an otherwise idle machine — if the VM is busy with something else, the numbers get muddier because the workload competes for the uncapped time too. Run the measurement on a quiet <code>sandbox</code> for a clean 2× result, and read <code>throttled_usec</code> as the ground truth rather than the wall-clock ratio, since it directly counts frozen time regardless of what else is happening.</p>
+<p>When you cap the container in part 3, you're capping it from the <em>outside</em> before <code>pivot_root</code> and the namespace bundle — the cgroup is set on the launching shell's PID, and because cgroup membership is inherited across <code>unshare</code>/<code>fork</code>/<code>exec</code>, the whole container tree stays in it. That inheritance is why one write at launch governs every process the container spawns, exactly as a real runtime relies on. If you instead tried to set the cgroup from <em>inside</em> the pivoted container, you'd find <code>/sys/fs/cgroup</code> isn't mounted there — which is itself a lesson in why runtimes configure cgroups from the host side, before handing off.</p>
+<div class="k8s-link">
+<p>You have now built the complete core of a container: B6's namespaces (private view) plus B7's cgroup (rationed resources), assembled by hand. That is exactly what runc does for every pod — create the namespaces, create the cgroup with the pod's <code>resources</code>, place the process. Everything Kubernetes layers on top (the image as rootfs, scheduling, networking, health checks, security context) surrounds this core without changing it. When you read a pod spec's <code>resources</code> now, you're reading the <code>cpu.max</code>/<code>memory.max</code> you just wrote by hand; when a pod is <code>OOMKilled</code> or CPU-throttled, you've already measured the mechanism.</p>
+<p>The runtime handoff is <a href="w1.html#cp-1-21">W1.21</a>; the resource model you've now built from scratch is <a href="w3.html#cp-3-16">W3.16</a>–<a href="w3.html#cp-3-18">W3.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 time</code> (and the shell builtin) for wall-vs-CPU timing, the kernel <code>cgroup-v2.rst</code> for <code>cpu.stat</code>/<code>memory.events</code>, <code>man 1 stress-ng</code> and <code>man 1 openssl</code> for the load generators. Re-read <a href="b6.html#cp-b6-14">B6.14</a> for the container script this extends. In the exam docs, pod <code>resources</code> and container termination reasons.</p>
+</article>
+
+<article class="lesson drill" id="cp-b7-14" data-id="b7-14">
+<div class="lesson-head"><span class="cp-id">B7.14</span><h4>Debugging drill — slow on an idle box, and dead with no logs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The two failures this module exists to make diagnosable both share the shape of every drill in this track: the obvious place to look is the wrong place. A throttled service is slow, but <code>top</code> says the CPU is idle — so the CPU looks innocent. An OOM-killed process is dead, but its own logs say nothing — so the app looks innocent. Both times, the evidence is in a cgroup file the default tools never show. Reproducing both and fixing them by reading state, not guessing, is what converts this module into a reflex.</p>
+<h5 class="verify">Symptom 1 — slow, but the CPU is idle</h5>
+<ol class="lab">
+<li>Reproduce it: a tightly capped workload that stalls while the host looks unbusy. It <em>feels</em> like something is wrong with the app or the machine, but host CPU is low.
+<pre class="cmd">multipass shell sandbox
+sudo mkdir -p /sys/fs/cgroup/dbg
+echo '+cpu' | sudo tee /sys/fs/cgroup/dbg/cgroup.subtree_control &gt;/dev/null
+sudo mkdir /sys/fs/cgroup/dbg/leaf
+echo '5000 100000' | sudo tee /sys/fs/cgroup/dbg/leaf/cpu.max      # 5% — brutal cap
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/dbg/leaf/cgroup.procs; exec yes &gt;/dev/null' &amp;
+top -bn1 | grep '%Cpu'                                              # host looks idle</pre>
+<pre class="out">%Cpu(s): <b>5.1</b> us, 0.4 sy, ...   ← the machine is 94% idle — nothing looks wrong</pre></li>
+<li>Diagnose from the cgroup, not the host: read <code>cpu.stat</code> twice and watch <code>throttled_usec</code> race upward. That's the tell that the process is starving on its own quota.
+<pre class="cmd">cat /sys/fs/cgroup/dbg/leaf/cpu.stat | grep throttled_usec
+sleep 4
+cat /sys/fs/cgroup/dbg/leaf/cpu.stat | grep -E 'nr_throttled|throttled_usec'
+cat /sys/fs/cgroup/dbg/leaf/cpu.max                                # the culprit value</pre>
+<pre class="out">throttled_usec 1900000
+nr_throttled 88
+<b>throttled_usec 5700000</b>          ← +3.8s frozen in 4s of wall-clock
+<b>5000 100000</b>                     ← a 5% cap: the smoking gun</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>CPU throttling, not a slow machine.</strong> The process is capped at 5% of a core by <code>cpu.max = 5000 100000</code>, so in every 100ms window it runs for 5ms and is frozen for 95ms — brutal latency — while using so little CPU that the host graph shows the machine as idle. Host-level tools (<code>top</code>, node dashboards) measure total utilisation and are blind to a single cgroup's throttling; the evidence is <code>cpu.stat</code>'s <code>throttled_usec</code> climbing. The fix is to raise or remove the cap (<code>echo '100000 100000' &gt; …/cpu.max</code>, or <code>max 100000</code> for unlimited) after confirming the workload genuinely needs the CPU. The reflex: "slow app, idle host" ⇒ suspect a CPU cap, and confirm with <code>cpu.stat</code> before blaming the app or the hardware. Clean up: <code>kill %1; sudo rmdir /sys/fs/cgroup/dbg/leaf</code>.</p></details>
+
+<h5 class="verify">Symptom 2 — it dies with no error in its own logs</h5>
+<ol class="lab">
+<li>Reproduce it: a memory-capped process that vanishes. Run it capturing its own output to a log — and see the log say nothing about <em>why</em> it died.
+<pre class="cmd">echo 40M | sudo tee /sys/fs/cgroup/dbg/leaf/memory.max 2&gt;/dev/null \
+  || { echo '+memory' | sudo tee /sys/fs/cgroup/dbg/cgroup.subtree_control &gt;/dev/null; \
+       echo 40M | sudo tee /sys/fs/cgroup/dbg/leaf/memory.max; }
+sudo dmesg -C
+sudo bash -c 'echo $$ &gt; /sys/fs/cgroup/dbg/leaf/cgroup.procs
+              exec stress-ng --vm 1 --vm-bytes 200M -t 8s' &gt; /tmp/app.log 2&gt;&amp;1
+echo "exit: $?"
+echo '--- the app'\''s own log: ---'; cat /tmp/app.log</pre>
+<pre class="out">exit: <b>137</b>
+--- the app's own log: ---
+stress-ng: info: [xxxx] started    ← it logged startup...
+# ...and then nothing. No error, no "out of memory" — SIGKILL gave it no chance.</pre></li>
+<li>Diagnose where the evidence actually is: the exit code (137 = SIGKILL), the cgroup's counter, and the kernel log — none of them the app's log.
+<pre class="cmd">cat /sys/fs/cgroup/dbg/leaf/memory.events | grep oom_kill
+sudo dmesg -T | grep -i 'killed process' | tail -1</pre>
+<pre class="out"><b>oom_kill 1</b>                        ← the cgroup killed something for memory
+[... noble] Memory cgroup out of memory: <b>Killed process 5310 (stress-ng-vm)</b> ...</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>The OOM killer, recorded everywhere except the app's logs.</strong> The process exceeded its cgroup's <code>memory.max</code> (40M), the kernel sent it <code>SIGKILL</code>, and because <code>SIGKILL</code> can't be caught (B2.15) the app had no chance to log its own death — hence the silent log and the bare <code>Killed</code>. The evidence trio: exit <strong>137</strong> (128 + signal 9), <code>memory.events</code>' <code>oom_kill</code> counter, and <code>dmesg</code>'s verdict naming the cgroup and the exact PID. The fix is to raise the memory limit, fix the leak, or right-size the workload — but first <em>confirm</em> it was OOM (not some other <code>SIGKILL</code>) via <code>memory.events</code>/<code>dmesg</code>. The reflex: a process that exits 137 with nothing useful in its own logs ⇒ check <code>dmesg</code> and the cgroup's <code>memory.events</code>, never keep re-reading the app log. Clean up: <code>kill</code> anything left, <code>sudo rmdir /sys/fs/cgroup/dbg/leaf /sys/fs/cgroup/dbg</code>.</p></details>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both symptoms are cases where the loud object is innocent and the quiet one is guilty — the same shape as B2–B6's drills. "The machine is slow" is really "this cgroup is throttled"; "the app crashed silently" is really "the kernel OOM-killed it." The cure in both is to stop staring at the loud-but-innocent object (host CPU graph, app log) and read the quiet-but-guilty state (<code>cpu.stat</code>, <code>dmesg</code>/<code>memory.events</code>). Memorise the two reflexes — "slow + idle host ⇒ throttling," "137 + silent log ⇒ OOM" — and you'll diagnose in seconds what otherwise costs hours.</p>
+<p>The subtle trap in symptom 2 is trusting the app's logs to explain the app's death. For an OOM kill they never will, by construction — <code>SIGKILL</code> is instantaneous and un-catchable. Any debugging habit of "keep re-reading the crashed process's own logs" fails here; the discipline is to know which failures leave evidence <em>outside</em> the process (OOM, hard kills, throttling) and go straight to the kernel/cgroup record for those. That instinct transfers directly to reading <code>OOMKilled</code> and exit codes in Kubernetes.</p>
+<div class="k8s-link">
+<p>Both are everyday Kubernetes tickets. Symptom&nbsp;1 is "the pod is slow but the node CPU is fine" — almost always a too-tight <code>resources.limits.cpu</code> throttling the container, found via <code>cpu.stat</code> on the node or the <code>container_cpu_cfs_throttled_*</code> metrics, fixed by raising/removing the CPU limit. Symptom&nbsp;2 is "the pod restarts and <code>kubectl logs</code> shows nothing about why" — an <code>OOMKilled</code> container (exit 137), diagnosed from <code>kubectl describe pod</code>'s <code>lastState</code> reason and, on the node, <code>dmesg</code> — exactly the evidence you just gathered by hand. This drill is the node-level version of the two most common pod-performance investigations.</p>
+<p>Both scenarios recur as headline exercises in troubleshooting, <a href="w6.html">W6</a>, and connect back to the limits set in <a href="w3.html#cp-3-16">W3.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel <code>cgroup-v2.rst</code> for <code>cpu.stat</code> (throttling fields) and <code>memory.events</code> (<code>oom_kill</code>). <code>man 1 dmesg</code> (<code>-T</code>, <code>-C</code>) for the kernel log. <code>man 7 cgroups</code> for the controller context. Re-read <a href="#cp-b7-7">B7.7</a> (throttling evidence) and <a href="#cp-b7-9">B7.9</a> (the OOM trio) — this drill exists to make both permanent. In the exam docs, pod termination reasons and CPU-throttling discussions.</p>
+</article>
+</div><!-- /g-project -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B7 recall quiz</h3>
-<p>Answer out loud before revealing. If you can explain why a namespaced pod with no memory limit can still take down a node, this module has done its job.</p>
+<p>Answer out loud before revealing. If you can explain why a namespaced pod with no memory limit can still take down a node, and diagnose "slow on an idle box," this module has done its job.</p>
 <ol>
 <li>In one sentence each, what does a namespace control and what does a cgroup control?
 <details class="reveal"><summary>Answer</summary><p>A namespace controls what a process can <em>see</em> — a private copy of one kernel resource (process list, hostname, network, mounts). A cgroup controls how much a set of processes can <em>use</em> — a metered cap on CPU, memory, process slots, and disk I/O. Hiding is not rationing; a container is deliberately both.</p></details></li>
+<li>What single command proves a box is on cgroups v2, and why do most old tutorials' paths (like <code>/sys/fs/cgroup/cpu/…</code>) fail on 24.04?
+<details class="reveal"><summary>Answer</summary><p><code>stat -fc %T /sys/fs/cgroup</code> returning <code>cgroup2fs</code>. Those paths are v1, which gave each controller its own separate hierarchy (a top-level <code>cpu/</code>, <code>memory/</code> directory). v2 uses one unified hierarchy where a process lives at a single node and controllers are files (<code>cpu.max</code>, <code>memory.max</code>) inside each cgroup — so the per-controller top-level directories simply don't exist.</p></details></li>
+<li>How do you create a cgroup, put a limit on it, and delete it — and why did control files appear that you never created?
+<details class="reveal"><summary>Answer</summary><p><code>mkdir</code> a directory under <code>/sys/fs/cgroup</code> (the directory <em>is</em> the cgroup, so the kernel auto-populates it with <code>cgroup.procs</code>, <code>cpu.max</code>, etc.); <code>echo</code> a value into a control file to set a limit; <code>rmdir</code> to delete (only when empty of processes and children). The files are the kernel's interface, created because the directory is a cgroup — you don't author them.</p></details></li>
+<li>You <code>mkdir</code> a child cgroup and writing to its <code>cpu.max</code> fails with "No such file or directory," though the directory exists. Why, and what's the fix?
+<details class="reveal"><summary>Answer</summary><p>The parent hasn't delegated the <code>cpu</code> controller, so the child has no <code>cpu.max</code> file. Write <code>+cpu</code> to the parent's <code>cgroup.subtree_control</code> and the child's <code>cpu.max</code> appears. (And by the no-internal-process rule, once a cgroup has controller-enabled children it may not itself hold processes — put those in leaves.)</p></details></li>
+<li>What's the difference between <code>cpu.weight</code> and <code>cpu.max</code>, and which one caps a process on an idle machine?
+<details class="reveal"><summary>Answer</summary><p><code>cpu.weight</code> (1–10000, default 100) is a <em>relative</em> share that only divides CPU under contention — with nothing else competing, even weight 1 uses a whole idle core. <code>cpu.max</code> (<code>QUOTA PERIOD</code> µs) is an <em>absolute</em> quota per window that caps the process even on an idle machine. So <code>cpu.max</code> is the one that caps regardless of demand; weight never imposes a ceiling.</p></details></li>
+<li>Translate <code>cpu.max = 50000 100000</code>, and explain how a process capped this way can be slow while the host CPU looks idle.
+<details class="reveal"><summary>Answer</summary><p>50000/100000 = half of one CPU (50ms of runtime per 100ms window). Once it spends its 50ms it's <em>throttled</em> — frozen until the next window — so a flat-out process runs 50ms, stalls 50ms, repeat. It uses little of the machine (host looks idle) yet suffers big latency; the proof is <code>cpu.stat</code>'s <code>throttled_usec</code> climbing.</p></details></li>
+<li>What is the difference between <code>memory.high</code> and <code>memory.max</code>?
+<details class="reveal"><summary>Answer</summary><p><code>memory.high</code> is the soft limit: crossing it makes the kernel reclaim hard and throttle the processes (they crawl but survive). <code>memory.max</code> is the hard limit: when reclaim can't keep usage under it, the OOM killer fires and kills a process. High = "brake"; max = "wall." Memory isn't compressible, so there's no "run slower forever" option — only reclaim or kill.</p></details></li>
+<li>A container exits 137 with nothing in its own logs. What happened, how is 137 computed, and where do you find the real evidence?
+<details class="reveal"><summary>Answer</summary><p>It was OOM-killed: the kernel sent <code>SIGKILL</code> (signal 9) for exceeding <code>memory.max</code>, and Unix reports "killed by signal N" as exit <code>128 + N</code> = 137. Because <code>SIGKILL</code> can't be caught, the app logged nothing. Evidence lives in the cgroup's <code>memory.events</code> (<code>oom_kill</code> counter) and the kernel log (<code>dmesg</code>, which names the cgroup and PID) — never the app's own logs. (137 = SIGKILL generally; confirm OOM specifically via those two.)</p></details></li>
+<li>How does <code>pids.max</code> contain a fork bomb, and why must you test the bomb only inside such a cgroup?
+<details class="reveal"><summary>Answer</summary><p><code>pids.max</code> caps the total tasks in the cgroup; once reached, further <code>fork()</code> fails with <code>EAGAIN</code>, so the bomb stops growing at the cap instead of exhausting the host's process table. You test it only inside the capped cgroup because an uncontained fork bomb would exhaust the whole machine in seconds — build the cage first, then run the dangerous thing inside it.</p></details></li>
+<li>How do you move a running process into a cgroup, and how do you confirm it worked from both directions?
+<details class="reveal"><summary>Answer</summary><p>Write its PID to the destination cgroup's <code>cgroup.procs</code> (a process is in exactly one cgroup, so the write moves it — no separate removal; the limits apply immediately). Confirm from the destination via its <code>cgroup.procs</code> listing the PID, and from the process via <code>/proc/PID/cgroup</code> naming the new cgroup. The target must be a leaf.</p></details></li>
+<li>What are systemd slices and scopes, and how do you cap a service's CPU without editing <code>/sys/fs/cgroup</code> directly?
+<details class="reveal"><summary>Answer</summary><p>A slice is a structural, process-free cgroup that groups and apportions resources (<code>system.slice</code>, <code>user.slice</code>); a scope wraps externally-created processes systemd manages (a login <code>session-N.scope</code>). Services live in <code>system.slice/&lt;name&gt;.service</code>. Cap one with <code>systemctl set-property &lt;unit&gt; CPUQuota=20%</code>, which writes <code>cpu.max = 20000 100000</code> — and persists, whereas hand-editing the file would be overwritten by systemd.</p></details></li>
+<li>Give the two debugging reflexes this module drills, each as "symptom ⇒ where the evidence is."
+<details class="reveal"><summary>Answer</summary><p>(1) Slow app but idle host CPU ⇒ CPU throttling from a too-tight <code>cpu.max</code>; the evidence is <code>cpu.stat</code>'s <code>throttled_usec</code>, not <code>top</code>. (2) Process exits 137 with a silent log ⇒ OOM kill; the evidence is <code>dmesg</code> and the cgroup's <code>memory.events</code>, not the app's logs. In both, the loud object (host CPU, app log) is innocent and the quiet cgroup state is guilty.</p></details></li>
 </ol>
 </div>
+
+<div class="outcome">
+<ul>
+<li>State the distinction the module rests on — namespaces hide, cgroups limit — and why a container needs both dials.</li>
+<li>Explain cgroups v2's unified hierarchy, prove a box is v2 with <code>stat -fc %T</code>, and recognise v1 paths in stale docs.</li>
+<li>Navigate <code>/sys/fs/cgroup</code> as a filesystem: <code>mkdir</code> a cgroup, read its control files, <code>rmdir</code> it.</li>
+<li>Apply the two v2 rules — delegate a controller with <code>cgroup.subtree_control</code>, obey no-internal-process — and read each error on sight.</li>
+<li>Distinguish <code>cpu.weight</code> (a share under contention) from <code>cpu.max</code> (a hard quota), and predict each one's behaviour on an idle box.</li>
+<li>Read <code>cpu.stat</code> and explain a service that is slow while the host CPU is idle as throttling, with <code>throttled_usec</code> as proof.</li>
+<li>Distinguish <code>memory.high</code> (throttle + reclaim) from <code>memory.max</code> (OOM kill), and read <code>memory.current</code> and <code>memory.events</code>.</li>
+<li>Trigger an OOM kill and collect its three fingerprints: exit 137, <code>oom_kill</code>, and the <code>dmesg</code> verdict.</li>
+<li>Contain a fork bomb with <code>pids.max</code> and cap disk throughput with <code>io.max</code>, understanding why each protects the machine.</li>
+<li>Move a running process into a cgroup with <code>cgroup.procs</code> and confirm membership from <code>/proc/PID/cgroup</code>.</li>
+<li>Read a service's cgroup from <code>systemctl status</code>, explain slices/scopes, and cap it live with <code>systemctl set-property</code>.</li>
+<li>Measure a self-built cage with <code>time</code> + <code>cpu.stat</code>, and add a cgroup to container v0.1 so it starts life rationed as well as isolated.</li>
+<li>Diagnose "slow but idle host" (throttling) and "dead with silent logs" (OOM) from cgroup evidence, not guesswork.</li>
+<li>Map every control here onto Kubernetes requests, limits, QoS, throttling, OOMKilled, and node-pressure eviction.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
 
 <nav class="pager"><a href="b6.html">← B6 · Isolation I: namespaces, chroot, pivot_root</a><a href="../beginner.html#b8">B8 · Networking I — the real network →</a></nav>
 
