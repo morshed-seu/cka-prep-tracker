@@ -266,6 +266,203 @@ grep -c /tmp/disk.img /etc/fstab</pre>
 </article>
 </div><!-- /g-devices -->
 
+<!-- ---------------- The VFS view ---------------- -->
+<div class="grp" id="g-vfs"><h3>The VFS view</h3>
+
+<article class="lesson" id="cp-b5-5" data-id="b5-5">
+<div class="lesson-head"><span class="cp-id">B5.5</span><h4>The VFS: one interface over every filesystem</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have used <code>cat</code> on a file in your home directory, on a file under <code>/proc</code> that isn't really a file at all, and (in a moment) on a file in a RAM disk — and it just worked, identically, every time. That is not luck. It is the <abbr title="virtual filesystem — the kernel layer that gives every filesystem the same interface">VFS</abbr>, the single most important abstraction in this whole module, because it is the thing that lets the next lessons hand a process an entirely different filesystem without changing a single line of any program. Grasp the VFS and overlayfs stops being surprising; it is just one more filesystem plugged into the same socket.</p>
+<h5>The concept</h5>
+<p>The <strong>VFS (virtual filesystem)</strong> is a layer inside the kernel that defines <em>one</em> set of operations — <code>open</code>, <code>read</code>, <code>write</code>, <code>stat</code>, <code>readdir</code>, and a few more — and forces every real filesystem to implement them. ext4 implements them by reading blocks off a disk. <code>tmpfs</code> implements them by reading pages of RAM. <code>procfs</code> implements <code>read</code> by making up the answer on the spot from kernel data structures. <code>overlayfs</code> implements them by consulting a stack of other filesystems. A network filesystem implements them by sending packets to another machine. The programs above — <code>cat</code>, your editor, every process — call the <em>same</em> syscalls (B3) and never know or care which implementation is underneath.</p>
+<p>Think of it as a standard wall socket. Every appliance has the same plug; behind the wall the power might come from the grid, a generator, or solar panels, and the appliance neither knows nor needs to. The VFS is that socket for storage: one plug shape (<code>open</code>/<code>read</code>/<code>write</code>), many sources behind the wall. This is precisely why B6 can put a process into a completely different root filesystem and every ordinary program keeps working — they were never talking to ext4, they were always talking to the VFS.</p>
+<div class="flow"><span>cat · your editor · any process</span><em>→ same syscalls →</em><span class="hot">VFS</span><em>→</em><span>ext4 · tmpfs · procfs · overlayfs · NFS</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the filesystem types this kernel knows how to speak. Each line in <code>/proc/filesystems</code> is one implementation registered behind the VFS; <code>nodev</code> marks the ones not backed by a block device.
+<pre class="cmd">cat /proc/filesystems | head -20</pre>
+<pre class="out">nodev	sysfs
+nodev	<b>tmpfs</b>
+nodev	proc
+nodev	<b>overlay</b>
+	<b>ext4</b>
+	vfat
+...</pre></li>
+<li>See many different filesystem types stitched into one tree, all reachable by the same commands. <code>findmnt</code>'s <code>FSTYPE</code> column is the VFS implementation behind each branch.
+<pre class="cmd">findmnt -o TARGET,FSTYPE,SOURCE | head -12</pre>
+<pre class="out">TARGET                FSTYPE   SOURCE
+/                     <b>ext4</b>     /dev/sda1
+├─/proc               <b>proc</b>     proc
+├─/sys                sysfs    sysfs
+├─/dev/shm            <b>tmpfs</b>    tmpfs
+├─/run                tmpfs    tmpfs
+...</pre></li>
+<li>Prove the interface is genuinely uniform: the same <code>cat</code> reads a real file on ext4 and a made-up-on-demand "file" on procfs, with no hint it did anything different.
+<pre class="cmd">cat /etc/hostname          # ext4: bytes off a disk
+cat /proc/uptime           # procfs: numbers the kernel synthesises now
+stat -f -c 'fstype=%T' /etc/hostname /proc/uptime</pre>
+<pre class="out">sandbox
+1234.56 1200.00
+fstype=<b>ext2/ext3</b>                 ← the disk-backed file
+fstype=<b>proc</b>                       ← same cat, different fs behind the VFS</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, in one sentence, why <code>cat</code> needs no special knowledge of ext4, tmpfs, or procfs to read a file on any of them. (Because <code>cat</code> only ever calls the VFS operations <code>open</code>/<code>read</code>; the kernel routes those to whichever filesystem implementation owns the path, so the difference is entirely below <code>cat</code>'s view.) Then answer: how does this abstraction make overlayfs possible at all? (overlayfs is just another VFS implementation — it satisfies the same operations by consulting a stack of other filesystems, so every program works on it unchanged.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Everything is a file" is a VFS statement, and it has limits. <code>/proc/uptime</code> looks like a file and reads like one, but it has no blocks on any disk — its <code>read</code> runs kernel code that produces the answer on the spot, which is why its size shows as 0 and why you cannot seek around it like a real file. The uniform interface is real, but some filesystems implement only part of it or implement it with surprises; treating a <code>/proc</code> or <code>/sys</code> file as if it were an ordinary ext4 file (copying it, checking its size, memory-mapping it) is a common source of confusion.</p>
+<p>Not every operation is supported by every filesystem. A read-only filesystem's <code>write</code> returns <code>EROFS</code>; procfs directories can't be renamed; some virtual files reject <code>seek</code>. The VFS defines the <em>interface</em>; each filesystem chooses which parts it honours, so "the interface is uniform" does not mean "every operation always succeeds".</p>
+<div class="k8s-link">
+<p>The VFS is the quiet reason a container works at all. When a container runtime gives a pod its own root filesystem (an overlay mount, coming up), every binary inside the container — none of which was compiled with any knowledge of overlayfs — keeps functioning, because they all speak the VFS interface and overlayfs sits behind it. The same uniformity is why Kubernetes can project a <code>ConfigMap</code> as files, back an <code>emptyDir</code> with either disk or <code>tmpfs</code> (RAM), and mount a network volume, all appearing to the application as ordinary files it reads with ordinary code. "It's just a file to the app" is the VFS keeping its promise.</p>
+<p>The RAM-vs-disk choice for an <code>emptyDir</code> (<a href="w5.html#cp-5-1">W5.1</a>) is exactly "which VFS implementation backs this mount"; the ConfigMap-as-files projection is the same idea.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 open</code>, <code>man 2 read</code>, <code>man 2 stat</code> for the operations the VFS defines; <code>man 5 filesystems</code> and <code>cat /proc/filesystems</code> for the registered implementations. <code>man 8 findmnt</code> with <code>-o FSTYPE</code> shows which one backs each mount. <code>man 5 proc</code> for how procfs fakes files convincingly. No exam-docs analogue — this is kernel architecture the cluster stands on.</p>
+</article>
+
+<article class="lesson" id="cp-b5-6" data-id="b5-6">
+<div class="lesson-head"><span class="cp-id">B5.6</span><h4>The file is not its name: inodes and directory entries</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Almost everyone carries a wrong mental model: that a file <em>is</em> its name and path, the way a variable is its label. Linux does not work that way, and the gap between the two explains a whole cluster of otherwise-baffling behaviours — why you can delete a file another process is still happily reading, why a file can have two names, why "renaming" is instantaneous no matter how large the file. The fix is one clean idea: the file and its name are separate things, joined by a number.</p>
+<h5>The concept</h5>
+<p>Every file is really an <strong>inode</strong> — an on-disk record holding all the file's actual properties: its type, owner and group, permission bits, size, timestamps, link count, and the pointers to the data blocks. The inode has a <em>number</em> but no name. The name lives somewhere else entirely: a <strong>directory</strong> is just a table of <code>(name → inode number)</code> pairs. So "the file <code>/home/ubuntu/notes.txt</code>" is really "walk to the directory <code>/home/ubuntu</code>, look up the name <code>notes.txt</code> in its table, get an inode number, go read that inode." The name is a label in a table; the file is the inode the label points at.</p>
+<p>That indirection is the point. It means a single inode can be reachable by more than one name (two directory entries pointing at the same number — a hard link, next lesson). It means "deleting a file" is really removing one <code>(name → number)</code> entry, and the inode itself only disappears when its <strong>link count</strong> — how many names point at it — reaches zero <em>and</em> no process still has it open. And it means renaming or moving within a filesystem just rewrites a table entry; the inode and its gigabytes of data never move.</p>
+<div class="flow"><span>name in a directory</span><em>→ maps to</em><span class="hot">inode number</span><em>→ points at</em><span>inode: owner · mode · size · data blocks</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See the number behind the name. <code>ls -i</code> prints each name's inode number; <code>stat</code> shows the same number plus everything the inode actually stores — note there is no filename anywhere in the inode's own fields.
+<pre class="cmd">echo hello &gt; /tmp/a.txt
+ls -i /tmp/a.txt
+stat /tmp/a.txt</pre>
+<pre class="out"><b>266241</b> /tmp/a.txt
+  File: /tmp/a.txt
+  Size: 6   Blocks: 8   IO Block: 4096   regular file
+Device: 803h/2051d   <b>Inode: 266241   Links: 1</b>
+Access: (0664/-rw-rw-r--)  Uid: (1000/ubuntu)  Gid: (1000/ubuntu)</pre></li>
+<li>Prove the name is separate from the file by renaming and watching the inode number stay identical — same file, new label.
+<pre class="cmd">mv /tmp/a.txt /tmp/b.txt
+ls -i /tmp/b.txt</pre>
+<pre class="out"><b>266241</b> /tmp/b.txt              ← same inode: only the directory entry changed</pre></li>
+<li>Look at a directory <em>as</em> a table. Every entry is a name paired with an inode number, including the two the filesystem always creates: <code>.</code> (this directory) and <code>..</code> (its parent).
+<pre class="cmd">ls -ai /tmp | head</pre>
+<pre class="out">      2 <b>.</b>
+      2 <b>..</b>
+266241 b.txt
+...</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You ran <code>mv /tmp/a.txt /tmp/b.txt</code> and the inode number did not change. Explain what <code>mv</code> actually did to the directory table. (It removed the entry <code>a.txt → 266241</code> and added <code>b.txt → 266241</code> — the inode and its data were never touched, which is why renaming a huge file is instant.) Then answer: if two names in a directory both showed inode <code>266241</code>, what would be true about them? (They would be the same file — two labels for one inode — so editing "one" changes "both", because there is only one.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Inode numbers are unique only <em>within one filesystem</em>, not globally. Two files on different filesystems can share an inode number and be completely unrelated — which is why <code>stat</code> reports a <code>Device</code> as well as an <code>Inode</code>, and why the true identity of a file is the <code>(device, inode)</code> pair. Tools that de-duplicate or detect hard links compare both; comparing inode numbers alone across mount points gives false matches.</p>
+<p>Deleting a name is not always deleting the file. <code>rm</code> removes a directory entry and decrements the link count; the data blocks are freed only when the count hits zero and no process holds the inode open. This is the mechanism behind the deleted-but-open puzzle in B5.8 — the name is gone, the inode isn't, because a file descriptor is still a reference to it.</p>
+<div class="k8s-link">
+<p>The inode-vs-name split is why atomic config updates work the way they do in Kubernetes. When the kubelet updates a projected <code>ConfigMap</code> or <code>Secret</code> volume, it does not edit the files in place — it builds a new directory of the content and swaps a symlink to point at it, so a reader either sees the entire old version or the entire new one, never a half-written file. That trick is only possible because a name is an independent pointer to an inode, exactly what this lesson establishes. The same reasoning explains why a container that had a file open keeps reading the old content after the ConfigMap changes (its descriptor references the old inode) until it re-opens by name.</p>
+<p>The projected-volume atomic-swap behaviour surfaces in <a href="w5.html#cp-5-1">W5.1</a>; the "I updated the ConfigMap but the running process still sees the old value" gotcha is this inode reference in action.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 inode</code> for what an inode stores (and the file-type bits), <code>man 1 stat</code> for reading it (<code>Inode</code>, <code>Links</code>, <code>Device</code>), and <code>man 1 ls</code> under <code>-i</code>. <code>man 2 rename</code> confirms that renaming within a filesystem is a directory-entry operation. <code>man 3 readdir</code> shows a directory being read as the table of entries it is.</p>
+</article>
+
+<article class="lesson" id="cp-b5-7" data-id="b5-7">
+<div class="lesson-head"><span class="cp-id">B5.7</span><h4>Two kinds of link: hard links and symlinks</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Now that you know a name and a file are different things, links follow naturally — and there are exactly two kinds, which people constantly confuse. A <strong>hard link</strong> is a second true name for the same inode; a <strong>symbolic link</strong> is a tiny separate file that merely holds a path to somewhere else. They behave differently the moment you delete or move the original, and knowing which is which is the difference between "my link still works" and "my link is now a dangling arrow to nothing".</p>
+<h5>The concept</h5>
+<p>Both let one file be reachable two ways, but the mechanism is opposite:</p>
+<ul>
+<li>A <strong>hard link</strong> (<code>ln target newname</code>) adds a second <code>(name → inode number)</code> entry pointing at the <em>same inode</em>. There is no "original" and "copy" — both names are equal, first-class references to one file, and the inode's link count goes up by one. Delete either name and the file survives under the other; the data vanishes only when the last name is removed. Because it references an inode number, a hard link cannot cross filesystems (numbers are per-filesystem) and, by convention, cannot point at a directory.</li>
+<li>A <strong>symbolic link</strong> (<code>ln -s target newname</code>) creates a brand-new, separate file — its own inode — whose entire contents are a text path to the target. It is a signpost. Follow it and you are redirected to whatever that path currently names. Delete or move the target and the symlink still exists but now points at nothing — a "dangling" link. Symlinks <em>can</em> cross filesystems and <em>can</em> point at directories, precisely because they store a path, not an inode number.</li>
+</ul>
+<p>The one-line test to keep them straight: a hard link shares the file's <em>identity</em> (same inode); a symlink shares only the file's <em>address</em> (a path), and addresses can go stale.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make a hard link and watch the link count. Both names share one inode number, and the count in <code>stat</code> is now 2.
+<pre class="cmd">echo 'the original' &gt; /tmp/orig
+ln /tmp/orig /tmp/hard
+ls -li /tmp/orig /tmp/hard</pre>
+<pre class="out">266300 -rw-rw-r-- <b>2</b> ubuntu ubuntu 13 ... /tmp/orig     ← same inode 266300,
+266300 -rw-rw-r-- <b>2</b> ubuntu ubuntu 13 ... /tmp/hard     ← link count 2</pre></li>
+<li>Delete the "original" and prove the hard link kept the data alive — the inode had another name, so nothing was freed; the count drops to 1.
+<pre class="cmd">rm /tmp/orig
+cat /tmp/hard
+stat -c 'links=%h' /tmp/hard</pre>
+<pre class="out"><b>the original</b>                        ← still here: the inode outlived the name
+links=1</pre></li>
+<li>Now a symlink, and break it. The symlink is its own tiny file (note the different inode and the <code>l</code> type); delete its target and it dangles.
+<pre class="cmd">echo 'target data' &gt; /tmp/real
+ln -s /tmp/real /tmp/link
+ls -li /tmp/link; readlink /tmp/link
+rm /tmp/real
+cat /tmp/link</pre>
+<pre class="out">266322 <b>l</b>rwxrwxrwx 1 ubuntu ubuntu 9 ... /tmp/link -&gt; /tmp/real
+/tmp/real
+cat: /tmp/link: <b>No such file or directory</b>   ← dangling: the path no longer resolves</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Predict before deleting anything: you have a file, a hard link to it, and a symlink to it. You <code>rm</code> the file's original name. Which of the other two still gives you the data, and why? (The hard link does — it is an equal name for the same inode, so removing one name leaves the inode alive. The symlink does not — it stored the now-gone path, so it dangles.) Then say why a hard link can't span two filesystems but a symlink can. (A hard link references an inode number, which is only meaningful within one filesystem; a symlink stores a path string, which is meaningful anywhere.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A dangling symlink is not an error until you follow it. <code>ls -l</code> will happily show a symlink whose target no longer exists (often highlighted in red), and creating one is legal — you can make a symlink to a path that doesn't exist yet. The failure only appears at the moment something tries to <em>resolve</em> it, as <code>ENOENT</code>. So "the file exists (I can <code>ls</code> the link) but I can't read it" is very often a broken symlink; <code>readlink -f</code> shows where it actually points.</p>
+<p>Editors can quietly convert a hard link into a separate file. Some editors save by writing a new file and renaming it over the old name, which breaks the hard-link relationship — after such a save, your two "hard-linked" names are now two independent files. Hard links are best for stable data, not for files that get rewritten by tools that don't preserve them; when in doubt, <code>stat</code> the link count before and after.</p>
+<div class="k8s-link">
+<p>Symlinks are load-bearing in a container's filesystem and in Kubernetes volume projection. The atomic ConfigMap/Secret update from B5.6 works by swapping a symlink (<code>..data</code>) to point at a new timestamped directory — the whole "consistent view during an update" guarantee rides on symlink semantics. Container images also lean on symlinks heavily (for example, <code>/lib</code> pointing into <code>/usr/lib</code>), and a symlink that points outside the intended tree is a classic container-escape and image-scanning concern. Recognising a projected volume's <code>..data</code> symlink for what it is demystifies the odd directory layout you'll see inside a mounted ConfigMap.</p>
+<p>You'll see that <code>..data</code> symlink structure when you inspect a mounted ConfigMap in <a href="w3.html">W3</a>; the atomic-update behaviour is revisited in <a href="w5.html#cp-5-1">W5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ln</code> for creating both kinds (<code>-s</code> for symbolic), <code>man 7 symlink</code> for how symlink resolution works, and <code>man 2 link</code>/<code>man 2 symlink</code> for the syscalls. <code>man 1 readlink</code> (<code>-f</code> to resolve fully) and <code>man 1 stat</code> (link count via <code>%h</code>) for inspecting them.</p>
+</article>
+
+<article class="lesson" id="cp-b5-8" data-id="b5-8">
+<div class="lesson-head"><span class="cp-id">B5.8</span><h4>The disk is full and nothing is big: <code>df</code> vs <code>du</code>, open-but-deleted, inodes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Three of the most common "how is this even possible" disk incidents all come from the same root: the filesystem's own accounting and the sum of the files you can <em>see</em> are two different numbers, and they drift apart for specific, knowable reasons. A disk reports 100% full but <code>du</code> finds only a few megabytes. A file you deleted didn't free any space. A filesystem refuses to create a file with gigabytes free. Each looks like a bug and each has a five-second explanation once you know where to look — and this is the exact toolkit the B5.18 drill and real W6 pages lean on.</p>
+<h5>The concept</h5>
+<p>Two commands answer "how much space?" from opposite directions:</p>
+<ul>
+<li><strong><code>df</code></strong> asks the <em>filesystem</em>: from the superblock's own bookkeeping, how many blocks (and, with <code>-i</code>, how many inodes) are used and free? This is the authoritative "how full am I" number.</li>
+<li><strong><code>du</code></strong> walks the directory tree and adds up the sizes of the files it can <em>reach by name</em>. This is "how much do the visible files account for".</li>
+</ul>
+<p>When these two disagree, the gap is the whole diagnosis. Three causes cover almost every case:</p>
+<ol>
+<li><strong>A deleted-but-still-open file.</strong> A process opened a file, then it was deleted (its name removed) while the process still holds the descriptor. From B5.6: the name is gone so <code>du</code> can't see it, but the inode and its data blocks survive until the process closes the fd — so <code>df</code> still counts the space. Result: <code>df</code> says full, <code>du</code> says empty. The holder is visible in <code>/proc/PID/fd</code> as a link marked <code>(deleted)</code>.</li>
+<li><strong>Inode exhaustion.</strong> The fixed inode count from <code>mkfs</code> (B5.2) ran out — millions of tiny files each took one inode — so the filesystem can't create another file even though block space is free. <code>df -i</code> shows 100% <em>inodes</em> used while <code>df</code> shows blocks free.</li>
+<li><strong>Space hidden under a mount point.</strong> Files written to a directory <em>before</em> something was mounted over it (B5.3) still occupy the underlying filesystem but are shadowed, so <code>du</code> of the mounted path can't see them.</li>
+</ol>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Reproduce the deleted-but-open file. Start a process writing to a file, then delete the file's name while that process keeps it open — the space stays used with no visible file to blame.
+<pre class="cmd">( tail -f /dev/null &gt; /tmp/ghost.log &amp; echo $! ) &amp;&amp; sleep 1
+# grow it, then delete the NAME while the writer holds it open:
+dd if=/dev/zero of=/tmp/ghost.log bs=1M count=20 conv=notrunc 2&gt;/dev/null
+rm /tmp/ghost.log
+ls /tmp/ghost.log</pre>
+<pre class="out">1234                                    ← the writer's PID
+ls: cannot access '/tmp/ghost.log': <b>No such file or directory</b></pre></li>
+<li>Find the ghost. The name is gone but a process still holds the inode; <code>/proc/PID/fd</code> shows the descriptor pointing at the deleted file, which is why the space isn't back.
+<pre class="cmd">ls -l /proc/1234/fd | grep deleted</pre>
+<pre class="out">l-wx------ ... 1 -&gt; <b>/tmp/ghost.log (deleted)</b>   ← space freed only when this closes</pre></li>
+<li>See inode accounting directly. <code>df -i</code> reports inodes, a different budget from blocks — this is the number that hits zero in the exhaustion case even when <code>df</code> shows free space. (Kill the writer to release the ghost.)
+<pre class="cmd">df -i /tmp
+kill 1234</pre>
+<pre class="out">Filesystem  Inodes  IUsed  IFree IUse% Mounted on
+/dev/sda1   322400   90312 232088   <b>29%</b> /       ← inodes, counted separately from bytes</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>df</code> said space was used but <code>ls</code> found no file. Explain the discrepancy in terms of inodes and link counts. (The file's name was removed, so <code>du</code>/<code>ls</code> can't see it, but a process still holds the inode open — its link count is 0 but its open count is not — so the inode and its blocks persist, and <code>df</code>, which reads the filesystem's own accounting, still counts them.) Then say which command you'd reach for first when a disk is "full" but files look small, and what it would tell you. (<code>df -i</code> — if inodes are exhausted while blocks are free, the problem is millions of tiny files, not big ones.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Restarting the process is the fix for a deleted-but-open file, and deleting more files is not. Since the space is held by an open descriptor, no amount of hunting for large files helps — you must make the holder close the fd, usually by restarting it (or, in a pinch, truncating through <code>/proc/PID/fd/N</code>). The reflex when <code>df</code> and <code>du</code> disagree by a lot: look for <code>(deleted)</code> in <code>/proc/*/fd</code> (or run <code>lsof +L1</code>) before anything else.</p>
+<p>Inode exhaustion is invisible to plain <code>df</code>. The default <code>df</code> shows only block usage, so a filesystem at 100% inodes but 40% blocks looks half-empty right up until every <code>touch</code> and <code>write</code> fails with <code>No space left on device</code> — the same <code>ENOSPC</code> error as a truly full disk, for a completely different reason. Always check <code>df -i</code> when <code>ENOSPC</code> appears on a disk that <code>df</code> says has room.</p>
+<div class="k8s-link">
+<p>Both failures are routine node incidents in Kubernetes. A container that logs heavily and has its log file rotated (renamed and deleted) while the process holds it open produces the classic "the node disk is full but I can't find what's using it" page — it is the deleted-but-open file, one layer down, and the fix is restarting the offending pod. Inode exhaustion hits nodes that run many short-lived pods or write millions of small files, and it triggers the kubelet's disk-pressure eviction with plenty of bytes free — mystifying until you run <code>df -i</code> on the node. The <code>df</code>/<code>du</code>/<code>df -i</code>/<code>lsof</code> reflexes transfer directly to debugging a node.</p>
+<p>Disk-pressure eviction and "node disk full" are <a href="w6.html">W6</a> troubleshooting scenarios; the ephemeral-storage limits that bound a pod's disk use are in <a href="w5.html#cp-5-1">W5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 df</code> (<code>-h</code> for readable, <code>-i</code> for inodes) and <code>man 1 du</code> (<code>-sh</code>, <code>-x</code> to stay on one filesystem) for the two views, <code>man 8 lsof</code> (<code>+L1</code> finds open-but-unlinked files) for the holder, and <code>man 5 proc</code> under <code>/proc/[pid]/fd</code>. Re-read <a href="#cp-b5-6">B5.6</a> — this whole lesson is the inode/link-count model made operational.</p>
+</article>
+</div><!-- /g-vfs -->
+
 <!-- INSERT-GROUPS-HERE -->
 
 <nav class="pager"><a href="b4.html">← B4 · Users, groups, permissions, capabilities</a><a href="../beginner.html#b6">B6 · Isolation I — namespaces, chroot, pivot_root →</a></nav>
