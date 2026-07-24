@@ -463,6 +463,196 @@ kill 1234</pre>
 </article>
 </div><!-- /g-vfs -->
 
+<!-- ---------------- Special mounts ---------------- -->
+<div class="grp" id="g-special"><h3>Special mounts</h3>
+
+<article class="lesson" id="cp-b5-9" data-id="b5-9">
+<div class="lesson-head"><span class="cp-id">B5.9</span><h4>Memory as a filesystem: <code>tmpfs</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Not every filesystem lives on a disk. A <strong>tmpfs</strong> is a filesystem whose storage is RAM — you mount it, write files to it, read them back with ordinary commands, and every byte is sitting in memory, gone forever on reboot. Your VM is already running several without you knowing. Understanding tmpfs is the difference between "an <code>emptyDir</code> with <code>medium: Memory</code>" being a mysterious incantation and being an obvious "put this mount in RAM", and it is your first concrete example of the VFS letting a non-disk thing be a perfectly ordinary filesystem.</p>
+<h5>The concept</h5>
+<p>A <strong>tmpfs</strong> ("temporary filesystem") is a VFS implementation backed by the kernel's page cache — the same memory used for caching disk data — rather than by a block device. Files you create in it occupy RAM. The consequences flow from that one fact:</p>
+<ul>
+<li><strong>Fast</strong> — no disk is involved, so reads and writes run at memory speed.</li>
+<li><strong>Ephemeral</strong> — RAM doesn't survive a reboot, so a tmpfs is empty every boot; it is scratch space, never storage.</li>
+<li><strong>Counts against memory</strong> — a file in tmpfs consumes RAM exactly as a running program would, so filling a tmpfs can exhaust memory and trigger the OOM killer (B2). The <code>size=</code> option caps how large it may grow; it can also spill to swap if the system has any.</li>
+</ul>
+<p>You already rely on several. <code>/run</code> (runtime state that should not persist), <code>/dev/shm</code> (shared-memory scratch for programs), and parts of <code>/sys</code> are tmpfs — which is exactly why <code>/run</code> is empty and rebuilt on every boot. It is the standard Linux answer to "I need a fast, disposable place to put files".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Mount a 64&nbsp;MiB RAM filesystem and use it like any other. The <code>size=</code> option is the ceiling; write a file and it is now living in memory.
+<pre class="cmd">sudo mkdir -p /mnt/scratch
+sudo mount -t tmpfs -o size=64M tmpfs /mnt/scratch
+echo 'this lives in RAM' | sudo tee /mnt/scratch/note &gt;/dev/null
+findmnt /mnt/scratch</pre>
+<pre class="out">TARGET       SOURCE FSTYPE OPTIONS
+<b>/mnt/scratch tmpfs  tmpfs</b>  rw,relatime,size=65536k</pre></li>
+<li>See the ones you already have. Every mount here is RAM-backed and was set up by the system at boot — none of it survives a reboot.
+<pre class="cmd">findmnt -t tmpfs -o TARGET,SIZE,USED</pre>
+<pre class="out">TARGET               SIZE  USED
+/run                 393M  1.2M
+/dev/shm             994M     0
+/run/lock            5.0M     0
+<b>/mnt/scratch          64M    17</b>          ← the one you just made</pre></li>
+<li>Confirm the cap bites. Try to write more than the size allows and it fails with "No space left" — the same <code>ENOSPC</code> as a full disk, but here it means "the memory budget for this mount is used up". Then unmount to release the RAM.
+<pre class="cmd">dd if=/dev/zero of=/mnt/scratch/big bs=1M count=100 2&gt;&amp;1 | tail -1
+sudo umount /mnt/scratch</pre>
+<pre class="out">dd: error writing '/mnt/scratch/big': <b>No space left on device</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain why a file in <code>/mnt/scratch</code> disappears on reboot but a file in <code>/mnt/data</code> (the ext4 image) does not. (tmpfs is backed by RAM, which is cleared on reboot; the ext4 filesystem is backed by a block device whose contents persist.) Then answer: your tmpfs is capped at 64&nbsp;MiB — what runs out when you exceed it, and what error do you get? (Memory allocated to that mount; you get <code>ENOSPC</code> / "No space left on device", the same error a full disk gives, because from the filesystem's view the space budget is exhausted.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>tmpfs space <em>is</em> memory, and forgetting that is dangerous. A tmpfs with no <code>size=</code> defaults to half of RAM, and files written to it are not "free scratch" — they compete with running processes for physical memory and can drive the machine into swapping or OOM-killing. Filling a tmpfs is filling RAM. Always set an explicit <code>size=</code> on a tmpfs you create, sized as a fraction of available memory, not of disk.</p>
+<p>Don't confuse <code>/tmp</code> with tmpfs. On many systems <code>/tmp</code> is an ordinary directory on the root disk, not a tmpfs — so files there <em>do</em> survive a reboot (until something cleans them) and don't consume RAM. Whether <code>/tmp</code> is a tmpfs is a per-distro choice; check with <code>findmnt /tmp</code> rather than assuming. The name "temporary filesystem" refers to the RAM-backed mechanism, not to the <code>/tmp</code> directory.</p>
+<div class="k8s-link">
+<p>This is exactly <code>emptyDir</code> with <code>medium: Memory</code> in a pod spec: the volume becomes a tmpfs, so it is fast and wiped when the pod dies, and — the critical operational fact — every byte written counts against the container's memory limit and can OOM-kill the pod. A Secret mounted into a pod is also backed by tmpfs by default, precisely so the secret material never touches the node's disk. When you reason about "why did my pod get OOM-killed when its process was using little memory", a runaway <code>medium: Memory</code> emptyDir is a prime suspect, and it is this lesson's RAM-is-the-storage fact at work.</p>
+<p>You'll set <code>emptyDir: {medium: Memory}</code> and see the memory-limit interaction in <a href="w5.html#cp-5-1">W5.1</a>; the tmpfs-backed Secret mount is a recurring detail in <a href="w3.html">W3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 tmpfs</code> for the filesystem and its options (<code>size=</code>, <code>nr_inodes=</code>, <code>mode=</code>), <code>man 8 mount</code> under <code>-t tmpfs</code>, and <code>man 8 findmnt</code> with <code>-t tmpfs</code> to list them. <code>free -h</code> and <code>man 5 proc</code> (<code>/proc/meminfo</code>) show tmpfs usage counting as memory. In the exam docs, <code>emptyDir</code> with <code>medium: Memory</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b5-10" data-id="b5-10">
+<div class="lesson-head"><span class="cp-id">B5.10</span><h4>A file that acts like a disk: loop devices</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have already used this trick twice — <code>mount -o loop</code> on the image file — without seeing the machinery. A <strong>loop device</strong> is the mechanism that lets an ordinary file <em>be</em> a block device: it wraps <code>/tmp/disk.img</code> in a <code>/dev/loopN</code> handle that behaves, to the whole rest of the system, exactly like a disk. This is how you experiment with filesystems without a spare drive, how a downloaded <code>.iso</code> or cloud image gets inspected, and — one level up — a piece of how container and snapshot storage is built.</p>
+<h5>The concept</h5>
+<p>Recall from B5.1 that a block device is just a handle (major/minor) to a driver that serves fixed-size blocks. A <strong>loop device</strong> is a driver that serves those blocks <em>out of a regular file</em>: block <em>N</em> of <code>/dev/loop0</code> is simply the bytes at offset <em>N</em>&times;blocksize in the backing file. Once <code>losetup</code> associates a file with a <code>/dev/loopN</code>, everything that works on a real disk works on the file through that device — <code>mkfs</code>, <code>mount</code>, <code>fdisk</code>, <code>lsblk</code> — because none of them can tell the difference; they only speak the block-device interface, and the loop driver answers it.</p>
+<p><code>mount -o loop file dir</code> is a convenience that does two steps at once: it finds a free loop device, attaches the file to it with <code>losetup</code>, and mounts that loop device — then detaches it automatically on unmount. Doing the steps by hand (as below) is what makes the "a file pretending to be a disk" idea concrete, and it's what you need when you want to <em>partition</em> an image or inspect it without mounting.</p>
+<div class="flow"><span>/tmp/disk.img (a file)</span><em>→ losetup →</em><span class="hot">/dev/loop0 (a block device)</span><em>→ mount/mkfs treat it as</em><span>a real disk</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Attach the image to a loop device by hand. <code>-f</code> finds a free one, <code>--show</code> prints which it chose, <code>-P</code> would scan for partitions inside. Now <code>lsblk</code> lists it like any disk.
+<pre class="cmd">LOOP=$(sudo losetup -f --show /tmp/disk.img)
+echo "attached as $LOOP"
+lsblk "$LOOP"</pre>
+<pre class="out">attached as <b>/dev/loop0</b>
+NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+<b>loop0</b>    7:0    0  128M  0 loop</pre></li>
+<li>Mount the loop device the ordinary way — no <code>-o loop</code> now, because it already <em>is</em> a block device. This is exactly what <code>mount -o loop</code> was doing for you all along.
+<pre class="cmd">sudo mount "$LOOP" /mnt/data
+findmnt /mnt/data
+losetup -a</pre>
+<pre class="out">TARGET    SOURCE      FSTYPE OPTIONS
+/mnt/data <b>/dev/loop0</b>  ext4   rw,relatime
+<b>/dev/loop0</b>: [2051]:266xxx (/tmp/disk.img)   ← loop → backing file</pre></li>
+<li>Tear it down in the right order: unmount first, then detach the loop device to free it.
+<pre class="cmd">sudo umount /mnt/data
+sudo losetup -d "$LOOP"
+losetup -a</pre>
+<pre class="out">                                        ← empty: the loop device is released</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain what <code>mount -o loop /tmp/disk.img /mnt/data</code> does under the hood, in terms of the two steps you just did by hand. (It picks a free loop device, attaches the file to it with the equivalent of <code>losetup</code>, then mounts that loop device — and reverses both on unmount.) Then answer: why can <code>mkfs</code>, <code>lsblk</code>, and <code>mount</code> all operate on a loop device without any special "this is really a file" awareness? (Because the loop driver presents the same block-device interface as a real disk; those tools only ever speak that interface, so the backing being a file is invisible to them — the VFS/block-layer abstraction again.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Loop devices leak if you forget to detach them. Every <code>losetup -f</code> without a matching <code>losetup -d</code> leaves a loop device tied up and the backing file pinned open — run enough of them and you exhaust the loop devices or can't delete the image. <code>losetup -a</code> lists what's attached; detach with <code>losetup -d /dev/loopN</code>. The <code>mount -o loop</code> form avoids this by auto-detaching on unmount, which is one reason to prefer it unless you specifically need the raw device.</p>
+<p>Order matters on teardown: unmount <em>before</em> detaching. Detaching a loop device that is still mounted (or forcing it) can leave the filesystem in an inconsistent state and the mount pointing at nothing. Always <code>umount</code> first, then <code>losetup -d</code> — the same "release users before removing the thing" discipline as the busy-unmount gotcha in B5.3.</p>
+<div class="k8s-link">
+<p>Loop devices show up under container and Kubernetes storage in a few places. Some storage drivers and CSI plugins back a volume with a filesystem image and expose it via a loop device; disk-image-based tools and certain snapshot mechanisms do the same. More practically, when you need to inspect a raw volume image, a VM disk, or a container export on a node, <code>losetup</code> + <code>mount</code> is how you open it read-only and look inside without a spare disk. The mental model — "a file the kernel is presenting as a block device" — is also the cleanest way to understand how a single node hosts dozens of independent "disks" for pods without dozens of physical drives.</p>
+<p>This is background for the block-and-file-backed volume mechanics you'll meet in <a href="w5.html">W5</a>; there's no direct exam task, but it's the plumbing under image-backed storage.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 losetup</code> for attaching/detaching and listing (<code>-f</code>, <code>--show</code>, <code>-P</code>, <code>-a</code>, <code>-d</code>), <code>man 8 mount</code> under <code>-o loop</code> for the convenience form, and <code>man 4 loop</code> for the driver itself. <code>man 8 lsblk</code> shows loop devices with type <code>loop</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b5-11" data-id="b5-11">
+<div class="lesson-head"><span class="cp-id">B5.11</span><h4>One directory in two places: bind mounts</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>So far every mount has attached a <em>device</em> to a directory. A <strong>bind mount</strong> does something different and, once it clicks, surprisingly powerful: it attaches a directory that already exists to a <em>second</em> path, so the same files are reachable through two different locations — no copy, no symlink, the very same inodes seen twice. This is the mechanism a container runtime uses to inject a host directory into a container, and it is the honest answer to "how is that config file both on the host and inside the pod".</p>
+<h5>The concept</h5>
+<p>A <strong>bind mount</strong> (<code>mount --bind src dst</code>) grafts the subtree at <code>src</code> onto <code>dst</code>. After it, walking into <code>dst</code> lands you in the exact same inodes as <code>src</code> — write a file through one path and it is instantly there through the other, because there is only one set of files. It is not a copy (no duplicate data, no drift) and not a symlink (no separate signpost file that can dangle) — it is the same directory subtree with a second entry in the mount table. This is fundamentally different from the earlier mounts: nothing new is being made available, an existing part of the tree is simply being made reachable at another point.</p>
+<p>One sharp edge that trips everyone: <strong>a read-only bind is not read-only on the first try.</strong> <code>mount --bind -o ro src dst</code> quietly ignores the <code>ro</code> and gives you a writable bind, because the read-only flag applies to the underlying mount, not to the bind operation itself. To actually get a read-only view you must do it in two steps — bind first, then <em>remount</em> with <code>ro</code>: <code>mount -o remount,ro,bind dst</code>. Knowing this saves you from a bind mount you believed was locked but wasn't.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Bind a directory to a second path and prove it's the same files. Create <code>src</code> with a file, bind it onto <code>dst</code>, and note both paths show the identical inode — one file, two doors.
+<pre class="cmd">mkdir -p /tmp/src /tmp/dst
+echo 'one copy, two paths' &gt; /tmp/src/data
+sudo mount --bind /tmp/src /tmp/dst
+ls -i /tmp/src/data /tmp/dst/data
+echo 'written via dst' &gt;&gt; /tmp/dst/data
+cat /tmp/src/data</pre>
+<pre class="out">266401 /tmp/src/data
+266401 /tmp/dst/data                    ← same inode: not a copy
+one copy, two paths
+<b>written via dst</b>                        ← the write through dst is visible in src</pre></li>
+<li>See it in the mount table and observe the read-only surprise. The <code>-o ro</code> on a plain bind is ignored — the mount comes up writable.
+<pre class="cmd">findmnt /tmp/dst
+sudo mount --bind -o ro /tmp/src /tmp/dst    # re-bind "read-only"
+touch /tmp/dst/still-writable                # ...but this succeeds</pre>
+<pre class="out">TARGET   SOURCE            FSTYPE OPTIONS
+/tmp/dst /dev/sda1[/tmp/src] ext4 rw,relatime   ← still rw despite -o ro</pre></li>
+<li>Make it genuinely read-only with the remount, then prove writes are refused. Clean up with <code>umount</code>.
+<pre class="cmd">sudo mount -o remount,ro,bind /tmp/dst
+touch /tmp/dst/nope
+sudo umount /tmp/dst</pre>
+<pre class="out">touch: cannot touch '/tmp/dst/nope': <b>Read-only file system</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You wrote to <code>/tmp/dst/data</code> and the change appeared in <code>/tmp/src/data</code>. Explain why, in terms of inodes. (A bind mount makes the two paths lead to the very same inodes — there is one file, reachable two ways, so a write through either path is a write to the one inode.) Then say what two-step incantation you need for a truly read-only bind and why one step doesn't work. (Bind first, then <code>mount -o remount,ro,bind dst</code>; the <code>ro</code> flag on the initial <code>--bind</code> is ignored because read-only is a property of the underlying mount, applied by the remount, not by the bind itself.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A bind mount reflects the source at bind time, not a frozen snapshot — but it does <em>not</em> follow the source if the source itself is later replaced by a new mount, unless propagation (next lesson) is set up to carry it. For plain data this is intuitive (same files, live), but for mount points it is the root of real confusion: bind-mounting a directory that later has something mounted <em>inside</em> it may or may not show that new mount through the bind, depending entirely on propagation. Keep "same files, live" for the simple case and defer the mount-inside-a-bind case to B5.12.</p>
+<p>The read-only-bind trap has bitten production systems. People bind-mount a directory into a sandbox with <code>-o ro</code>, believe it is protected, and only discover the mount was writable when something inside modifies host files. If you rely on a read-only bind for isolation, verify it with an actual write attempt (as the lab does) or check for <code>ro</code> in <code>findmnt</code> — don't trust that the flag on <code>--bind</code> took effect.</p>
+<div class="k8s-link">
+<p>Bind mounts are how a <code>hostPath</code> volume works: the kubelet bind-mounts a directory from the node into the container's filesystem, so the pod sees the node's files at the mount path — the same inodes, reachable inside the container, exactly as in the lab. It is also the mechanism behind mounting the container runtime's socket, host logs, or device directories into a pod. And the read-only surprise matters directly: when you mark a <code>hostPath</code> or volume mount <code>readOnly: true</code>, the container runtime is responsible for doing the remount step you just learned — a bug there (or a missing remount) is how a "read-only" host mount turns out to be writable, a real container-security finding.</p>
+<p>You'll use <code>hostPath</code> and <code>readOnly</code> mounts in <a href="w5.html#cp-5-1">W5.1</a>, and the security implications of writable host mounts recur in the RBAC/hardening material of <a href="w7.html">W7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 mount</code> under <em>Bind mount operation</em> and <em>The remount operation</em> (the <code>remount,ro,bind</code> two-step is documented there), and <code>man 8 findmnt</code> to see a bind's source subtree in brackets. <code>man 7 mount_namespaces</code> covers how binds interact with namespaces (the container case). In the exam docs, <code>hostPath</code> volumes and <code>readOnly</code> mounts.</p>
+</article>
+
+<article class="lesson" id="cp-b5-12" data-id="b5-12">
+<div class="lesson-head"><span class="cp-id">B5.12</span><h4>Mount propagation: does a mount cross over?</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the subtlest idea in the module, and it is the one that separates "I can use mounts" from "I understand why container mounts behave the way they do". <strong>Mount propagation</strong> answers a single question: if you mount something <em>underneath</em> a mount point, does that new mount also appear at its bind-mounted peers? The answer is configurable — private, shared, or slave — and the choice is exactly what lets a container see the host's mounts without the container's own throwaway mounts leaking back onto the host. Get this and the container runtime's mount setup stops looking like black magic.</p>
+<h5>The concept</h5>
+<p>When two paths are related by a bind mount, the kernel has to decide whether a <em>later</em> mount made under one of them shows up under the other. That policy is the mount's <strong>propagation type</strong>:</p>
+<ul>
+<li><strong>private</strong> — no crossing. A mount made under one side is invisible to the other. Each is sealed.</li>
+<li><strong>shared</strong> — two-way. The two paths form a <em>peer group</em>; a mount made under either appears under both. Changes propagate in both directions.</li>
+<li><strong>slave</strong> (and <strong>rslave</strong>, its recursive form) — one-way. The slave <em>receives</em> mounts from its master but does not send its own back. Mounts flow master→slave only.</li>
+</ul>
+<p>The one-way <strong>rslave</strong> case is the whole reason this matters, because it is what a container runtime wants. The runtime binds the host's filesystem into the container as a slave: if the host mounts a new disk or a network share, it appears inside the container (master→slave, useful) — but if the container mounts something in its own throwaway way, that mount does <em>not</em> propagate back and pollute the host (slave doesn't send). Private would seal the container off from useful host mounts; shared would let container mounts escape onto the host, a real hazard. rslave is the deliberate middle: the host can reach in, the container cannot reach out.</p>
+<div class="flow"><span>host mounts a disk</span><em>→ (rslave) →</em><span class="hot">appears in container</span><em>· container mounts something →</em><span>stays in container</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set up a shared peer group and prove two-way propagation. Bind a directory onto itself to make it a mount point, mark it shared, then bind it to a peer — now a mount under one appears under the other.
+<pre class="cmd">sudo mkdir -p /mnt/a /mnt/b
+sudo mount --bind /mnt/a /mnt/a          # make /mnt/a a mount point
+sudo mount --make-shared /mnt/a
+sudo mount --bind /mnt/a /mnt/b          # /mnt/b joins the peer group
+sudo mkdir -p /mnt/a/sub
+sudo mount -t tmpfs tmpfs /mnt/a/sub     # mount UNDER a...
+findmnt /mnt/b/sub</pre>
+<pre class="out">TARGET     SOURCE FSTYPE OPTIONS
+<b>/mnt/b/sub tmpfs  tmpfs</b>  rw,relatime          ← it propagated: shared is two-way</pre></li>
+<li>Now switch the same setup to private and watch propagation stop. Tear down, rebuild as private, and the mount under <code>a</code> does <em>not</em> appear under <code>b</code>.
+<pre class="cmd">sudo umount /mnt/a/sub; sudo umount /mnt/b; sudo umount /mnt/a
+sudo mount --bind /mnt/a /mnt/a; sudo mount --make-private /mnt/a
+sudo mount --bind /mnt/a /mnt/b
+sudo mount -t tmpfs tmpfs /mnt/a/sub
+findmnt /mnt/b/sub || echo 'no propagation — private'</pre>
+<pre class="out"><b>no propagation — private</b>              ← private seals each side off</pre></li>
+<li>Clean up the whole scaffold.
+<pre class="cmd">sudo umount /mnt/a/sub 2&gt;/dev/null; sudo umount /mnt/b; sudo umount /mnt/a</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>In the shared run the tmpfs under <code>/mnt/a</code> appeared under <code>/mnt/b</code>; in the private run it did not. Explain the difference in one sentence. (Shared makes the two a peer group so mounts propagate both ways; private gives each its own sealed propagation, so a mount under one is invisible to the other.) Then answer the design question: why does a container runtime use <strong>rslave</strong> for the host filesystem rather than shared or private? (rslave is one-way — the container receives host mounts (so new host disks/shares appear inside) but the container's own mounts don't propagate back onto the host; shared would let container mounts escape to the host, and private would hide useful host mounts from the container.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Propagation is a property of a mount point, and the default has changed under people's feet. <code>systemd</code> makes most mounts <code>shared</code> by default on a modern system, which is why the lab has to explicitly bind-and-<code>--make-shared</code> to get predictable behaviour and why a naive experiment can give surprising results — a mount you make in one place suddenly appearing elsewhere because the tree was shared. When propagation matters, set it explicitly (<code>--make-private</code>/<code>--make-shared</code>/<code>--make-rslave</code>) rather than relying on the inherited default.</p>
+<p>This is the source of a notorious class of container bug: a mount made inside a container "leaking" onto the host, or a host mount failing to appear inside a container, almost always traces to the propagation type on the relevant mount point. When a bind mount's contents seem wrong across a container boundary — new mounts present or absent unexpectedly — check propagation with <code>findmnt -o TARGET,PROPAGATION</code> before suspecting anything more exotic.</p>
+<div class="k8s-link">
+<p>Mount propagation is a field you can actually set in a pod: <code>volumeMounts[].mountPropagation</code> takes <code>None</code> (private), <code>HostToContainer</code> (rslave — the container sees host mounts made under the volume), or <code>Bidirectional</code> (rshared — mounts made in the container propagate back to the host). <code>Bidirectional</code> is powerful and dangerous, restricted to privileged containers, and is exactly how components like a CSI node driver deliberately push mounts out to the node so other pods can see them. Every "the CSI driver mounted a volume but the app pod can't see it", or "my sidecar's mount isn't visible to the main container", is a mount-propagation question — this lesson is the model for all of them.</p>
+<p>You'll encounter <code>mountPropagation</code> and its privileged <code>Bidirectional</code> mode in the storage and security material of <a href="w5.html">W5</a> and <a href="w7.html">W7</a>; CSI node drivers rely on it directly.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 mount_namespaces</code> under <em>SHARED SUBTREES</em> for the full propagation model, <code>man 8 mount</code> for <code>--make-shared</code>/<code>--make-private</code>/<code>--make-slave</code>/<code>--make-rslave</code>, and <code>man 8 findmnt</code> with <code>-o PROPAGATION</code> to read a mount's type. The kernel's <code>Documentation/filesystems/sharedsubtree.rst</code> is the primary source. In the exam docs, <code>mountPropagation</code> on a volume mount.</p>
+</article>
+</div><!-- /g-special -->
+
 <!-- INSERT-GROUPS-HERE -->
 
 <nav class="pager"><a href="b4.html">← B4 · Users, groups, permissions, capabilities</a><a href="../beginner.html#b6">B6 · Isolation I — namespaces, chroot, pivot_root →</a></nav>
