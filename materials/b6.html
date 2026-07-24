@@ -238,6 +238,292 @@ net:[4026531992]                  ← unchanged: net was never unshared</pre></l
 </article>
 </div><!-- /g-idea -->
 
+<!-- ---------------- Hands-on, one namespace at a time ---------------- -->
+<div class="grp" id="g-handson"><h3>Hands-on, one namespace at a time</h3>
+
+<article class="lesson" id="cp-b6-4" data-id="b6-4">
+<div class="lesson-head"><span class="cp-id">B6.4</span><h4>UTS: a process with its own hostname</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>We start with the gentlest namespace because it isolates the smallest, most harmless thing: the machine's name. Nothing depends on the hostname the way things depend on the process list or the network, so you can create a UTS namespace, change the name inside it, and see the effect without any risk of wedging your session. It is the perfect first proof that "a process can have a private answer to one question" is a real, mechanical thing and not a slogan.</p>
+<h5>The concept</h5>
+<p>The <strong>UTS namespace</strong> isolates exactly two strings: the hostname and the NIS domain name. (UTS stands for "Unix Time-sharing System", the name of the kernel struct that holds them — the name is historical baggage, not a hint about function.) A process in its own UTS namespace can call <code>sethostname()</code> and change what <em>it</em> and its children see, while every other process on the machine keeps the old name. That is the entire feature.</p>
+<p>What makes it a good teacher is that <code>unshare --uts bash</code> maps precisely onto one system call: the shell calls <code>unshare(CLONE_NEWUTS)</code>, and from then on <code>hostname newname</code> is a <code>sethostname()</code> that lands only in the private copy. Recall from B3 that a command is a thin wrapper over a syscall — here you can see the whole stack in one line. Below, the same two-step (make a UTS namespace, set a hostname in it) is written once in C with the raw syscalls and once in Python, to make the wrapper explicit; the <code>unshare</code> command is doing nothing more than this.</p>
+<div class="langpair">
+<figure><figcaption>/tmp/uts.c — C, raw <code>unshare(2)</code> + <code>sethostname(2)</code></figcaption>
+<pre class="cmd">#define _GNU_SOURCE
+#include &lt;sched.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+int main(void){
+    unshare(CLONE_NEWUTS);              // private copy of the hostname
+    sethostname("isolated", 8);         // only this namespace sees it
+    execlp("bash", "bash", NULL);       // hand off to a shell
+}</pre></figure>
+<figure><figcaption>/tmp/uts.py — Python, the same two calls</figcaption>
+<pre class="cmd">import ctypes, os
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+CLONE_NEWUTS = 0x04000000
+libc.unshare(CLONE_NEWUTS)              # same syscall as `unshare --uts`
+os.sethostname("isolated")             # same syscall as `hostname isolated`
+os.execlp("bash", "bash")</pre></figure>
+</div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create the namespace and rename the machine inside it. <code>sudo</code> is needed because changing a hostname requires <code>CAP_SYS_ADMIN</code> (B4) — the sudo also sidesteps the user-namespace restriction we discuss in B6.8.
+<pre class="cmd">multipass shell sandbox
+hostname                       # sandbox
+sudo unshare --uts bash        # new UTS namespace
+hostname container-01          # sethostname() in the private copy
+hostname                       # container-01</pre>
+<pre class="out">sandbox
+<b>container-01</b></pre></li>
+<li>From a second terminal, confirm the host's name is untouched — the copy diverged, the original did not.
+<pre class="cmd">multipass shell sandbox
+hostname</pre>
+<pre class="out"><b>sandbox</b>                          ← host unchanged</pre></li>
+<li>Confirm it really is a distinct namespace by inode (B6.3), not just a cosmetic prompt change. Back in the first shell:
+<pre class="cmd">readlink /proc/self/ns/uts     # inside the unshare shell
+exit
+readlink /proc/self/ns/uts     # host</pre>
+<pre class="out">uts:[4026532210]               ← private
+uts:[4026531838]               ← host default (different inode)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>After <code>exit</code>, is the host's hostname affected by anything you did? (No — the change lived and died with the private UTS namespace; leaving it drops you back to the shared name.) And why did the two <code>readlink</code> outputs differ? (Different inode numbers mean different UTS namespaces — the proof that <code>unshare --uts</code> forked a real one rather than just editing a shell variable.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The shell prompt may not update to the new hostname until you start a fresh prompt, because bash caches <code>\h</code>. Do not trust the prompt string; trust <code>hostname</code> and the <code>/proc/self/ns/uts</code> inode. This is a general lesson for the whole module — the prompt is decoration, the <code>/proc</code> evidence is truth.</p>
+<p>A UTS namespace changes the name a process <em>reports</em>, not any name a DNS server or another machine knows. Setting <code>hostname container-01</code> inside a namespace does not make anything on the network reachable as <code>container-01</code>; name resolution is a separate system (B10). This is the same "the label is not the thing" separation you saw between filenames and inodes in B5.</p>
+<div class="k8s-link">
+<p>This is why a pod's hostname is its own. Each pod gets a UTS namespace, so a process inside sees <code>hostname</code> return the pod's name (by default the pod name), independent of the node it runs on and of every other pod. When you set <code>hostname</code> or <code>subdomain</code> on a pod spec, or read <code>$HOSTNAME</code> inside a container and get the pod name rather than the node name, this UTS namespace is the entire reason. A StatefulSet relies on it to give each replica a stable, predictable in-pod hostname.</p>
+<p>You will see per-pod hostnames when you meet pod identity in <a href="w3.html">W3</a> (StatefulSets) and pod internals in <a href="w1.html#cp-1-21">W1.21</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 uts_namespaces</code> for the type, <code>man 2 sethostname</code> and <code>man 2 unshare</code> for the two syscalls, and <code>man 1 unshare</code> under <code>--uts</code>. <code>man 1 hostnamectl</code> is the systemd-era way to set a persistent hostname (a different concern — the persistent name on disk, not the namespace). No exam-docs entry; pod <code>hostname</code>/<code>subdomain</code> fields are the Kubernetes surface.</p>
+</article>
+
+<article class="lesson" id="cp-b6-5" data-id="b6-5">
+<div class="lesson-head"><span class="cp-id">B6.5</span><h4>PID: your shell becomes PID&nbsp;1</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The PID namespace is the one that makes a container feel like a real, separate machine — because inside it, the process list is <em>short</em> and your shell is <strong>PID&nbsp;1</strong>, the first process, the one every OS treats as special. This is where "a container thinks it is alone" stops being abstract: you run <code>ps</code> and you genuinely see three processes on what is otherwise a busy VM. It is also where the special responsibilities of PID&nbsp;1 — which trip up real containers constantly — become something you can feel directly.</p>
+<h5>The concept</h5>
+<p>A <strong>PID namespace</strong> gives its members a private numbering of processes. The first process created in a new PID namespace is <strong>PID&nbsp;1</strong> inside it, and its children get 2, 3, 4… — a fresh sequence that has nothing to do with the host's PIDs. The same process has <em>two</em> PIDs at once: a small one inside its namespace and a large real one on the host (a PID namespace nests, so the outer view always still exists). Two consequences carry real weight:</p>
+<ul>
+<li><strong>PID&nbsp;1 is special, and now it is you.</strong> The kernel gives PID&nbsp;1 two jobs: it is the <em>reaper</em> that adopts orphaned processes so they do not become zombies, and it has special signal handling — the kernel will not deliver a default-action signal (like <code>SIGTERM</code>) to PID&nbsp;1 unless the process installed a handler for it. A shell as PID&nbsp;1 that ignores <code>SIGTERM</code> is why "my container won't stop" happens.</li>
+<li><strong>Killing PID&nbsp;1 ends the namespace.</strong> When PID&nbsp;1 exits, the kernel sends <code>SIGKILL</code> to every other process in that PID namespace and tears the namespace down. There is no "init respawns things" here — PID&nbsp;1 <em>is</em> the namespace's life; end it and everything in it dies at once.</li>
+</ul>
+<p>One subtlety you will hit immediately: <code>ps</code> reads <code>/proc</code>, and <code>/proc</code> reflects whatever the <em>mount</em> namespace shows — not the PID namespace. So <code>unshare --pid</code> alone leaves <code>ps</code> still listing host processes, because it is reading the host's <code>/proc</code>. You need <code>--fork --mount-proc</code> so that a fresh <code>/proc</code>, reflecting the new PID namespace, is mounted. That coupling — a PID namespace only looks right once <code>/proc</code> is remounted — is the whole point of the next lesson (B6.6) and half of the debugging drill (B6.15).</p>
+<div class="flow"><span>unshare --pid --fork --mount-proc</span><em>→ new shell is</em><span class="hot">PID 1</span><em>· ps shows</em><span>3 processes</span><em>· kill 1 →</em><span>namespace gone</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Enter a new PID namespace with a fresh <code>/proc</code>. <code>--fork</code> makes <code>unshare</code> fork a child to <em>be</em> PID&nbsp;1 (the namespace's first process must be a child, not <code>unshare</code> itself); <code>--mount-proc</code> mounts a <code>/proc</code> that reflects the new namespace.
+<pre class="cmd">multipass shell sandbox
+sudo unshare --pid --fork --mount-proc bash
+echo $$                         # your shell's PID *inside* the namespace
+ps aux</pre>
+<pre class="out"><b>1</b>                              ← you are PID 1 in here
+USER  PID ... COMMAND
+root    1 ... bash              ← three processes on the whole "machine"
+root    8 ... ps aux</pre></li>
+<li>See the two-PID reality: this same shell has a large host PID too. From a second terminal, find it — <code>bash</code> whose parent is the <code>unshare</code>.
+<pre class="cmd">pgrep -a bash | tail -2</pre>
+<pre class="out">4711 unshare --pid --fork --mount-proc bash
+4712 bash                       ← host PID 4712 == PID 1 inside</pre></li>
+<li>Watch PID&nbsp;1 end the namespace. Exit the inner shell; every process that was in it is gone, and the fresh <code>/proc</code> unmounts with it.
+<pre class="cmd">exit                            # PID 1 exits → namespace torn down
+# (from the second terminal) confirm host PID 4712 no longer exists:
+ps -p 4712 -o pid= || echo 'gone'</pre>
+<pre class="out"><b>gone</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Inside the namespace, <code>echo $$</code> printed <code>1</code> but the host saw a PID like 4712 — explain how one process has two PIDs. (A PID namespace nests: the process is PID&nbsp;1 in its own namespace and simultaneously an ordinary large PID in the parent namespace, which never stopped seeing it.) Then: why does killing PID&nbsp;1 take the whole namespace with it? (The kernel <code>SIGKILL</code>s every remaining process in a PID namespace when its PID&nbsp;1 exits and reaps the namespace — PID&nbsp;1 is the namespace's anchor.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Without <code>--mount-proc</code>, <code>ps</code> inside the new PID namespace still lists every host process, and beginners conclude the namespace "didn't work". It worked — <code>ps</code> is just reading the host's <code>/proc</code>, which is a <em>mount</em>-namespace artifact, not a PID-namespace one. This is the single most common namespace confusion, and it is exactly symptom 1 of the debugging drill (B6.15). The rule: a PID namespace is only legible once its own <code>/proc</code> is mounted.</p>
+<p>The "PID&nbsp;1 ignores SIGTERM unless it handles it" rule bites real containers hard. If your container's PID&nbsp;1 is a shell or an app that never installed a <code>SIGTERM</code> handler, <code>docker stop</code> / a pod deletion sends <code>SIGTERM</code>, nothing happens, and after the grace period the runtime resorts to <code>SIGKILL</code> — a slow, ungraceful stop. This is why production images use a tiny init (like <code>tini</code>) as PID&nbsp;1 or ensure the main process forwards signals. You are feeling the mechanism now so the Kubernetes symptom later reads as obvious.</p>
+<div class="k8s-link">
+<p>Every container's main process is PID&nbsp;1 in its own PID namespace — which is why your app sees itself as PID&nbsp;1 and why Kubernetes' <code>terminationGracePeriodSeconds</code> exists: it is the window between the <code>SIGTERM</code> the kubelet sends to your PID&nbsp;1 and the <code>SIGKILL</code> it follows up with. If your process does not handle <code>SIGTERM</code>, that whole grace period is wasted and the pod dies hard. <code>shareProcessNamespace: true</code> on a pod merges its containers into <em>one</em> PID namespace so they can see each other's processes — a direct application of this lesson. And the reaping duty of PID&nbsp;1 is why a poorly-chosen entrypoint accumulates zombie processes in a container.</p>
+<p>Graceful shutdown and <code>terminationGracePeriodSeconds</code> appear in <a href="w3.html">W3</a> (workload lifecycle); the pause container as the pod's stable PID&nbsp;1 holder is in <a href="w1.html#cp-1-21">W1.21</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 pid_namespaces</code> for PID&nbsp;1 semantics, reaping, and the "kill PID&nbsp;1 tears down the namespace" rule; <code>man 1 unshare</code> under <code>--pid</code>, <code>--fork</code>, and <code>--mount-proc</code>; <code>man 2 clone</code> for <code>CLONE_NEWPID</code>. <code>man 5 proc</code> explains why <code>ps</code> depends on a correctly-mounted <code>/proc</code>. In the exam docs, <code>terminationGracePeriodSeconds</code> and <code>shareProcessNamespace</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b6-6" data-id="b6-6">
+<div class="lesson-head"><span class="cp-id">B6.6</span><h4>mount: a private copy of the mount table</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The mount namespace is what lets a container have its <em>own filesystem</em> — its own <code>/</code>, its own <code>/proc</code>, its own mounts — without disturbing the host's. It is also the namespace that finally explains the loose end from B6.5: why a new PID namespace needed <code>--mount-proc</code>. Everything about "the container sees a different root" traces back to this one namespace, and it ties directly to the propagation modes you learned in B5.</p>
+<h5>The concept</h5>
+<p>A <strong>mount namespace</strong> gives a process a private copy of the <em>mount table</em> — the kernel's list of what is mounted where (B5.3). After <code>unshare --mount</code>, mounts you make are visible only inside; mounts the host makes may or may not reach you depending on <strong>propagation</strong> (B5.12). This is the first namespace whose isolation is not automatic in both directions, and that is where propagation comes back:</p>
+<ul>
+<li>By default a new mount namespace starts as a <em>copy</em> of the host's current mounts, but the copies are typically <code>shared</code> peers — so a mount the host makes can still propagate in, and vice versa, unless the runtime changes the mode.</li>
+<li>Real runtimes immediately make their mounts <code>rslave</code> (recursive slave): host mount events flow <em>into</em> the container, but the container's own mounts do not leak <em>out</em> to the host. That asymmetry — hear the host, do not disturb the host — is exactly the propagation lesson from B5.12, now with a reason.</li>
+</ul>
+<p>And here is the resolution of B6.5's puzzle: <code>--mount-proc</code> is not a PID feature at all — it is a <em>mount</em> operation. When <code>unshare --pid --fork --mount-proc</code> runs, the <code>--mount-proc</code> implies <code>--mount</code> (a new mount namespace) and then mounts a fresh <code>procfs</code> over <code>/proc</code> inside it. Because <code>/proc</code> is a window onto the PID namespace, and the fresh mount is created <em>inside</em> the new PID namespace, <code>ps</code> finally shows the short list. No mount namespace, no place to hang a private <code>/proc</code>, no correct <code>ps</code>. The two namespaces are partners.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Get a private mount table and mount a tmpfs (B5.9) inside it. The mount succeeds and is visible here.
+<pre class="cmd">multipass shell sandbox
+sudo unshare --mount bash
+mkdir -p /mnt/private
+mount -t tmpfs tmpfs /mnt/private
+echo 'only in here' &gt; /mnt/private/note
+findmnt /mnt/private</pre>
+<pre class="out">TARGET       SOURCE FSTYPE OPTIONS
+/mnt/private tmpfs  <b>tmpfs</b>  rw,relatime</pre></li>
+<li>From a second terminal on the host, prove the mount is invisible outside — the private mount table did its job.
+<pre class="cmd">multipass shell sandbox
+findmnt /mnt/private || echo 'host sees no such mount'
+ls /mnt/private 2&gt;/dev/null || echo 'host sees nothing'</pre>
+<pre class="out"><b>host sees no such mount</b>
+<b>host sees nothing</b>          ← the tmpfs and its note exist only in the namespace</pre></li>
+<li>Close the loop from B6.5: show that <code>--mount-proc</code> is really "new mount namespace + mount procfs". Compare the <code>mnt</code> inode with and without it.
+<pre class="cmd">exit
+sudo unshare --pid --fork --mount-proc bash -c 'readlink /proc/self/ns/mnt; head -1 /proc/mounts | grep -q proc && echo "fresh /proc mounted"'</pre>
+<pre class="out">mnt:[4026532340]               ← a private mount namespace was created
+fresh /proc mounted            ← procfs was mounted inside it</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, now, why <code>unshare --pid</code> without <code>--mount-proc</code> shows host processes in <code>ps</code>. (<code>ps</code> reads <code>/proc</code>; without a new mount namespace and a fresh procfs mounted in it, <code>/proc</code> is still the host's window onto the host PID namespace.) Then: why do container runtimes make the host filesystem <code>rslave</code> rather than fully private? (So the container <em>receives</em> host mount changes — a newly-attached volume shows up — but the container's own transient mounts never propagate back and clutter or endanger the host.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A new mount namespace is a <em>snapshot-plus-propagation</em>, not a blank slate. You start out seeing the host's current mounts (that is why <code>/</code>, <code>/home</code>, etc. are all there); the isolation is about future changes and their propagation, governed entirely by the private/shared/slave modes from B5.12. If you expected an empty mount table, re-read that lesson — the mental model "private mount namespace = private mount <em>events</em>, seeded from a copy" is the accurate one.</p>
+<p>Mounts made in a mount namespace vanish when the last process leaves it — there is nothing to clean up on the host, which is usually a feature. But combine a mount namespace with a leaked <code>/proc/PID/ns/mnt</code> bind mount and you get a namespace that persists with its mounts intact and no processes, the mount-flavoured version of the leak in B6.15. Unmount inside, or let the namespace die cleanly; do not pin its <code>ns</code> file unless you mean to.</p>
+<div class="k8s-link">
+<p>This is the namespace behind everything filesystem-shaped in a pod. Each container gets a mount namespace whose root is the overlay you built in B5 — its own <code>/</code>, its own <code>/etc</code>, its own mounted volumes — which is why one container's files are invisible to another in the same pod unless a shared volume is mounted into both. Kubernetes' <code>mountPropagation</code> field (<code>None</code>/<code>HostToContainer</code>/<code>Bidirectional</code>) is exactly the private/rslave/shared choice from B5.12 and this lesson, exposed on a volumeMount. A CSI driver mounting a volume on the node and expecting the pod to see it depends on <code>HostToContainer</code> propagation working — precisely the <code>rslave</code> direction described above.</p>
+<p><code>mountPropagation</code> and volume visibility live in <a href="w5.html">W5</a>; the container's overlay root connects back to <a href="b5.html#cp-b5-16">B5.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 mount_namespaces</code> for the snapshot semantics and propagation between namespaces, <code>man 1 unshare</code> under <code>--mount</code> and <code>--mount-proc</code>, and <code>man 2 mount</code> / <code>man 8 mount</code> for the propagation flags (re-read <a href="b5.html#cp-b5-12">B5.12</a>). <code>man 5 proc</code> for why <code>/proc</code> must be mounted per PID namespace. In the exam docs, <code>mountPropagation</code> on a volumeMount.</p>
+</article>
+
+<article class="lesson" id="cp-b6-7" data-id="b6-7">
+<div class="lesson-head"><span class="cp-id">B6.7</span><h4>IPC: a private world of shared memory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The IPC namespace is small and easy to skip, but skipping it leaves a real hole in your mental model of isolation: without it, two containers could quietly share memory through a mechanism that has nothing to do with files or the network. Seeing it work — create a shared-memory segment on the host, then watch it be invisible inside a new IPC namespace — closes that hole and explains a class of "why can't these two containers see each other's shared memory?" questions.</p>
+<h5>The concept</h5>
+<p>The <strong>IPC namespace</strong> isolates <abbr title="Inter-Process Communication">IPC</abbr> objects of the old System&nbsp;V kind and POSIX message queues: shared-memory segments, semaphore sets, and message queues. These are a way for unrelated processes to communicate by a shared key rather than through a file or a socket — process A creates a segment with key <code>0x1234</code>, process B attaches to the same key, and now they share raw memory. Without an IPC namespace, that key space is global to the machine: any process can attach to any segment it has permission for. With one, each namespace has its own key space, so the same key in two namespaces refers to two different (or non-existent) segments. You list these objects with <code>ipcs</code> and create/remove them with <code>ipcmk</code>/<code>ipcrm</code>.</p>
+<p>It is worth being clear about what this namespace does <em>not</em> cover, because "IPC" is a broad word. Pipes, Unix domain sockets, and signals are <em>not</em> governed by the IPC namespace — pipes and sockets are filesystem/mount and network concerns, signals are a PID-namespace matter. The IPC namespace is specifically about the System&nbsp;V / POSIX shared-memory and queue APIs. It is narrow on purpose.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a shared-memory segment on the host and confirm it is listed. <code>ipcmk -M</code> makes a 1&nbsp;KiB segment; <code>ipcs -m</code> lists shared memory.
+<pre class="cmd">multipass shell sandbox
+ipcmk -M 1024
+ipcs -m | tail -3</pre>
+<pre class="out">Shared Memory Segments
+key        shmid  owner  perms  bytes  nattch  status
+0x00000000 <b>32768</b>  ubuntu 644    1024   0</pre></li>
+<li>Enter a new IPC namespace and list again — the segment is gone, because this namespace has its own, empty key space.
+<pre class="cmd">sudo unshare --ipc bash
+ipcs -m | tail -2</pre>
+<pre class="out">Shared Memory Segments
+key        shmid  owner  perms  bytes  nattch  status
+                                                        ← empty: none of the host's segments exist here</pre></li>
+<li>Prove the isolation is two-way: create a segment <em>inside</em> the namespace, then check it is invisible on the host.
+<pre class="cmd">ipcmk -M 2048            # inside the namespace
+exit
+ipcs -m | grep -c 2048 || echo 'host cannot see the namespace segment'</pre>
+<pre class="out"><b>host cannot see the namespace segment</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name one IPC mechanism the IPC namespace isolates and one it does <em>not</em>. (Isolates: System&nbsp;V shared memory / semaphores / message queues and POSIX message queues. Does not: pipes, Unix sockets, signals — those belong to mount, network, and PID concerns respectively.) Then: two containers need to share a large in-memory buffer via System&nbsp;V shm — what has to be true of their IPC namespaces? (They must share one IPC namespace; separate IPC namespaces have separate key spaces and cannot see each other's segments.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The host's default <code>/dev/shm</code> (a tmpfs used for POSIX shared memory) is a <em>mount</em>, not an IPC-namespace object — so isolating <code>/dev/shm</code> is a mount-namespace job, while System&nbsp;V segments are the IPC-namespace job. Containers get both by default, which is why two containers do not accidentally share memory either way, but the two mechanisms are isolated by two <em>different</em> namespaces. Do not assume one flag covers all "shared memory".</p>
+<p>Leftover System&nbsp;V segments are a classic resource leak: unlike a file, a shm segment survives the death of the process that made it until someone runs <code>ipcrm</code> or the namespace is destroyed. On a shared host this accumulates; inside a container it is bounded because the whole IPC namespace is torn down when the container exits, which quietly reaps every segment. That automatic cleanup is a real, if invisible, benefit of the namespace.</p>
+<div class="k8s-link">
+<p>By default each pod has its own IPC namespace shared <em>among</em> its containers, so containers in one pod can use System&nbsp;V shared memory together while remaining isolated from other pods. <code>hostIPC: true</code> drops that isolation and puts the pod in the node's IPC namespace — occasionally needed for talking to a host daemon via shared memory, and a red flag in a security review for exactly that reason. Databases and some ML workloads that use large shared-memory buffers care whether their containers share an IPC namespace, and whether <code>/dev/shm</code> is big enough — both are decisions this lesson explains.</p>
+<p><code>hostIPC</code> and pod-shared IPC appear in <a href="w1.html#cp-1-21">W1.21</a> and as a security concern in <a href="w7.html">W7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 ipc_namespaces</code> for what is and is not isolated, <code>man 1 ipcs</code> / <code>man 1 ipcmk</code> / <code>man 1 ipcrm</code> for listing and managing the objects, and <code>man 1 unshare</code> under <code>--ipc</code>. <code>man 7 svipc</code> covers the System&nbsp;V IPC API itself. In the exam docs, the pod <code>hostIPC</code> field.</p>
+</article>
+
+<article class="lesson" id="cp-b6-8" data-id="b6-8">
+<div class="lesson-head"><span class="cp-id">B6.8</span><h4>user: becoming root without being root</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every namespace so far changed what a process can <em>see</em>. The user namespace is the one that changes <em>who it is</em>: inside it, your ordinary account can be uid&nbsp;0 — root — while the host still sees you as your unprivileged self. This is the foundation of "rootless" containers, the mechanism that lets an unprivileged user create all the <em>other</em> namespaces, and the one place where Ubuntu 24.04 deliberately puts up a guardrail you must understand rather than blindly disable.</p>
+<h5>The concept</h5>
+<p>A <strong>user namespace</strong> maps user and group IDs between the inside and the outside. A <strong>uid map</strong> says, for example, "uid&nbsp;0 inside = uid&nbsp;1000 (your real account) outside". So a process in the namespace can see itself as root — <code>id</code> reports uid&nbsp;0, it holds a full set of capabilities <em>within the namespace</em> — while every action it takes on host-owned resources is still checked against your real, unprivileged uid&nbsp;1000. You are root over your own private world and a nobody everywhere else. This is genuinely powerful for two reasons:</p>
+<ul>
+<li><strong>It is the key that unlocks the others.</strong> Creating most namespaces normally needs <code>CAP_SYS_ADMIN</code>. But a process that first creates a <em>user</em> namespace becomes root <em>inside</em> it, and that in-namespace root is allowed to create the other namespace types nested underneath. This is how a completely unprivileged user runs containers with no <code>sudo</code> at all — "rootless" containers (Podman's headline feature) are built on exactly this.</li>
+<li><strong>The capabilities are scoped.</strong> Being uid&nbsp;0 inside does not let you do uid-0 things to the host, because those capabilities only apply to resources <em>owned by the namespace</em>. You can, say, mount a filesystem inside your user+mount namespace, but you cannot suddenly read another user's files on the host.</li>
+</ul>
+<p>Now the guardrail. Historically, unprivileged user namespaces were a rich source of kernel privilege-escalation bugs: they hand an unprivileged user a path to code that previously required root, and any bug in that code becomes a root exploit. So <strong>Ubuntu 23.10+ (including 24.04) ships <code>kernel.apparmor_restrict_unprivileged_userns=1</code></strong>, an AppArmor-backed restriction that blocks an <em>unprivileged</em> process from creating a user namespace unless it has an AppArmor profile permitting it (or you run it with privilege). This is why <code>unshare --user</code> as a plain user may fail with <code>EPERM</code> on your VM. Two honest ways forward, both of which you should understand before choosing:</p>
+<ul>
+<li>Run it <em>with</em> privilege (<code>sudo unshare --user ...</code>): root is exempt from the restriction, so the lab works and you still see the mapping. This is what we do below.</li>
+<li>Relax the sysctl on your throwaway VM only (<code>echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns</code>) to feel the genuinely-unprivileged, rootless path. Do this <em>knowing</em> you are re-opening the attack surface the default closes — acceptable on a disposable <code>sandbox</code>, never a habit on a real machine.</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a user namespace and map yourself to root. <code>--map-root-user</code> writes the uid map "0 inside = you outside". Inside, <code>id</code> claims uid&nbsp;0.
+<pre class="cmd">multipass shell sandbox
+id                              # uid=1000(ubuntu) on the host
+sudo unshare --user --map-root-user bash
+id                             # inside the user namespace</pre>
+<pre class="out">uid=1000(ubuntu) gid=1000(ubuntu) ...
+<b>uid=0(root) gid=0(root)</b> ...    ← "root" — but only in here</pre></li>
+<li>Read the translation table the kernel is using. Three columns: first id inside, first id outside, count. This <em>is</em> the mapping that makes the illusion consistent and safe.
+<pre class="cmd">cat /proc/self/uid_map</pre>
+<pre class="out">         0       1000          1       ← inside-uid 0 → outside-uid 1000, range of 1</pre></li>
+<li>Feel the boundary: in-namespace root cannot touch a host-root-owned file, because the capability is scoped to the namespace, not the host.
+<pre class="cmd">cat /etc/shadow | head -1 2&gt;&amp;1 || true
+exit</pre>
+<pre class="out">cat: /etc/shadow: <b>Permission denied</b>   ← "root" inside ≠ root over host files</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You were uid&nbsp;0 inside but could not read <code>/etc/shadow</code> — reconcile those two facts. (Your capabilities as in-namespace root apply only to resources owned by the user namespace; <code>/etc/shadow</code> is owned by the host's real root, and against the host you are still uid&nbsp;1000, so the permission check fails.) Then: why is the user namespace the one that lets an unprivileged user create the others? (It makes the process root <em>inside</em> the namespace, and that in-namespace root satisfies the <code>CAP_SYS_ADMIN</code> requirement for creating the nested mnt/pid/net/… namespaces.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Do not reflexively set <code>apparmor_restrict_unprivileged_userns=0</code> and forget it. The default is a real, deliberate mitigation: unprivileged user namespaces have repeatedly been the entry point for kernel privilege-escalation exploits (fresh bypasses were still being published in 2025), so disabling the restriction genuinely widens the attack surface of the machine. On a disposable <code>sandbox</code> VM it is a reasonable, informed trade to see the rootless path; on anything you care about, leave it on and grant per-application AppArmor profiles instead. Understand the trade, then decide — that is the whole point of the checkpoint.</p>
+<p>"Root inside a user namespace" fools some tools into acting privileged when they are not, producing confusing errors. A program may see uid&nbsp;0, attempt a host-level privileged operation, and fail with <code>EPERM</code> in a way that looks like a bug but is the mapping working correctly. When something "runs as root but can't do root things", check <code>/proc/self/uid_map</code> — you may be in a user namespace where that root is local.</p>
+<div class="k8s-link">
+<p>User namespaces are how Kubernetes is making containers that run as root <em>inside</em> the container map to an unprivileged uid <em>on the node</em> — the <code>hostUsers: false</code> pod field (user namespaces for pods, GA in recent releases) does exactly the mapping you just read in <code>/proc/self/uid_map</code>, so a container compromise as "root" is only an unprivileged user on the node. This is defence in depth on top of <code>runAsNonRoot</code> and the capability-dropping you learned in B4. Rootless Kubernetes distributions (running the kubelet and runtime without host root) are built on the same unprivileged-user-namespace mechanism this lesson gated.</p>
+<p>Pod user namespaces (<code>hostUsers</code>), <code>runAsNonRoot</code>, and dropped capabilities are security topics in <a href="w7.html">W7</a>; the capability model is <a href="b4.html#cp-b4-13">B4.13</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 user_namespaces</code> is essential — read its "User and group ID mappings" and capabilities sections; <code>man 1 unshare</code> under <code>--user</code>/<code>--map-root-user</code>; <code>man 5 proc</code> for <code>/proc/[pid]/uid_map</code> and <code>gid_map</code>. For the Ubuntu restriction, <code>man 7 apparmor</code> and the sysctl <code>kernel.apparmor_restrict_unprivileged_userns</code> (<code>sysctl -a | grep userns</code>). In the exam docs, the pod <code>hostUsers</code> field and <code>securityContext</code> (<code>runAsNonRoot</code>, <code>runAsUser</code>).</p>
+</article>
+
+<article class="lesson" id="cp-b6-9" data-id="b6-9">
+<div class="lesson-head"><span class="cp-id">B6.9</span><h4>cgroup: re-rooting your view of the hierarchy</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the last and subtlest of the eight, and it is a preview of the whole next module. A cgroup namespace does not limit any resource — B7 is about the limiting. What it does is <em>hide where you sit</em> in the machine's resource-control hierarchy, so that a containerised process sees its own cgroup as the root of the tree rather than as some deeply-nested branch of the host's. It is a cosmetic-looking namespace that turns out to matter for both tidiness and a little bit of security.</p>
+<h5>The concept</h5>
+<p>Recall (or preview) that the kernel arranges processes into a tree of <strong>cgroups</strong> — control groups — for accounting and limiting CPU, memory, and I/O (all of B7). On Ubuntu 24.04 this is the cgroup v2 unified hierarchy, one tree rooted at <code>/sys/fs/cgroup</code>, and a process's place in it shows in <code>/proc/self/cgroup</code> as a path like <code>/system.slice/docker-abc123.scope</code>. A <strong>cgroup namespace</strong> relativises that path: it makes the process's <em>current</em> cgroup appear to be <code>/</code>, so from inside, <code>/proc/self/cgroup</code> reads <code>/</code> and the process cannot see the host's <code>system.slice</code>, other containers' scopes, or where it really sits. The accounting and limits are unchanged — the process is still in the same real cgroup, still capped the same way — but its <em>view</em> of the hierarchy is re-rooted at its own node.</p>
+<p>Why bother? Two modest reasons. First, tidiness: software inside a container that reads <code>/proc/self/cgroup</code> or walks <code>/sys/fs/cgroup</code> (systemd, some runtimes, resource-aware apps) sees a clean tree rooted at itself instead of a confusing absolute path exposing the host's layout. Second, a little information hiding: the host's cgroup paths can leak details (other tenants' container ids, the orchestrator's structure), and re-rooting keeps those out of the container. It is the quietest namespace, but it completes the picture — a container's view of the resource hierarchy is private, just like its processes, mounts, and network.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See where your shell really sits in the host hierarchy — a nested path under a slice.
+<pre class="cmd">multipass shell sandbox
+cat /proc/self/cgroup</pre>
+<pre class="out">0::<b>/user.slice/user-1000.slice/session-3.scope</b>   ← deep in the host tree</pre></li>
+<li>Enter a cgroup namespace and read the same file — now the current cgroup looks like the root. <code>--cgroup</code> re-roots the view at wherever the process currently is.
+<pre class="cmd">sudo unshare --cgroup bash
+cat /proc/self/cgroup</pre>
+<pre class="out">0::<b>/</b>                              ← same real cgroup, but now it appears as /</pre></li>
+<li>Confirm the limits did not change — this is a view, not a control. The real cgroup path is still discoverable from the host side by PID.
+<pre class="cmd">echo $$
+exit
+# from the host, look up that PID's real cgroup:
+cat /proc/$(pgrep -n bash)/cgroup</pre>
+<pre class="out">0::/user.slice/user-1000.slice/session-3.scope   ← the real position never moved</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Inside the cgroup namespace <code>/proc/self/cgroup</code> read <code>/</code>, yet the process's real cgroup and its limits were unchanged — what exactly did the namespace change? (Only the <em>view</em>: it re-rooted the visible cgroup path at the process's current node, hiding the host's tree above it; the actual cgroup membership, accounting, and limits are identical.) Then: name the two reasons a runtime bothers to create one. (Tidiness — software inside sees a clean tree rooted at itself; and information hiding — the host's cgroup paths, which can leak other tenants' ids and the orchestrator's layout, stay out of the container.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Do not confuse the cgroup <em>namespace</em> (this lesson: hides your position in the tree) with cgroups <em>themselves</em> (B7: enforce CPU/memory/IO limits). Creating a cgroup namespace grants no resource control whatsoever — a process in a fresh cgroup namespace with no limits set can still use the whole machine. The namespace is about visibility; the limiting is a separate mechanism you configure in B7. Blurring the two leads to the false belief that "containerising" a process caps it, when capping requires actually writing limits into its cgroup.</p>
+<p>The re-rooting is relative to where the process was <em>at unshare time</em>. If you move the process into a different cgroup afterwards, the view can show a path <em>above</em> the new namespace root, which looks odd. In practice a runtime creates the cgroup namespace at the moment it places the container in its final cgroup, so the two line up; by hand, just know the root is pinned to your position when you ran <code>unshare --cgroup</code>.</p>
+<div class="k8s-link">
+<p>When you <code>kubectl exec</code> into a container and inspect <code>/sys/fs/cgroup</code> or <code>/proc/self/cgroup</code>, the clean tree you see — rooted at the container rather than at the node's <code>kubepods.slice/…</code> path — is this namespace. The kubelet places each pod's containers in a cgroup under <code>kubepods</code> (where the CPU/memory limits from B7 and your pod's <code>resources</code> requests/limits are enforced), and the cgroup namespace hides that placement so tools inside the container see themselves at the root. Understanding that the <em>limits</em> live in the real cgroup while the container only sees a re-rooted <em>view</em> is what stops "the container thinks it's at cgroup root, so it must be unlimited" — a dangerous misreading B7 will fully dismantle.</p>
+<p>Pod resource limits and their cgroup enforcement are the whole of <a href="w3.html">W3</a>'s scheduling/limits material and the next module, B7.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 cgroup_namespaces</code> for the re-rooting semantics, <code>man 1 unshare</code> under <code>--cgroup</code>, and <code>man 7 cgroups</code> for the hierarchy this namespace gives a view of (the subject of B7). <code>cat /proc/self/cgroup</code> and <code>ls /sys/fs/cgroup</code> are the two views to compare. In the exam docs, pod <code>resources.requests</code>/<code>limits</code> are where the real cgroups get their numbers.</p>
+</article>
+</div><!-- /g-handson -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B6 recall quiz</h3>
 <p>Answer out loud before revealing. If you can explain what a pod's shared namespaces are and what the pause container holds, this module has done its job.</p>
