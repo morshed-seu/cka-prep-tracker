@@ -742,6 +742,342 @@ term 1: 3/3 reachable, need 2 -&gt; LEADER = member 2
 </article>
 
 </div>
+
+<!-- ---------------- Patterns ---------------- -->
+<div class="grp" id="g-patterns"><h3>Patterns</h3>
+
+<article class="lesson" id="cp-b13-10" data-id="b13-10">
+<div class="lesson-head"><span class="cp-id">B13.10</span><h4>Idempotency: the property that makes retrying safe</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><a href="#cp-b13-2">B13.2</a> established that you must retry, because you can never know whether the first attempt worked. This lesson is the other half of that sentence: if you are going to retry, the operation must be safe to run twice. Get this wrong and the retry — the thing you added for reliability — becomes the outage.</p>
+<h5>The concept</h5>
+<p>An operation is <strong>idempotent</strong> when running it twice leaves the system in the same state as running it once. The test is not "does it error the second time" but "is the end state the same". Two shapes make the difference obvious:</p>
+<ul>
+<li><strong>Relative</strong> — "add 1 to the counter", "append this rule", "scale up by one replica". Running it twice does it twice. Not idempotent, and a retry after a timeout silently doubles the effect.</li>
+<li><strong>Absolute</strong> — "set the counter to 5", "ensure this rule exists", "make the replica count 3". Running it twice changes nothing the second time. Idempotent, and safe to retry as often as you like.</li>
+</ul>
+<p>The rewrite is nearly always available and nearly always the same move: <strong>state the desired end state instead of the change</strong>. That is what <code>mkdir -p</code> does that <code>mkdir</code> does not, what <code>ln -sf</code> does that <code>ln -s</code> does not, and what <code>iptables -C … || iptables -A …</code> does that a bare <code>-A</code> does not (a lesson <a href="b9.html#cp-b9-19">B9.19</a> made you learn the hard way, when re-running the CNI script appended duplicate NAT rules).</p>
+<p>Where the operation genuinely cannot be made absolute — charging a card, sending an email — the standard answer is an <strong>idempotency key</strong>: the client generates a unique id for the attempt, and the server records which ids it has already processed, so a retry with the same key returns the original result instead of doing the work again. The uncertainty is not removed; it is moved to a place where it can be recorded.</p>
+<div class="flow"><span>"add 1"</span><em>→</em><span>retry doubles it</span><em>·</em><span class="hot">"set to 5"</span><em>→</em><span>retry changes nothing</span></div>
+<p>Describe the destination, not the step — then repetition is free.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a small provisioning script in the relative style — the way people naturally write them — and run it once.
+<pre class="cmd">cd ~/dist; cat &gt; provision.sh &lt;&lt;'EOF'
+#!/bin/bash
+mkdir /srv/app                                    # create the directory
+echo "worker" &gt;&gt; /srv/app/roles                   # append our role
+sudo iptables -A INPUT -p tcp --dport 8088 -j ACCEPT   # open our port
+EOF
+chmod +x provision.sh; sudo mkdir -p /srv; ./provision.sh; echo "exit=$?"</pre>
+<pre class="out">exit=<b>0</b>          ← worked. Now imagine the caller timed out and did not hear that.</pre></li>
+<li>Run it again, as any retry would. Every one of the three operations misbehaves, and only one of them says so.
+<pre class="cmd">./provision.sh; echo "exit=$?"; cat /srv/app/roles; sudo iptables -S INPUT | grep 8088</pre>
+<pre class="out">mkdir: cannot create directory '/srv/app': File exists     ← noisy, and harmless
+exit=1
+worker
+<b>worker</b>                                                     ← silently duplicated
+-A INPUT -p tcp --dport 8088 -j ACCEPT
+<b>-A INPUT -p tcp --dport 8088 -j ACCEPT</b>                     ← silently duplicated</pre></li>
+<li>Now rewrite each line into the absolute style: state what should be true, not what to do.
+<pre class="cmd">cat &gt; provision.sh &lt;&lt;'EOF'
+#!/bin/bash
+mkdir -p /srv/app                                       # ensure the directory exists
+grep -qx worker /srv/app/roles 2&gt;/dev/null || echo worker &gt; /srv/app/roles
+sudo iptables -C INPUT -p tcp --dport 8088 -j ACCEPT 2&gt;/dev/null \
+  || sudo iptables -A INPUT -p tcp --dport 8088 -j ACCEPT
+EOF
+sudo iptables -F INPUT; rm -rf /srv/app; ./provision.sh; echo "exit=$?"</pre>
+<pre class="out">exit=<b>0</b></pre></li>
+<li>Run the idempotent version five times and confirm nothing accumulates. This is the property, demonstrated rather than asserted.
+<pre class="cmd">for i in 1 2 3 4 5; do ./provision.sh || echo "FAILED on run $i"; done
+wc -l &lt; /srv/app/roles; sudo iptables -S INPUT | grep -c 8088</pre>
+<pre class="out">1
+<b>1</b>          ← five runs, one role line, one rule. Same end state as a single run.</pre></li>
+<li>Do the counter version too, because it is the clearest statement of the idea.
+<pre class="cmd">echo 0 &gt; c
+relative() { n=$(cat c); echo $((n+1)) &gt; c; }; absolute() { echo 5 &gt; c; }
+relative; relative; relative; echo "relative x3 -&gt; $(cat c)"
+absolute; absolute; absolute; echo "absolute x3 -&gt; $(cat c)"</pre>
+<pre class="out">relative x3 -&gt; <b>3</b>          ← the retry count is visible in the data
+absolute x3 -&gt; <b>5</b>          ← indistinguishable from running it once</pre></li>
+<li>Sketch the idempotency key for the case that cannot be made absolute, then clean up.
+<pre class="cmd">: &gt; processed.log
+charge() { grep -qx "$1" processed.log &amp;&amp; { echo "key $1: already charged, returning the original result"; return; }
+           echo "$1" &gt;&gt; processed.log; echo "key $1: charging now"; }
+charge req-7f2a; charge req-7f2a
+sudo iptables -F INPUT; rm -rf /srv/app ~/dist/c ~/dist/processed.log</pre>
+<pre class="out">key req-7f2a: charging now
+key req-7f2a: <b>already charged</b>, returning the original result          ← retry made safe by a key</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Define idempotency by end state rather than by error behaviour, and classify five operations on sight: <code>mkdir</code>, <code>mkdir -p</code>, <code>iptables -A</code>, <code>echo x &gt;&gt; file</code>, <code>echo x &gt; file</code>. Then do the rewrite in your head for one of your own scripts and name the general move — describe the desired end state, not the change. Finally, say what an idempotency key buys and where the state has to live for it to work (on the server, keyed by the client's id, for at least as long as retries can arrive).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The dangerous failures here are the quiet ones. Step 2's <code>mkdir</code> printed an error and stopped nothing important; the appended role line and the duplicated firewall rule printed nothing at all and are exactly the kind of thing found weeks later. When auditing a script for idempotency, pay least attention to the commands that fail loudly on the second run and most to the ones that succeed.</p>
+<p>The second trap is that a sequence of idempotent steps is not automatically an idempotent script. If step three fails halfway, a re-run must be able to start from that partial state and still reach the end — which means every step must tolerate being run against a system where earlier steps are already done and later ones are not. That is what "converges" means, and it is stricter than "each command is safe to repeat".</p>
+<div class="k8s-link">
+<p>This is why the Kubernetes API is declarative, and it is the single most load-bearing design decision in the system. <code>kubectl apply</code> submits a desired end state, so applying the same manifest ten times gives the same result as applying it once — the retry after a timeout is safe by construction. Compare the imperative alternatives: <code>kubectl create</code> repeated is an error, and a hypothetical "scale up by one" repeated is an outage. The same requirement runs all the way down: every controller's actions must be replayable, because a controller re-runs its reconcile function constantly and can be restarted at any moment (<a href="#cp-b13-12">B13.12</a>).</p>
+<p>The path a write takes and the points at which it can time out is <a href="w1.html#cp-1-3">W1.3</a>; the controller pattern that depends on replayable actions is <a href="w1.html#cp-1-16">W1.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 mkdir</code> (<code>-p</code>), <code>man 1 ln</code> (<code>-sf</code>) and <code>man 8 iptables</code> (<code>-C</code>, the check verb that makes rule management idempotent) are the three practical examples. <code>man 1 install</code> is an underrated idempotent alternative to <code>cp</code>+<code>chmod</code>+<code>mkdir</code>. For the general idea, the HTTP specification's notion of idempotent methods (<code>PUT</code> and <code>DELETE</code> yes, <code>POST</code> no) is the same distinction with different words.</p>
+</article>
+
+<article class="lesson" id="cp-b13-11" data-id="b13-11">
+<div class="lesson-head"><span class="cp-id">B13.11</span><h4>Retry like an adult: exponential backoff and jitter</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Retrying is mandatory (<a href="#cp-b13-2">B13.2</a>), and retrying naively is how a small failure becomes a large one. A struggling service that gets hammered by every client at once never recovers — the retries are the load. Backoff and jitter are the two-line fix, and they explain the name of the most common pod state you will ever debug.</p>
+<h5>The concept</h5>
+<p>Two independent ideas, usually used together:</p>
+<ul>
+<li><strong>Exponential backoff</strong> — wait longer after each failure, doubling: 1s, 2s, 4s, 8s, 16s, up to a cap. This gives a struggling service room to recover instead of amplifying its load, and it keeps a permanently broken dependency from consuming your CPU forever. The cap matters: without one, the delay grows until the client is effectively dead.</li>
+<li><strong>Jitter</strong> — add randomness to each delay, so clients that failed at the same moment do not retry at the same moment. Without it, backoff synchronises the herd rather than dispersing it: everyone fails together at T, everyone retries at T+1, everyone fails together again, and the pattern repeats with more force at each step.</li>
+</ul>
+<p>The thundering herd is worth picturing concretely. A service restarts; five hundred clients get a connection error within the same second; all five hundred wait exactly one second; all five hundred hit the service simultaneously as it is still warming up; it falls over again. The retries are perfectly reasonable individually and lethal collectively. Full jitter — sleeping a random duration between zero and the current backoff — spreads that spike across the whole window and is what most production libraries implement.</p>
+<p>Two more rules complete the pattern. Cap the total number of attempts or the total time, so a request does not retry forever. And <strong>only retry what is safe to retry</strong>: a definite error before processing (connection refused) is safe; a timeout is only safe if the operation is idempotent (<a href="#cp-b13-10">B13.10</a>). Backoff without idempotency just spreads the double-charges out politely.</p>
+<div class="flow"><span>fail</span><em>→</em><span>1s</span><em>→</em><span>2s</span><em>→</em><span>4s</span><em>→</em><span class="hot">cap</span><em>·</em><span>+ jitter so the herd disperses</span></div>
+<p>Backoff protects the server from you; jitter protects it from all of you at once.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Print a plain exponential backoff schedule with a cap, so the shape is concrete.
+<pre class="cmd">cd ~/dist; python3 -c "
+delay = 1.0
+for attempt in range(1, 9):
+    print(f'attempt {attempt}: wait {min(delay, 30):5.1f}s')
+    delay *= 2"</pre>
+<pre class="out">attempt 1: wait   1.0s
+attempt 2: wait   2.0s
+attempt 3: wait   4.0s
+attempt 5: wait  16.0s
+attempt 6: wait  <b>30.0</b>s          ← the cap, from here on</pre></li>
+<li>Simulate the herd without jitter. Five hundred clients that failed together retry together — count how many land in each second.
+<pre class="cmd">python3 -c "
+from collections import Counter
+c = Counter()
+for client in range(500):
+    delay = 1.0
+    for attempt in range(4):
+        c[round(delay)] += 1
+        delay *= 2
+for sec in sorted(c): print(f't+{sec:&gt;2}s: {c[sec]:&gt;4} retries {\"#\"*(c[sec]//12)}')"</pre>
+<pre class="out">t+ 1s:  <b>500</b> retries ##########################################
+t+ 2s:  <b>500</b> retries ##########################################
+t+ 4s:  <b>500</b> retries ##########################################
+t+ 8s:  <b>500</b> retries ##########################################
+                       ↑ four spikes of 500. The recovering service meets a wall each time.</pre></li>
+<li>Add full jitter — a random wait between zero and the current backoff — and count again.
+<pre class="cmd">python3 -c "
+from collections import Counter
+import random
+c = Counter()
+for client in range(500):
+    delay = 1.0
+    for attempt in range(4):
+        c[round(random.uniform(0, delay))] += 1
+        delay *= 2
+for sec in sorted(c): print(f't+{sec:&gt;2}s: {c[sec]:&gt;4} retries {\"#\"*(c[sec]//12)}')"</pre>
+<pre class="out">t+ 0s:  <b>438</b> retries ####################################
+t+ 1s:   322 retries ##########################
+t+ 2s:   198 retries ################
+t+ 5s:    97 retries ########
+t+ 8s:    41 retries ###          ← same total work, spread over the window instead of stacked</pre></li>
+<li>Implement the real thing in ten lines — backoff, cap, jitter, attempt limit — and watch it retry against something that is genuinely down.
+<pre class="cmd">cat &gt; retry.py &lt;&lt;'EOF'
+import random, subprocess, sys, time
+delay, cap, attempts = 1.0, 8.0, 5
+for n in range(1, attempts + 1):
+    rc = subprocess.run(['curl', '-sf', '-m', '1', 'http://localhost:9199/'],
+                        capture_output=True).returncode
+    if rc == 0:
+        print(f'attempt {n}: success'); sys.exit(0)
+    wait = random.uniform(0, min(delay, cap))
+    print(f'attempt {n}: failed (rc={rc}), sleeping {wait:.2f}s')
+    time.sleep(wait); delay *= 2
+print('giving up after', attempts, 'attempts')
+EOF
+python3 retry.py</pre>
+<pre class="out">attempt 1: failed (rc=7), sleeping 0.42s          ← rc 7 = connection refused: safe to retry
+attempt 3: failed (rc=7), sleeping 2.87s
+attempt 5: failed (rc=7), sleeping 6.11s
+<b>giving up after 5 attempts</b>          ← bounded: it does not retry forever</pre></li>
+<li>Now start the service mid-retry and watch the loop succeed instead of giving up.
+<pre class="cmd">( sleep 3; python3 -m http.server 9199 &amp;&gt;/dev/null ) &amp;
+python3 retry.py</pre>
+<pre class="out">attempt 1: failed (rc=7), sleeping 0.88s
+attempt 2: failed (rc=7), sleeping 1.55s
+attempt 3: failed (rc=7), sleeping 3.21s
+attempt 4: <b>success</b>          ← the recovery it was waiting for, without hammering</pre></li>
+<li>Stop the server, and note the one precondition this whole pattern rests on.
+<pre class="cmd">kill %1 2&gt;/dev/null; pkill -f 'http.server 9199'
+echo "retry is only safe when the operation is idempotent (B13.10) or the error was definite"</pre>
+<pre class="out">retry is only safe when the operation is idempotent (B13.10) or the error was definite</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State what each half of the pattern prevents: backoff stops one client from amplifying a struggling service's load, jitter stops many clients from synchronising into a spike. Then name the two bounds every retry loop needs (a delay cap and an attempt or total-time limit) and say what happens without each. Finally, connect it back: which errors are safe to retry blindly, and which require the operation to be idempotent first?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Retry loops nest, and the nesting multiplies. If a client retries three times, and the service it calls retries three times against <em>its</em> dependency, the bottom of the stack sees nine attempts per user request — and each layer's timeout should be shorter than the layer above it, or the outer layer gives up while the inner one is still trying and the work is wasted. Retrying at every layer is a common way to build an accidental load generator.</p>
+<p>The second is retrying errors that will never succeed. A <code>401</code>, a <code>404</code> or a malformed-request error is not going to become correct on the fourth attempt; retrying it wastes time and hides the real problem. Retry the transient category — connection failures, timeouts, <code>503</code>, <code>429</code> — and fail fast on everything else.</p>
+<div class="k8s-link">
+<p><code>CrashLoopBackOff</code> is this pattern wearing a status name, and reading it that way removes most of the confusion around it. When a container exits, the kubelet restarts it; when it keeps exiting, the kubelet backs off exponentially — roughly 10s, 20s, 40s, doubling to a cap of five minutes by default — and resets the counter once the container has run successfully for long enough. So <code>CrashLoopBackOff</code> is not a diagnosis and not an error state: it is the node protecting itself from a pod that will not stay up, exactly as your <code>retry.py</code> protects a struggling server. The diagnosis is always one layer down, in <code>kubectl logs --previous</code> and the container's exit code. (A newer enhancement to make that maximum delay configurable and shorter is in progress upstream but is not the default, so five minutes is still what you should expect to see.)</p>
+<p>Reading a crash loop properly — <code>--previous</code>, <code>lastState</code> and the exit-code alphabet — is <a href="w6.html#cp-6-16">W6.16</a>; the restart policy that decides whether a container is restarted at all is <a href="w3.html#cp-3-1">W3.1</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 curl</code> has the pattern built in — <code>--retry</code>, <code>--retry-delay</code>, <code>--retry-max-time</code> and <code>--retry-all-errors</code> — and reading those flags is a quick way to see which decisions a retry policy has to make. <code>man 5 systemd.service</code> for <code>RestartSec=</code> and the start rate limiter (<a href="b11.html#cp-b11-4">B11.4</a>), which is systemd's version of the same protection. For the canonical treatment of full jitter, the AWS Architecture Blog's "Exponential Backoff and Jitter" is short and worth the read.</p>
+</article>
+
+<article class="lesson" id="cp-b13-12" data-id="b13-12">
+<div class="lesson-head"><span class="cp-id">B13.12</span><h4>The reconciliation loop, and watch versus poll</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the shape of every Kubernetes controller without exception, and it is the reason the system recovers from things nobody wrote recovery code for. It is also a pattern you can implement anywhere, in any language, in about twenty lines — and once you have, the whole control plane stops being magic.</p>
+<h5>The concept</h5>
+<p>A <strong>reconciliation loop</strong> does four things, forever:</p>
+<ol>
+<li>Read the <strong>desired</strong> state — what should be true.</li>
+<li>Observe the <strong>actual</strong> state — what is true right now.</li>
+<li><strong>Act</strong> on the difference, making the smallest change that moves actual toward desired.</li>
+<li>Repeat.</li>
+</ol>
+<p>Use the canonical picture: a thermostat. It does not remember that it turned the heating on; it compares the target temperature to the measured one and acts. That is why it recovers from a window being opened, a sensor glitch or its own restart, without any of those cases being programmed.</p>
+<p>Notice what the loop is <em>not</em>: it is not a one-shot script that performs an action and assumes it succeeded. That distinction is the whole value. If the action fails, the next pass observes the same difference and tries again. If something external undoes the work, the next pass notices and redoes it. If the controller itself restarts, it does not need to remember anything, because the truth is in the observation, not in its memory. This is also why every action must be idempotent (<a href="#cp-b13-10">B13.10</a>) — the loop will run it again.</p>
+<p>Then the second question: how do you know when to run a pass?</p>
+<ul>
+<li><strong>Polling</strong> — run every N seconds regardless. Simple, and <em>self-healing</em>: it cannot miss anything permanently, because it re-observes everything each time. It costs latency (up to N seconds of delay) and constant work even when nothing changes.</li>
+<li><strong>Watching</strong> — subscribe to a stream of changes and act when one arrives. Immediate and cheap when idle, but a missed or dropped event means permanent drift, because nothing will tell you again.</li>
+</ul>
+<p>Real systems do <strong>both</strong>: watch for responsiveness, and re-list periodically so a missed event cannot become permanent drift. That combination is not belt-and-braces caution, it is the only way to get low latency and eventual correctness at once.</p>
+<div class="flow"><span>desired</span><em>·</em><span>observed</span><em>→</em><span class="hot">act on the difference</span><em>→</em><span>repeat</span></div>
+<p>No memory of past actions is needed — which is exactly why it recovers from everything.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write one pass of a reconciler: desired count in a file, actual count observed from the process table, act on the difference.
+<pre class="cmd">cd ~/dist; echo 3 &gt; desired
+pass() {
+  want=$(cat desired); have=$(pgrep -fc 'sleep 4242' || true)
+  echo "desired=$want actual=$have"
+  while [ "$have" -lt "$want" ]; do sleep 4242 &amp; have=$((have+1)); echo "  + started a worker"; done
+  while [ "$have" -gt "$want" ]; do pkill -o -f 'sleep 4242'; have=$((have-1)); echo "  - stopped a worker"; done
+}
+pass</pre>
+<pre class="out">desired=3 actual=0
+  + started a worker
+  + started a worker
+  + started a worker          ← one pass converged the difference</pre></li>
+<li>Run the same pass again with nothing changed. A correct reconciler does nothing when there is nothing to do — that is what makes it safe to run forever.
+<pre class="cmd">pass</pre>
+<pre class="out">desired=3 actual=3          ← no action. Idempotent by construction.</pre></li>
+<li>Break the actual state from outside, the way reality does, and run a pass. No undo logic exists, and none is needed.
+<pre class="cmd">pkill -o -f 'sleep 4242'; echo "killed one worker behind the reconciler's back"; pass</pre>
+<pre class="out">killed one worker behind the reconciler's back
+desired=3 actual=2
+  + started a worker          ← recovered, without anyone writing a recovery path</pre></li>
+<li>Change the desired state instead and watch the same code handle the opposite direction.
+<pre class="cmd">echo 1 &gt; desired; pass</pre>
+<pre class="out">desired=1 actual=3
+  - stopped a worker
+  - stopped a worker          ← scaling down is the same subtraction, not a different feature</pre></li>
+<li>Compare watch against poll. Start a watcher that reacts instantly, and a poller that reacts within its interval.
+<pre class="cmd">: &gt; events.log
+( tail -f -n0 events.log | while read -r line; do echo "WATCH saw: $line at $(date +%T)"; done ) &amp;
+( while true; do sleep 5; echo "POLL  re-listed at $(date +%T): $(wc -l &lt; events.log) events"; done ) &amp;
+echo "change-1" &gt;&gt; events.log; sleep 6</pre>
+<pre class="out">WATCH saw: change-1 at 10:22:03          ← immediate
+POLL  re-listed at 10:22:08: 1 events    ← up to 5 s later, but it re-checks everything</pre></li>
+<li>Now show the failure mode each has. Stop the watcher, make a change it will never hear about, and see who notices.
+<pre class="cmd">kill %1 2&gt;/dev/null; echo "change-2 (while the watcher was down)" &gt;&gt; events.log; sleep 6
+kill %1 %2 2&gt;/dev/null; pkill -f 'sleep 4242'; rm -f events.log desired</pre>
+<pre class="out">POLL  re-listed at 10:22:19: <b>2</b> events
+      ↑ the poller picked it up on the next pass; the watcher would have missed it forever</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Recite the four steps of the loop, then answer the question that shows you understand why it is used: why does a reconciler need no memory of what it did last time? (Because the truth is in the observation — it compares desired to actual, so its own restart, a failed action and external interference are all the same situation on the next pass.) Then state what watching and polling each buy and what each fails at, and explain why real controllers do both.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The commonest way to get this wrong is to act on the <em>event</em> rather than on the <em>state</em>. A handler that says "a delete event arrived, so remove one worker" is a one-shot script with extra steps: it breaks if the event is duplicated, if it is missed, or if it arrives out of order. The correct handler ignores the event's content entirely and uses it only as a hint to run a full pass — which is why Kubernetes controllers put a key in a work queue rather than acting on the event object.</p>
+<p>The second is a loop with no rate limit. A reconciler that acts, fails, and immediately re-runs will spin at full speed against a broken dependency, which is the thundering herd of <a href="#cp-b13-11">B13.11</a> aimed at your own system. Real controllers pull from a rate-limited queue with exponential backoff per key, so a persistently failing object is retried more and more slowly rather than continuously.</p>
+<div class="k8s-link">
+<p>Every controller in Kubernetes is this loop, and the fact that you just wrote one is the point of the module. The Deployment controller compares the desired replica count with the pods that exist and creates or deletes the difference — which is why deleting a pod that a Deployment owns triggers no undo logic at all: the next pass simply observes one fewer pod than desired and creates one. The implementation adds two things to your version: an <strong>informer</strong>, which is the watch-plus-periodic-relist combination from step 5 with a local cache, and a <strong>rate-limited work queue</strong>, which is the backoff from the gotcha above. The reconcile function itself is your <code>pass()</code>.</p>
+<p>The controller pattern in full — informer, queue, reconcile — is <a href="w1.html#cp-1-16">W1.16</a>; the ownership references that let a controller know which objects are its business, and cascade deletion, are <a href="w1.html#cp-1-17">W1.17</a>; and the watch mechanism itself, as an HTTP request you can make by hand, is <a href="w1.html#cp-1-6">W1.6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 tail</code> (<code>-f</code>) is the poor man's watch used above; <code>man 7 inotify</code> is the kernel mechanism a real file watcher uses, and reading its "Limitations and caveats" section is instructive — it documents exactly the missed-event problem that forces a periodic re-list. <code>man 5 systemd.path</code> if you want a watch that starts a unit, and <code>man 5 systemd.timer</code> for the polling half (<a href="b11.html#cp-b11-2">B11.2</a>).</p>
+</article>
+
+<article class="lesson" id="cp-b13-13" data-id="b13-13">
+<div class="lesson-head"><span class="cp-id">B13.13</span><h4>Leases, heartbeats, and why every timeout is a guess</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Deciding that a peer is dead is the most consequential guess a distributed system makes — evict its work too early and you cause an outage that never existed; too late and real failures go unhandled. The mechanism is simple enough to build in ten lines, and the trade-off it forces has no correct answer, only a chosen one. This is also exactly how Kubernetes decides a node is <code>NotReady</code>.</p>
+<h5>The concept</h5>
+<p>A <strong>heartbeat</strong> is a periodic "I am still here" signal. A monitor records when it last saw one and declares the peer dead when the gap exceeds a <strong>timeout</strong>. That is the whole mechanism, and it inherits the flaw from <a href="#cp-b13-2">B13.2</a>: a peer that is merely slow, or whose heartbeat was dropped, is indistinguishable from a peer that is gone. Every failure detector is therefore a heuristic that can be wrong in both directions.</p>
+<p>The trade-off is direct and worth stating as a sentence you can defend: <strong>a shorter timeout detects real failures faster and invents more failures that never happened.</strong> Shorten it enough and you get <em>flapping</em> — a peer repeatedly declared dead and then alive, each transition triggering expensive work like moving its workload, which loads the system further, which causes more missed heartbeats. That feedback loop is why conservative timeouts are usually right: the cost of reacting late to a real failure is normally much smaller than the cost of reacting wrongly to a healthy peer under load.</p>
+<p>A <strong>lease</strong> is the same idea made into a lock with an expiry. A holder acquires the lease for a duration and must renew before it expires; if the holder dies, the lease simply expires and someone else may take it. This is what makes distributed locking safe in the presence of crashes — a plain lock held by a process that died is held forever, while a lease resolves itself. Leader election is usually exactly this: whoever holds the lease is the leader, the leader renews continuously, and if it stops renewing, the others compete for the expired lease.</p>
+<p>One rule that keeps this correct: <strong>renew far more often than the expiry.</strong> A holder that renews every 10 seconds on a 40-second lease survives three consecutive lost renewals; one that renews at 35 seconds on a 40-second lease loses its leadership to a single dropped packet.</p>
+<div class="flow"><span>heartbeat every R</span><em>→</em><span>monitor sees gap &gt; T</span><em>→</em><span class="hot">declared dead</span><em>·</em><span>T small = fast detection + false positives</span></div>
+<p>There is no correct T — only a choice about which error you would rather make.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a heartbeat and a monitor. The heartbeat touches a file; the monitor judges its age.
+<pre class="cmd">cd ~/dist
+( while true; do touch heartbeat; sleep 1; done ) &amp;
+check() { age=$(( $(date +%s) - $(stat -c %Y heartbeat) ))
+  [ "$age" -le "$1" ] &amp;&amp; echo "peer ALIVE (last seen ${age}s ago, timeout ${1}s)" \
+                      || echo "peer DEAD  (last seen ${age}s ago, timeout ${1}s)"; }
+sleep 2; check 5</pre>
+<pre class="out">peer ALIVE (last seen 0s ago, timeout 5s)          ← renewing every 1 s against a 5 s timeout</pre></li>
+<li>Stop the peer and watch the monitor notice — after the timeout, not immediately. That delay is the detection time you chose.
+<pre class="cmd">kill %1; for i in 1 2 3 4 5 6; do check 5; sleep 1; done</pre>
+<pre class="out">peer ALIVE (last seen 1s ago, timeout 5s)
+peer ALIVE (last seen 4s ago, timeout 5s)
+peer <b>DEAD</b>  (last seen 6s ago, timeout 5s)          ← detected, ~5 s after it actually stopped</pre></li>
+<li>Now make the peer <em>slow</em> rather than dead — the case a detector cannot distinguish — and use a tight timeout.
+<pre class="cmd">( while true; do touch heartbeat; sleep 3; done ) &amp;      # a struggling peer: renews every 3 s
+for i in 1 2 3 4 5 6; do check 2; sleep 1; done</pre>
+<pre class="out">peer ALIVE (last seen 0s ago, timeout 2s)
+peer <b>DEAD</b>  (last seen 3s ago, timeout 2s)          ← a false positive: it is alive and renewing
+peer ALIVE (last seen 0s ago, timeout 2s)
+peer <b>DEAD</b>  (last seen 3s ago, timeout 2s)          ← flapping: dead, alive, dead, alive</pre></li>
+<li>Widen the timeout against the same slow peer and watch the false positives disappear — at the cost of slower real detection.
+<pre class="cmd">for i in 1 2 3 4 5 6; do check 10; sleep 1; done; kill %1</pre>
+<pre class="out">peer ALIVE (last seen 2s ago, timeout 10s)
+peer ALIVE (last seen 1s ago, timeout 10s)          ← stable. Detection of a REAL death now takes 10 s.</pre></li>
+<li>Turn the heartbeat into a lease with an expiry, and see a second contender take over automatically when the holder dies.
+<pre class="cmd">cat &gt; lease.sh &lt;&lt;'EOF'
+#!/bin/bash
+me=$1; ttl=5
+while true; do
+  if [ ! -f lease ] || [ $(( $(date +%s) - $(stat -c %Y lease) )) -gt $ttl ]; then
+    echo "$me" &gt; lease; echo "$me: ACQUIRED the lease"
+  elif [ "$(cat lease)" = "$me" ]; then
+    touch lease; echo "$me: renewed"
+  fi
+  sleep 2
+done
+EOF
+chmod +x lease.sh; rm -f lease; ./lease.sh alpha &amp; sleep 3; ./lease.sh beta &amp; sleep 4</pre>
+<pre class="out">alpha: ACQUIRED the lease
+alpha: renewed
+alpha: renewed          ← beta is running but stays quiet: the lease is held and unexpired</pre></li>
+<li>Kill the holder and watch the lease expire into the other contender's hands, with no coordination between them.
+<pre class="cmd">kill %1; sleep 9; kill %2 2&gt;/dev/null; rm -f lease heartbeat lease.sh</pre>
+<pre class="out">beta: <b>ACQUIRED the lease</b>          ← the holder died; the lease expired; the successor took it
+beta: renewed                    ← no handover protocol, no cleanup, no stuck lock</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the failure-detection trade-off in one sentence you would defend in a review, and describe flapping and why it is self-reinforcing under load. Then explain what a lease adds to a lock (an expiry, so a dead holder does not hold it forever) and the renewal rule (renew several times per expiry period, so a single lost renewal is survivable). Finally, name the two errors a detector can make and which one is usually more expensive in practice.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Tuning a timeout down after a slow incident is the classic overcorrection, and it usually makes things worse. The incident you remember is the one where a failure took too long to detect; the incidents you cause by shortening the timeout are diffuse — a node evicted under load, pods rescheduled unnecessarily, a leader election storm during a traffic spike — and are rarely traced back to the change. Change detection timeouts deliberately, with the load case in mind, not in the aftermath of a single outage.</p>
+<p>The second is treating a lease as a guarantee of exclusivity. It is not, quite: a holder whose process was paused (a long garbage-collection pause, a stopped VM, a full disk) can wake up believing it still holds a lease that expired while it was frozen, and act — briefly — as a second leader. Systems that need real safety add fencing on top (<a href="#cp-b13-9">B13.9</a>), where each lease acquisition increments a number that downstream systems check, so a stale holder's writes are rejected.</p>
+<div class="k8s-link">
+<p>Kubernetes uses this mechanism twice, and both are worth knowing precisely. <strong>Node health</strong> is a <code>Lease</code> object in <code>kube-node-lease</code> that each kubelet renews roughly every 10 seconds; if the node controller sees no renewal for the node-monitor grace period — 40 seconds by default — it marks the node <code>NotReady</code>, and eviction of that node's pods begins later still. Those numbers are exactly the trade-off you just measured: 10-second renewals against a 40-second timeout means three consecutive missed renewals are survivable, and a genuinely dead node is detected in well under a minute. <strong>Leader election</strong> is the second use: only one kube-controller-manager and one kube-scheduler is active at a time, and the active one is simply whichever holds a lease it keeps renewing — which is why running three of each does not double-reconcile anything.</p>
+<p>Node heartbeats and the full death timeline, second by second, is <a href="w1.html#cp-1-22">W1.22</a>; leader election among control-plane components is <a href="w1.html#cp-1-18">W1.18</a>; and the practical <code>NotReady</code> troubleshooting ladder is <a href="w6.html#cp-6-10">W6.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 stat</code> (<code>-c %Y</code>) and <code>man 1 touch</code> are the whole heartbeat mechanism above. <code>man 1 flock</code> is the single-machine lock this generalises — worth comparing, because it has no expiry and relies on the kernel releasing it when the process dies, which is a luxury no distributed system has. <code>man 5 systemd.service</code> for <code>WatchdogSec=</code>, systemd's own heartbeat: a service that stops pinging is restarted, the same mechanism one layer down.</p>
+</article>
+
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
