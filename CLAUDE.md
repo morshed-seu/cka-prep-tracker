@@ -79,7 +79,8 @@ Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0
 | B-S12 | `materials/b7.html` — cgroups v2: CPU/memory/pids/io limits, throttling, OOM (14 cp) | ✅ done |
 | B-S13 | `materials/b8.html` — Networking I: layers/ARP/CIDR, routing, TCP/UDP, tcpdump, the 5-rung ladder (18 cp) | ✅ done |
 | B-S14 | `materials/b9.html` — Networking II: netns/veth/bridge, ip_forward+NAT+conntrack, netfilter hooks/tables/filter-vs-nat/iptables-nft/rule-order, DNAT+statistic LB + NodePort + unix sockets, CNI-v0.1 project + drill (20 cp) | ✅ done |
-| B-S15…B-S18 | `materials/b10.html` … `materials/b13.html`, one module per session | ⬜ next (B-S15 = `b10.html`) |
+| B-S15 | `materials/b10.html` — Names: DNS &amp; resolution: resolver library/nsswitch, /etc/hosts, resolv.conf + ndots, search-list fan-out, recursive-vs-authoritative, `dig +trace` delegation, systemd-resolved stub, record types, `dig` anatomy, TTL, negative caching, dnsmasq-zone-into-a-namespace project + drill (13 cp) | ✅ done |
+| B-S16…B-S18 | `materials/b11.html` … `materials/b13.html`, one module per session | ⬜ next (B-S16 = `b11.html`) |
 | B-S19 | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA | ⬜ |
 
 **Resume recipe for any beginner-track session:** read this table → read the target module's section in `docs/BEGINNER-TRACK.md` → `git log --oneline -8` (what actually landed, vs. just marked done) → run the three checkers for a green baseline → do the work → checkers → commit → tick the row here and update the `cka-materials-plan` memory.
