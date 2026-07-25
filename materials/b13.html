@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B13: distributed systems fundamentals — the three reasons anyone accepts a second machine (scale, availability, blast radius) with the availability arithmetic done out loud; partial failure demonstrated for real, where a dropped reply is indistinguishable from a request that never arrived; why there is no shared clock and why systems order events with counters instead of timestamps; the eight fallacies and a measured latency ladder; stateless versus stateful and the lost-update demo that shows why two writers corrupt; leader/follower replication with measurable lag; strong versus eventual consistency and CAP as a partition-time choice; quorum arithmetic and why four members buy nothing over three; Raft's three parts — leader election, log replication, commit — simulated locally, plus split brain and fencing; idempotency; exponential backoff with jitter; the reconciliation loop and watch-versus-poll; leases, heartbeats and the timeout trade-off; a mini project building a reconciler as a systemd unit plus a three-member quorum simulation; and a debugging drill covering a reconciler that fights itself and a heartbeat timeout tuned so tight it invents failures.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B13 · Distributed systems fundamentals — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B13 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+    <li><a href="b9.html">B9 · Networking II</a></li>
+    <li><a href="b10.html">B10 · DNS &amp; names</a></li>
+    <li><a href="b11.html">B11 · systemd &amp; logs</a></li>
+    <li><a href="b12.html">B12 · Security &amp; PKI</a></li>
+    <li><a href="b13.html">B13 · Distributed systems</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b13">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B13 — Distributed systems fundamentals</h1>
+  <p>Every module so far has happened inside one machine. One kernel, one process table, one clock, one filesystem — and one enormous simplification you have been enjoying without noticing: when you call something, it either runs or it does not, and you always find out which. Add a second machine and that guarantee disappears. A request can arrive, be executed perfectly, and have its reply lost on the way back, and the caller has no way to tell that apart from a request that never arrived at all. Almost everything strange about distributed systems grows out of that one sentence.</p>
+  <p>If one hotel has been the machine all along, this module is the city: many buildings, no shared switchboard, messages carried between them by runners who sometimes do not come back. You cannot ask "did they get it?" without sending another runner, who may also not come back. So instead of certainty, distributed systems are built out of a small set of compromises — retry, but make the operation safe to repeat; guess at failure with a timeout, and accept that you will sometimes be wrong; require a majority to agree, so two halves of a split can never both act.</p>
+  <p>Kubernetes is a very large answer to exactly these problems, which is why this module is the last conceptual one before the capstone. Every piece of it that seems arbitrary at first — why etcd wants three members and never four, why controllers loop forever instead of doing things once, why a node goes <code>NotReady</code> forty seconds after it stops speaking rather than instantly, why <code>kubectl apply</code> can be run ten times without harm — is one of the compromises below, chosen deliberately. Four movements: <strong>what changes</strong> when there are two machines, <strong>state and agreement</strong> (replication, consistency, quorum, consensus), the <strong>patterns</strong> every distributed system converges on, and then a project where you build a controller and a quorum simulation of your own.</p>
+  <div class="weights">
+    <span>Checkpoints<b>15</b></span>
+    <span>Hours<b>~5</b></span>
+    <span>Prerequisites<b>B2, B8, B11</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Name the three reasons anyone accepts distribution, and do the availability arithmetic that justifies the second machine.</li>
+<li>Explain partial failure, and demonstrate that a lost reply is indistinguishable from a request that never arrived.</li>
+<li>Say why there is no shared clock, and what systems use instead of timestamps to order events.</li>
+<li>Recite the eight fallacies and match each to a failure you have already caused, with a measured latency ladder to back them up.</li>
+<li>Separate stateless from stateful services, and show why two writers to one piece of state corrupt it.</li>
+<li>Describe leader/follower replication, measure replication lag, and say what a follower being behind costs a reader.</li>
+<li>Put strong and eventual consistency in plain words, and state CAP as the partition-time choice it actually is.</li>
+<li>Do quorum arithmetic in your head, and explain why four members tolerate no more failures than three.</li>
+<li>Narrate Raft's three parts — election, replication, commit — and say what quorum and fencing prevent.</li>
+<li>Recognise a non-idempotent operation on sight, and rewrite it into a form that is safe to retry.</li>
+<li>Implement exponential backoff with jitter, and explain what each half prevents.</li>
+<li>Implement a reconciliation loop, and choose between watching and polling knowing what each buys.</li>
+<li>Explain leases and heartbeats, and reason about the timeout trade-off from measurements rather than instinct.</li>
+<li>Build a reconciler that keeps N workers alive as a systemd unit, and a three-member quorum simulation that shows exactly when writes must stop.</li>
+<li>Diagnose a reconciler that fights itself and a failure detector tuned so tightly it invents failures.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B2</strong> is the working prerequisite: the reconciler you build supervises real processes, so <code>fork</code>/<code>exec</code> (<a href="b2.html#cp-b2-5">B2.5</a>), signals (<a href="b2.html#cp-b2-8">B2.8</a>) and the hand-written supervisor (<a href="b2.html#cp-b2-17">B2.17</a>) are all directly reused — this module is that supervisor's idea, generalised. <strong>B8</strong> matters because the failures here are network failures: a dropped packet, a timeout, a connection that hangs rather than refuses (<a href="b8.html#cp-b8-9">B8.9</a>), and you will drop traffic deliberately with the packet-filtering tools from <a href="b9.html#cp-b9-11">B9.11</a>. <strong>B11</strong> is how the reconciler graduates from a script into a service (<a href="b11.html#cp-b11-3">B11.3</a>). Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>) — this module needs no second machine, because every distributed behaviour here is simulated with processes, files and firewall rules on one box, which is exactly enough to make the mechanisms visible. Nothing needs installing beyond what B8/B9 already added (<code>netcat-openbsd</code> for the partial-failure lab); <code>python3</code>, <code>iptables</code> and <code>timedatectl</code> ship with the system. One lesson deliberately moves the clock backwards, so take a snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>) if that makes you nervous — the lab puts it back.</p>
+</div>
+
+<!-- ---------------- What changes ---------------- -->
+<div class="grp" id="g-changes"><h3>What changes</h3>
+
+<article class="lesson" id="cp-b13-1" data-id="b13-1">
+<div class="lesson-head"><span class="cp-id">B13.1</span><h4>Why anyone accepts a second machine at all</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Distribution is expensive. It brings failure modes that do not exist on one box, it makes debugging harder, and it forces every design decision through questions nobody had to ask before. Knowing the three reasons people pay that price is what lets you tell a system that needed distributing from one that was distributed out of habit — and it explains why a Kubernetes cluster is shaped the way it is.</p>
+<h5>The concept</h5>
+<p>There are exactly three reasons, and they are worth being able to name:</p>
+<ul>
+<li><strong>Scale</strong> — the work does not fit on one machine. Not "would be faster spread out", but genuinely does not fit: more requests than one box can serve, more data than one disk holds, more CPU than one socket provides. This is the reason people assume is primary and it is often the least common of the three.</li>
+<li><strong>Availability</strong> — the service must survive losing a machine. One machine has a failure probability that no amount of good engineering removes: disks die, kernels panic, someone unplugs the wrong cable, the datacentre loses power. If the service must keep answering through that, there must be another machine already running.</li>
+<li><strong>Blast radius</strong> — one failure should not take everything. Separating workloads onto different machines means a memory leak in one does not evict the other, and a bad deploy takes down one replica rather than the service.</li>
+</ul>
+<p>The availability reason has arithmetic behind it, and the arithmetic is the argument. If one machine is available 99% of the time, two <em>independent</em> machines are both down only 0.01% of the time — 99.99% availability, four hours of downtime a year instead of three and a half days. That word <em>independent</em> is doing enormous work, and it is where real systems fail: two machines in the same rack share a power feed, two replicas on the same node share a kernel, and two datacentres on the same fibre path share a backhoe. Redundancy only multiplies when the failures do not correlate — which is exactly what a Kubernetes anti-affinity rule exists to enforce.</p>
+<p>Note also what distribution costs you in exchange, so the trade is honest: every call that used to be a function call is now a network request that can fail slowly (<a href="#cp-b13-2">B13.2</a>); state that used to be a variable now needs replication and agreement (<a href="#cp-b13-8">B13.8</a>); and a system that used to have one clock now has none (<a href="#cp-b13-3">B13.3</a>). The rest of this module is that bill, itemised.</p>
+<div class="flow"><span>scale</span><em>·</em><span>availability</span><em>·</em><span class="hot">blast radius</span><em>→</em><span>and the bill: partial failure, no clock, agreement</span></div>
+<p>Three reasons to say yes; the rest of the module is what you pay.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Establish what one machine actually is, so "does not fit" is a measurement rather than a feeling.
+<pre class="cmd">multipass shell sandbox
+nproc; free -h | awk '/Mem:/{print "RAM:", $2}'; df -h --output=size / | tail -1</pre>
+<pre class="out">2
+RAM: 3.8Gi
+  <b>39G</b>          ← this is the ceiling. "Scale" means the work genuinely exceeds it.</pre></li>
+<li>See the scale argument as a real speed-up, using every core you have. Same four jobs, run one at a time and then all at once.
+<pre class="cmd">time seq 1 4 | xargs -P 1 -I{} bash -c 'openssl speed -seconds 1 sha256 &gt;/dev/null 2&gt;&amp;1'
+time seq 1 4 | xargs -P 4 -I{} bash -c 'openssl speed -seconds 1 sha256 &gt;/dev/null 2&gt;&amp;1'</pre>
+<pre class="out">real    0m4.0s          ← four jobs, one at a time
+real    <b>0m2.1s</b>          ← four jobs, four at a time: parallelism helps until the cores run out</pre></li>
+<li>Do the availability arithmetic rather than asserting it. This is the whole justification for a second replica, in three lines.
+<pre class="cmd">python3 -c "
+for a in (0.99, 0.999):
+    print(f'one machine {a:.3%}  -> downtime/yr {(1-a)*365*24:6.1f} h')
+    print(f'two machines {1-(1-a)**2:.5%} -> downtime/yr {((1-a)**2)*365*24:6.1f} h')"</pre>
+<pre class="out">one machine 99.000%  -> downtime/yr   87.6 h
+two machines <b>99.99000%</b> -> downtime/yr    0.9 h        ← two nines become four, if independent
+one machine 99.900%  -> downtime/yr    8.8 h
+two machines 99.99990% -> downtime/yr    0.0 h</pre></li>
+<li>Then check the assumption the arithmetic rests on. Two processes on this VM are not independent at all — one kernel, one power supply, one hypervisor.
+<pre class="cmd">uptime -s; systemd-detect-virt; ls /sys/class/power_supply/ 2&gt;/dev/null | wc -l</pre>
+<pre class="out">2026-07-25 08:31:02
+<b>kvm</b>                        ← both "replicas" share one hypervisor, one host kernel, one host disk
+0                          ← correlated failure is the default; independence is engineered</pre></li>
+<li>Demonstrate blast radius with something you can already do: two workloads on one machine, one of which misbehaves (<a href="b7.html#cp-b7-8">B7.8</a>). Without a limit, the neighbour suffers.
+<pre class="cmd">sudo systemd-run --unit=hog --quiet -p MemoryMax=200M \
+  python3 -c "b=[]; [b.append(bytearray(1048576)) for _ in iter(int,1)]"
+sleep 3; systemctl is-active hog; systemctl show -p Result --value hog
+sudo systemctl reset-failed hog 2&gt;/dev/null; echo "the rest of the machine survived"</pre>
+<pre class="out">failed
+<b>oom-kill</b>                  ← the cage confined the damage: blast radius, enforced by cgroups
+the rest of the machine survived</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the three reasons without looking, and for each, name a system you know that has it as its <em>primary</em> reason. Then state the availability multiplication and its precondition in one sentence — two 99% machines give 99.99% <em>if and only if</em> their failures are independent — and give one concrete way that independence is commonly lost. If you can also say what distribution costs (partial failure, no shared clock, the need for agreement), you have the shape of the whole module.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The commonest mistake is distributing for scale that does not exist. A single modern machine handles a genuinely enormous amount of work — tens of thousands of requests per second, terabytes of disk, dozens of cores — and a distributed version of a system that fits on one box is usually slower, harder to debug and <em>less</em> available, because it has more parts that can fail and a network between them. "We might need to scale someday" is not one of the three reasons.</p>
+<p>The second is treating redundancy as automatically independent. Two replicas scheduled onto the same node, two nodes in the same rack, two zones on the same power grid: each pair fails together, so the arithmetic above quietly does not apply. Every real availability incident with a surprised post-mortem has a correlated failure in it somewhere, and the correlation was usually invisible on the architecture diagram.</p>
+<div class="k8s-link">
+<p>All three reasons are visible in the shape of a cluster. Scale is why a Deployment has a replica count and why nodes are added rather than enlarged. Availability is why the control plane can be run with three or five control-plane nodes rather than one, and why losing a worker is a scheduling event rather than an outage. Blast radius is why pods have resource limits (<a href="b7.html#cp-b7-1">B7</a>'s cgroups, wearing a Kubernetes name), why namespaces exist, and why the scheduler can be told to spread replicas across nodes and zones instead of packing them together — the anti-affinity rule is the "make the failures independent" precondition, written as configuration.</p>
+<p>The two high-availability control-plane topologies, and what the load balancer in front of them is for, is <a href="w2.html#cp-2-11">W2.11</a>; spreading replicas so their failures stay independent is <a href="w3.html#cp-3-13">W3.13</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">This lesson is arithmetic and judgement rather than tooling, so the useful pages are the measuring ones: <code>man 1 nproc</code>, <code>man 1 free</code> and <code>man 1 df</code> for the ceiling, <code>man 1 xargs</code> (the <code>-P</code> flag) for the parallelism demo, and <code>man 1 systemd-detect-virt</code> for what your "independent" machines are actually running on. <code>man 5 systemd.resource-control</code> for the blast-radius controls from <a href="b7.html#cp-b7-11">B7.11</a>.</p>
+</article>
+
+<article class="lesson" id="cp-b13-2" data-id="b13-2">
+<div class="lesson-head"><span class="cp-id">B13.2</span><h4>Partial failure: the one fact everything else follows from</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the defining difference between one machine and many, and nearly every other idea in this module is a response to it. On one machine, a function call runs or it does not, and you always know which. Across a network there is a third outcome that has no local equivalent: <em>it might have worked, and you cannot find out</em>. Once you have seen that outcome with your own eyes, retries, idempotency, timeouts and consensus all stop being abstractions.</p>
+<h5>The concept</h5>
+<p>Send a request to another machine and get no reply. At least four things could have happened:</p>
+<ul>
+<li>The request never arrived — it was dropped on the way out.</li>
+<li>It arrived, and the machine died before doing anything.</li>
+<li>It arrived, was executed completely, and the <em>reply</em> was lost on the way back.</li>
+<li>It arrived and is still being processed, slowly, and the reply is coming.</li>
+</ul>
+<p>From the caller's position these are <strong>identical</strong>. There is no observation you can make, and no timeout you can set, that distinguishes them — because the only way to ask "did you get it?" is to send another message, which is subject to exactly the same uncertainty. This is not an engineering shortfall to be fixed with a better protocol; it is a property of communicating over a channel that can lose things.</p>
+<p>Everything follows. Because you cannot know, you must <strong>retry</strong> — and because a retry may be a second execution of something that already succeeded, the operation must be safe to repeat, which is <strong>idempotency</strong> (<a href="#cp-b13-10">B13.10</a>). Because you cannot wait forever, you need a <strong>timeout</strong> — and a timeout is a guess, so you will sometimes declare a healthy peer dead (<a href="#cp-b13-13">B13.13</a>). Because two nodes may disagree about who is alive, you need a way to <strong>agree</strong> that a minority cannot override (<a href="#cp-b13-8">B13.8</a>). Four ideas, one cause.</p>
+<p>There is a related asymmetry worth naming: the distinction between <em>failed</em> and <em>slow</em> is undecidable. A peer that is merely overloaded looks exactly like a peer that is dead, and this is why every failure detector in every distributed system is, formally, a heuristic that can be wrong.</p>
+<div class="flow"><span>no reply</span><em>→</em><span>never arrived?</span><em>·</em><span>done, reply lost?</span><em>·</em><span class="hot">still running?</span><em>→</em><span>indistinguishable</span></div>
+<p>The caller cannot tell these apart — so the system must be designed as if all of them are true.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a "server" that receives a request, records that it did the work, and never replies. This is the executed-but-reply-lost case, made concrete.
+<pre class="cmd">cd ~ &amp;&amp; : &gt; work.log
+while true; do nc -l -p 9000 &gt;&gt; work.log; echo "--- executed at $(date +%T)" &gt;&gt; work.log; done &amp;
+sleep 1; ss -ltn | grep 9000</pre>
+<pre class="out">LISTEN 0  1  *:<b>9000</b>  *:*          ← listening; it will read a request and answer nothing</pre></li>
+<li>Send a request as a client with a timeout. From the client's seat, this is a failure — it got nothing back.
+<pre class="cmd">curl -s --max-time 3 http://localhost:9000/charge-card ; echo "curl exit=$?"</pre>
+<pre class="out">curl exit=<b>28</b>          ← 28 = timeout. The client knows only that no answer came.</pre></li>
+<li>Now look at the server's side of the same event. The work was done — the client's conclusion of "it failed" is simply wrong.
+<pre class="cmd">grep -c 'charge-card' work.log; tail -2 work.log</pre>
+<pre class="out">1
+GET /charge-card HTTP/1.1
+<b>--- executed at 09:14:22</b>          ← the card WAS charged. The caller has no way to know.</pre></li>
+<li>Produce the other case — a request that genuinely never arrives — and compare what the client sees. Drop the traffic before it reaches the listener (<a href="b9.html#cp-b9-12">B9.12</a>).
+<pre class="cmd">sudo iptables -I INPUT -p tcp --dport 9000 -j DROP
+curl -s --max-time 3 http://localhost:9000/charge-card ; echo "curl exit=$?"
+grep -c 'charge-card' work.log</pre>
+<pre class="out">curl exit=<b>28</b>          ← identical symptom, identical exit code
+1                      ← but this time nothing was executed: still 1 from step 3</pre></li>
+<li>Put the two side by side. Same client observation, opposite server reality — this is partial failure in one screen.
+<pre class="cmd">echo "case A (reply lost)  : client=timeout(28)  server=executed"
+echo "case B (never arrived): client=timeout(28)  server=did nothing"</pre>
+<pre class="out">case A (reply lost)  : client=timeout(28)  server=executed
+case B (never arrived): client=timeout(28)  server=did nothing
+                       ↑ identical           ↑ the only place the truth exists</pre></li>
+<li>Show the third case too — slow, not dead — because this is the one that makes every timeout a guess.
+<pre class="cmd">sudo iptables -D INPUT -p tcp --dport 9000 -j DROP
+curl -s --max-time 1 http://localhost:9000/slow; echo "client gave up: exit=$?"
+sleep 2; tail -1 work.log</pre>
+<pre class="out">client gave up: exit=<b>28</b>
+--- executed at 09:15:40          ← the server was working the whole time; the client was wrong</pre></li>
+<li>Clean up the listener and the log.
+<pre class="cmd">kill %1 2&gt;/dev/null; pkill -f 'nc -l -p 9000'; rm -f ~/work.log; echo cleaned</pre>
+<pre class="out">cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>List the four things that could have happened when a request gets no reply, and say why no timeout value distinguishes them. Then derive the three consequences out loud, in order: you must retry (because you cannot know), so operations must be safe to repeat; you must time out (because you cannot wait forever), so you will sometimes be wrong about who is dead; and you must have a rule for agreeing when peers disagree. If you can point at your own <code>work.log</code> as evidence for the first one, the lesson has landed.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most dangerous instinct here is to design as though "the request failed" is a fact you were given. It is a <em>conclusion the client drew</em>, and it is wrong roughly as often as the reply-lost case occurs. Payment systems, order systems and provisioning systems all learn this the same way: a client that retries a non-idempotent operation after a timeout charges the card twice, and the logs on both sides look completely reasonable.</p>
+<p>The second is expecting error codes to disambiguate. A connection refused (<a href="b8.html#cp-b8-9">B8.9</a>) genuinely tells you nothing was executed — that one is informative. But a timeout, a reset mid-response, and a connection that hangs and then dies are all silent about what the far side did. Treat "I received a definite error before the request was processed" and "I received nothing" as two completely different situations, because only the first is actually safe to retry blindly.</p>
+<div class="k8s-link">
+<p>The API server is unusually honest about this problem, and its answer is worth knowing. Every write goes through the same uncertainty — <code>kubectl apply</code> may time out after the object was created — which is precisely why the API is declarative and its operations are idempotent: applying the same manifest again is defined to be harmless, so the retry is safe by construction. For the operations that genuinely cannot be made idempotent, Kubernetes uses optimistic concurrency instead: every object carries a <code>resourceVersion</code>, and an update that names a stale one is rejected with a conflict rather than silently overwriting someone else's change.</p>
+<p>The end-to-end path a write actually takes, and where it can fail on each hop, is <a href="w1.html#cp-1-3">W1.3</a>; what still works when etcd itself stops answering — the largest partial failure a cluster can have — is <a href="w6.html#cp-6-8">W6.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 curl</code> for <code>--max-time</code> and the exit-code table (28 is timeout, 7 is connection refused — the distinction the gotcha rests on). <code>man 1 nc</code> for the throwaway listener. <code>man 8 iptables</code> for the <code>DROP</code> rule that manufactures a lost request; <code>man 7 tcp</code> for what the kernel does while a client waits, and why a dropped SYN produces a long hang rather than an error.</p>
+</article>
+
+<article class="lesson" id="cp-b13-3" data-id="b13-3">
+<div class="lesson-head"><span class="cp-id">B13.3</span><h4>There is no shared clock</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Which of these two events happened first?" is a question you have answered with timestamps your whole career, and across machines it is not reliably answerable that way. Clocks differ, drift apart and occasionally jump backwards when something corrects them. Knowing this is what stops you from debugging a distributed system by sorting two machines' logs together and believing the result.</p>
+<h5>The concept</h5>
+<p>Every machine has its own clock, and no two agree exactly. Three separate problems stack up:</p>
+<ul>
+<li><strong>Offset</strong> — two clocks read different times right now, typically by milliseconds, sometimes by much more.</li>
+<li><strong>Drift</strong> — they run at slightly different rates, so the offset grows on its own. A cheap oscillator can drift seconds per day.</li>
+<li><strong>Jumps</strong> — when a time daemon corrects the clock it may step it, and a step can go <em>backwards</em>. Time on a machine is not guaranteed to be monotonic.</li>
+</ul>
+<p>That last one is the killer, because it breaks the assumption underneath timestamp ordering. If a clock steps back by two seconds, an event that genuinely happened later can carry an earlier timestamp than one that happened before it — on the same machine, never mind across two.</p>
+<p>Linux offers a way out for measuring durations: two different clocks. <code>CLOCK_REALTIME</code> is wall-clock time, which can be stepped by NTP and by an administrator. <code>CLOCK_MONOTONIC</code> only ever moves forward at a steady rate since boot, and is immune to steps. Rule of thumb worth internalising: <strong>use the wall clock only for displaying times to humans; use the monotonic clock for every timeout, deadline and duration.</strong> Code that measures an interval with the wall clock will one day measure a negative one.</p>
+<p>For ordering <em>events across machines</em>, neither clock helps, so distributed systems stop using time altogether and use a <strong>logical counter</strong> instead: a number that increases with every change, whose only meaning is "this came after that". Kubernetes uses this pervasively — etcd's <code>revision</code>, and the <code>resourceVersion</code> on every object, are counters, not times. They can be compared within one cluster and are meaningless anywhere else, which is why you cannot compare a <code>resourceVersion</code> between two clusters, or reason about how long ago a revision was.</p>
+<div class="flow"><span>wall clock: display only</span><em>·</em><span>monotonic: durations</span><em>·</em><span class="hot">logical counter: ordering across machines</span></div>
+<p>Three clocks for three jobs; using the first one for the other two is the classic bug.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at your clock's health. <code>timedatectl</code> reports whether a time daemon is disciplining it and how far off it was.
+<pre class="cmd">timedatectl | head -5
+timedatectl timesync-status 2&gt;/dev/null | grep -E 'Offset|Frequency|Server' </pre>
+<pre class="out">System clock synchronized: <b>yes</b>
+              NTP service: active
+Server: 185.125.190.58 (ntp.ubuntu.com)
+<b>Offset: +1.417ms</b>                  ← already over a millisecond out, on a well-behaved machine
+Frequency: -12.938ppm               ← and drifting: this is the rate correction being applied</pre></li>
+<li>See the two clocks side by side. One tracks the world; the other only counts forward from boot.
+<pre class="cmd">python3 -c "
+import time
+print('realtime  ', time.time())
+print('monotonic ', time.monotonic())"
+cut -d' ' -f1 /proc/uptime</pre>
+<pre class="out">realtime   1785060912.734       ← seconds since 1970, adjustable by NTP or by root
+monotonic  4213.116              ← seconds since boot, cannot be stepped
+4213.12                          ← the same source, via /proc/uptime</pre></li>
+<li>Break ordering on purpose. Write a file, step the clock backwards, write a second file — and watch the newer file claim to be older.
+<pre class="cmd">sudo systemctl stop systemd-timesyncd
+touch ~/first; sudo date -s '-60 seconds' &gt;/dev/null; touch ~/second
+ls -l --time-style=+%H:%M:%S ~/first ~/second | awk '{print $6, $7}'</pre>
+<pre class="out">09:32:10 /home/ubuntu/first
+<b>09:31:11</b> /home/ubuntu/second          ← written second, timestamped a minute earlier</pre></li>
+<li>Prove that sorting by timestamp now lies. This is exactly what happens when you merge two machines' logs.
+<pre class="cmd">ls -t ~/first ~/second</pre>
+<pre class="out">/home/ubuntu/first          ← "most recent first" now puts the older file on top
+/home/ubuntu/second</pre></li>
+<li>Show the monotonic clock is unharmed by the same step — which is why timeouts must use it.
+<pre class="cmd">python3 -c "
+import time,subprocess
+m1,r1 = time.monotonic(), time.time()
+subprocess.run(['sudo','date','-s','+60 seconds'],capture_output=True)
+print(f'monotonic elapsed: {time.monotonic()-m1:.2f}s   realtime elapsed: {time.time()-r1:.2f}s')"</pre>
+<pre class="out">monotonic elapsed: <b>0.01s</b>   realtime elapsed: <b>60.01s</b>
+                   ↑ the truth       ↑ what a wall-clock timeout would have believed</pre></li>
+<li>Put the clock back under NTP's control and confirm it recovered.
+<pre class="cmd">sudo systemctl start systemd-timesyncd; sleep 3
+timedatectl | grep -E 'synchronized|Local time'; rm -f ~/first ~/second</pre>
+<pre class="out">Local time: Sat 2026-07-25 09:33:14 UTC
+System clock synchronized: <b>yes</b>          ← corrected, by a step you did not see happen</pre></li>
+<li>See a logical counter for comparison — a number whose only job is ordering. The journal's cursor and sequence numbers are exactly this idea.
+<pre class="cmd">journalctl -n 1 -o json 2&gt;/dev/null | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+print('seqnum   ', d.get('__SEQNUM','n/a'))
+print('realtime ', d.get('__REALTIME_TIMESTAMP'))
+print('monotonic', d.get('__MONOTONIC_TIMESTAMP'))"</pre>
+<pre class="out">seqnum    <b>184213</b>          ← increases with every entry; ordering without trusting any clock
+realtime  1785060912734891
+monotonic 4213116004</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the three separate clock problems and say which one breaks ordering outright. Then state the rule for each clock in one line — wall clock for display, monotonic for durations and timeouts, logical counters for ordering across machines — and explain why a <code>resourceVersion</code> cannot be compared between two clusters or converted into a time. If you still have the two files from step 3 in mind, you can also answer the practical question: what happens to a "sort the logs by timestamp" investigation when one machine's clock is 40 seconds out?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Measuring a duration with the wall clock is the bug this lesson exists to prevent. Code that records <code>time.time()</code> at the start and end of an operation will, eventually, compute a negative elapsed time or a sixty-second one for something instantaneous — and it will do it rarely enough to be blamed on anything else. Every language has a monotonic clock; use it for every deadline, retry interval and timeout.</p>
+<p>The second is a certificate-shaped one you have already met: clock skew produces errors that look like corruption. A machine whose clock is behind rejects freshly-issued certificates as <em>not yet valid</em> (<a href="b12.html#cp-b12-11">B12.11</a>), and a node whose clock is far ahead can invalidate tokens the moment it receives them. When exactly one machine in a cluster misbehaves in an inexplicable, security-flavoured way, check <code>timedatectl</code> before anything else.</p>
+<div class="k8s-link">
+<p>Kubernetes avoids wall-clock ordering wherever correctness depends on it. Every object carries a <code>resourceVersion</code>, which is etcd's revision counter — a monotonically increasing integer with no relationship to time. Watches resume from a resourceVersion rather than from a timestamp, which is why a controller that reconnects does not miss changes and does not need the two machines' clocks to agree. The <code>creationTimestamp</code> you see in an object is for humans; nothing in the system orders events with it.</p>
+<p>etcd's revision model — how those counters work, and what compaction does to old ones — is <a href="w1.html#cp-1-10">W1.10</a>; where objects actually live under those revisions is <a href="w1.html#cp-1-8">W1.8</a>. And the clock-skew certificate failure is <a href="w2.html#cp-2-6">W2.6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 timedatectl</code> for the sync status and <code>timesync-status</code> output. <code>man 2 clock_gettime</code> is the page that defines <code>CLOCK_REALTIME</code> versus <code>CLOCK_MONOTONIC</code> — the whole lesson in one man page. <code>man 5 systemd-timesyncd.conf</code> for what disciplines the clock on Ubuntu, and <code>man 7 time</code> for the general model.</p>
+</article>
+
+<article class="lesson" id="cp-b13-4" data-id="b13-4">
+<div class="lesson-head"><span class="cp-id">B13.4</span><h4>The eight fallacies, and a latency ladder you have measured yourself</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The eight fallacies are a checklist of assumptions that feel obviously true, are quietly built into most code, and are all false. Reading them is mildly interesting; matching each one to a failure you personally caused in B8–B10 is what makes them stick. The latency ladder is the numeric half of the same lesson: an intuition for what things cost, so "just call the service again" gets priced correctly.</p>
+<h5>The concept</h5>
+<p>The list, formulated at Sun Microsystems, is eight assumptions that every distributed system eventually violates:</p>
+<ul>
+<li><strong>The network is reliable</strong> — packets are dropped, links flap, and a message sent is not a message received (<a href="#cp-b13-2">B13.2</a>).</li>
+<li><strong>Latency is zero</strong> — a call across a datacentre is roughly a hundred thousand times slower than a local function call, and one across the world is a million.</li>
+<li><strong>Bandwidth is infinite</strong> — it is shared, finite, and the thing your backup job saturates at 02:00.</li>
+<li><strong>The network is secure</strong> — anyone on the path can read and modify unless you did the work in <a href="b12.html#cp-b12-12">B12.12</a>.</li>
+<li><strong>Topology doesn't change</strong> — pods move, IPs are reused, nodes are replaced. This is why you resolve names instead of caching addresses (<a href="b10.html#cp-b10-11">B10.11</a>).</li>
+<li><strong>There is one administrator</strong> — the firewall rule you did not know about was added by someone you have not met.</li>
+<li><strong>Transport cost is zero</strong> — serialising, encrypting and copying data costs CPU on both ends, and the wire itself costs money.</li>
+<li><strong>The network is homogeneous</strong> — different MTUs, different hardware, different behaviour, which is exactly the black hole from <a href="b8.html#cp-b8-18">B8.18</a>.</li>
+</ul>
+<p>The latency ladder gives the second fallacy a number. Orders of magnitude are what matter, not exact figures: a memory reference is ~100 nanoseconds, an SSD read ~100 microseconds (1,000×), a round trip within a datacentre ~0.5 milliseconds (5,000×), a round trip across a continent ~50–100 milliseconds. The practical consequence is that <strong>the number of round trips dominates</strong> almost everything else. One request that fetches everything beats ten that each fetch a piece, regardless of how fast the far end is, because the round trips do not overlap.</p>
+<div class="flow"><span>memory ~100 ns</span><em>→</em><span>SSD ~100 µs</span><em>→</em><span class="hot">same-DC RTT ~0.5 ms</span><em>→</em><span>cross-continent ~50 ms</span></div>
+<p>Each step is roughly a thousand times the last — which is why round trips, not bytes, are the thing to count.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Measure the top of the ladder: a memory reference and a local function call, in nanoseconds.
+<pre class="cmd">python3 -c "
+import timeit
+d={'k':1}
+print('dict lookup : %8.1f ns' % (timeit.timeit(lambda: d['k'], number=1000000)*1000))
+print('function call: %8.1f ns' % (timeit.timeit(lambda: (lambda:1)(), number=1000000)*1000))"</pre>
+<pre class="out">dict lookup :     <b>28.4</b> ns          ← the baseline everything else is measured against
+function call:     51.2 ns</pre></li>
+<li>Measure a disk read with the cache bypassed, so it is the device you are timing and not RAM.
+<pre class="cmd">dd if=/dev/zero of=/tmp/lat.bin bs=1M count=64 oflag=direct 2&gt;&amp;1 | tail -1
+dd if=/tmp/lat.bin of=/dev/null bs=4k count=1000 iflag=direct 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">67.1 MB, 0.42 s, 160 MB/s
+4.1 MB copied, 0.089 s          ← ~89 µs per 4 KiB read: a thousand times a memory reference</pre></li>
+<li>Measure a loopback round trip — a network call with no network in it. This is the floor no real network beats.
+<pre class="cmd">ping -c 5 -q 127.0.0.1 | tail -1</pre>
+<pre class="out">rtt min/avg/max/mdev = 0.021/<b>0.038</b>/0.061/0.014 ms          ← ~38 µs with zero wire involved</pre></li>
+<li>Measure a real internet round trip and see the next two rungs at once.
+<pre class="cmd">ping -c 5 -q 1.1.1.1 | tail -1</pre>
+<pre class="out">rtt min/avg/max/mdev = 8.4/<b>11.2</b>/14.9/2.1 ms          ← 300× loopback, 100,000× a memory read</pre></li>
+<li>Now price the thing that actually matters: round trips. Start a local server, then compare ten sequential requests against one.
+<pre class="cmd">python3 -m http.server 9001 &amp;&gt;/dev/null &amp; sleep 1
+time bash -c 'for i in $(seq 10); do curl -s -o /dev/null http://localhost:9001/ ; done'
+time curl -s -o /dev/null http://localhost:9001/</pre>
+<pre class="out">real    0m0.212s          ← ten round trips
+real    <b>0m0.021s</b>          ← one round trip: the count is what you pay for</pre></li>
+<li>Match a fallacy to a fault you already caused. Each of these was a real lab, not a hypothetical.
+<pre class="cmd">kill %1 2&gt;/dev/null; rm -f /tmp/lat.bin
+cat &lt;&lt;'EOF'
+network is reliable  -> B13.2: the dropped reply you just manufactured
+latency is zero      -> this lesson: 100,000x between a call and a round trip
+topology fixed       -> B10.13: the stale cache pointing at a moved service
+network is secure    -> B12.12: the "encrypted but unauthenticated" connection
+homogeneous network  -> B8.18: the MTU black hole
+one administrator    -> B9.14: a rule someone added, shadowing yours
+EOF</pre>
+<pre class="out">(six fallacies, six faults you have personally reproduced)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Recite the eight fallacies and attach a concrete failure to at least five of them — ideally ones you caused yourself in B8–B12. Then state the latency ladder in orders of magnitude (nanoseconds, microseconds, sub-millisecond, tens of milliseconds) and the design rule that falls out of it: minimise round trips, because each one costs more than everything you do between them. Check yourself with a real question — is it better to make one request that returns 1 MB, or a thousand that return 1 KB each, and why?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The fallacies are seductive because each one is <em>almost</em> true in a lab. On a single machine with loopback networking, the network really is reliable, latency really is negligible, and topology really does not change — so code written and tested there encodes all eight assumptions without anyone noticing. They surface for the first time in production, together, usually during an incident. This is the argument for testing with deliberate failure injection rather than only in the happy environment.</p>
+<p>The second is misreading averages. A mean latency of 11 ms with a tail at 900 ms is a completely different system from a flat 11 ms, and the tail is what your users and your timeouts actually experience. When you have a choice, look at the 99th percentile; a distributed system with many components is dominated by its slowest ones, because a request that touches ten services meets ten chances to hit a tail.</p>
+<div class="k8s-link">
+<p>The latency ladder explains one of the most confusing Kubernetes performance symptoms there is: a slow API server whose real cause is a slow disk. etcd commits every write to disk on a majority of members before acknowledging it (<a href="#cp-b13-9">B13.9</a>), so etcd's write latency is bounded by <code>fdatasync</code> on the slowest member of the quorum. Put etcd on a spinning disk or a throttled network volume and every object creation in the cluster pays that cost — the symptom presents as "kubectl is slow", several layers above the actual fault.</p>
+<p>Checking etcd's health, including the latency metrics that make this visible, is <a href="w1.html#cp-1-13">W1.13</a>; the wider "the API server is slow or unavailable" ladder is <a href="w6.html#cp-6-5">W6.5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The fallacies have no man page — they are a list worth keeping. For the measurements: <code>man 1 dd</code> (especially <code>iflag=direct</code>, which is what makes it a device measurement rather than a page-cache one), <code>man 8 ping</code> for round-trip statistics, and <code>man 1 curl</code> with <code>-w '%{time_total}'</code> for per-request timing. <code>man 7 tcp</code> explains why the first request to a new connection costs more than the ones after it.</p>
+</article>
+
+</div>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
