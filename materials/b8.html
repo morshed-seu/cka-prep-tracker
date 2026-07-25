@@ -297,6 +297,145 @@ ip link show lo | head -1</pre>
 </article>
 </div><!-- /g-layers -->
 
+<!-- ---------------- Routing ---------------- -->
+<div class="grp" id="g-routing"><h3>Routing</h3>
+
+<article class="lesson" id="cp-b8-5" data-id="b8-5">
+<div class="lesson-head"><span class="cp-id">B8.5</span><h4>The routing table: ordered rules and longest-prefix match</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Once a packet's destination isn't on the local wire, the machine has to decide which door to send it out of — that decision is routing, and it's made by a table you can read. The rule that governs it, longest-prefix match, is refreshingly simple once stated plainly, and it's the exact same rule a CNI plugin uses to make pods on different nodes reach each other. Reading a routing table confidently is the second rung of the ladder and the thing that turns "how does traffic get anywhere?" from magic into a lookup.</p>
+<h5>The concept</h5>
+<p>The <strong>routing table</strong> is an ordered set of rules, each saying "for destinations in <em>this</em> prefix, send the packet out <em>this</em> interface, optionally via <em>this</em> next-hop router." <code>ip route</code> prints it. Three kinds of entry cover almost everything:</p>
+<ul>
+<li><strong>On-link (directly connected) routes</strong> — for a subnet the machine is physically on, like <code>10.191.62.0/24 dev ens3</code>. "These are my neighbours; reach them directly (via ARP), no router needed."</li>
+<li><strong>The default route</strong> — <code>default via 10.191.62.1 dev ens3</code>, written as the prefix <code>0.0.0.0/0</code> (match anything). "For everything I don't have a more specific rule for, hand it to this gateway."</li>
+<li><strong>Specific routes</strong> — a rule for some other subnet via a particular next hop, e.g. another node's pod CIDR via that node's IP.</li>
+</ul>
+<p>When several rules could match a destination, the kernel uses <strong>longest-prefix match</strong>: the <em>most specific</em> route wins — the one with the longest prefix (biggest number after the slash) — regardless of the order it's printed in. A <code>/32</code> (one exact host) beats a <code>/24</code> beats the <code>/0</code> default. That's the entire algorithm. And note what routing does <em>not</em> do: it has no idea whether the destination actually exists or will answer. It only decides "out which door, to which next hop." Reachability is somebody else's problem — routing just picks the exit. This is precisely how a CNI plugin works: it doesn't "connect" pods, it <em>adds a route</em> so that packets for another node's pod CIDR leave by the right interface. Routing is door-selection, nothing more.</p>
+<div class="flow"><span>dest 10.244.1.5</span><em>· matches /24 and /0 →</em><span class="hot">longest prefix (/24) wins</span><em>→ out that door</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your routing table and name each line's type. There's a default, and at least one on-link route for your own subnet.
+<pre class="cmd">multipass shell sandbox
+ip route</pre>
+<pre class="out"><b>default via 10.191.62.1</b> dev ens3 proto dhcp ...    ← the default route (0.0.0.0/0)
+10.191.62.0/24 dev ens3 proto kernel scope link ...   ← on-link: my own subnet, reach directly</pre></li>
+<li>Prove longest-prefix match by adding a more specific route and watching it take precedence over the default without being "first." Add a dummy route for one <code>/32</code> and a <code>/24</code>, then note the kernel would pick the most specific.
+<pre class="cmd"># add a specific route (blackhole = a safe no-op target for the demo)
+sudo ip route add blackhole 10.244.1.0/24
+sudo ip route add blackhole 10.244.1.5/32
+ip route | grep 10.244.1        # both present; /32 is more specific than /24</pre>
+<pre class="out">blackhole 10.244.1.0/24
+blackhole 10.244.1.5/32          ← the /32 wins for 10.244.1.5 despite the /24 existing</pre></li>
+<li>Clean up the demo routes.
+<pre class="cmd">sudo ip route del 10.244.1.5/32
+sudo ip route del 10.244.1.0/24
+ip route | grep -c 10.244.1 || echo 'cleaned'</pre>
+<pre class="out">cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State longest-prefix match in one sentence, and rank these for destination <code>10.244.1.5</code>: a <code>/0</code> default, a <code>/24</code> route, a <code>/32</code> route. (The most specific route — longest prefix — wins regardless of print order; ranked: <code>/32</code> beats <code>/24</code> beats the <code>/0</code> default.) Then: does having a route to a destination mean the destination is reachable? (No — routing only chooses which interface and next hop to send toward; it says nothing about whether anything is there or will answer. Reachability is proven at higher layers.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Ordered set of rules" can mislead: the routing table is <em>printed</em> in an order, but selection is by specificity, not by line order — a more specific route further down still wins. (There's a separate, advanced concept of route <em>metrics</em> to break ties between equally-specific routes, but longest-prefix is the first and dominant rule.) Don't read a routing table top-to-bottom looking for "the first match"; find the <em>most specific</em> match. This is the opposite of how firewall rules work (those are first-match), and mixing up the two models is a common confusion.</p>
+<p>A machine can have a perfect route to a destination and still not reach it, and a missing route produces a very specific symptom: "Network is unreachable" <em>immediately</em>, from the local kernel, before any packet is sent — distinct from a timeout (packet sent, no answer) or "No route to host" (an ARP/link failure). Learn those three failure phrasings apart: <em>Network unreachable</em> = no matching route at all; <em>timeout</em> = routed out but nothing answered; <em>No route to host</em> = routed to the local segment but the neighbour didn't resolve. Each points at a different rung.</p>
+<div class="k8s-link">
+<p>Routed CNI plugins are nothing but routing table entries. In a routed datapath, each node gets a route saying "pod CIDR <code>10.244.2.0/24</code> is via node-2's IP," so a packet from a pod here to a pod there is just longest-prefix match choosing the uplink and the right next hop — no tunnels, no magic. Even overlay CNIs like Flannel add on-link routes for the local pod <code>/24</code> via the bridge. When pods on different nodes can't talk, "is there a route to that node's pod CIDR?" is one of the first questions, and <code>ip route</code> on the node answers it. The "route ≠ reachability" split is why a present route plus a dropped packet points you at the filter rung, not the route rung.</p>
+<p>Per-node pod-CIDR routes and the routed vs overlay datapath are <a href="w4.html#cp-4-7">W4.7</a>; building the routes by hand is part of <a href="w4.html#cp-4-2">W4.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-route</code> is the whole lesson — <code>add</code>, <code>del</code>, <code>show</code>, route types (<code>unicast</code>, <code>blackhole</code>), scope, and next hops. <code>man 8 ip</code> for the <code>get</code> subcommand (next lesson). For the algorithm, <code>man 7 rtnetlink</code> covers the kernel routing interface. In the exam docs, routing is assumed under cluster networking; <code>--pod-network-cidr</code> is where the per-node ranges originate.</p>
+</article>
+
+<article class="lesson" id="cp-b8-6" data-id="b8-6">
+<div class="lesson-head"><span class="cp-id">B8.6</span><h4>ip route get: ask the kernel which route wins</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Reading a routing table by eye and working out which rule wins for a given destination is error-prone — you can miscount a prefix or miss a more specific route. There's a command that removes all doubt: <code>ip route get</code> asks the kernel to run the <em>actual</em> routing decision for one destination and report exactly what it chose. Making this your reflex — ask, don't guess — is one of the highest-leverage habits in the whole module, because it collapses "which route applies?" into a single authoritative answer.</p>
+<h5>The concept</h5>
+<p><code>ip route get &lt;destination&gt;</code> performs a real route lookup — the same one the kernel would do to send a packet there — and prints the outcome: the chosen <strong>source address</strong> the packet will carry, the <strong>interface</strong> it will leave by, and the <strong>next hop</strong> (<code>via ...</code>) if it's going through a gateway. It's not a guess or a simulation of the table; it's the kernel's own decision engine answering for one address. Because it reports the <em>source</em> address too, it also tells you which of your interfaces/addresses the kernel will use as the origin — invaluable when a machine has several and you need to know which one a connection will appear to come from.</p>
+<p>The habit to build: whenever you're about to reason about routing "by hand," run <code>ip route get</code> instead. It's faster and it can't miscount. Compare the output for a public address (which will show <code>via</code> your gateway) with one on your own subnet (which will show direct, no <code>via</code>) and the on-link-vs-routed distinction from B8.5 becomes concrete. This command is the routing rung of the ladder in a single line.</p>
+<div class="flow"><span>ip route get 8.8.8.8</span><em>→ kernel answers:</em><span class="hot">src · dev · via</span><em>· the exact decision, no guessing</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask the kernel how it would reach a public address. The answer names the source address, the exit interface, and the gateway it goes <code>via</code>.
+<pre class="cmd">multipass shell sandbox
+ip route get 8.8.8.8</pre>
+<pre class="out">8.8.8.8 <b>via 10.191.62.1</b> dev ens3 <b>src 10.191.62.10</b> uid 1000
+    cache
+# via the gateway (routed), out ens3, appearing to come from 10.191.62.10</pre></li>
+<li>Contrast with a destination on your own subnet — no <code>via</code>, because it's on-link (reached directly by ARP, not through a router).
+<pre class="cmd">MYNET=$(ip -o -4 addr show ens3 | awk '{print $4}')   # e.g. 10.191.62.10/24
+ip route get 10.191.62.20</pre>
+<pre class="out">10.191.62.20 dev ens3 src 10.191.62.10 uid 1000    ← no "via": direct, on-link
+    cache</pre></li>
+<li>See it resolve a Kubernetes-style pod address against a route you add, proving it picks the specific route. Add a route and query through it.
+<pre class="cmd">sudo ip route add 10.244.2.0/24 via 10.191.62.1 dev ens3   # pretend node-2's pods
+ip route get 10.244.2.7                                       # which route wins?
+sudo ip route del 10.244.2.0/24</pre>
+<pre class="out">10.244.2.7 <b>via 10.191.62.1</b> dev ens3 src 10.191.62.10   ← chose the /24 we added</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What three things does <code>ip route get</code> report, and why is it better than reading <code>ip route</code> by eye? (The source address the packet will use, the exit interface, and the next hop / <code>via</code> if routed — it runs the kernel's actual routing decision for that destination, so it can't miscount a prefix or miss a more specific route.) Then: one <code>ip route get</code> shows <code>via</code> a gateway and another shows no <code>via</code> — what distinguishes them? (No <code>via</code> means the destination is on-link — on a directly-connected subnet, reached via ARP; <code>via</code> means it's routed through a next-hop gateway.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>ip route get</code> tells you the <em>routing</em> decision only — it does not send a packet, does not consult firewall rules, and does not prove the destination answers. So a clean <code>ip route get</code> result means "the route rung is fine," not "it works" — the packet could still be dropped by a filter or hit a dead host. Use it to <em>clear</em> the routing rung and move up the ladder, not to declare victory. It's a diagnostic for one specific layer.</p>
+<p>The <code>src</code> address it reports matters more than beginners expect. On a multi-homed machine (several interfaces/addresses), the source address the kernel picks determines which address the far end sees and replies to — and if return routing for that source is broken, you get one-way connectivity that's baffling until you notice the <code>src</code>. When debugging "the request goes out but no reply comes back," check the <code>src</code> in <code>ip route get</code>; an unexpected source address is a classic cause. You can even force one with <code>ip route get &lt;dst&gt; from &lt;src&gt;</code> to test.</p>
+<div class="k8s-link">
+<p>On a node, <code>ip route get &lt;podIP&gt;</code> is the fastest way to answer "how would this node send a packet to that pod?" — it instantly shows whether the packet goes to the local bridge (a pod on this node), out the uplink via another node (routed CNI), or into a tunnel device (overlay). When cross-node pod traffic breaks, <code>ip route get</code> the destination pod IP on the source node tells you whether the route even exists and where it points, in one line, before you touch <code>tcpdump</code>. It's the single most useful routing command in node-level Kubernetes debugging.</p>
+<p>You'll use exactly this reflex when tracing the pod-to-pod datapath in <a href="w4.html#cp-4-2">W4.2</a> and diagnosing broken CNI in <a href="w4.html#cp-4-8">W4.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-route</code> under <code>get</code> — the syntax, the <code>from</code> option to test a specific source, and the fields in the reply. <code>man 8 ip</code> for the command family. This is pure Linux mechanism with no exam-docs page, but it's the workhorse behind every "trace the datapath" exercise in W4.</p>
+</article>
+
+<article class="lesson" id="cp-b8-7" data-id="b8-7">
+<div class="lesson-head"><span class="cp-id">B8.7</span><h4>ICMP tools: what ping and traceroute actually prove</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>ping</code> is the first thing everyone reaches for and the most misread tool in networking. It answers a much narrower question than people think, and treating "ping works" or "ping fails" as a verdict on the whole connection is the single most common false conclusion in network debugging. Learning precisely what <code>ping</code> and <code>traceroute</code> prove — and what they can't — turns them from a superstition into two sharp, honest instruments.</p>
+<h5>The concept</h5>
+<p>Both tools use <strong>ICMP</strong> (Internet Control Message Protocol), a helper protocol at the network layer that is <em>separate</em> from TCP and UDP. That separateness is the whole lesson:</p>
+<ul>
+<li><strong><code>ping</code></strong> sends an ICMP <em>echo request</em> and waits for an <em>echo reply</em>. A reply proves exactly one thing: the host is up and its network stack will answer ICMP, and the path there and back works at the network layer. It proves <em>nothing</em> about whether any actual service (a web server, a database) is running or reachable — those are TCP/UDP on specific ports, a different protocol ping never touches.</li>
+<li><strong><code>traceroute</code></strong> reveals the <em>path</em> by a clever trick: it sends packets with deliberately tiny <abbr title="Time To Live — a hop counter decremented by each router; at zero the packet is dropped">TTL</abbr> values — first TTL 1, then 2, then 3 — so each successive router along the way is the one that decrements the TTL to zero, drops the packet, and sends back an ICMP "time exceeded" complaint. Collecting those complaints, one per hop, reconstructs the route. So traceroute maps the routers between you and a destination.</li>
+</ul>
+<p>Because ICMP is its own protocol, firewalls treat it independently of TCP and UDP — many networks allow or block ICMP separately from application traffic. This produces the two results that look like paradoxes but aren't: a host that <strong>ignores ping but serves traffic perfectly</strong> (ICMP filtered, TCP open — extremely common, some networks drop all ping), and a host that <strong>answers ping but has every port closed</strong> (ICMP open, nothing listening). "Ping works but nothing else does" is therefore not a contradiction — it's a filter or a dead service, and concluding "the network is fine, ping worked" or "the host is down, ping failed" from ICMP alone is the classic mistake. Ping tests the network layer; your service lives at the transport/application layers, and you must test <em>those</em> to know they work.</p>
+<div class="flow"><span>ping ok</span><em>= host answers ICMP (network layer)</em><span class="hot">≠</span><em>service works (transport/app)</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Use <code>ping</code> for what it proves — network-layer reachability — and note its silence about services.
+<pre class="cmd">multipass shell sandbox
+ping -c2 example.com          # does the host answer ICMP?</pre>
+<pre class="out">64 bytes from ... time=8.0 ms
+64 bytes from ... time=7.9 ms       ← network layer to that host is fine...
+# ...but this says nothing about whether port 80 or 443 is open</pre></li>
+<li>Demonstrate the false-conclusion trap directly: find something that answers ping but not a given port, or vice versa. Here, a host answers ping while a bogus port is refused/filtered — proving ping ≠ service.
+<pre class="cmd">ping -c1 example.com &gt;/dev/null &amp;&amp; echo 'ping: OK'
+curl -s -m3 -o /dev/null -w '%{http_code}\n' http://example.com:81 || echo 'port 81: no service'</pre>
+<pre class="out">ping: OK                       ← ICMP fine
+port 81: no service            ← but this port isn't served — ping told us nothing about it</pre></li>
+<li>Map the path with <code>traceroute</code> and watch the TTL trick reveal hops. Each line is a router that complained "time exceeded."
+<pre class="cmd">traceroute -n example.com | head -6     # -n: no name lookups (faster, honest)</pre>
+<pre class="out">traceroute to example.com, 30 hops max
+ 1  10.191.62.1  0.6 ms ...            ← first hop: our gateway (TTL 1 expired here)
+ 2  192.0.2.1    3.2 ms ...            ← next router (TTL 2)
+ 3  * * *                              ← a hop that doesn't answer ICMP (common, not an error)
+ ...</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Exactly what does a successful <code>ping</code> prove, and what does it <em>not</em> prove? (It proves the host is up and answers ICMP echo and the network-layer path works both ways; it proves nothing about whether any TCP/UDP service is running or reachable, because those are different protocols on specific ports.) Then: explain how <code>traceroute</code> discovers each hop. (It sends packets with increasing TTL — 1, 2, 3… — so each successive router decrements the TTL to zero, drops the packet, and returns an ICMP "time exceeded," and collecting those replies reconstructs the path.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>* * *</code> lines in traceroute almost never mean a problem — they mean that hop is configured not to send ICMP "time exceeded" replies (very common for security), so traceroute times out waiting for that one router even though traffic passes through it fine. Don't read stars as "the path is broken there"; the connection can complete perfectly with several starred hops. Stars mean "this router is quiet," not "traffic stops here."</p>
+<p>Because ICMP is separately filterable, <code>ping</code> failing is <em>weak evidence</em> — plenty of perfectly reachable hosts (and most cloud load balancers, and many corporate networks) drop ICMP by policy, so "I can't ping it" does not mean "it's down." Always confirm reachability with the actual protocol you care about — a TCP connect to the real port (<code>curl</code>, <code>nc -vz host port</code>) — before concluding a host is unreachable. Ping is a useful <em>positive</em> signal (a reply proves the network layer) and a poor <em>negative</em> one (no reply may just be a filter).</p>
+<div class="k8s-link">
+<p>This is why Kubernetes health checks are TCP or HTTP probes, never ping: liveness/readiness must test the <em>actual service</em> at the transport/application layer, and ICMP would prove nothing about whether the container is serving. It's also why "I can't ping the pod/Service" is a red herring in cluster debugging — Service ClusterIPs are virtual (no host answers ICMP for them at all, they only exist as rewrite rules), and many pods don't respond to ping, so pinging a Service is meaningless. Test the real port with <code>curl</code>/<code>nc</code> from inside a pod instead. The "ping ≠ service" discipline directly prevents the most common wrong turn in W4/W6 network debugging.</p>
+<p>Service ClusterIPs being virtual (unpingable by design) is <a href="w4.html#cp-4-9">W4.9</a>; TCP/HTTP probes replace ping in workload health, <a href="w3.html">W3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ping</code> (echo request/reply, <code>-c</code>, <code>-W</code> timeout) and <code>man 8 traceroute</code> (the TTL method, <code>-n</code>, <code>-I</code> for ICMP mode vs the default UDP probes). <code>man 7 icmp</code> for the protocol and the kernel's rate limiting of ICMP. In the exam docs, pod <code>livenessProbe</code>/<code>readinessProbe</code> types (<code>tcpSocket</code>, <code>httpGet</code>) are the Kubernetes reason ping is never used for health.</p>
+</article>
+</div><!-- /g-routing -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B8 recall quiz</h3>
 <p>Answer out loud before revealing. If you can climb the five-rung ladder from memory and say what each rung's tool proves, this module has done its job.</p>
