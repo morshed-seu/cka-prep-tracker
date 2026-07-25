@@ -160,7 +160,7 @@ veth1@if6    DOWN ...         ← the other end arrived in the namespace</pre></
 <li>Prove they are inseparable: delete the host end and the namespace end vanishes too. (Re-create it afterwards for the next lesson.)
 <pre class="cmd">sudo ip link del veth0                            # delete one end...
 sudo ip netns exec red ip -br link show          # ...the other is gone from red too
-sudo ip link add veth0 type veth peer name veth1 && sudo ip link set veth1 netns red   # rebuild</pre>
+sudo ip link add veth0 type veth peer name veth1 &amp;&amp; sudo ip link set veth1 netns red   # rebuild</pre>
 <pre class="out">lo  DOWN ...                 ← veth1 is gone: deleting either end destroys both</pre></li>
 </ol>
 <h5 class="verify">Verify</h5>
@@ -281,7 +281,7 @@ sudo ip netns exec red ping -c2 10.10.0.1  # can red reach the gateway?</pre>
 sudo ip netns add blue
 sudo ip link add vethb0 type veth peer name vethb1
 sudo ip link set vethb1 netns blue
-sudo ip link set vethb0 up && sudo ip link set vethb0 master br0
+sudo ip link set vethb0 up &amp;&amp; sudo ip link set vethb0 master br0
 sudo ip netns exec blue sh -c '
   ip link set lo up; ip link set vethb1 up
   ip addr add 10.10.0.3/24 dev vethb1
@@ -923,6 +923,207 @@ echo 'srw-rw---- 1 root root 0 ... /run/containerd/containerd.sock'</pre>
 
 </div><!-- /g-lb -->
 
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b9-19" data-id="b9-19">
+<div class="lesson-head"><span class="cp-id">B9.19</span><h4>Mini project — CNI v0.1, in two scripts</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every mechanism in this module was a piece; this project assembles them into the two things a cluster's data plane is actually made of. Script one builds a <strong>pod network</strong> — several private machines, each addressed, routed and given internet egress. Script two builds a <strong>Service</strong> — one published address that round-robins across two of them. You will have hand-built a CNI plugin and a kube-proxy, in shell, <em>before either word is introduced</em> — which is the whole point: nothing in Kubernetes networking will be able to intimidate you once you've written the thing it automates. Keep both scripts; B14's capstone extends exactly these.</p>
+<h5>The concept</h5>
+<p>The union of "CNI plugin" and "kube-proxy" is nothing you haven't already done by hand:</p>
+<ol>
+<li><strong><code>net-up.sh</code></strong> — create <code>N</code> namespaces on one bridge, each with an address from a chosen subnet (B9.4), a default route via the bridge gateway (B9.4), and masqueraded egress to the internet (B9.8), on a forwarding host (B9.6). That is a pod network: the IPAM, the wiring, and the egress path a CNI sets up per pod.</li>
+<li><strong><code>publish.sh</code></strong> — publish one host port that round-robins into two of the namespaces, using a prerouting DNAT (B9.16) with a <code>statistic</code>-matched pair of backend rules (B9.15). That is a NodePort Service with load balancing.</li>
+</ol>
+<p>The discipline that makes this a <em>project</em> rather than a pile of commands is that each script is idempotent-ish and self-documenting: parameterised by the subnet and count, cleaning up before it builds, and printing what it did. Run them, then prove the result with a loop of <code>curl</code>s that shows the traffic splitting — the same evidence-first habit from every module's project.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write <code>net-up.sh</code>: a bridge, then a loop creating <code>N</code> namespaces each wired, addressed, routed and given egress. (Reset any earlier hand-built namespaces first to avoid clashes.)
+<pre class="cmd">multipass shell sandbox
+cat &gt; ~/net-up.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SUBNET=10.20.0 ; N=${1:-3} ; UPLINK=ens3
+sysctl -wq net.ipv4.ip_forward=1
+ip link add cni0 type bridge 2&gt;/dev/null || true
+ip addr add ${SUBNET}.1/24 dev cni0 2&gt;/dev/null || true
+ip link set cni0 up
+iptables -t nat -C POSTROUTING -s ${SUBNET}.0/24 -o $UPLINK -j MASQUERADE 2&gt;/dev/null \
+  || iptables -t nat -A POSTROUTING -s ${SUBNET}.0/24 -o $UPLINK -j MASQUERADE
+for i in $(seq 1 "$N"); do
+  ns=pod$i ; host=veth$i ; peer=eth0
+  ip netns add $ns 2&gt;/dev/null || true
+  ip link add $host type veth peer name $peer 2&gt;/dev/null || true
+  ip link set $peer netns $ns
+  ip link set $host up ; ip link set $host master cni0
+  ip netns exec $ns sh -c "ip link set lo up; ip link set eth0 up;
+    ip addr add ${SUBNET}.$((i+1))/24 dev eth0;
+    ip route add default via ${SUBNET}.1"
+  echo "  $ns = ${SUBNET}.$((i+1))"
+done
+EOF
+chmod +x ~/net-up.sh; sudo ~/net-up.sh 3</pre>
+<pre class="out">  pod1 = 10.20.0.2
+  pod2 = 10.20.0.3
+  pod3 = 10.20.0.4        ← three "pods" on a bridge, each with egress — a pod network</pre></li>
+<li>Write <code>publish.sh</code>: start a distinct server in two of the namespaces, then publish host port 8080 as a round-robin DNAT across them.
+<pre class="cmd">cat &gt; ~/publish.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+A=10.20.0.2 ; B=10.20.0.3 ; PORT=8080
+for p in 1 2; do mkdir -p /tmp/pod$p; echo "pod$p" &gt;/tmp/pod$p/id
+  ip netns exec pod$p bash -c "cd /tmp/pod$p &amp;&amp; python3 -m http.server 80 &amp;&gt;/dev/null &amp;"; done
+sleep 1
+iptables -t nat -A PREROUTING -p tcp --dport $PORT \
+  -m statistic --mode random --probability 0.5 -j DNAT --to-destination $A:80
+iptables -t nat -A PREROUTING -p tcp --dport $PORT -j DNAT --to-destination $B:80
+iptables -t nat -A OUTPUT -p tcp --dport $PORT -d 127.0.0.1 \
+  -m statistic --mode random --probability 0.5 -j DNAT --to-destination $A:80
+iptables -t nat -A OUTPUT -p tcp --dport $PORT -d 127.0.0.1 -j DNAT --to-destination $B:80
+echo "published :$PORT -> {$A,$B} round-robin"
+EOF
+chmod +x ~/publish.sh; sudo ~/publish.sh</pre>
+<pre class="out">published :8080 -> {10.20.0.2,10.20.0.3} round-robin</pre></li>
+<li>Prove it: hit the published port repeatedly and watch the load split across the two backends — a Service, hand-built.
+<pre class="cmd">for i in $(seq 20); do curl -s http://127.0.0.1:8080/id; done | sort | uniq -c</pre>
+<pre class="out">     10 pod1
+     10 pod2        ← one published address, round-robined across two backends: a Service by hand</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the two things these scripts build and which Kubernetes component automates each. (<code>net-up.sh</code> builds a pod network — the wiring, IPAM addressing, routing and egress a CNI plugin does per pod; <code>publish.sh</code> builds a load-balanced published Service — the DNAT and probabilistic backend selection kube-proxy does per Service.) Then: why did <code>publish.sh</code> add rules in <em>both</em> <code>PREROUTING</code> and <code>OUTPUT</code>? (So the published port works both for external traffic — which enters via prerouting — and for traffic the host itself originates, like the test <code>curl</code> to <code>127.0.0.1</code> — which skips prerouting and needs an <code>OUTPUT</code> rule, exactly as kube-proxy installs both.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Re-running these scripts appends duplicate NAT rules (the <code>-A</code> keeps adding), which skews the load split and confuses debugging — a hand-built CNI needs a cleanup path just as a real one does. Before a re-run, flush the nat table (<code>sudo iptables -t nat -F</code>) and delete the namespaces (<code>for n in pod1 pod2 pod3; do sudo ip netns del $n; done</code>), or make the scripts idempotent with <code>-C</code> checks like the masquerade rule already uses. "It worked the first time and got weird the second" is almost always duplicated rules.</p>
+<p>This is a <em>v0.1</em> deliberately: it has no IPAM persistence (you're picking addresses by hand), no cleanup on pod deletion, no health checking of backends, and no cross-node story. Those gaps are exactly the problems a real CNI and kube-proxy solve — which is the point. Keeping the scripts and later listing everything they <em>don't</em> handle is a precise map of what Kubernetes' networking layer adds on top of the primitives you now fully understand.</p>
+<div class="k8s-link">
+<p>You have now built, by hand, the two mechanisms that the entire "Services and Networking" domain of the CKA rests on. <code>net-up.sh</code> is what a CNI plugin does when the kubelet asks it to attach a pod; <code>publish.sh</code> is what kube-proxy does when a NodePort Service is created. When W4 introduces pods-get-IPs, ClusterIP, NodePort and the CNI contract, you'll be recognising your own scripts wearing formal names — and the B14 capstone will extend these very files toward speaking the real CNI <code>ADD</code>/<code>DEL</code> contract.</p>
+<p>The by-hand pod network is formalised in <a href="w4.html#cp-4-2">W4.2</a>; the CNI contract your scripts approximate is <a href="w4.html#cp-4-5">W4.5</a>; the Service types they implement are <a href="w4.html#cp-4-12">W4.12</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">Everything you used: <code>man 8 ip-netns</code>, <code>man 8 ip-link</code>, <code>man 8 ip-address</code>, <code>man 8 ip-route</code>, <code>man 8 iptables</code>, <code>man 8 iptables-extensions</code> (the <code>statistic</code> match and <code>DNAT</code>/<code>MASQUERADE</code> targets), <code>man 8 sysctl</code>. In the exam docs, the "Cluster Networking" concept and the CNI/kube-proxy references describe the automated versions of these two scripts.</p>
+</article>
+
+<article class="lesson drill" id="cp-b9-20" data-id="b9-20">
+<div class="lesson-head"><span class="cp-id">B9.20</span><h4>Debugging drill — filter-vs-nat, a dead DNAT rule, a stale conntrack entry</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Three faults, each diagnosed to a <em>specific rule or a specific table entry</em> rather than guessed — and each is a real cluster incident in miniature. The first teaches you to read the symptom (ping vs curl); the second to read the counters (which rule actually fired); the third to suspect <em>state</em>, not rules, when a fixed configuration still misbehaves. Reproduce all three and the module's machinery becomes a diagnostic reflex: when a virtual network breaks, you localise it to a rule or a flow, you don't thrash.</p>
+<h5 class="verify">Symptom 1 — ping works but curl doesn't (filter vs nat)</h5>
+<ol class="lab">
+<li>A backend answers ping but its port hangs. Read the timing and the ruleset to place the fault in the <code>filter</code> table, not the addressing.
+<pre class="cmd">multipass shell sandbox
+sudo ip netns exec pod1 bash -c 'cd /tmp/pod1 &amp;&amp; python3 -m http.server 80 &amp;&gt;/dev/null &amp;'; sleep 1
+sudo iptables -I FORWARD -p tcp -d 10.20.0.2 --dport 80 -j DROP   # plant the fault
+ping -c1 10.20.0.2 &gt;/dev/null &amp;&amp; echo 'ping: ok'
+time curl -s -o /dev/null -m3 http://10.20.0.2; echo "curl exit=$?"</pre>
+<pre class="out">ping: ok                       ← ICMP passes: network layer + wiring are fine
+curl exit=28  (real ~3s)       ← TCP/80 hangs to timeout: a silent DROP in filter, not a nat/route fault</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A <code>filter</code>-table DROP on the backend's TCP port, while ICMP is untouched.</strong> "Ping works but curl doesn't" localises the fault above the network layer, and the <em>hang</em> (rather than an instant refusal) says it's a silent DROP, not a REJECT or a missing listener. Confirm by reading the chain — <code>iptables -L FORWARD -n -v</code> shows a DROP rule whose counter climbs as you retry — and fix by removing it: <code>sudo iptables -D FORWARD -p tcp -d 10.20.0.2 --dport 80 -j DROP</code>. The reflex: <em>filter</em> decides pass/drop and <em>nat</em> rewrites — they're different tables, and "reachable by ping, dead on a port" is always a filter question. In a cluster this exact signature (hang, not refuse) is a NetworkPolicy dropping the traffic; the diagnosis is identical one layer up.</p></details>
+
+<h5 class="verify">Symptom 2 — a DNAT rule that never matches</h5>
+<ol class="lab">
+<li>A published port returns nothing, yet a DNAT rule is clearly present. Don't argue about whether it "should" match — read its counter and find it dead, shadowed by a rule above it.
+<pre class="cmd">sudo iptables -t nat -F PREROUTING
+sudo iptables -t nat -A PREROUTING -p tcp --dport 9090 -j DNAT --to-destination 10.20.0.99:80  # wrong/dead backend, added first
+sudo iptables -t nat -A PREROUTING -p tcp --dport 9090 -j DNAT --to-destination 10.20.0.2:80   # the correct rule, shadowed below
+sudo iptables -t nat -Z PREROUTING
+curl -s -o /dev/null -m2 http://127.0.0.1:9090; echo "exit=$?"     # via OUTPUT it won't even match; test path below
+sudo iptables -t nat -L PREROUTING -n -v --line-numbers | grep 9090</pre>
+<pre class="out">1  N pkts  DNAT ... tcp dpt:9090 to:10.20.0.99:80    ← FIRST match wins: every packet claimed here
+2  0 pkts  DNAT ... tcp dpt:9090 to:10.20.0.2:80     ← counter 0: the correct rule is dead/shadowed</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>The correct DNAT is shadowed by an earlier rule that claims the same packets first.</strong> Within a chain the first match wins (B9.14), so the rule pointing at the wrong backend (<code>10.20.0.99</code>, which nothing answers) catches every packet and the correct rule below it never fires — proven by its zero counter while traffic flows. (A sibling of this fault is a DNAT placed in the <em>wrong chain</em> entirely — e.g. in <code>POSTROUTING</code>, after routing — where it also never matches; the counter is the same tell.) Fix by removing or reordering: delete the shadowing rule (<code>iptables -t nat -D PREROUTING 1</code>) so the good rule becomes first. The reflex: a DNAT that "does nothing" is a <em>counter</em> question — read <code>-L -n -v</code>, find the rule whose counter moves, and check whether it's the one you meant. This is exactly how you find why a Service sends traffic to the wrong (or a dead) endpoint by reading its <code>KUBE-</code> chain top-down.</p></details>
+
+<h5 class="verify">Symptom 3 — a stale conntrack entry pinning a dead backend</h5>
+<ol class="lab">
+<li>You fix a rule mid-flow, but an existing connection keeps hitting the old, now-wrong backend. The rules are correct; the fault is <em>state</em>. Reproduce by establishing a flow, changing the rule, and watching the old flow ignore the change.
+<pre class="cmd">sudo iptables -t nat -F
+sudo iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport 7070 -j DNAT --to-destination 10.20.0.2:80
+( while :; do curl -s -o /dev/null http://127.0.0.1:7070; sleep 0.3; done ) &amp;   # a steady flow
+sleep 1; sudo conntrack -L -p tcp 2&gt;/dev/null | grep 7070 | head -1        # entry pins the mapping
+# now "fix" the rule to point at pod2 — but the tracked flow won't follow:
+sudo iptables -t nat -R OUTPUT 1 -p tcp -d 127.0.0.1 --dport 7070 -j DNAT --to-destination 10.20.0.3:80
+sleep 1; echo '--- flush conntrack so new state is created: ---'
+sudo conntrack -D -p tcp --dport 80 2&gt;/dev/null | tail -1; kill %1 2&gt;/dev/null</pre>
+<pre class="out">tcp 6 ... dport=80 ... dst=10.20.0.2 [ASSURED]    ← the flow is pinned to the OLD backend, 10.20.0.2
+--- flush conntrack so new state is created: ---
+conntrack v1.4.7: 1 flow entries have been deleted.   ← after flush, new connections see the fixed rule</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A conntrack entry pins an existing flow to its original translation, so a corrected rule appears to do nothing.</strong> Once a connection is tracked (B9.9), its packets follow the recorded state, not the current ruleset — so a DNAT you fix mid-flow doesn't move traffic already mapped to the old backend, even when the backend is gone. The tells: the rule is provably correct (its counter moves, it points at the right place) yet traffic still lands on the wrong/dead endpoint, and <code>conntrack -L</code> shows an entry with the stale mapping. The fix is to force new state: retry with a <em>fresh</em> connection, or flush the stale entries with <code>conntrack -D</code>/<code>conntrack -F</code>. The reflex: <em>when the rules are right but traffic still goes to the wrong place, suspect state, not configuration.</em> This is precisely why kube-proxy deletes conntrack entries when endpoints change, and why "a Service still hits a deleted pod" is remediated by flushing conntrack.</p></details>
+<h5 class="gotcha">Gotchas</h5>
+<p>The three faults escalate in kind on purpose. The first lives in the <em>wrong table</em> (filter, not nat) and is read from the symptom. The second lives in the <em>wrong order</em> (shadowed) and is read from a counter. The third lives in <em>state</em>, not rules at all, and is read from the conntrack table — the hardest to see because every rule is correct. Together they map the three places a virtual-network fault can hide: which table, which position, or which cached flow. A clean ruleset that still misbehaves is the signature that pushes you from rules to state.</p>
+<p>The stale-conntrack fault is the one that humbles people, because the instinct "the config is right, so it must be working" is exactly wrong: NAT has a memory, and the memory can outlive the truth. Keep <code>conntrack -L</code> in your kit next to <code>iptables -L -v</code> — one shows the rules, the other shows the flows currently ignoring any rule change. When they disagree, the flow wins until it's flushed or expires, and knowing that saves the hour you'd otherwise spend re-checking correct rules.</p>
+<div class="k8s-link">
+<p>All three are everyday cluster incidents. Filter-vs-nat (hang vs refuse) is the NetworkPolicy-vs-missing-endpoint distinction you'll make constantly. A shadowed/mis-chained DNAT is how a Service routes to the wrong or a dead endpoint, found by reading its <code>KUBE-</code> chain with counters. And a stale conntrack entry pinning traffic to a deleted pod is a known kube-proxy edge case — the reason kube-proxy actively clears conntrack on endpoint changes and the reason "flush conntrack" is a real remediation step. You now have the by-hand version of all three, which is the version you actually understand.</p>
+<p>Breaking the CNI and reading signatures is <a href="w4.html#cp-4-8">W4.8</a>; the kube-proxy chain walk is <a href="w4.html#cp-4-10">W4.10</a>; endpoint readiness and the conntrack-pinning it interacts with is <a href="w4.html#cp-4-11">W4.11</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> (<code>-L -v</code> counters, <code>-Z</code>, <code>-R</code>/<code>-D</code> to reorder/remove), <code>man 8 conntrack</code> (<code>-L</code> to read, <code>-D</code>/<code>-F</code> to flush), and re-read <a href="#cp-b9-12">B9.12</a> (filter vs nat), <a href="#cp-b9-14">B9.14</a> (rule order/counters) and <a href="#cp-b9-9">B9.9</a> (conntrack). In the exam docs, these map onto the Service and NetworkPolicy troubleshooting guidance.</p>
+</article>
+
+</div><!-- /g-project -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B9 recall quiz</h3>
+<p>Answer out loud before revealing. If you can explain how a ClusterIP works — an address that exists nowhere — and how a packet leaves a private namespace for the internet and finds its way back, this module has done its job.</p>
+<ol>
+<li>A brand-new network namespace can reach nothing at all. Name at least four things it has its own of, and say why that means each pod gets a whole IP.
+<details class="reveal"><summary>Answer</summary><p>Its own interfaces, routing table, netfilter rules, port space and loopback. Because the <em>port space</em> is private, two processes in different namespaces can both bind the same port without conflict — so giving each pod its own namespace (hence its own IP) is what lets pods not fight over the node's ports. A fresh namespace even starts with loopback <em>down</em>, so <code>ping 127.0.0.1</code> fails until <code>ip link set lo up</code>.</p></details></li>
+<li>What is a veth pair, and what happens to one end if you delete the other?
+<details class="reveal"><summary>Answer</summary><p>A virtual patch cable — two linked interfaces where whatever enters one end exits the other and nowhere else. It's always created and destroyed as a pair: deleting either end destroys both, because there's no such thing as half a veth. A container runtime makes one per pod — <code>eth0</code> inside the pod, a <code>vethXXXX</code> on the node.</p></details></li>
+<li>You give a bridge an IP address. What does that change about its role?
+<details class="reveal"><summary>Answer</summary><p>A bridge is a learning switch — it learns which MAC is on which port and forwards frames accordingly. Give it an IP and it <em>also</em> becomes the gateway the attached namespaces route through, because a bridge is simultaneously a switch for its ports and a real, addressable interface on the host. On a node this is <code>cni0</code>/<code>docker0</code>.</p></details></li>
+<li>Name the three NAT flavours by what and when each rewrites, and match each to a Kubernetes feature.
+<details class="reveal"><summary>Answer</summary><p>SNAT — source address, outbound, to a fixed IP (POSTROUTING); MASQUERADE — source address, outbound, to the outgoing interface's current IP (POSTROUTING); DNAT — destination address, inbound (PREROUTING). Pod egress = MASQUERADE; a ClusterIP → pod = DNAT; a NodePort inbound = DNAT.</p></details></li>
+<li>You remove a masquerade rule and pings from a private namespace stop getting replies — but the requests still leave the box. Why?
+<details class="reveal"><summary>Answer</summary><p>Forwarding is still on, so the request is delivered out the uplink — but now with its private source address (e.g. <code>10.10.0.2</code>), which no internet router has a route back to, so the reply is dropped out there. "Requests leave, replies never arrive" is the exact signature of missing/broken source NAT. The masquerade rule doesn't help the packet leave; it makes its source answerable.</p></details></li>
+<li>What does conntrack store, and name the two consequences that bite in production.
+<details class="reveal"><summary>Answer</summary><p>It stores every flow's 4-tuple plus any NAT translation, so replies can be matched and un-translated. (1) A rule changed mid-flow does nothing to flows already tracked — the flow follows recorded state, so you must retry with a fresh connection. (2) The table is finite (<code>nf_conntrack_max</code>); fill it under load and the kernel logs <code>table full, dropping packet</code> and drops traffic every rule says should pass.</p></details></li>
+<li>Why must DNAT run in the prerouting hook, and why is a rule in the <code>input</code> chain useless for affecting pod traffic?
+<details class="reveal"><summary>Answer</summary><p>DNAT changes the destination, and the change must happen <em>before</em> the routing decision so the kernel routes on the new address — that's prerouting. Pod traffic is <em>forwarded</em> through the node (prerouting → forward → postrouting), so it never traverses <code>input</code> (which is only for traffic addressed <em>to</em> this host); a rule in <code>input</code> is inspected by none of it.</p></details></li>
+<li>"Ping works but curl doesn't," and the curl <em>hangs</em> before failing. What's happening, and what would an <em>instant</em> failure have meant instead?
+<details class="reveal"><summary>Answer</summary><p>A <code>filter</code>-table DROP is silently eating the TCP SYN while ICMP passes untouched — the network layer is fine, one TCP port is filtered. The hang is the DROP signature (client waits out its timeout). An instant failure would be a REJECT or a reset — an active refusal (a closed port / no listener). In Kubernetes: hang ≈ NetworkPolicy deny; instant ≈ Service with no ready endpoints.</p></details></li>
+<li>On Ubuntu 24.04, what is the <code>iptables</code> command really, and why is <code>nft list ruleset</code> the command that settles "is this rule there?"
+<details class="reveal"><summary>Answer</summary><p><code>iptables</code> is <code>iptables-nft</code> — a compatibility front-end that translates iptables syntax into rules enforced by the nftables engine (confirmed by <code>iptables -V</code> printing <code>nf_tables</code>). <code>nft list ruleset</code> shows the whole unified engine regardless of which front-end wrote a rule, so it can't be fooled by a partial, dialect-specific view. kube-proxy's iptables-mode rules land in nftables underneath — hence thousands of <code>KUBE-</code> chains in <code>nft list ruleset</code>.</p></details></li>
+<li>Within a chain, which rule decides a packet's fate, and how do you prove a specific rule is dead?
+<details class="reveal"><summary>Answer</summary><p>The first rule whose match fits, walking top to bottom (first match wins) — so a rule appended after a terminating rule that already catches the traffic is shadowed. Prove a rule dead by reading counters (<code>iptables -L -n -v</code>): generate matching traffic and if the rule's packet counter stays at zero, it's shadowed or in a chain the traffic never enters — dead by measurement, not by argument.</p></details></li>
+<li>A ClusterIP is an address no machine holds. What actually makes it work, and why are the load-balancing probabilities <em>chained</em> rather than equal?
+<details class="reveal"><summary>Answer</summary><p>A DNAT rule rewrites the virtual destination to a real backend IP before routing — nothing answers ARP for the ClusterIP; it exists only as rewrite rules. For N backends the probabilities are chained (e.g. 1/3, then 1/2, then 1) because each rule's probability applies only to packets that fell through the rules above it, which yields an even split. This is kube-proxy's iptables mode exactly, and conntrack pins each connection to its chosen backend.</p></details></li>
+<li>Why is write access to <code>/run/containerd/containerd.sock</code> equivalent to root on the node?
+<details class="reveal"><summary>Answer</summary><p>Whoever can write to it can tell the runtime to start a container with the host filesystem mounted, running privileged with all capabilities — i.e. obtain a root shell on the host. A unix socket's access control is just its file permissions, so the socket's mode <em>is</em> the node's security boundary. That's why bind-mounting the runtime socket into a pod (or adding a user to the runtime/docker group) hands over the node, and why it's the canonical trust-boundary example for B12.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Create a network namespace and explain what it gets its own of — interfaces, routes, netfilter, port space, loopback — and why that gives each pod a whole IP.</li>
+<li>Build a <code>veth</code> pair as a patch cable and a bridge as a learning switch, move one end into a namespace, and read the <code>@peer</code> pairing across the boundary.</li>
+<li>Address a private subnet deliberately — bridge-as-gateway, an address per namespace, a default route — the three IPAM decisions a CNI makes per pod.</li>
+<li>Connect two namespaces and prove the path by capturing the same packet at two points, the core CNI-debugging technique.</li>
+<li>Turn the host into a router with <code>ip_forward</code>, and explain the pods-reach-each-other-but-nothing-beyond signature of forgetting it.</li>
+<li>Explain SNAT, MASQUERADE and DNAT by what and when each rewrites, and give a private subnet masqueraded egress to the internet.</li>
+<li>Read the "requests leave, replies don't" signature of missing source NAT, and explain why NAT needs conntrack's memory.</li>
+<li>Read the conntrack table, and explain the "rule changed mid-flow does nothing" and "table full drops everything" failures.</li>
+<li>Draw the five netfilter hooks and the to-host vs through-host paths, and say why DNAT lives in prerouting and pod traffic skips <code>input</code>.</li>
+<li>Read any Linux firewall as tables/chains/rules/targets, and write ACCEPT/DROP/REJECT/jump rules by hand.</li>
+<li>Reproduce "ping works but curl doesn't" from a filter DROP, and read DROP (hang) vs REJECT (instant) — the NetworkPolicy-vs-missing-endpoint distinction.</li>
+<li>Know that 24.04's backend is nftables and <code>iptables</code> is <code>iptables-nft</code>, and read the same ruleset in both dialects.</li>
+<li>Debug by first-match-wins and packet counters — find which rule fired and prove a shadowed rule dead.</li>
+<li>Build a round-robin load balancer from DNAT + <code>-m statistic</code> (kube-proxy's iptables mode) and publish a host port (a NodePort), by hand.</li>
+<li>Explain unix domain sockets — stream/datagram, filesystem permissions, the abstract namespace — and why access to <code>containerd.sock</code> is root on the node.</li>
+<li>Assemble a CNI v0.1 in two scripts, and diagnose filter-vs-nat, a shadowed/mis-chained DNAT, and a stale conntrack entry — the three places a virtual-network fault hides.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b8.html">← B8 · Networking I: the real network</a><a href="../beginner.html#b10">B10 · Names — DNS and resolution →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-25. iproute2 6.1 (<code>ip</code>, <code>ss</code>, <code>bridge</code>), iptables 1.8.10 in <code>nf_tables</code> mode (<code>iptables-nft</code>) over the 24.04 kernel (6.8), nftables 1.0.9 (<code>nft</code>), conntrack-tools 1.4.7 (<code>conntrack</code>), socat 1.8, tcpdump 4.99, netcat-openbsd 1.226. kube-proxy facts checked against Kubernetes v1.35 (LF CKA target): nftables kube-proxy mode is GA (since v1.33) but iptables remains the default mode; IPVS is deprecated in v1.35.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
