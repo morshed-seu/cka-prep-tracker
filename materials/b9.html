@@ -315,6 +315,185 @@ sleep 1; sudo ip netns exec blue ping -c1 10.10.0.2 &gt;/dev/null; wait</pre>
 
 </div><!-- /g-wiring -->
 
+<!-- ---------------- Getting out ---------------- -->
+<div class="grp" id="g-egress"><h3>Getting out</h3>
+
+<article class="lesson" id="cp-b9-6" data-id="b9-6">
+<div class="lesson-head"><span class="cp-id">B9.6</span><h4>Turn the host into a router: ip_forward</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Your two namespaces reach each other and the bridge, but not the internet — and the reason is one switch that is off by default. An ordinary computer is a <em>host</em>: it deals with traffic addressed to itself and refuses to be a middleman. Anything running containers must instead be a <em>router</em>, passing traffic between its pods and the outside world. Flipping that one setting is why it appears in every Kubernetes install guide, and forgetting it produces one of the most common "pods can talk to each other but not to anything beyond the node" mysteries.</p>
+<h5>The concept</h5>
+<p>By default the Linux kernel treats itself as a host, controlled by the sysctl <code>net.ipv4.ip_forward</code>, which starts at <code>0</code>. With forwarding off, the kernel <strong>accepts</strong> packets whose destination is one of its own addresses and <strong>silently drops</strong> any packet that arrived for somewhere else — it will not pass a packet from one interface out another. That is the right default for a laptop and the wrong one for anything hosting namespaces, because forwarding <em>between</em> a private veth and the uplink is the whole job.</p>
+<p>Set <code>net.ipv4.ip_forward=1</code> and the kernel becomes a <strong>router</strong>: a packet arriving on one interface, addressed to somewhere the kernel has a route to, gets forwarded out the appropriate interface toward its destination. In plain terms, "this packet isn't for me, but I know a next hop, so I'll pass it along" — the defining behaviour of a router. This alone still isn't enough for the private subnet to reach the internet (the replies have nowhere to come back to until you add NAT in B9.8), but it is the necessary first half: without forwarding, the packet never even leaves the box.</p>
+<div class="flow"><span>ip_forward=0</span><em>· packet not for me → dropped ·</em><span class="hot">ip_forward=1</span><em>· packet not for me → forwarded on</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the current setting — <code>0</code> on a stock VM — and watch what happens with forwarding off: a ping from <code>red</code> to the internet produces nothing leaving the uplink, because the host drops the forwarded packet.
+<pre class="cmd">multipass shell sandbox
+sysctl net.ipv4.ip_forward
+sudo tcpdump -nn -i ens3 icmp -c1 -w /dev/null &amp; sleep 1
+sudo ip netns exec red ping -c1 -W2 1.1.1.1 &gt;/dev/null; sleep 1; sudo pkill -f 'tcpdump.*ens3' 2&gt;/dev/null</pre>
+<pre class="out">net.ipv4.ip_forward = <b>0</b>              ← forwarding off: host is a plain host
+# tcpdump on ens3 captured 0 packets — the forwarded ping never left the box</pre></li>
+<li>Turn forwarding on and repeat the capture: now the request <em>leaves</em> the uplink (you'll still get no reply until B9.8 adds NAT, because the source is a private address — that's the cliffhanger).
+<pre class="cmd">sudo sysctl -w net.ipv4.ip_forward=1
+sudo tcpdump -nn -i ens3 icmp -c1 &amp; sleep 1
+sudo ip netns exec red ping -c1 -W2 1.1.1.1 &gt;/dev/null; wait 2&gt;/dev/null</pre>
+<pre class="out">net.ipv4.ip_forward = 1
+IP <b>10.10.0.2 &gt; 1.1.1.1: ICMP echo request</b> ...   ← now it leaves — but with a private source</pre></li>
+<li>Note the change is not persistent — <code>sysctl -w</code> lasts until reboot. See where you'd make it permanent (you don't need to on the throwaway VM).
+<pre class="cmd">echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-forward.conf   # the permanent way
+sudo sysctl --system &gt;/dev/null 2&gt;&amp;1; sysctl net.ipv4.ip_forward</pre>
+<pre class="out">net.ipv4.ip_forward = 1        ← now survives reboot via /etc/sysctl.d/</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What does the kernel do, by default, with a packet whose destination is not one of its own addresses, and what does <code>ip_forward=1</code> change? (By default it silently drops such a packet — it is a host, not a router; setting <code>ip_forward=1</code> makes it forward the packet out the interface toward the destination, i.e. behave as a router.) Then: after enabling forwarding, a ping from the private namespace to <code>1.1.1.1</code> now <em>leaves</em> the uplink but still gets no reply — why? (The packet still carries its private source address <code>10.10.0.2</code>, which the internet has no route back to; forwarding delivers it outward, but only NAT — next lessons — rewrites the source so a reply can return.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>sysctl -w</code> changes are lost at reboot; the durable form is a file in <code>/etc/sysctl.d/</code> (or an entry in <code>/etc/sysctl.conf</code>) applied by <code>sysctl --system</code>. On real nodes the CNI or the install steps drop exactly such a file, which is why the setting "just persists" on a working cluster — but a hand-set node that reverts after a reboot and stops routing pod traffic is a real incident. Set it the durable way anywhere it matters.</p>
+<p>There are also per-interface forwarding knobs (<code>net.ipv4.conf.&lt;iface&gt;.forwarding</code>) and the global one interacts with them; for IPv6 the equivalent is <code>net.ipv6.conf.all.forwarding</code>. And forwarding being on doesn't override a restrictive <code>FORWARD</code> firewall chain — on a hardened host you also need a rule permitting the forwarded traffic (B9.11). On the stock <code>sandbox</code> the <code>FORWARD</code> policy is <code>ACCEPT</code>, so forwarding alone is enough here.</p>
+<div class="k8s-link">
+<p><code>net.ipv4.ip_forward=1</code> is set on every Kubernetes node, by the same reasoning: a node forwards traffic between pod veths and between pods and the outside world, so it is a router whether or not anyone calls it one. The CNI plugins and kubeadm preflight expect it; when it's missing the signature is unmistakable — pods reach other pods on the same node's bridge (that's switching, not routing) but nothing off-node and nothing on the internet. It's one of the first things a node-networking checklist verifies.</p>
+<p>The datapath families that all assume a forwarding node are <a href="w4.html#cp-4-7">W4.7</a>; broken-CNI signatures (including forwarding/routing faults) are <a href="w4.html#cp-4-8">W4.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 sysctl</code> (<code>-w</code>, <code>--system</code>, and how <code>/etc/sysctl.d</code> files are ordered), and the kernel's <code>Documentation/networking/ip-sysctl.rst</code> for <code>ip_forward</code> and the per-interface <code>forwarding</code> knobs. In the exam docs, "Installing kubeadm" lists the sysctls (including forwarding and <code>bridge-nf-call-iptables</code>) as a prerequisite step.</p>
+</article>
+
+<article class="lesson" id="cp-b9-7" data-id="b9-7">
+<div class="lesson-head"><span class="cp-id">B9.7</span><h4>The three NAT flavours, by what they rewrite</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Forwarding gets a packet <em>toward</em> the internet, but a packet whose source is a private address (<code>10.10.0.2</code>) can never receive a reply — no one out there has a route back to private space. The fix is address translation, and there are exactly three flavours of it. They sound interchangeable until you learn them by the one thing that distinguishes them: <em>what</em> each rewrites and <em>when</em>. Once you can name which rewrite is supposed to be happening, "the packet arrived carrying an address I didn't expect" stops being a mystery and becomes a specific question about a specific rule — which is most of NAT debugging.</p>
+<h5>The concept</h5>
+<p><strong>NAT</strong> (Network Address Translation) is a router rewriting addresses in a packet as it passes through. The three flavours, by what and when they rewrite:</p>
+<ul>
+<li><strong>SNAT</strong> (source NAT) — rewrite the <em>source</em> address on the way <em>out</em>, to a <strong>fixed</strong> IP you name. Use it when your router has a known, stable public address. The reply comes back to that address and the router reverses the swap.</li>
+<li><strong>MASQUERADE</strong> — SNAT that uses <em>whatever address the outgoing interface currently has</em>, looked up automatically, instead of a hardcoded one. Slightly more work per packet, but it "just works" on links whose address is dynamic (DHCP, a cloud VM). It's the source-NAT you reach for when you don't want to name the IP.</li>
+<li><strong>DNAT</strong> (destination NAT) — rewrite the <em>destination</em> address (and often port) on the way <em>in</em>. Use it to publish an internal service on an external address/port (port forwarding), or to make a single virtual address stand in for a real backend.</li>
+</ul>
+<p>These map onto <em>where</em> they can run, which you'll formalise in B9.10: source rewriting happens last, in the <code>POSTROUTING</code> hook (after the routing decision, on the way out); destination rewriting happens first, in the <code>PREROUTING</code> hook (before routing, so the kernel routes on the <em>new</em> destination). The single most useful thing to hold onto: <strong>everything in a cluster's data path is one of these three.</strong> Pods reaching the internet is MASQUERADE; a Service's ClusterIP becoming a real pod IP is DNAT; a NodePort turning an inbound host-port hit into a pod is DNAT. Name the rewrite and you've named the mechanism.</p>
+<div class="flow"><span>SNAT — src, out, fixed IP</span><em>·</em><span>MASQUERADE — src, out, iface's IP</span><em>·</em><span class="hot">DNAT — dst, in</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the <code>nat</code> table's structure — the built-in chains that correspond to the hooks where NAT runs. It's empty now; you'll fill <code>POSTROUTING</code> in B9.8 and <code>PREROUTING</code> in B9.16.
+<pre class="cmd">multipass shell sandbox
+sudo iptables -t nat -L -n | grep -E 'Chain (PRE|POST|OUTPUT)'</pre>
+<pre class="out">Chain <b>PREROUTING</b> (policy ACCEPT)     ← where DNAT lives (rewrite destination, before routing)
+Chain <b>POSTROUTING</b> (policy ACCEPT)    ← where SNAT/MASQUERADE live (rewrite source, after routing)
+Chain OUTPUT (policy ACCEPT)             ← locally-generated packets</pre></li>
+<li>See the rule <em>shapes</em> for each flavour without committing them yet (<code>-C</code> checks whether a rule exists; the point is to read the syntax and where each target goes).
+<pre class="cmd"># the three shapes you'll use — note the table, chain, and target for each:
+echo 'SNAT:      iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o ens3 -j SNAT   --to-source 10.191.62.10'
+echo 'MASQUERADE: iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o ens3 -j MASQUERADE'
+echo 'DNAT:      iptables -t nat -A PREROUTING  -p tcp --dport 8080 -j DNAT       --to-destination 10.10.0.2:80'</pre>
+<pre class="out">SNAT:      ... POSTROUTING ... -j SNAT  --to-source ...        ← source, fixed, on the way out
+MASQUERADE: ... POSTROUTING ... -j MASQUERADE                   ← source, dynamic, on the way out
+DNAT:      ... PREROUTING ... -j DNAT --to-destination ...      ← destination, on the way in</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>For each of SNAT, MASQUERADE and DNAT, say what it rewrites, in which direction, and which chain it runs in. (SNAT — source address, outbound, to a fixed IP, in <code>POSTROUTING</code>; MASQUERADE — source address, outbound, to the outgoing interface's current IP, in <code>POSTROUTING</code>; DNAT — destination address, inbound, in <code>PREROUTING</code>.) Then: match each cluster feature to its flavour — pods reaching the internet, a ClusterIP, a NodePort. (Pod egress = MASQUERADE; ClusterIP → pod = DNAT; NodePort inbound = DNAT.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>MASQUERADE vs SNAT is a real trade-off, not a style choice: MASQUERADE looks up the interface's address for every new flow (cheap enough, but non-zero) and, usefully, <em>drops its conntrack entries when the interface goes down</em> so stale translations to an old address don't linger — which is exactly why it suits dynamic uplinks. Plain SNAT to a fixed address is marginally faster and correct when the address never changes. Prefer MASQUERADE when the uplink IP can change; prefer SNAT when it's pinned and you want the tiny efficiency.</p>
+<p>DNAT has to happen <em>before</em> the routing decision, which is why it lives in <code>PREROUTING</code>: the kernel must see the rewritten destination in order to route the packet to the right place. A DNAT rule placed in the wrong chain (say <code>POSTROUTING</code>, after routing) simply never does anything useful, and the counter stays at zero — a mistake you'll deliberately reproduce in the B9.20 drill. The direction/chain pairing isn't arbitrary; it's forced by when the rewrite has to take effect.</p>
+<div class="k8s-link">
+<p>kube-proxy's entire job is writing these three rewrites. Pod-to-external traffic is MASQUERADE'd (so the reply returns to the node, which un-NATs it back to the pod). A Service's ClusterIP — an address that exists on no interface anywhere — is made real purely by DNAT rules that rewrite it to a chosen pod IP. A NodePort is DNAT applied to an inbound host port. When you read the <code>KUBE-</code> chains in W4, every line is one of the three flavours you just named, and knowing which rewrite <em>should</em> occur is how you spot the one that isn't.</p>
+<p>The ClusterIP-as-DNAT idea is <a href="w4.html#cp-4-9">W4.9</a>; walking the actual kube-proxy chains is <a href="w4.html#cp-4-10">W4.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables-extensions</code> documents the <code>SNAT</code>, <code>DNAT</code>, <code>MASQUERADE</code> and <code>REDIRECT</code> targets and their options (<code>--to-source</code>, <code>--to-destination</code>). <code>man 8 iptables</code> for the <code>-t nat</code> table and its built-in chains. The nftables equivalents (<code>snat</code>, <code>dnat</code>, <code>masquerade</code> statements) are in <code>man 8 nft</code>. In the exam docs, this underlies every Service-type explanation.</p>
+</article>
+
+<article class="lesson" id="cp-b9-8" data-id="b9-8">
+<div class="lesson-head"><span class="cp-id">B9.8</span><h4>Give the private subnet real internet access</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the moment the hand-built network stops being a toy: one rule, and namespaces you conjured from nothing can reach the actual internet. It's also the clearest possible demonstration of what NAT does, because removing that single rule produces an unforgettable signature — requests still <em>leave</em> the box, but replies never come back. Watching that happen fuses "forwarding" and "translation" into one working mental model.</p>
+<h5>The concept</h5>
+<p>You already have the two prerequisites: forwarding on (B9.6) so the host passes the packet along, and the vocabulary of MASQUERADE (B9.7). Now add exactly one rule to the <code>nat</code> table's <code>POSTROUTING</code> chain: <em>for traffic from <code>10.10.0.0/24</code> leaving via the uplink <code>ens3</code>, masquerade the source.</em> With it in place, a ping from <code>red</code> to <code>1.1.1.1</code> leaves the box with the host's <em>public</em> source address; the reply comes back to the host; and conntrack (B9.9) reverses the translation, delivering the reply back to <code>10.10.0.2</code>. From inside the namespace it simply looks like the internet works.</p>
+<p>Remove the rule and the failure is precise and instructive: forwarding is still on, so the request still leaves <code>ens3</code> — but now carrying its <em>private</em> source <code>10.10.0.2</code>, an address no router on the internet has a route back to, so the reply is dropped somewhere out there and never returns. "Requests leave, replies never arrive" is the exact signature of missing (or wrong) source NAT, and you'll recognise it for the rest of your career. The rule doesn't help the packet <em>get out</em> — forwarding does that — it makes the packet's source <em>answerable</em>.</p>
+<div class="flow"><span>red 10.10.0.2 → 1.1.1.1</span><em>→ MASQUERADE →</em><span class="hot">src rewritten to host's public IP</span><em>→ reply returns, conntrack un-NATs it</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Add the masquerade rule and confirm the private namespace now reaches the internet. (Ensure <code>ip_forward=1</code> from B9.6 is still set.)
+<pre class="cmd">multipass shell sandbox
+sudo iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o ens3 -j MASQUERADE
+sudo ip netns exec red ping -c2 1.1.1.1</pre>
+<pre class="out">64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=12.3 ms   ← the private namespace reached the internet ✓
+2 packets transmitted, 2 received, 0% packet loss</pre></li>
+<li>Watch the rewrite happen: capture on the uplink while <code>red</code> pings, and see the source address is the <em>host's</em>, not <code>10.10.0.2</code> — that's the masquerade at work.
+<pre class="cmd">sudo tcpdump -nn -i ens3 icmp -c1 &amp; sleep 1
+sudo ip netns exec red ping -c1 1.1.1.1 &gt;/dev/null; wait 2&gt;/dev/null
+ip -br addr show ens3    # compare: this host's address is the source you saw</pre>
+<pre class="out">IP <b>10.191.62.10 &gt; 1.1.1.1</b>: ICMP echo request ...   ← source is the HOST, not 10.10.0.2
+ens3  UP  10.191.62.10/24                              ← ...which is this interface's address</pre></li>
+<li>Now the signature: delete the rule and ping again. The request still leaves (forwarding is on) but with the private source, so no reply returns — a clean demonstration of what NAT was doing.
+<pre class="cmd">sudo iptables -t nat -D POSTROUTING -s 10.10.0.0/24 -o ens3 -j MASQUERADE
+sudo ip netns exec red ping -c2 -W2 1.1.1.1; echo "exit=$?"
+sudo iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o ens3 -j MASQUERADE   # restore</pre>
+<pre class="out">2 packets transmitted, <b>0 received</b>, 100% packet loss     ← replies never return
+exit=1                                                       ← requests left; no answer came back</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What does the masquerade rule rewrite, and on which packets? (The source address of traffic from <code>10.10.0.0/24</code> leaving via <code>ens3</code> — it swaps the private source for the uplink interface's own address, so replies can find their way back.) Then: with the rule removed but forwarding still on, why do requests still leave while replies stop arriving? (Forwarding delivers the request out the uplink, but it now carries the private source <code>10.10.0.2</code>, which no internet router can route a reply back to — so the request goes and the reply is lost: the exact signature of missing source NAT.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The rule works on <code>sandbox</code> because the <code>FORWARD</code> chain's policy is <code>ACCEPT</code> — the packet is both forwarded and NAT'd. On a host with a restrictive <code>FORWARD</code> policy (common on anything hardened) you'd <em>also</em> need explicit filter rules permitting the forwarded traffic in both directions, or the NAT rule appears not to work even though it's correct. NAT and filtering are separate tables doing separate jobs (B9.12); a masquerade rule never grants passage a filter rule denies.</p>
+<p>Scope the rule with both <code>-s</code> (the private subnet) and <code>-o</code> (the uplink) so you masquerade <em>only</em> the traffic you mean to. A too-broad MASQUERADE (no source or interface match) will also rewrite traffic that shouldn't be touched — including, on a real node, traffic between pods that needs to keep its real source for NetworkPolicy and logging. "Masquerade only what's actually leaving to somewhere that needs it" is the same principle behind a cluster's carefully-scoped masq rules.</p>
+<div class="k8s-link">
+<p>This one rule is pod egress. When a pod talks to something outside the cluster, its packet is MASQUERADE'd to the node's address so the external service can reply to the node, which un-NATs it back to the pod — exactly what you just built. CNIs and the optional <code>ip-masq-agent</code> install precisely-scoped masquerade rules that rewrite pod-to-<em>external</em> traffic but deliberately <em>skip</em> pod-to-pod and pod-to-service traffic (which must keep real addresses). The "requests leave, replies don't" signature you produced is a real cluster symptom of a missing or misscoped egress masquerade.</p>
+<p>Pod egress masquerade and the ClusterIP datapath are <a href="w4.html#cp-4-9">W4.9</a>; the datapath families that shape where masquerade is needed are <a href="w4.html#cp-4-7">W4.7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> (<code>-t nat</code>, <code>-A</code>/<code>-D</code>, <code>-s</code>, <code>-o</code>) and <code>man 8 iptables-extensions</code> (the <code>MASQUERADE</code> and <code>SNAT</code> targets). To see the reverse-mapping that makes it work, jump to <code>conntrack -L</code> in the next lesson. In the exam docs, egress/masquerade behaviour is discussed under the CNI and <code>ip-masq-agent</code> pages.</p>
+</article>
+
+<article class="lesson" id="cp-b9-9" data-id="b9-9">
+<div class="lesson-head"><span class="cp-id">B9.9</span><h4>Why NAT needs a memory: conntrack</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The masquerade rule in B9.8 rewrote the outgoing source — but something had to <em>remember</em> that rewrite in order to reverse it on the reply, or the answer would arrive at the host addressed to the host and never find its way back to <code>red</code>. That memory is <strong>conntrack</strong>, and it's not a background detail: two of its properties cause real, confusing outages in clusters, and both become obvious once you've watched the table fill and empty by hand.</p>
+<h5>The concept</h5>
+<p><strong>conntrack</strong> (connection tracking) is the kernel keeping a record of every flow passing through it — identified by the 4-tuple from B8.10 (source IP, source port, dest IP, dest port), together with any NAT translation applied. When the masqueraded request goes out, conntrack logs "flow from <code>10.10.0.2:x</code> to <code>1.1.1.1</code>, source rewritten to <code>10.191.62.10:y</code>"; when the reply arrives for <code>10.191.62.10:y</code>, conntrack finds that record and reverses the translation, delivering it back to <code>10.10.0.2:x</code>. This is the switchboard's log of calls currently in progress — without it, NAT could translate outgoing packets but could never match the returns. You watch it with <code>conntrack -L</code>.</p>
+<p>Two consequences bite for real, and both are worth committing to memory:</p>
+<ul>
+<li><strong>A rule changed mid-flow does nothing to flows already in the table.</strong> Once a connection is tracked, its packets follow the <em>recorded</em> state, not the current rules. So a NAT/DNAT rule you fix appears not to work — until you retry with a <em>fresh</em> connection, which creates a new conntrack entry that sees the new rule. (This is a whole debugging drill in B9.20.)</li>
+<li><strong>The table is finite.</strong> It has a maximum size (<code>net.netfilter.nf_conntrack_max</code>); a machine under heavy connection churn can fill it and then logs <code>nf_conntrack: table full, dropping packet</code> and drops traffic that every rule says should pass. A NAT box that mysteriously drops connections under load is very often a full conntrack table.</li>
+</ul>
+<div class="flow"><span>request out: log flow + NAT</span><em>→</em><span class="hot">conntrack table (the switchboard log)</span><em>→</em><span>reply in: match &amp; un-NAT</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch a tracked, NAT'd flow appear. Start a slow ping from <code>red</code> in the background, then list the conntrack entry for it — you'll see the original tuple and the masqueraded reply tuple side by side.
+<pre class="cmd">multipass shell sandbox
+sudo ip netns exec red ping -i0.5 1.1.1.1 &gt;/dev/null &amp;
+sleep 1; sudo conntrack -L 2&gt;/dev/null | grep '1.1.1.1' | head -1
+sudo pkill -f 'ping -i0.5' 2&gt;/dev/null</pre>
+<pre class="out">icmp 1 29 src=10.10.0.2 dst=1.1.1.1 ... <b>src=1.1.1.1 dst=10.191.62.10</b> ... mark=0
+#          ↑ original (private)              ↑ reply tuple: how the answer comes back, then un-NAT'd</pre></li>
+<li>See the table's size and its ceiling — the numbers behind the "table full" failure. On a busy NAT box these climb toward the max.
+<pre class="cmd">sudo sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count</pre>
+<pre class="out">net.netfilter.nf_conntrack_max = 262144      ← the ceiling
+net.netfilter.nf_conntrack_count = 41        ← current flows; "table full" happens when count hits max</pre></li>
+<li>Watch an entry expire. Open a short TCP connection, see it as <code>ESTABLISHED</code>/<code>ASSURED</code>, then watch it age out of the table after it closes.
+<pre class="cmd">sudo ip netns exec red sh -c 'curl -s -o /dev/null http://1.1.1.1 &amp; sleep 1; :'
+sudo conntrack -L -p tcp 2&gt;/dev/null | grep -m1 'dport=80' || echo '(flow already expired)'</pre>
+<pre class="out">tcp 6 110 ESTABLISHED src=10.10.0.2 ... dport=80 ... [ASSURED] ...   ← a live tracked TCP flow
+# moments after close it transitions to TIME_WAIT and is then removed — the memory is temporary</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What does conntrack store, and why can NAT not work without it? (It stores every flow's 4-tuple plus any NAT translation applied, so that when a reply arrives the kernel can match it to the outgoing flow and reverse the translation; without that memory the router could rewrite outbound packets but never map the replies back to the private origin.) Then: you fix a broken DNAT rule but the connection you already had open still misbehaves — why, and what makes it work? (The existing flow is pinned to its recorded conntrack state and ignores the new rule; a <em>fresh</em> connection creates a new entry that sees the corrected rule — so you retry, you don't wait.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>conntrack tracks UDP and even ICMP too, despite those being "connectionless" — it uses timeouts rather than handshake state to decide when a "flow" is over, which is why a DNS-heavy or ICMP-heavy load can still fill the table. Each protocol has its own idle timeout (short for UDP, long for established TCP), tunable via the <code>nf_conntrack_*_timeout_*</code> sysctls. So "connectionless" at the protocol layer doesn't mean "untracked" at the NAT layer.</p>
+<p>The "table full" failure is nasty precisely because it's <em>load-dependent and rule-independent</em>: every firewall rule says the traffic should pass, packets are being dropped anyway, and the only evidence is the kernel log line and a <code>count</code> pinned near <code>max</code>. When a busy NAT box or node drops a fraction of connections under load with no rule explaining it, check <code>nf_conntrack_count</code> against <code>nf_conntrack_max</code> before anything else — it's a five-second check that saves hours.</p>
+<div class="k8s-link">
+<p>conntrack is load-bearing for kube-proxy: every Service connection is a DNAT'd flow whose return path depends on a conntrack entry, and the entry is what <em>pins</em> a given client connection to the one backend pod it was first balanced to (so a long-lived connection keeps hitting the same pod). Two famous cluster incidents follow directly: nodes under heavy connection churn hitting <code>nf_conntrack: table full</code> and dropping traffic (the fix is raising <code>nf_conntrack_max</code>), and a <em>stale</em> conntrack entry still steering traffic to a pod that has already been deleted — which is why kube-proxy actively deletes conntrack entries when endpoints change, and why "flush conntrack" is a real remediation. You reproduce that stale-entry fault in B9.20.</p>
+<p>The conntrack-backed ClusterIP datapath is <a href="w4.html#cp-4-9">W4.9</a>; endpoint readiness deciding which backends conntrack may pin to is <a href="w4.html#cp-4-11">W4.11</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 conntrack</code> for listing (<code>-L</code>), filtering (<code>-p</code>, <code>--dport</code>) and deleting (<code>-D</code>, <code>-F</code>) entries; the kernel's <code>Documentation/networking/nf_conntrack-sysctl.rst</code> for <code>nf_conntrack_max</code>, <code>nf_conntrack_count</code> and the per-protocol timeouts. <code>/proc/net/nf_conntrack</code> is the raw table if <code>conntrack</code> isn't installed. In the exam docs, conntrack tuning appears in kube-proxy and large-cluster guidance.</p>
+</article>
+
+</div><!-- /g-egress -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
