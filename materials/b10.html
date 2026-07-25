@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B10: names — how a hostname becomes an IP address, taken apart in order. The resolver library and /etc/nsswitch.conf's hosts: line (why ping and dig can disagree); /etc/hosts as the oldest name database, proved with tcpdump; /etc/resolv.conf line by line — nameserver, search, options ndots; watching a short name fan out into a series of queries and the trailing dot that stops it; recursive vs authoritative nameservers; the root → TLD → authoritative delegation walk with dig +trace; systemd-resolved's 127.0.0.53 stub on Ubuntu 24.04; the record types A, AAAA, CNAME, PTR, SRV, TXT, NS and what each is for; reading a dig answer completely — sections, status, flags, query time; TTL as the cache contract; negative caching and resolvectl flush-caches; a mini project running dnsmasq with a fake zone resolved from inside a B9 network namespace; and a debugging drill covering a wrong nameserver, a search domain that silently rewrites a query, and a stale cached record.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B10 · Names: DNS and resolution — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B10 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+    <li><a href="b9.html">B9 · Networking II</a></li>
+    <li><a href="b10.html">B10 · DNS &amp; names</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b10">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B10 — Names: DNS and resolution</h1>
+  <p>"It's always DNS" is the oldest joke in operations, and it is funny for an unflattering reason: DNS is the layer almost nobody sits down and learns. People pick up fragments — <code>/etc/hosts</code> exists, <code>dig</code> prints something, restarting things sometimes helps — and then spend years treating name resolution as weather. This module takes it apart in order and leaves you with no mystery in it. A name becomes an address through a specific chain of software, each link of which you can read, test and break on purpose: the program's call into the C library, the library's list of sources to try, a static file, a configuration file with three kinds of line, a query on the wire, a resolver that walks the internet's tree on your behalf, and a cache that remembers the answer — including, awkwardly, remembering failure.</p>
+  <p>We work outward from the program. <strong>The client side</strong>: who actually resolves (the resolver library, not "DNS"), why <code>ping</code> and <code>dig</code> can honestly disagree, and how the three lines of <code>/etc/resolv.conf</code> turn one short name into a series of queries. <strong>The system side</strong>: the difference between a resolver that does legwork and a server that holds truth, the root → TLD → authoritative walk you can watch yourself, and the local stub listener Ubuntu 24.04 puts in front of everything. <strong>Records and caching</strong>: what each record type is <em>for</em>, how to read a <code>dig</code> answer completely rather than squinting at the middle of it, and why TTLs and negative caching make DNS changes feel non-deterministic. Then you run your own resolver, serve your own zone, and resolve it from inside a network namespace you built in B9 — after which Kubernetes' <code>ndots:5</code> and its four-rung search ladder will read as ordinary configuration you could have written yourself.</p>
+  <div class="weights">
+    <span>Checkpoints<b>13</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>B8 (B9 helpful)</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Name the software that actually resolves a hostname — the C library's resolver — and read <code>/etc/nsswitch.conf</code>'s <code>hosts:</code> line to say which sources it tries and in what order.</li>
+<li>Explain from first principles why <code>ping myhost</code> can succeed while <code>dig myhost</code> returns nothing, and know which of the two tests what your application does.</li>
+<li>Use <code>/etc/hosts</code> deliberately, and prove with <code>tcpdump</code> that a name answered from it puts no packet on the wire.</li>
+<li>Read <code>/etc/resolv.conf</code> line by line — <code>nameserver</code>, <code>search</code>, <code>options ndots:N</code> — and predict the queries a given short name will generate.</li>
+<li>Watch one short name fan out into a series of queries in the right order, and stop the fan-out on demand with a trailing dot.</li>
+<li>Distinguish a recursive resolver from an authoritative server, and say which one your machine is configured to talk to.</li>
+<li>Follow the root → TLD → authoritative delegation walk with <code>dig +trace</code> and explain why each step is a referral rather than an answer.</li>
+<li>Explain the <code>127.0.0.53</code> stub on Ubuntu 24.04, find the real upstreams with <code>resolvectl status</code>, and know why hand-editing <code>/etc/resolv.conf</code> stops working.</li>
+<li>Say what each record type is for — A, AAAA, CNAME, PTR, SRV, TXT, NS — and query one of each.</li>
+<li>Read a <code>dig</code> answer completely: QUESTION/ANSWER/AUTHORITY/ADDITIONAL, <code>status:</code>, the flags, and the query time.</li>
+<li>Route an investigation from the status field alone — <code>NXDOMAIN</code> (the name doesn't exist) versus <code>SERVFAIL</code> (the server failed trying).</li>
+<li>Prove you were served from a cache by watching a TTL count down, and explain why a DNS change is never instant.</li>
+<li>Explain negative caching — why a name can keep failing after it starts existing — and flush deliberately with <code>resolvectl flush-caches</code>.</li>
+<li>Run your own resolver with a private zone, point a machine and a network namespace at it, and watch the query cross a veth.</li>
+<li>Diagnose the three classic resolution faults — wrong nameserver, a search domain that rewrites the query, a stale cached record — from their symptoms alone.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B8</strong> is the real prerequisite: you need UDP, ports and <code>tcpdump</code> to watch a query leave the machine and an answer come back, and the whole module leans on being able to see the wire. <strong>B9</strong> is helpful rather than required — the mini project resolves names from inside the <code>red</code> namespace on the <code>br0</code> bridge you built there, and the last lab is much more satisfying if you can watch a query cross a veth you made yourself. Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster. This module changes name resolution on that VM on purpose — it points the machine at a resolver you wrote, and later breaks resolution three ways — so take a snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>). Install the tools once up front: <code>sudo apt-get install -y dnsutils tcpdump dnsmasq</code> (<code>dnsutils</code> is the package that provides <code>dig</code>; <code>resolvectl</code> ships with systemd and is already there). If <code>dnsmasq</code>'s service fails to start on install, that is expected and is explained — and fixed — in <a href="#cp-b10-12">B10.12</a>.</p>
+</div>
+
+<!-- ---------------- The client side ---------------- -->
+<div class="grp" id="g-client"><h3>The client side</h3>
+
+<article class="lesson" id="cp-b10-1" data-id="b10-1">
+<div class="lesson-head"><span class="cp-id">B10.1</span><h4>Who actually resolves a name: the resolver library and nsswitch.conf</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>When a program wants to talk to <code>example.com</code>, something has to turn that text into an IP address before a single packet can be addressed. Most people call that something "DNS" and stop. It is worth being more precise, because the imprecision is the direct cause of the most confusing symptom in this whole field: <code>ping myhost</code> works, <code>dig myhost</code> finds nothing, and both people in the argument are correct. Once you know exactly which piece of software does the resolving, and how it decides where to look, that symptom stops being a paradox and becomes a one-line diagnosis.</p>
+<h5>The concept</h5>
+<p>Programs don't speak DNS. A program calls a function in the C library — historically <code>gethostbyname()</code>, today <code><abbr title="the standard C-library call that turns a hostname (and optional service) into a list of socket addresses">getaddrinfo()</abbr></code> — and hands it a name. Everything after that is the library's business. That bundle of library code is called the <strong>resolver</strong>, and DNS is only <em>one</em> of the places it may look. It might also look in a local file, or ask a local daemon, or use multicast discovery on the LAN. The program never finds out which; it gets an address back and moves on.</p>
+<p>What tells the resolver where to look, and in which order, is a single line in <code>/etc/nsswitch.conf</code> — the <strong>name service switch</strong>, a table that says "for each kind of lookup, here are the sources to try, left to right." The line that matters here is the one starting <code>hosts:</code>. Each word on it names a plug-in module the library will load and ask, in order, until one of them produces an answer:</p>
+<ul>
+<li><code>files</code> — read <code>/etc/hosts</code>, the static local table (<a href="#cp-b10-2">B10.2</a>). No network involved at all.</li>
+<li><code>dns</code> — do a real DNS query to whichever servers <code>/etc/resolv.conf</code> lists (<a href="#cp-b10-3">B10.3</a>). This is the only entry that puts a packet on the wire in the classic way.</li>
+<li><code>resolve</code> — hand the question to <code>systemd-resolved</code> over a local socket and let <em>it</em> decide (<a href="#cp-b10-7">B10.7</a>), which is how Ubuntu's caching stub gets involved.</li>
+<li><code>mdns4_minimal</code> — try multicast DNS on the local link, the <code>.local</code> zeroconf mechanism used to find printers and the like.</li>
+<li><code>myhostname</code> — synthesise answers for the machine's own name and <code>localhost</code>, so those work even with no files and no network.</li>
+</ul>
+<p>Between the modules you'll see bracketed <strong>actions</strong> like <code>[NOTFOUND=return]</code> or <code>[!UNAVAIL=return]</code>. They control what happens on a given result rather than adding a source. <code>[NOTFOUND=return]</code> means "if that module answered <em>definitively, the name does not exist</em>, stop here and report failure — do not try the modules further right." <code>[!UNAVAIL=return]</code> means the opposite emphasis: keep going to the next module only when this one was unavailable (not running), otherwise trust its verdict. These brackets are why order alone doesn't tell you the whole story — a module in the middle of the line can end the search.</p>
+<p>Now the paradox dissolves. <code>ping</code> calls <code>getaddrinfo()</code>, so it walks this whole line and may be answered by <code>/etc/hosts</code>, by mDNS or by <code>systemd-resolved</code>'s cache without any DNS query leaving the machine. <code>dig</code> does not use the resolver library at all: it builds a DNS packet itself and sends it straight to a nameserver. They are testing different systems. <code>dig</code> tests <em>the DNS server</em>; <code>getaddrinfo()</code> tests <em>what your application will actually experience</em>. When they disagree, that difference is the finding, not a nuisance.</p>
+<div class="flow"><span>program</span><em>→</em><span>getaddrinfo()</span><em>→</em><span class="hot">nsswitch hosts: files → dns</span><em>→</em><span>/etc/hosts</span><em>or</em><span>a DNS query</span></div>
+<p>The chain a name walks: the program asks the C library, the library consults the switch, and only the <code>dns</code> entry produces a packet.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the switch line that governs every hostname lookup on this machine. Yours may differ from the output shown — read <em>your</em> line and name the sources in order.
+<pre class="cmd">multipass shell sandbox
+grep '^hosts:' /etc/nsswitch.conf</pre>
+<pre class="out">hosts:          <b>files</b> mdns4_minimal [NOTFOUND=return] <b>dns</b>
+    # some images show plain "files dns", others insert "resolve [!UNAVAIL=return]"
+    # in every variant, files comes first and dns is the fallback</pre></li>
+<li>Watch the resolver actually walk that line. <code>getent hosts</code> is the command-line front end to exactly the same library call your programs make, so it is the honest test of "what will my application get?"
+<pre class="cmd">getent hosts localhost        # answered without any network
+getent ahosts example.com | head -3   # ahosts shows every address the resolver returns</pre>
+<pre class="out">127.0.0.1       localhost         ← came from /etc/hosts via the "files" module
+23.220.75.232   STREAM example.com   ← came from the "dns" module, over the network</pre></li>
+<li>Prove the two tools take different paths. Ask <code>dig</code> for the machine's own hostname — a name that resolves fine through the library — and watch DNS alone come up empty.
+<pre class="cmd">hostname                                   # this machine's name
+getent hosts "$(hostname)"                 # via the resolver library: works
+dig +short "$(hostname)"                   # via DNS only: nothing</pre>
+<pre class="out">sandbox
+127.0.1.1       sandbox        ← the library found it in /etc/hosts
+                               ← dig printed nothing: no DNS record exists for it</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking, answer three questions. Which function do ordinary programs call to resolve a name, and which file decides where that function looks? (<code>getaddrinfo()</code> in the C library; <code>/etc/nsswitch.conf</code>'s <code>hosts:</code> line.) A colleague says "DNS is broken" because <code>dig myhost</code> returns nothing, yet the application connects fine — who is right? (Both: <code>dig</code> correctly reports there is no DNS record, and the application correctly gets an answer from an earlier source such as <code>/etc/hosts</code>. Nothing is broken; they are testing different systems.) And which of <code>dig</code> or <code>getent hosts</code> tells you what your application will experience? (<code>getent hosts</code> — it uses the same library path the application does.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The trap is reaching for <code>dig</code> as the universal DNS test. It is a superb tool for testing <em>a nameserver</em> and a misleading one for testing <em>an application's resolution</em>, because it skips <code>/etc/hosts</code>, skips <code>nsswitch.conf</code> and skips any local caching daemon. Half of all "but it works from my machine" arguments are one person using <code>dig</code> and the other using the application. The discipline that saves you: when a program can't resolve something, test with <code>getent hosts NAME</code> first (does the program's path work?) and only then with <code>dig NAME</code> (does DNS itself work?). The pair of answers localises the fault immediately — library path works but DNS doesn't means something local is answering; DNS works but the library path doesn't means the switch, or a file, is intercepting.</p>
+<p>The second trap is assuming order is everything on the <code>hosts:</code> line. A bracketed action such as <code>[NOTFOUND=return]</code> can terminate the search in the middle, so a module listed further right may never be consulted even though "the order says it should be." If a lookup fails in a way that makes no sense given the sources you can see, read the brackets, not just the words.</p>
+<div class="k8s-link">
+<p>Inside a pod, this same line is the reason two debugging commands can tell different stories. Pods get a generated <code>/etc/resolv.conf</code> and an <code>/etc/hosts</code> the kubelet writes (including any <code>hostAliases</code> you set), and the application resolves through <code>getaddrinfo()</code> exactly as here — so a name can work for <code>curl</code> and appear absent to <code>dig</code>, or vice versa. When you eventually debug "the app can't reach the Service," the first fork in the road is the one you just learned: is the resolver library's path broken, or is CoreDNS broken?</p>
+<p>The pod's generated resolver configuration is <a href="w4.html#cp-4-16">W4.16</a>; the cluster DNS debugging ladder, where this distinction is the first rung, is <a href="w4.html#cp-4-18">W4.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 nsswitch.conf</code> is the definitive reference for the switch line, including the full action syntax in brackets. <code>man 3 getaddrinfo</code> documents what programs actually call and the shape of what comes back. <code>man 8 nss-resolve</code> explains the <code>resolve</code> module and its interaction with <code>dns</code>; <code>man 8 nss-myhostname</code> covers the synthesised local names. <code>man 1 getent</code> shows how to query any switch database from the shell. No exam-docs page covers this layer — Kubernetes assumes it, which is why it belongs here.</p>
+</article>
+
+<article class="lesson" id="cp-b10-2" data-id="b10-2">
+<div class="lesson-head"><span class="cp-id">B10.2</span><h4>/etc/hosts: the oldest name database, and proving nothing left the machine</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Before DNS existed, the entire internet's name-to-address mapping was one file that people copied around. That file still exists on your machine, it is still consulted first, and it still wins over any DNS server on earth. That makes it the fastest way to test "would this work if the name pointed at that IP?" without touching any server — and, when someone has quietly put a line in it, the most invisible cause of "this machine resolves that name differently from every other machine."</p>
+<h5>The concept</h5>
+<p><code>/etc/hosts</code> is a plain text file mapping addresses to names: an IP address, whitespace, then one or more names for it. The first field is the address, the rest are aliases; lines starting with <code>#</code> are comments. There is no zone, no server, no TTL and no expiry — it is a static table, read fresh from disk on each lookup, and because <code>files</code> sits first on the <code>hosts:</code> switch line (<a href="#cp-b10-1">B10.1</a>), an entry here short-circuits the whole rest of the resolution chain.</p>
+<p>Two properties follow, and both are load-bearing:</p>
+<ul>
+<li><strong>It is authoritative locally and invisible globally.</strong> Only this machine sees it. That's what makes it a perfect test instrument — you can point a production hostname at a test server for one machine, for one afternoon — and what makes a forgotten entry so maddening, because every diagnostic on <em>other</em> machines will disagree with this one and nothing in DNS will explain why.</li>
+<li><strong>It generates no traffic.</strong> A name answered from this file produces zero packets. This is provable, and proving it is the lab: run <code>tcpdump</code> on port 53 and watch a resolution happen in complete silence. That silence is itself a diagnostic — if you are debugging a name and see no DNS query at all, something local answered.</li>
+</ul>
+<p>One nuance worth carrying: on a system running <code>systemd-resolved</code> (<a href="#cp-b10-7">B10.7</a>), <code>/etc/hosts</code> may be read by the stub resolver rather than by the <code>files</code> module — resolved parses the file itself and answers from it, with caching. The effect is the same (no query leaves the box, the local mapping wins), but it explains why a <code>tcpdump</code> on the external interface stays quiet even for names you did <em>not</em> put in <code>/etc/hosts</code>: the loopback conversation with the stub is a different capture.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the file you already have. Every Linux machine ships with at least loopback and its own hostname here — which is why <code>localhost</code> resolves with the network unplugged.
+<pre class="cmd">cat /etc/hosts</pre>
+<pre class="out">127.0.0.1 localhost
+<b>127.0.1.1 sandbox</b>          ← the machine's own name, mapped locally
+::1 ip6-localhost ip6-loopback  ← the IPv6 equivalents</pre></li>
+<li>Add your own mapping. Pick a name that certainly does not exist in DNS, so there is no ambiguity about where the answer came from.
+<pre class="cmd">echo '192.0.2.10  shop.internal  shop' | sudo tee -a /etc/hosts
+getent hosts shop.internal</pre>
+<pre class="out">192.0.2.10      shop.internal shop     ← resolved instantly, with both names</pre></li>
+<li>Now prove no query was sent. Start a capture on all interfaces filtered to DNS traffic, resolve the name in a second shell, and watch nothing appear. Then resolve a real internet name in the same window and watch packets fly — the contrast is the whole lesson.
+<pre class="cmd"># window 1:
+sudo tcpdump -nn -i any port 53
+# window 2:
+getent hosts shop.internal        # answered from /etc/hosts
+getent hosts example.com          # answered by DNS</pre>
+<pre class="out">listening on any, link-type LINUX_SLL2 ...
+    <b>(nothing at all while shop.internal is resolved)</b>
+14:02:19.556 IP 127.0.0.1.41290 &gt; 127.0.0.53.53: 4512+ A? example.com. (29)
+14:02:19.577 IP 127.0.0.53.53 &gt; 127.0.0.1.41290: 4512 1/0/0 A 23.220.75.232 (45)</pre></li>
+<li>Confirm that the file wins even against a name DNS <em>can</em> answer. Map a real domain to an obviously wrong address, resolve it, then remove the line so you don't leave a trap behind.
+<pre class="cmd">echo '203.0.113.99  example.com' | sudo tee -a /etc/hosts
+getent hosts example.com          # the local file overrides the internet
+dig +short example.com            # dig ignores /etc/hosts entirely
+sudo sed -i '/203.0.113.99/d' /etc/hosts    # clean up</pre>
+<pre class="out">203.0.113.99    example.com       ← getent: the local file won
+23.220.75.232                      ← dig: DNS still says the real address</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You should be able to state, and have just witnessed, that a name in <code>/etc/hosts</code> resolves with no packet on the wire, and that it overrides DNS for every program that uses the resolver library. Confirm the residual entry is still working (<code>getent hosts shop.internal</code> returns <code>192.0.2.10</code>) and that your <code>example.com</code> override is gone (<code>getent hosts example.com</code> now agrees with <code>dig +short example.com</code>). Then explain in one sentence why step 4 produced two different answers from two tools on the same machine.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The overriding gotcha is the invisible override. Because this file is consulted before anything else and leaves no trace in any log or capture, an entry someone added months ago will silently defeat every DNS-side investigation you run. When one machine disagrees with all the others about a name, <code>/etc/hosts</code> is the first place to look — before the resolver, before the server, before the zone. It costs one <code>grep</code> and it has ended many long afternoons.</p>
+<p>A milder one: the file has no TTL and no expiry, so nothing ever cleans it up. Test entries survive reboots, image builds and the departure of whoever added them. If you add a line for a temporary purpose — as you just did — remove it when you're finished, or at minimum comment it with a date and reason. And note that <code>dig</code> ignoring the file (step 4) is not a bug: <code>dig</code> is a DNS tool, and <code>/etc/hosts</code> is not DNS.</p>
+<div class="k8s-link">
+<p>Containers have their own <code>/etc/hosts</code> — it is written into the container filesystem at start-up, which is why editing it inside a running pod survives no restart at all. Kubernetes exposes controlled additions to it through a pod's <code>hostAliases</code> field, which is exactly the mechanism you just used by hand: a static name-to-IP mapping consulted before DNS, per pod. And "the container's <code>/etc/hosts</code> has an entry nobody expected" is the containerised version of the invisible override above.</p>
+<p>The generated pod resolver files, including <code>/etc/hosts</code> and <code>hostAliases</code>, are covered in <a href="w4.html#cp-4-16">W4.16</a>; the DNS debugging ladder that checks them is <a href="w4.html#cp-4-18">W4.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 hosts</code> is one page and worth reading end to end — the field order, aliases, and the fact that it is consulted per the switch. <code>man 5 nsswitch.conf</code> for <em>why</em> it is consulted first. <code>man 8 tcpdump</code> for the capture filter used here (<code>-i any</code>, <code>port 53</code>, <code>-nn</code> to keep numbers numeric so the capture doesn't itself trigger lookups). For the systemd-resolved interaction, <code>man 8 systemd-resolved</code> documents that it reads <code>/etc/hosts</code> internally.</p>
+</article>
+
+<article class="lesson" id="cp-b10-3" data-id="b10-3">
+<div class="lesson-head"><span class="cp-id">B10.3</span><h4>/etc/resolv.conf line by line: nameserver, search, options ndots</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This file is the entire client-side configuration of DNS on a Unix machine, and it has effectively three kinds of line. Read it fluently and you can predict, before running anything, exactly which queries a given name will produce and in which order. That prediction skill is what turns Kubernetes' famous <code>ndots:5</code> from folklore into arithmetic — because a pod's version of this file is generated from precisely these same three fields.</p>
+<h5>The concept</h5>
+<p>When the <code>dns</code> module on the switch line is reached (<a href="#cp-b10-1">B10.1</a>), it reads <code>/etc/resolv.conf</code> to learn three things:</p>
+<ul>
+<li><strong><code>nameserver IP</code></strong> — who to ask. You may list up to three; they are tried <em>in order</em>, and the second is only consulted when the first fails to answer within a timeout, not when it answers "no such name." That distinction matters enormously: a healthy server saying <code>NXDOMAIN</code> ends the query, so a backup nameserver does not rescue you from a wrong-but-responsive one. Failover here is for a <em>dead</em> server, not a wrong one.</li>
+<li><strong><code>search dom1 dom2 …</code></strong> — a list of domains to append to short names. With <code>search example.com corp.example.com</code>, the name <code>web</code> may be tried as <code>web.example.com.</code> then <code>web.corp.example.com.</code>. This is a convenience for typing short names inside an organisation, and it is also the single sneakiest source of "it resolved, but to the wrong host."</li>
+<li><strong><code>options ndots:N</code></strong> — the threshold that decides whether a name is treated as short or as complete. If a name contains <strong>fewer than N dots</strong>, the resolver tries it against the search list <em>first</em>, and only tries it as-typed afterwards. If it contains N or more dots, the name is tried as-typed first. The default is <code>ndots:1</code>, meaning any name with no dots at all (<code>web</code>) gets the search treatment while anything with a dot (<code>example.com</code>) is tried literally first.</li>
+</ul>
+<p>Put those together and the algorithm for one lookup is mechanical. Count the dots in the name. If that count is less than <code>ndots</code>, generate one query per search domain (name + "." + domain), in list order, and only if all of them fail, query the name by itself. If the count is <code>ndots</code> or more, query the name by itself first, and fall back to the search list if that fails. Every query goes to <code>nameserver</code> #1 until it times out.</p>
+<p>Now the Kubernetes number makes sense in advance of ever meeting it. A pod is handed <code>options ndots:5</code> and a search list of four domains. Any name with fewer than five dots — which is nearly every name a human types, including <code>google.com</code> with its single dot — is tried against all four search domains first, producing four failures before the real query succeeds. That is not a bug and not magic; it is this algorithm, with these two numbers, doing exactly what it says.</p>
+<div class="flow"><span>name "web"</span><em>→</em><span>dots(0) &lt; ndots(1)?</span><em>yes →</em><span class="hot">web.example.com.</span><em>fails →</em><span>web.</span></div>
+<p>The dot count decides the order: short names go through the search list first, complete names are tried as-typed first.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the file as it stands. On Ubuntu 24.04 it is a symlink to a generated file, and it will point at the local stub — both of which are explained in <a href="#cp-b10-7">B10.7</a>; for now just read the three kinds of line.
+<pre class="cmd">ls -l /etc/resolv.conf
+cat /etc/resolv.conf</pre>
+<pre class="out">lrwxrwxrwx 1 root root 39 ... /etc/resolv.conf -&gt; <b>../run/systemd/resolve/stub-resolv.conf</b>
+nameserver <b>127.0.0.53</b>        ← the local stub, not an upstream server
+options edns0 trust-ad
+search .                       ← an empty search list on a fresh cloud VM</pre></li>
+<li>Look at the same configuration from the resolver's point of view, including the defaults you did not write. <code>resolvectl</code> shows the effective values rather than the file's text.
+<pre class="cmd">resolvectl status | head -20</pre>
+<pre class="out">Global
+       Protocols: +LLMNR +mDNS ...
+resolv.conf mode: stub
+Link 2 (ens3)
+    Current Scopes: DNS
+         DNS Servers: <b>192.168.64.1</b>      ← the real upstream behind the stub
+          DNS Domain: <b>~.</b>                 ← a routing domain; see B10.7</pre></li>
+<li>Do the dot-counting by hand before you ever watch it on the wire (that is <a href="#cp-b10-4">B10.4</a>'s job). Count the dots in each name and apply the rule: fewer than <code>ndots</code> means the search list is tried first.
+<pre class="cmd">printf '%s\n' "web" "web.corp" "api.web.corp" | \
+  awk '{n=gsub(/\./,"."); print $0, "dots="n, (n&lt;1 ? "search first" : "literal first")}'</pre>
+<pre class="out">web dots=0 search first          ← 0 &lt; ndots(1): try search domains first
+web.corp dots=1 literal first    ← 1 &gt;= ndots(1): try as typed first
+api.web.corp dots=2 literal first</pre></li>
+<li>See the Kubernetes numbers applied to the same arithmetic — with <code>ndots:5</code>, ordinary names flip to the other branch.
+<pre class="cmd">printf '%s\n' "web" "web.corp" "google.com" "api.web.svc.cluster.local" | \
+  awk '{n=gsub(/\./,"."); print $0, "dots="n, (n&lt;5 ? "SEARCH LIST FIRST" : "literal first")}'</pre>
+<pre class="out">web dots=0 SEARCH LIST FIRST
+web.corp dots=1 SEARCH LIST FIRST
+<b>google.com dots=1 SEARCH LIST FIRST</b>    ← why external lookups from a pod are slow
+api.web.svc.cluster.local dots=4 SEARCH LIST FIRST</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Answer these from the rule, not from memory of the output. With <code>search example.com corp.example.com</code> and <code>options ndots:1</code>, how many queries will <code>web</code> produce at most, and in what order? (Up to three: <code>web.example.com.</code>, then <code>web.corp.example.com.</code>, then <code>web.</code> on its own.) With <code>options ndots:5</code>, how many will <code>google.com</code> produce before the successful one? (One per search domain first — with four search domains, four failures, then the literal query.) And why does adding a second <code>nameserver</code> line not protect you from a nameserver that answers wrongly? (Because a definite answer, including <code>NXDOMAIN</code>, ends the lookup — the second server is only tried when the first fails to respond at all.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most expensive misunderstanding here is treating multiple <code>nameserver</code> lines as redundancy. They protect against a server that is <em>down</em>, and not at all against a server that is <em>up and wrong</em>: the first server's authoritative-sounding "that name doesn't exist" terminates the search before the second is ever asked. If a resolver is returning bad answers, adding a backup changes nothing; you must fix or remove the bad one.</p>
+<p>The second is forgetting that <code>ndots</code> interacts with the search list to make lookups <em>slower</em>, not just different. Every search-list attempt is a real query with a real round trip and a real timeout budget. A high <code>ndots</code> combined with a long search list means every external name pays for several failures first — which is exactly the well-known Kubernetes DNS performance complaint, and why appending a trailing dot (<a href="#cp-b10-4">B10.4</a>) is such an effective fix for hot paths.</p>
+<p>Finally: on this machine the file is a symlink to generated content. Editing it directly appears to work and then silently reverts when something regenerates it — covered properly in <a href="#cp-b10-7">B10.7</a>. Resist the urge to <code>vi /etc/resolv.conf</code> until you've read that lesson.</p>
+<div class="k8s-link">
+<p>Every pod gets this exact file, generated by the kubelet: <code>nameserver</code> pointing at the cluster DNS Service address, <code>search</code> carrying <code>&lt;namespace&gt;.svc.cluster.local svc.cluster.local cluster.local</code> (plus any node search domains), and <code>options ndots:5</code>. That search list is what lets one pod reach another Service by bare name — <code>curl http://payments</code> works because <code>payments</code> is tried as <code>payments.&lt;namespace&gt;.svc.cluster.local</code> first. And the <code>ndots:5</code> that makes external lookups cost four extra queries is the same arithmetic you just did by hand. You can override all three fields per pod with <code>dnsConfig</code>.</p>
+<p>The pod's <code>resolv.conf</code> and the full <code>ndots:5</code> ladder is <a href="w4.html#cp-4-16">W4.16</a>; the record shapes those search domains resolve to are <a href="w4.html#cp-4-17">W4.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 resolv.conf</code> is the authoritative list of every directive and option, including <code>ndots</code>, <code>timeout</code>, <code>attempts</code> and <code>rotate</code> — read the <code>options</code> section carefully, it is short and it is the whole game. <code>man 1 resolvectl</code> for reading the effective configuration rather than the file. <code>man 5 systemd-resolved.conf</code> for where the values on Ubuntu actually come from.</p>
+</article>
+
+<article class="lesson" id="cp-b10-4" data-id="b10-4">
+<div class="lesson-head"><span class="cp-id">B10.4</span><h4>Watch a short name fan out into a series of queries — and stop it with a dot</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The previous lesson gave you the rule on paper. This one makes you watch it happen on the wire, because seeing four queries leave the machine for one name you typed once is the moment the search list stops being abstract. It also hands you the single most useful DNS diagnostic there is: the trailing dot, which takes the search list out of the experiment entirely and tells you in one command whether your problem is the name, the zone, the server — or the search path.</p>
+<h5>The concept</h5>
+<p>A <strong>fully qualified domain name</strong> (FQDN) is a name written all the way to the root, and the root is written as a trailing dot: <code>example.com.</code> — with the final dot — is complete, while <code>example.com</code> is, strictly, a name the resolver may still add something to. That trailing dot is not decoration. It is an instruction: <em>this name is complete, ask exactly this, do not consult the search list.</em> Every DNS name on the wire is fully qualified; the search list is purely a client-side convenience that manufactures FQDNs from what you typed.</p>
+<p>So one typed name can become several queries, and the queries are what you can observe. Run a capture on port 53 (<a href="#cp-b10-2">B10.2</a>) while resolving a short name with a search list configured, and you see the fan-out in order: <code>name.searchdomain1.</code>, then <code>name.searchdomain2.</code>, and the literal <code>name.</code> last (assuming the dot count is below <code>ndots</code>). Each of those is a real round trip with a real cost. Add the trailing dot and the capture shows exactly one query.</p>
+<p>The diagnostic power comes from comparing the two. If <code>dig web.example.com.</code> (with the dot) succeeds but <code>web</code> alone fails, the zone and the server are fine and your <code>search</code> line is at fault. If the dotted form also fails, stop looking at the client entirely — the problem is upstream, in the server or the zone. One character splits the search space in half.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Give the machine a search domain to work with. Rather than editing the symlinked <code>/etc/resolv.conf</code> (<a href="#cp-b10-3">B10.3</a>), set it properly through <code>systemd-resolved</code> so it survives and can be undone cleanly.
+<pre class="cmd">sudo resolvectl domain ens3 example.com corp.example.com
+resolvectl domain ens3</pre>
+<pre class="out">Link 2 (ens3): <b>example.com corp.example.com</b>     ← two search domains, in order</pre></li>
+<li>Capture DNS traffic in one window and resolve a bare, non-existent short name in another. Count the queries and read their order — this is the fan-out, made visible.
+<pre class="cmd"># window 1:
+sudo tcpdump -nn -i any port 53
+# window 2:
+getent hosts nosuchhost</pre>
+<pre class="out">IP 127.0.0.1.35112 &gt; 127.0.0.53.53: A? <b>nosuchhost.example.com.</b> (40)
+IP 127.0.0.1.35112 &gt; 127.0.0.53.53: A? <b>nosuchhost.corp.example.com.</b> (45)
+IP 127.0.0.1.35112 &gt; 127.0.0.53.53: A? <b>nosuchhost.</b> (29)
+    ← one typed name, three queries, in search-list order then literal</pre></li>
+<li>Now do the same with a trailing dot and watch the search list be skipped entirely. This is the control experiment you will run for the rest of your career.
+<pre class="cmd"># window 2, with the capture still running:
+dig +short nosuchhost.example.com.     # explicitly complete: exactly one query</pre>
+<pre class="out">IP 127.0.0.1.41903 &gt; 127.0.0.53.53: A? <b>nosuchhost.example.com.</b> (40)
+    ← one query only; nothing else was tried</pre></li>
+<li>Now watch the <code>ndots</code> threshold pick the other branch. <code>example.org</code> has one dot, and the default <code>ndots</code> is 1 — one is not fewer than one, so this name is tried literally <em>first</em>, succeeds, and the search list is never reached. Same search configuration, one query instead of three, purely because of the dot count.
+<pre class="cmd">getent hosts example.org        # watch window 1</pre>
+<pre class="out">IP ... A? <b>example.org.</b> (29)          ← literal first: 1 dot &gt;= ndots 1
+    ← it answered, so example.org.example.com. was never asked</pre></li>
+<li>Put the search domains back to nothing so later lessons start clean.
+<pre class="cmd">sudo resolvectl domain ens3 ""
+resolvectl domain ens3</pre>
+<pre class="out">Link 2 (ens3):        ← empty again</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>With the capture running, you should be able to make the number of queries change on demand: bare short name with two search domains gives three queries; the same name with a trailing dot gives one. State what the trailing dot means (this name is complete — do not append anything) and give the one-line rule for using it as a diagnostic: <em>if it resolves with the dot and fails without it, the fault is in the search path, not in the server or the zone.</em></p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The dangerous version of the search list is not the slow one, it is the <em>silently successful</em> one. If you ask for <code>db</code> and your search list contains a domain where <code>db</code> happens to exist, you get a perfectly valid answer for a completely different machine — no error, no warning, and every tool reporting success. This is the fault you will practise in <a href="#cp-b10-13">B10.13</a>, and the trailing-dot test is what exposes it in seconds: ask for <code>db.</code> and watch the answer change or vanish.</p>
+<p>A second, subtler one: the search list applies to the resolver library, so <code>getent</code>/applications use it and <code>dig</code> mostly does not (<code>dig</code> has its own <code>+search</code>/<code>+nosearch</code> options and defaults to <em>not</em> searching). That is another way the two tools legitimately disagree, and another reason to test with <code>getent</code> when you care about what the application sees. If you want <code>dig</code> to imitate the application, pass <code>+search</code>.</p>
+<p>Finally, note the cost model: every search-list attempt is a round trip and, when a server is slow rather than absent, each one waits out a timeout. A short name with a long search list and an unhealthy first nameserver can take many seconds to fail — which users report as "the app hangs on startup," not as "DNS is misconfigured."</p>
+<div class="k8s-link">
+<p>This is precisely why a pod resolving <code>google.com</code> fires four failing queries first: with <code>ndots:5</code> and four search domains, <code>google.com</code> (one dot) is treated as a short name and walked through <code>google.com.default.svc.cluster.local</code>, <code>google.com.svc.cluster.local</code>, <code>google.com.cluster.local</code> and any node domain before the literal query succeeds. Writing <code>google.com.</code> with the trailing dot — or setting <code>dnsConfig.options ndots:1</code> for that pod — collapses all five into one, which is a standard fix for DNS-heavy workloads. It is also the fastest way to prove, inside a broken cluster, that CoreDNS itself is fine and the search path is the problem.</p>
+<p>The full cluster search ladder is walked in <a href="w4.html#cp-4-16">W4.16</a>; using it as a debugging step is <a href="w4.html#cp-4-18">W4.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 resolv.conf</code> for <code>search</code> and <code>ndots</code> semantics — in particular the sentence about names with a trailing dot never being modified. <code>man 1 dig</code> for <code>+search</code>/<code>+nosearch</code> and why <code>dig</code>'s default differs from the library's. <code>man 1 resolvectl</code> for <code>domain</code> (set a search domain per link) and the difference between a search domain and a routing domain written with a leading <code>~</code>. RFC 1034 §3.1 is the original statement that names are absolute when written to the root.</p>
+</article>
+
+</div><!-- /g-client -->
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
