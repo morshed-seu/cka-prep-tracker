@@ -307,6 +307,190 @@ resolvectl domain ens3</pre>
 
 </div><!-- /g-client -->
 
+<!-- ---------------- The system side ---------------- -->
+<div class="grp" id="g-system"><h3>The system side</h3>
+
+<article class="lesson" id="cp-b10-5" data-id="b10-5">
+<div class="lesson-head"><span class="cp-id">B10.5</span><h4>Two kinds of nameserver: recursive resolvers and authoritative servers</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Nameserver" is one word covering two jobs that have almost nothing in common. One does errands: it takes your question, chases the answer across the internet, and keeps a copy. The other holds truth: it owns the records for one slice of the namespace and answers only about that slice. Confusing them produces questions that can't be answered — "why doesn't my authoritative server resolve google.com?" — and, more practically, it is the distinction that makes CoreDNS's role in a cluster comprehensible, because CoreDNS is deliberately both at once.</p>
+<h5>The concept</h5>
+<p>An <strong>authoritative</strong> server is the source of truth for a <strong>zone</strong> — a contiguous chunk of the name tree such as <code>example.com</code> and everything beneath it. Its records were put there deliberately by whoever runs that zone. Ask it about a name in its zone and it answers definitively: here is the address, or that name does not exist, full stop. Ask it about anything <em>outside</em> its zone and, properly configured, it declines — not its business, and it has no idea.</p>
+<p>A <strong>recursive</strong> resolver holds no truth at all. It is the hotel operator who looks a name up before dialling: you give it a name, and it does the walking — asking the root servers, then the servers they point to, then the servers <em>they</em> point to, until it reaches an authoritative server that can answer (<a href="#cp-b10-6">B10.6</a>). Then it hands you the answer and, crucially, keeps a copy for as long as the record's TTL allows (<a href="#cp-b10-10">B10.10</a>) so the next person who asks gets it instantly. "Recursive" names the behaviour: it will recurse down the tree on your behalf, rather than replying "not mine, go ask someone else."</p>
+<p>The <code>nameserver</code> line in your <code>/etc/resolv.conf</code> (<a href="#cp-b10-3">B10.3</a>) always points at the recursive kind. Your machine is a <strong>stub resolver</strong> — it asks one question and expects a complete answer; it does no walking itself. That three-tier arrangement (stub → recursive → authoritative) is the shape of essentially every DNS deployment on earth.</p>
+<p>You can see which kind you're talking to in the flags of an answer (<a href="#cp-b10-9">B10.9</a>). A recursive resolver sets <code>ra</code> — "recursion available" — meaning it is willing to do the legwork. An authoritative answer carries <code>aa</code> — "authoritative answer" — meaning this server owns the record rather than remembering it. An answer with <code>ra</code> and no <code>aa</code> came from a cache or a chase; an answer with <code>aa</code> came from the horse's mouth.</p>
+<div class="flow"><span>your machine (stub)</span><em>→</em><span class="hot">recursive resolver</span><em>→</em><span>root</span><em>→</em><span>.com</span><em>→</em><span>authoritative for example.com</span></div>
+<p>Three tiers: you ask one question, the middle tier does all the walking, and only the last tier actually owns the record.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask your configured resolver a question and look at the flags. This is the recursive path — it will answer about a zone it does not own.
+<pre class="cmd">dig example.com A | grep -E 'flags:|ANSWER SECTION' -A2</pre>
+<pre class="out">;; flags: qr rd <b>ra</b>; QUERY: 1, ANSWER: 1, ...   ← ra = recursion available, no aa
+;; ANSWER SECTION:
+example.com.  1783  IN  A  23.220.75.232      ← an answer it fetched or cached for you</pre></li>
+<li>Now ask an authoritative server the same question directly. Find who is authoritative for the zone, then query one of those servers with <code>@</code> — and note the different flag.
+<pre class="cmd">dig +short NS example.com          # who owns this zone?
+dig @a.iana-servers.net example.com A | grep -E 'flags:|^example'</pre>
+<pre class="out">a.iana-servers.net.
+b.iana-servers.net.
+;; flags: qr <b>aa</b> rd; QUERY: 1, ANSWER: 1, ...   ← aa = authoritative, and no ra
+example.com.  86400  IN  A  23.220.75.232       ← note the full, un-decremented TTL</pre></li>
+<li>Prove the authoritative server refuses to do errands. Ask it about a zone it does not own — it will not chase the answer for you.
+<pre class="cmd">dig @a.iana-servers.net wikipedia.org A | grep -E 'status:|flags:|ANSWER:'</pre>
+<pre class="out">;; flags: qr; QUERY: 1, ANSWER: 0, AUTHORITY: 0
+    ← no ra: recursion is not available here; ANSWER: 0 — not its zone, not its problem</pre></li>
+<li>Contrast the two TTLs you just saw. The authoritative answer carried the record's full lifetime; the recursive one carried whatever was left of it (proof it came from a cache — the mechanism you'll pin down in <a href="#cp-b10-10">B10.10</a>).
+<pre class="cmd">dig +short +ttlunits example.com A          # via your resolver: partial TTL
+dig +short +ttlunits @a.iana-servers.net example.com A   # authoritative: full TTL</pre>
+<pre class="out">23.220.75.232        ← +short hides TTLs; re-run without +short to compare them side by side</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain in one sentence each: what a recursive resolver does that an authoritative server refuses to do (chase an answer through the tree on your behalf, for any zone, and cache the result), and what an authoritative server has that a recursive resolver does not (the actual records for a zone it owns, and the right to say definitively that a name in it does not exist). Then say which kind your <code>/etc/resolv.conf</code> points at (recursive — always) and which flag proves it (<code>ra</code>).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>An <strong>open recursive resolver</strong> — one that will do errands for anyone on the internet — is a genuine hazard, not just untidy: attackers use them as amplifiers, sending small forged queries that produce large answers aimed at a victim. That is why the resolver on your machine listens only on loopback, and why running the resolver you build in <a href="#cp-b10-12">B10.12</a> bound to a private address rather than <code>0.0.0.0</code> is the correct habit rather than a lab shortcut.</p>
+<p>The subtler gotcha is diagnosing at the wrong tier. If a name fails, asking your configured resolver tells you only that <em>something</em> in the chain failed. Asking the zone's authoritative server directly with <code>dig @server name</code> splits the problem cleanly in half: if the authoritative server answers correctly, the record exists and your resolver or the path to it is at fault; if the authoritative server also says no, the record genuinely isn't there and no amount of cache-flushing will help. Learn to bypass tiers deliberately — it is the fastest halving move in DNS debugging.</p>
+<div class="k8s-link">
+<p>CoreDNS in a cluster plays both roles in one process, which is why its configuration file has two distinct halves. It is <em>authoritative</em> for <code>cluster.local</code> — it owns the records for every Service and pod, generating them from the API rather than a zone file — and it is a <em>recursive forwarder</em> for everything else, passing external names on to the node's upstream resolvers. That dual identity explains the single most common cluster DNS symptom split: internal names failing (its authoritative half or its API watch is broken) versus external names failing (its forwarding half or the upstream is broken). Two different problems, two different fixes, told apart by which kind of name breaks.</p>
+<p>Reading CoreDNS's configuration plugin by plugin, including the <code>kubernetes</code> and <code>forward</code> halves, is <a href="w4.html#cp-4-15">W4.15</a>; splitting a failure by internal-versus-external is a rung of the ladder in <a href="w4.html#cp-4-18">W4.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">RFC 1034 §2.4 and §4 define the resolver-versus-name-server split in the original architecture and are surprisingly readable. <code>man 1 dig</code> for the <code>@server</code> syntax and the flag abbreviations (<code>aa</code>, <code>ra</code>, <code>rd</code>, <code>tc</code>). <code>man 5 named.conf</code> (if BIND is installed) shows how a real server is told to be one, the other, or both. For the amplification hazard, search "open resolver" — the operational literature is unanimous.</p>
+</article>
+
+<article class="lesson" id="cp-b10-6" data-id="b10-6">
+<div class="lesson-head"><span class="cp-id">B10.6</span><h4>The delegation walk: root → TLD → authoritative, watched with dig +trace</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Nobody, anywhere, holds a list of all the world's domain names. That fact is not a limitation — it is the design, and it is the reason DNS has scaled for forty years without a central database. Watching the walk once, with your own eyes, replaces a vague sense that "DNS is a distributed system" with a concrete picture of a tree where each level knows only who to ask next. It also explains why caching is not an optimisation but a structural necessity, and why a cluster's DNS is arranged the way it is.</p>
+<h5>The concept</h5>
+<p>The namespace is a tree, read right to left. <code>www.example.com.</code> is: the root (the final dot), then the <strong>top-level domain</strong> <code>com</code>, then <code>example</code>, then <code>www</code>. Each level is served by different machines, and a level does not know the contents of the levels below it — it knows only <strong>who is authoritative for the next level down</strong>. Handing off responsibility for a subtree like that is called <strong>delegation</strong>, and it is recorded as <code>NS</code> records (<a href="#cp-b10-8">B10.8</a>) pointing at the servers that take over.</p>
+<p>So a recursive resolver starting from scratch does this, and only this:</p>
+<ol>
+<li>Ask one of the thirteen <strong>root server</strong> addresses (which every resolver ships with, hard-coded — this is the one piece of bootstrap knowledge in the system) for <code>www.example.com.</code>. The root does not know. It replies with a <strong>referral</strong>: "I don't have that, but here are the servers for <code>com.</code>."</li>
+<li>Ask a <code>com.</code> server the same question. It doesn't know either. Another referral: "here are the servers for <code>example.com.</code>."</li>
+<li>Ask an <code>example.com.</code> server. This one owns the zone, so it answers authoritatively (the <code>aa</code> flag from <a href="#cp-b10-5">B10.5</a>).</li>
+</ol>
+<p>The key idea to internalise is that steps 1 and 2 return <em>referrals, not answers</em>. A referral is a redirection with a list of names and addresses attached — the addresses ride along in the ADDITIONAL section (<a href="#cp-b10-9">B10.9</a>) as <strong>glue records</strong>, so the resolver doesn't have to resolve the nameserver's own name before it can ask it anything, which would be circular. Only the final response is an answer.</p>
+<p>Now the necessity of caching is obvious. If every lookup on the internet started at the root, the thirteen root server clusters would field every query ever made. They don't, because every resolver in the chain remembers the referrals as well as the answers — TLD server lists have TTLs measured in days — so in practice a resolver already knows the <code>com.</code> servers and often the zone's servers too, and a "cold" lookup like the one you're about to watch is rare.</p>
+<div class="flow"><span>root (.)</span><em>referral →</em><span>com.</span><em>referral →</em><span>example.com.</span><em>answer →</em><span class="hot">23.220.75.232</span></div>
+<p>Two referrals and one answer: each level knows only who owns the next level down.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run the walk yourself. <code>+trace</code> makes <code>dig</code> stop using your recursive resolver and do the recursion itself, printing every step — which is why the output is long and worth reading top to bottom.
+<pre class="cmd">dig +trace www.example.com | grep -vE '^;|^$' | head -20</pre>
+<pre class="out">.            518400  IN  NS  a.root-servers.net.       ← the root's own NS set
+com.         172800  IN  NS  a.gtld-servers.net.       ← <b>referral</b>: go ask .com
+com.         172800  IN  NS  b.gtld-servers.net.
+example.com. 172800  IN  NS  a.iana-servers.net.       ← <b>referral</b>: go ask example.com
+example.com. 172800  IN  NS  b.iana-servers.net.
+www.example.com. 86400 IN A 23.220.75.232              ← the <b>answer</b>, from the zone itself</pre></li>
+<li>Read the server annotations. <code>dig</code> prints which server gave each block — watch the address change at every hop, which is the walk made explicit.
+<pre class="cmd">dig +trace www.example.com 2&gt;/dev/null | grep 'Received'</pre>
+<pre class="out">;; Received 525 bytes from 198.41.0.4#53(a.root-servers.net) in 12 ms   ← the root
+;; Received 1170 bytes from 192.5.6.30#53(a.gtld-servers.net) in 20 ms  ← the .com TLD
+;; Received 56 bytes from 199.43.135.53#53(a.iana-servers.net) in 8 ms  ← authoritative</pre></li>
+<li>Do one hop manually to prove a referral is not an answer. Ask a root server directly for a name it cannot possibly hold, and read what comes back: an empty ANSWER, a populated AUTHORITY.
+<pre class="cmd">dig @198.41.0.4 www.example.com | grep -E 'status:|ANSWER:|AUTHORITY SECTION' -A3 | head -12</pre>
+<pre class="out">;; flags: qr; QUERY: 1, <b>ANSWER: 0</b>, <b>AUTHORITY: 13</b>, ADDITIONAL: 27
+;; AUTHORITY SECTION:
+com.  172800  IN  NS  a.gtld-servers.net.      ← "not mine — these people handle .com"
+com.  172800  IN  NS  b.gtld-servers.net.</pre></li>
+<li>See the glue that stops the circularity. The ADDITIONAL section carries the referred servers' addresses, so the resolver can contact them without a second lookup.
+<pre class="cmd">dig @198.41.0.4 www.example.com | grep -A4 'ADDITIONAL SECTION'</pre>
+<pre class="out">;; ADDITIONAL SECTION:
+a.gtld-servers.net.  172800  IN  A     192.5.6.30       ← glue: the address rides along
+a.gtld-servers.net.  172800  IN  AAAA  2001:503:a83e::2:30</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>From your own <code>+trace</code> output, name the three servers that were asked and say which one gave an answer rather than a referral. Then explain, without notes, why the root servers are not overwhelmed by the world's DNS traffic (because referrals are cached with long TTLs, so almost no lookup actually starts at the root) and why glue records exist (so a referral to <code>a.gtld-servers.net</code> doesn't require resolving <em>that</em> name first, which would be circular).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>+trace</code> does not use your configured resolver, which is exactly why it is useful and exactly how it misleads people. It bypasses your <code>nameserver</code>, your cache and your search list entirely and talks to the internet's hierarchy directly. So a <code>+trace</code> that succeeds while ordinary resolution fails does not mean "DNS works" — it means <em>the public hierarchy</em> works while <em>your resolver or its path</em> does not. That is a valuable finding, but only if you know which question you asked. In a private or split-horizon setup (including a Kubernetes cluster) <code>+trace</code> is often useless, because the names you care about do not exist in the public tree at all.</p>
+<p>Second: a <code>+trace</code> run on a machine with no direct outbound access on port 53 — a common corporate or cloud setup where only the local resolver may talk to the internet — will hang or fail even when normal resolution is perfectly healthy. Don't diagnose that as broken DNS. It means the walk is someone else's job, which is the normal arrangement.</p>
+<div class="k8s-link">
+<p>A cluster's names live entirely outside this public tree, which is why <code>cluster.local</code> is a name nobody delegates and no root server has ever heard of. CoreDNS is simply <em>declared</em> authoritative for it inside the cluster, and every pod is pointed at CoreDNS. The delegation walk you just watched is what CoreDNS does on your behalf for <em>external</em> names via its forwarding configuration — usually not by walking the tree itself, but by forwarding to the node's upstream resolvers, which do. Understanding that a private zone is just an assertion made by whichever server your clients are pointed at is the whole conceptual basis for cluster DNS.</p>
+<p>The CoreDNS configuration declaring <code>cluster.local</code> and forwarding the rest is <a href="w4.html#cp-4-15">W4.15</a>; the record shapes it serves for that zone are <a href="w4.html#cp-4-17">W4.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 dig</code> for <code>+trace</code>, <code>+nssearch</code> and <code>+norecurse</code> (asking a server not to recurse is how you inspect exactly one tier). RFC 1034 §4.3.2 is the resolver algorithm the walk implements, written out step by step. The root server list lives at <code>/usr/share/dns/root.hints</code> on Debian-family systems if <code>dns-root-data</code> is installed — worth a look, since it is the one hard-coded fact in the entire system.</p>
+</article>
+
+<article class="lesson" id="cp-b10-7" data-id="b10-7">
+<div class="lesson-head"><span class="cp-id">B10.7</span><h4>The local twist: systemd-resolved and the 127.0.0.53 stub</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>On Ubuntu 24.04 your <code>/etc/resolv.conf</code> does not point at a real DNS server. It points at <code>127.0.0.53</code> — a small server running on the machine itself, which caches, applies its own rules, and forwards what's left to the actual upstreams. Not knowing this produces two specific confusions that cost people hours: a <code>tcpdump</code> on the network interface that shows nothing during a lookup that plainly worked, and an edit to <code>/etc/resolv.conf</code> that works until, some minutes or one reboot later, it silently reverts. Both are explained by the same daemon.</p>
+<h5>The concept</h5>
+<p><code>systemd-resolved</code> is a local resolver service. It listens on the loopback address <code>127.0.0.53</code>, port 53, and it is what every program on the machine actually talks to when the <code>dns</code> path is taken. It is the hotel operator in the middle: it keeps a cache, it knows which upstream server to use for which domain, and it merges DNS configuration from every source on the machine — DHCP leases, netplan, VPN clients — into one coherent view.</p>
+<p>Three consequences follow directly, and each one is a diagnostic:</p>
+<ul>
+<li><strong>Cached answers never touch the network.</strong> The query goes to loopback, the answer comes back from memory. So <code>tcpdump -i ens3 port 53</code> — a capture on the <em>uplink</em> — legitimately shows nothing. Capture on <code>-i any</code> or <code>-i lo</code> to see the query at all, and remember that seeing the loopback query but no uplink query means "served from cache," which is itself the answer to "why didn't my DNS change take effect?"</li>
+<li><strong><code>/etc/resolv.conf</code> is generated.</strong> It is a symlink to <code>/run/systemd/resolve/stub-resolv.conf</code>, a file under <code>/run</code> — a directory that lives in memory and is rebuilt at every boot. Editing the target edits a temporary file; editing through the symlink writes content that anything from a DHCP renewal to a service restart will overwrite. It looks like it worked, which is what makes it a trap. Configure the daemon instead.</li>
+<li><strong>Per-domain routing.</strong> resolved can send different domains to different upstreams. A <em>search domain</em> gets appended to short names as in <a href="#cp-b10-3">B10.3</a>; a <strong>routing domain</strong>, written with a leading <code>~</code> (as in <code>~lab</code>), is not appended to anything — it says "any query ending in <code>lab</code> goes to <em>this</em> server." That single feature is what makes <a href="#cp-b10-12">B10.12</a>'s project clean: you can hand your private zone to your own resolver without disturbing how the machine resolves everything else.</li>
+</ul>
+<p>You inspect all of this with <code>resolvectl</code>, not by reading files: <code>resolvectl status</code> shows the effective per-link configuration and the real upstreams, <code>resolvectl query NAME</code> resolves through the daemon and tells you where the answer came from (including whether it was a cache hit), and <code>resolvectl statistics</code> shows the cache's hit rate. To change configuration, drop a file into <code>/etc/systemd/resolved.conf.d/</code> and restart the service — the same drop-in pattern used everywhere in systemd.</p>
+<div class="flow"><span>program</span><em>→</em><span>127.0.0.53</span><em>→</em><span class="hot">systemd-resolved (cache + routing)</span><em>→</em><span>upstream 192.168.64.1</span></div>
+<p>Everything local goes through the stub first; only a cache miss produces a packet on the uplink.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the two facts the lesson rests on: the file is a symlink to generated content, and the nameserver in it is loopback.
+<pre class="cmd">readlink -f /etc/resolv.conf
+grep nameserver /etc/resolv.conf
+sudo ss -ulnp | grep ':53'</pre>
+<pre class="out">/run/systemd/resolve/stub-resolv.conf      ← generated, under /run (memory)
+nameserver <b>127.0.0.53</b>                    ← the local stub, not an upstream
+UNCONN 0 0 <b>127.0.0.53%lo:53</b> 0.0.0.0:* users:(("systemd-resolve",pid=...))</pre></li>
+<li>Find the real upstream servers — the ones the stub forwards to, which are nowhere in <code>/etc/resolv.conf</code>.
+<pre class="cmd">resolvectl status</pre>
+<pre class="out">Global
+  Protocols: +LLMNR +mDNS -DNSOverTLS DNSSEC=no/unsupported
+  resolv.conf mode: <b>stub</b>
+Link 2 (ens3)
+  Current Scopes: DNS
+  <b>DNS Servers: 192.168.64.1</b>        ← the actual upstream, learned from DHCP
+  DNS Domain: ~.</pre></li>
+<li>Watch the cache in action, and see exactly why a uplink capture can look empty. Run two captures side by side and resolve the same name twice.
+<pre class="cmd"># window 1 — the uplink only:
+sudo tcpdump -nn -i ens3 port 53
+# window 2:
+sudo resolvectl flush-caches
+getent hosts example.com        # cold: a packet must leave
+getent hosts example.com        # warm: served from cache</pre>
+<pre class="out">IP 192.168.64.5.51234 &gt; 192.168.64.1.53: 12938+ A? example.com. (29)
+IP 192.168.64.1.53 &gt; 192.168.64.5.51234: 12938 1/0/0 A 23.220.75.232 (45)
+    <b>(the second lookup produces nothing at all — it never left the box)</b></pre></li>
+<li>Ask the daemon directly and let it tell you the provenance of the answer. This is far more informative than <code>dig</code> here, because <code>dig</code> cannot tell you whether resolved served from cache.
+<pre class="cmd">resolvectl query example.com</pre>
+<pre class="out">example.com: 23.220.75.232                    -- link: ens3
+-- Information acquired via protocol DNS in 1.2ms.
+-- Data from: <b>cache network</b>          ← "cache" means this answer never left the machine</pre></li>
+<li>Practise the correct way to change resolver configuration: a drop-in, not an edit. (This adds a harmless option and then removes it — the real use of this pattern is <a href="#cp-b10-12">B10.12</a>.)
+<pre class="cmd">sudo mkdir -p /etc/systemd/resolved.conf.d
+printf '[Resolve]\nCache=yes\n' | sudo tee /etc/systemd/resolved.conf.d/99-lab.conf
+sudo systemctl restart systemd-resolved
+resolvectl status | head -4
+sudo rm /etc/systemd/resolved.conf.d/99-lab.conf &amp;&amp; sudo systemctl restart systemd-resolved</pre>
+<pre class="out">[Resolve]
+Cache=yes
+Global
+  Protocols: +LLMNR +mDNS ...        ← configuration applied by restarting, not by editing resolv.conf</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You should be able to explain a capture that shows nothing (the answer came from resolved's cache, so no packet reached the uplink) and to state where the real upstream servers are recorded (in resolved's per-link configuration, visible with <code>resolvectl status</code> — <em>not</em> in <code>/etc/resolv.conf</code>, which only ever names the stub). Confirm your drop-in is removed and <code>resolvectl status</code> still reports <code>resolv.conf mode: stub</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The classic mistake is hand-editing <code>/etc/resolv.conf</code>. It appears to work immediately — the resolver really does read the new content — and then a DHCP renewal, a netplan apply, a VPN connect or a reboot regenerates the file and your change is gone, usually at the least convenient moment and with no log entry that connects the two events. Whenever you find yourself about to edit it, edit <code>/etc/systemd/resolved.conf.d/*.conf</code> instead and restart the service. (If you genuinely want the file to be static, point the symlink at <code>/run/systemd/resolve/resolv.conf</code> for the real upstreams, or replace it with a plain file and accept that you now own it.)</p>
+<p>The second gotcha is capturing on the wrong interface. <code>tcpdump -i ens3 port 53</code> will show you upstream traffic only. Every query your programs make goes to <code>127.0.0.53</code> over loopback first, so <code>-i any</code> (or <code>-i lo</code>) is what you want when the question is "did my program ask at all?" Getting this wrong produces the false conclusion "the application never even tried to resolve," when in fact it tried and was answered from cache.</p>
+<p>Third: <code>resolvectl flush-caches</code> clears resolved's cache but has no effect on caches inside your application (many runtimes and libraries cache resolutions themselves, sometimes forever) or on any upstream resolver's cache. When a flush "doesn't help," the stale copy is somewhere else — a distinction that matters a lot in <a href="#cp-b10-11">B10.11</a>.</p>
+<div class="k8s-link">
+<p>This local-stub arrangement is the reason a node's own <code>/etc/resolv.conf</code> is not simply copied into pods. If it were, every pod would be told to use <code>127.0.0.53</code> — an address that, inside the pod's own network namespace (<a href="b9.html#cp-b9-1">B9.1</a>), reaches nothing at all, because loopback in a namespace is private to that namespace. The kubelet therefore has a flag pointing it at the <em>real</em> upstream list (typically <code>/run/systemd/resolve/resolv.conf</code>) to use when building pod configuration, and the classic symptom of getting this wrong is "external DNS from pods fails while internal names resolve fine." You will meet that exact failure in the advanced track already understanding its cause.</p>
+<p>How a pod's resolver configuration is built, including the upstream-file question, is <a href="w4.html#cp-4-16">W4.16</a>; CoreDNS's forwarding of external names to those upstreams is <a href="w4.html#cp-4-15">W4.15</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 systemd-resolved</code> explains the stub, the <code>/etc/resolv.conf</code> handling modes (stub, static, uplink, foreign) and how <code>/etc/hosts</code> is handled internally. <code>man 5 resolved.conf</code> lists every setting you can put in a drop-in — <code>DNS=</code>, <code>Domains=</code>, <code>Cache=</code>, <code>DNSStubListener=</code>. <code>man 1 resolvectl</code> for <code>status</code>, <code>query</code>, <code>domain</code>, <code>dns</code>, <code>statistics</code> and <code>flush-caches</code>. <code>man 8 tcpdump</code> for <code>-i any</code> versus a named interface.</p>
+</article>
+
+</div><!-- /g-system -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
