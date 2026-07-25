@@ -441,6 +441,245 @@ CNI                       -> your networking is a function, not a plugin contrac
 </article>
 
 </div>
+
+<!-- ---------------- Gauntlet ---------------- -->
+<div class="grp" id="g-gauntlet"><h3>The debugging gauntlet</h3>
+
+<article class="lesson drill" id="cp-b14-5" data-id="b14-5">
+<div class="lesson-head"><span class="cp-id">B14.5</span><h4>Run 1 — eight faults, one per layer, 45 minutes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Building something correct and repairing something broken are different skills, and only the second one is tested by an exam or an incident. Eight faults, one in each layer you have just assembled, is the smallest set that forces you to <em>locate</em> a fault before fixing it — which is the habit the whole track has been building toward.</p>
+<h5>The concept</h5>
+<p>Eight scripts in <code>labs/beginner/</code>, each planting exactly one fault, each with the same contract as the CKA track's drills: a banner, a typed confirmation, a wrong-box guard that refuses to run anywhere but the <code>sandbox</code> VM, a backup of whatever it is about to change, and a mission statement that never names the fault. One per layer:</p>
+<ul>
+<li><strong>permission</strong> — a service account can no longer read its own file (<a href="b4.html#cp-b4-6">B4.6</a>).</li>
+<li><strong>cgroup</strong> — a healthy service starts failing without its program changing (<a href="b7.html#cp-b7-8">B7.8</a>).</li>
+<li><strong>mount</strong> — files vanish from a directory without being deleted (<a href="b5.html#cp-b5-11">B5.11</a>).</li>
+<li><strong>route</strong> — a namespace reaches its own subnet and nothing beyond (<a href="b8.html#cp-b8-5">B8.5</a>).</li>
+<li><strong>iptables</strong> — a healthy service becomes unreachable (<a href="b9.html#cp-b9-12">B9.12</a>).</li>
+<li><strong>DNS</strong> — a correctly-spelled name stops resolving (<a href="b10.html#cp-b10-1">B10.1</a>).</li>
+<li><strong>systemd unit</strong> — a unit refuses to start and its program logs nothing (<a href="b11.html#cp-b11-9">B11.9</a>).</li>
+<li><strong>certificate</strong> — a TLS service keeps serving and clients stop trusting it (<a href="b12.html#cp-b12-10">B12.10</a>).</li>
+</ul>
+<p>The rule that makes this worth doing: <strong>five real minutes on a fault before you open a hint.</strong> The reveals below are staged — symptom, hint, full fix — so you can take exactly as much as you need. Taking the fix straight away converts a debugging exercise into a reading exercise, and the thing being trained here is the search, not the answer.</p>
+<div class="flow"><span>reproduce</span><em>→</em><span>locate the layer</span><em>→</em><span class="hot">confirm with one command</span><em>→</em><span>fix the cause</span><em>→</em><span>verify</span></div>
+<p>Five steps, in that order; skipping the middle two is what costs the minutes.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Snapshot first. Eight deliberate faults on one VM is exactly the situation snapshots exist for (<a href="b0.html#cp-b0-9">B0.9</a>).
+<pre class="cmd">exit                                   # back to your host
+multipass stop sandbox &amp;&amp; multipass snapshot sandbox --name pre-gauntlet
+multipass start sandbox &amp;&amp; multipass list | grep sandbox</pre>
+<pre class="out">sandbox   Running   10.x.x.x   Ubuntu 24.04 LTS          ← safety net in place</pre></li>
+<li>Copy the drill scripts onto the VM and read nothing else in that directory.
+<pre class="cmd">multipass transfer -r labs/beginner sandbox:/home/ubuntu/
+multipass shell sandbox
+ls ~/beginner/ | head -3</pre>
+<pre class="out">b14-cert-01.sh
+b14-cgroup-01.sh
+b14-dns-01.sh          ← the file names name the layer, not the fault. That is deliberate.</pre></li>
+<li>Plant all eight and start the clock. The runner feeds each script its own confirmation and prints only the mission blocks.
+<pre class="cmd">cd ~/beginner &amp;&amp; sudo bash b14-gauntlet.sh</pre>
+<pre class="out">planted 1/8: b14-permission-01           ok
+planted 2/8: b14-cgroup-01               ok
+...
+<b>8 of 8 faults planted. Start the clock.</b></pre></li>
+<li>Work them in any order, and note the time you start each one. The notes are the deliverable of <a href="#cp-b14-6">B14.6</a>, not the fixes.
+<pre class="cmd">date +%T; echo "starting: permission" | tee -a ~/gauntlet-notes.txt</pre>
+<pre class="out">14:02:11
+starting: permission          ← one line per fault; you will need these in the post-mortem</pre></li>
+<li>When all eight verify clean, stop the clock and record the total before you read anything below.
+<pre class="cmd">date +%T | tee -a ~/gauntlet-notes.txt; wc -l ~/gauntlet-notes.txt</pre>
+<pre class="out">14:47:36
+18 /home/ubuntu/gauntlet-notes.txt          ← run 1 done; B14.7 will compare against this</pre></li>
+</ol>
+<h5>Staged reveals</h5>
+<p>One group per fault. Open <em>Stage 1</em> only to confirm you are seeing the right symptom, <em>Stage 2</em> after five real minutes of your own work, and <em>Stage 3</em> when you want the answer.</p>
+
+<p><strong>b14-permission-01</strong> — the permission layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>sudo -u gauntlet cat /srv/gauntlet/data/config.txt</code> gives <em>Permission denied</em>. The file itself is mode <code>644</code>, owned by root, and world-readable — so the file's own permissions look completely correct, which is the point.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>Reading a file requires more than permission on the file: every directory on the path must grant <em>execute</em> (traverse) to the user doing the reading. Walk the path from <code>/</code> downward with <code>namei -l /srv/gauntlet/data/config.txt</code> and look at each component's mode rather than the last one.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p><code>namei -l</code> shows <code>/srv/gauntlet</code> at <code>drwxr-x---</code> — no <code>x</code> for "other", so the <code>gauntlet</code> user cannot traverse into it. Fix with <code>sudo chmod o+x /srv/gauntlet</code> (or <code>chmod 755</code>). Fingerprint: <em>file mode is fine, access still denied</em> → check the whole path, not the file (<a href="b4.html#cp-b4-6">B4.6</a>'s traverse ladder).</p></details>
+
+<p><strong>b14-cgroup-01</strong> — the resource-limit layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>gauntlet-worker.service</code> cycles through <code>activating (auto-restart)</code> and <code>failed</code>. <code>journalctl -u gauntlet-worker</code> shows the restarts but nothing from the program — no traceback, no error, no last words.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>A program that is killed rather than exiting cannot log why: <code>SIGKILL</code> is uncatchable. So read the exit status rather than the logs — <code>systemctl show -p ExecMainStatus -p Result gauntlet-worker</code> — and then ask who does the killing.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p><code>Result=oom-kill</code> and status 137 (128+9). <code>systemctl cat gauntlet-worker</code> shows a drop-in setting <code>MemoryMax=16M</code> against a program that allocates 64 MiB. Remove <code>/etc/systemd/system/gauntlet-worker.service.d/10-gauntlet.conf</code>, <code>daemon-reload</code>, restart. Fingerprint: <em>exit 137 + silent log</em> → look outside the program (<a href="b7.html#cp-b7-8">B7.8</a>).</p></details>
+
+<p><strong>b14-mount-01</strong> — the filesystem layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>/srv/gauntlet/data</code> is empty. No deletion happened, the parent directory's timestamps look ordinary, and free disk space did not change.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>A directory can be <em>covered</em> rather than emptied — a mount hides whatever was underneath without touching it. Ask the kernel what is mounted where: <code>findmnt /srv/gauntlet/data</code> or <code>mountpoint /srv/gauntlet/data</code>.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p><code>findmnt</code> shows a <code>tmpfs</code> mounted at <code>/srv/gauntlet/data</code>. <code>sudo umount /srv/gauntlet/data</code> and the three files reappear untouched. Fingerprint: <em>files gone, nothing deleted, space unchanged</em> → something is mounted over them (<a href="b5.html#cp-b5-11">B5.11</a>).</p></details>
+
+<p><strong>b14-route-01</strong> — the routing layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p>From inside <code>gauntlet-ns</code>, pinging <code>10.77.0.1</code> works and pinging the VM's own primary address times out. The interface is up, the address is correct, and nothing is refused — it simply never arrives.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>Local subnet works, everything else does not: that is rung three of the ladder (<a href="b8.html#cp-b8-16">B8.16</a>) — link and address passed, routing did not. Ask the kernel which route it would use rather than reading the table: <code>ip netns exec gauntlet-ns ip route get &lt;target&gt;</code>.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p><code>ip route get</code> reports <code>via 10.77.0.99</code> — a gateway that does not exist. Replace it: <code>sudo ip netns exec gauntlet-ns ip route replace default via 10.77.0.1</code>. Fingerprint: <em>subnet fine, off-subnet dead</em> → the default route, and <code>ip route get</code> is the one command that says so (<a href="b8.html#cp-b8-6">B8.6</a>).</p></details>
+
+<p><strong>b14-iptables-01</strong> — the packet-filter layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>gauntlet-web.service</code> is active, <code>ss -ltnp</code> shows it listening on 8082, and <code>curl --max-time 3 http://127.0.0.1:8082/</code> <em>hangs</em> until the timeout rather than being refused.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>The distinction is the whole diagnosis: a refused connection means nothing is listening; a hang means the packets are being dropped in flight. Rung four of the ladder — read the ruleset, and read the counters, not just the rules: <code>sudo iptables -L INPUT -n -v --line-numbers</code>.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p>A <code>DROP</code> rule at the top of <code>INPUT</code> matching <code>tcp dpt:8082</code>, with a climbing packet counter. Delete that rule only — <code>sudo iptables -D INPUT -p tcp --dport 8082 -j DROP</code> — rather than flushing the table. Fingerprint: <em>listener healthy + client hangs</em> → filter, and the counter proves which rule (<a href="b9.html#cp-b9-14">B9.14</a>).</p></details>
+
+<p><strong>b14-dns-01</strong> — the name-resolution layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>getent hosts gauntlet.svc</code> returns nothing and <code>curl http://gauntlet.svc:8082/</code> fails to resolve — while <code>grep gauntlet.svc /etc/hosts</code> shows the entry sitting there, correct and readable.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p><code>/etc/hosts</code> is not consulted by magic: the resolver reads <code>/etc/nsswitch.conf</code> to decide which sources to try, in order, for <code>hosts:</code> lookups. Compare that line with a system you have not broken.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p>The <code>hosts:</code> line in <code>/etc/nsswitch.conf</code> has lost its <code>files</code> source, so <code>/etc/hosts</code> is never read. Restore it (<code>hosts: files mdns4_minimal [NOTFOUND=return] dns</code>, matching the backup in <code>/root/.b14-fault-backups/</code>). Fingerprint: <em><code>dig</code> and <code>ping</code> disagree, or a hosts entry is ignored</em> → nsswitch, not DNS (<a href="b10.html#cp-b10-1">B10.1</a>).</p></details>
+
+<p><strong>b14-systemd-01</strong> — the service-management layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>gauntlet-api.service</code> is <code>failed</code>, and <code>journalctl -u gauntlet-api</code> contains systemd's own restart messages and nothing else at all — no output from the program, not even a startup line.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>No program output means the program never ran. <code>systemctl status</code> names the stage that failed in its <code>Process:</code> line — read the code after <code>status=</code> and look it up rather than guessing (<a href="b11.html#cp-b11-9">B11.9</a>).</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p><code>status=203/EXEC</code> — systemd could not execute the command at all. <code>systemctl cat gauntlet-api</code> shows a drop-in that clears <code>ExecStart=</code> and repoints it at <code>/usr/local/bin/gauntlet-api</code>, which does not exist. Delete the drop-in, <code>daemon-reload</code>, restart. Fingerprint: <em>203/EXEC</em> → path, execute bit or interpreter; never the program's own bug.</p></details>
+
+<p><strong>b14-cert-01</strong> — the TLS layer</p>
+<details class="reveal"><summary>Stage 1 · Expected symptom</summary><p><code>gauntlet-tls.service</code> is active and serving; <code>curl --cacert …/ca.crt https://localhost:8443/</code> fails with a certificate error mentioning the host name. <code>--insecure</code> would work, which tells you the transport is fine and the identity check is not.</p></details>
+<details class="reveal"><summary>Stage 2 · Hint</summary><p>Verification has two independent halves: is it signed by a CA I trust, and does it cover the name I asked for? Decide which one failed before touching anything — then print the certificate the server is actually serving: <code>openssl s_client -connect localhost:8443 2&gt;/dev/null | openssl x509 -noout -issuer -ext subjectAltName</code>.</p></details>
+<details class="reveal"><summary>Stage 3 · Full fix</summary><p>The issuer is still the Gauntlet CA — the chain is fine — but the SAN list reads <code>DNS:gauntlet-internal</code>, with no <code>localhost</code> and no <code>127.0.0.1</code>. Reissue from the CSR and the CA key already in <code>/srv/gauntlet/tls</code> with <code>subjectAltName=DNS:localhost,IP:127.0.0.1</code>, then restart the unit. Fingerprint: <em>chain OK, name rejected</em> → the SAN list, fixed by reissuing, never by editing trust (<a href="b12.html#cp-b12-10">B12.10</a>).</p></details>
+
+<h5 class="verify">Verify</h5>
+<p>All eight verification commands from the mission blocks pass, and you can state each fault's <em>fingerprint</em> — the symptom pair that identifies it — without re-reading the reveal. If any fault took more than ten minutes, note which rung of which ladder you skipped; that note is worth more than the fix and is the raw material for <a href="#cp-b14-6">B14.6</a>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The expensive habit this drill exposes is fixing before locating. Three of these eight faults present in a layer other than the one they live in — the service that will not start is a path problem, the empty directory is a mount, the unresolvable name is a resolver-configuration problem — so any minute spent editing the thing that <em>looks</em> broken is a minute spent in the wrong file. Reproduce, locate, confirm with one command, then fix.</p>
+<p>The second is opening Stage 3 early. It feels efficient and it removes the entire value of the exercise: what transfers to a real incident is the search procedure, and reading someone else's answer trains nothing. If you are stuck, Stage 2 is written to unstick you without giving it away.</p>
+<div class="k8s-link">
+<p>Every one of these eight has a direct cluster-scale twin, which is the point of drilling them at this layer first. The permission fault is a pod that cannot read a mounted Secret because of <code>fsGroup</code>; the cgroup fault is <code>OOMKilled</code> with exit 137 and empty logs; the mount fault is a volume mounted over a directory the image populated; the route and filter faults are a NetworkPolicy dropping traffic to a healthy pod (hang, not refusal); the DNS fault is a resolver misconfiguration that makes a correct Service name unresolvable; the unit fault is a container command that does not exist in the image; and the certificate fault is the apiserver SAN list missing a name someone put in front of it.</p>
+<p>The equivalent CKA drills, with the same staged-reveal format, are <a href="w6.html#cp-6-6">W6.6</a> (four apiserver faults), <a href="w6.html#cp-6-11">W6.11</a> (five kubelet faults) and the timed six-workload gauntlet at <a href="w6.html#cp-6-19">W6.19</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 namei</code> is the fastest way to read a whole path's permissions at once; <code>man 1 findmnt</code> and <code>man 1 mountpoint</code> for the mount fault; <code>man 8 ip-route</code> (<code>ip route get</code>) for the routing one; <code>man 8 iptables</code> for <code>-L -n -v --line-numbers</code>; <code>man 5 nsswitch.conf</code> for the resolver order; <code>man 1 systemctl</code> for <code>status</code>, <code>cat</code> and <code>show</code>; <code>man 1 openssl-s_client</code> for reading what a server is really serving.</p>
+</article>
+
+<article class="lesson" id="cp-b14-6" data-id="b14-6">
+<div class="lesson-head"><span class="cp-id">B14.6</span><h4>Post-mortem your own triage, and write the checklist</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Speed on the CKA and speed in a real incident come from having an <em>order</em>, not from knowing more commands. Almost every minute you lost in run 1 will turn out to be a skipped rung or a guess made before evidence — and the reason to write it down is that you cannot fix a habit you have not named. This one page is the real deliverable of the module.</p>
+<h5>The concept</h5>
+<p>A post-mortem here has three columns and no blame. For each fault: <strong>what did you check first</strong>, <strong>what did it cost</strong>, and <strong>which single command would have found it fastest</strong>. That third column is the one that becomes your checklist, because it is the difference between knowing a tool and knowing when to reach for it.</p>
+<p>Two patterns show up in nearly everyone's first run. The first is <em>fixing before locating</em> — editing the thing that looks broken rather than establishing which layer the fault is in. The second is <em>trusting a claim instead of testing it</em>: believing a service is unreachable because a client failed, rather than checking whether it is listening. Both are cured by the same discipline, which is to make the next command answer a question rather than attempt a repair.</p>
+<p>Your checklist should be ordered by <strong>cost of checking</strong>, cheapest first, so the early rungs are one-command questions that rule out whole layers. A useful skeleton, which you should rewrite in your own words rather than copy: is the thing running (<code>systemctl is-active</code>, <code>ps</code>) → is it listening (<code>ss -ltnp</code>) → can I reach it locally (<code>curl 127.0.0.1</code>) → does the name resolve (<code>getent hosts</code>) → is the path routable (<code>ip route get</code>) → is anything dropping it (<code>iptables -L -n -v</code>) → what does its own log say (<code>journalctl -u</code>) → what does its exit status say (<code>systemctl show -p</code>).</p>
+<div class="flow"><span>what did I check first</span><em>→</em><span>what did it cost</span><em>→</em><span class="hot">what would have found it fastest</span></div>
+<p>The third column, ordered by cost, is your checklist.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start the page from your own timing notes rather than from memory — memory reorders things flatteringly.
+<pre class="cmd">cat ~/gauntlet-notes.txt | head -6</pre>
+<pre class="out">14:02:11
+starting: permission
+14:09:40
+starting: cgroup          ← seven minutes on fault one: worth knowing why</pre></li>
+<li>Write the three columns, one row per fault. Be specific about the wasted minutes — that is the useful part.
+<pre class="cmd">cat &gt; ~/triage-postmortem.md &lt;&lt;'EOF'
+| fault      | checked first        | cost  | would have found it fastest      |
+|------------|----------------------|-------|----------------------------------|
+| permission | the file's own mode  | 6 min | namei -l /path/to/file           |
+| cgroup     | the program's logs   | 4 min | systemctl show -p Result         |
+| mount      | ls, then panic       | 5 min | findmnt /srv/gauntlet/data       |
+| route      | ip addr (was fine)   | 3 min | ip route get TARGET              |
+| iptables   | restarting the unit  | 7 min | iptables -L INPUT -n -v          |
+| dns        | /etc/hosts (was fine)| 5 min | getent hosts + nsswitch.conf     |
+| systemd    | the python command   | 4 min | systemctl status (status=203)    |
+| cert       | regenerating the CA  | 8 min | s_client + x509 -ext subjectAltName |
+EOF
+wc -l ~/triage-postmortem.md</pre>
+<pre class="out">11 /home/ubuntu/triage-postmortem.md          ← replace these rows with your real ones</pre></li>
+<li>Extract the checklist. Order it by how cheap each check is, not by how likely you think each fault is.
+<pre class="cmd">cat &gt; ~/triage-checklist.md &lt;&lt;'EOF'
+# My triage order — cheapest question first
+1. Is it running?        systemctl is-active X ; systemctl show -p Result -p ExecMainStatus X
+2. Is it listening?      ss -ltnp | grep PORT
+3. Local reach?          curl -s --max-time 3 http://127.0.0.1:PORT/
+4. Whole path readable?  namei -l /the/file
+5. Name resolves?        getent hosts NAME     (disagrees with dig? -> nsswitch)
+6. Route exists?         ip route get TARGET
+7. Anything dropping?    iptables -L -n -v     (hang = DROP, refused = no listener)
+8. What does it say?     journalctl -u X -n50  (silent + 137 = killed from outside)
+EOF
+cat ~/triage-checklist.md | wc -l</pre>
+<pre class="out">9          ← one page, your words, ordered by cost. This is the deliverable.</pre></li>
+<li>Sanity-check the order against the drill: for each of the eight faults, which line number would have found it?
+<pre class="cmd">printf '%s\n' "permission->4" "cgroup->1" "mount->(add: findmnt)" "route->6" \
+              "iptables->7" "dns->5" "systemd->1" "cert->(add: s_client)"</pre>
+<pre class="out">mount-&gt;(add: findmnt)
+cert-&gt;(add: s_client)          ← two gaps found: a checklist that misses faults is not finished</pre></li>
+<li>Close the gaps and keep the page somewhere you will actually open it during run 2.
+<pre class="cmd">printf '9. Files missing?      findmnt DIR   (mounted over, not deleted)\n10. TLS refused?      openssl s_client -connect H:P | openssl x509 -noout -issuer -ext subjectAltName\n' &gt;&gt; ~/triage-checklist.md
+tail -2 ~/triage-checklist.md</pre>
+<pre class="out">9. Files missing?      findmnt DIR   (mounted over, not deleted)
+10. TLS refused?      openssl s_client ...          ← ten rungs, and every fault has one</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Your checklist covers all eight faults — check that explicitly, as in step 4, rather than assuming — and every entry is a <em>question with a command</em>, not a repair. Then say out loud which of the two patterns cost you more in run 1, fixing before locating or trusting a claim instead of testing it, and name the specific rung you will run first next time because of it.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A checklist copied from someone else does not work, and this is not a motivational point. What makes a list fast is that each line reminds you of something you already know how to interpret; a borrowed line you have never run produces a command with output you then have to think about, which is slower than not having the line at all. Write yours in your own words even when they are worse words.</p>
+<p>The second trap is ordering by likelihood rather than by cost. "It is probably DNS" may be true and it is still the wrong first move if <code>systemctl is-active</code> takes one second and rules out a whole layer. Cheap questions first, always — the expensive checks are still there when the cheap ones have narrowed it down.</p>
+<div class="k8s-link">
+<p>This exercise is the beginner-track twin of the CKA track's one-page triage sheet, and the two pages compose rather than compete: yours answers "which layer of the machine is unhappy", the CKA one answers "which layer of the cluster is unhappy", and a node-level problem needs both. The Kubernetes version starts higher up — events, <code>describe</code>, logs, <code>--previous</code>, node conditions — and drops into your list the moment the answer is "the node itself".</p>
+<p>The CKA triage sheet is started at <a href="w6.html#cp-6-4">W6.4</a> and finished as a deliverable at <a href="w6.html#cp-6-23">W6.23</a>; the universal first moves it opens with are <a href="w6.html#cp-6-1">W6.1</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">No new tools here — the page you are writing is an index into the ones you already have. If you want a model for the format, the CKA track's <a href="../cheatsheets/triage-template.html">triage template</a> is the same idea one layer up, and is deliberately short enough to print.</p>
+</article>
+
+<article class="lesson drill" id="cp-b14-7" data-id="b14-7">
+<div class="lesson-head"><span class="cp-id">B14.7</span><h4>Run 2 — the same gauntlet, against the clock</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The second run is not about the faults, which you have now seen. It is about watching a written routine beat improvisation on problems you already understand — because that gap is the entire argument for having a routine at all, and it is much more convincing when you measure it on yourself.</p>
+<h5>The concept</h5>
+<p>Same eight faults, same VM, one difference: your checklist from <a href="#cp-b14-6">B14.6</a> is open beside you and you follow it top-down rather than jumping to what you remember. That constraint feels artificially slow on the first two faults and then stops feeling like anything, which is what a routine becoming automatic feels like from the inside.</p>
+<p>Expect roughly half the time. What actually shrinks is not the fixing — that was always quick — but the <em>searching</em>: the minutes spent deciding what to look at next. If your second run is not much faster, the useful conclusion is about the checklist rather than about you: it is probably ordered by likelihood instead of by cost, or its entries are repairs rather than questions.</p>
+<p>One honest caveat. A second run on faults you have seen measures the routine, not your ability to diagnose something new — the transferable claim is narrower: <em>having an order beats not having one</em>. That is still worth proving, and it is why the gauntlet is run twice rather than once.</p>
+<div class="flow"><span>run 1: search + fix</span><em>→</em><span>write the order</span><em>→</em><span class="hot">run 2: follow it top-down</span></div>
+<p>The fixes were never the slow part.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Reset the VM to a clean state, so run 2 starts from the same place run 1 did.
+<pre class="cmd">exit
+multipass restore sandbox.pre-gauntlet
+multipass shell sandbox &amp;&amp; ls ~/triage-checklist.md 2&gt;/dev/null || echo "checklist is on the host — copy it back"</pre>
+<pre class="out">checklist is on the host — copy it back          ← the snapshot predates it; that is expected</pre></li>
+<li>Put the checklist back and the scripts back. Keep the checklist visible in a second terminal.
+<pre class="cmd">multipass transfer triage-checklist.md sandbox:/home/ubuntu/
+multipass transfer -r labs/beginner sandbox:/home/ubuntu/
+multipass shell sandbox; cat ~/triage-checklist.md | head -3</pre>
+<pre class="out"># My triage order — cheapest question first
+1. Is it running?        systemctl is-active X ; ...</pre></li>
+<li>Plant all eight again and start the clock. Follow the list top-down for every fault, even when you are certain.
+<pre class="cmd">cd ~/beginner &amp;&amp; sudo bash b14-gauntlet.sh
+date +%T | tee ~/run2-notes.txt</pre>
+<pre class="out">8 of 8 faults planted. Start the clock.
+15:20:04</pre></li>
+<li>Stop the clock when all eight verify, and compare.
+<pre class="cmd">date +%T | tee -a ~/run2-notes.txt
+echo "run 1: 45 min   run 2: ___ min" | tee -a ~/run2-notes.txt</pre>
+<pre class="out">15:41:22
+run 1: 45 min   run 2: <b>21</b> min          ← the routine, measured</pre></li>
+<li>Do the honest review: which rungs did you actually skip under time pressure, and did skipping them cost you?
+<pre class="cmd">printf 'skipped rung 2 on the iptables fault -> cost 3 min\nfollowed the list on cert -> 90 seconds\n' &gt;&gt; ~/run2-notes.txt
+tail -2 ~/run2-notes.txt</pre>
+<pre class="out">skipped rung 2 on the iptables fault -&gt; cost 3 min
+followed the list on cert -&gt; 90 seconds          ← both directions of the same evidence</pre></li>
+<li>Clean up the sandbox, or restore the snapshot — the assessment lessons want a working VM, not a battlefield.
+<pre class="cmd">exit; multipass restore sandbox.pre-gauntlet; multipass shell sandbox
+systemctl is-failed gauntlet-worker 2&gt;/dev/null || echo "clean VM restored"</pre>
+<pre class="out">clean VM restored</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You have two times and a note explaining the difference. State the improvement as a claim you would defend: <em>an ordered checklist roughly halves the time on faults I already understand, because the search was the slow part and the fixes never were.</em> If run 2 was not faster, revise the checklist — ordered by cost, entries as questions — before moving on, because the assessment's practical tasks are timed too.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Do not over-claim from this measurement. You knew the faults, so run 2 exercised recall as well as routine, and the honest conclusion is the narrow one: having an order beats improvising. The way to test the wider claim is to have someone else plant a fault you have not seen, or to come back to the gauntlet in a month having forgotten the specifics.</p>
+<p>The second is discarding the checklist once the module is over. It is the one artefact here with a life beyond the track: it works on any Linux machine, it is what you will actually open during the CKA's troubleshooting domain, and its value comes from being maintained — add a rung every time a real incident catches you without one.</p>
+<div class="k8s-link">
+<p>The CKA's troubleshooting domain is 30% of the exam and is scored on time as much as on correctness, so this is the habit that most directly converts into a pass. The advanced track's gauntlet is the same exercise at cluster scale — six broken workloads, thirty minutes, notes closed — and people who arrive at it with a machine-level checklist already written spend their time on the Kubernetes-shaped part of each fault rather than rediscovering how to check whether something is listening.</p>
+<p>The cluster-scale gauntlet is <a href="w6.html#cp-6-19">W6.19</a>; the exam-day discipline of getting on and off a node quickly is <a href="w6.html#cp-6-14">W6.14</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 multipass</code> (or <code>multipass help snapshot</code> / <code>help restore</code>) for the snapshot cycle this lesson leans on — being able to reset to a known-good state in seconds is what makes destructive practice cheap. Everything else is the tooling from run 1.</p>
+</article>
+
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
