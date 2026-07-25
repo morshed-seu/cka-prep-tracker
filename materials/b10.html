@@ -747,6 +747,228 @@ removed</pre></li>
 
 </div><!-- /g-records -->
 
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b10-12" data-id="b10-12">
+<div class="lesson-head"><span class="cp-id">B10.12</span><h4>Mini project — run your own resolver and serve a private zone into a namespace</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything so far has been reading someone else's DNS. Now you become the server. You will run a resolver, invent a zone that exists nowhere on the internet, point a machine at it for that zone <em>only</em>, and then resolve those names from inside a network namespace you built in B9 — watching the query cross your own virtual cable. When you finish, you will have built, in miniature, exactly what CoreDNS is in a cluster: a resolver that is authoritative for a private zone, reachable from inside isolated network namespaces, forwarding everything else upstream. There is no step in that sentence you will not have performed with your own hands.</p>
+<h5>The concept</h5>
+<p><code>dnsmasq</code> is a small, single-binary DNS server (and DHCP server, though we ignore that here). It suits this project precisely because it is configured in a few lines and can be both authoritative for a made-up zone and a forwarder for everything else — the dual role from <a href="#cp-b10-5">B10.5</a>. The pieces you assemble:</p>
+<ul>
+<li><strong>A zone that is just an assertion.</strong> <code>local=/lab/</code> tells dnsmasq "you are authoritative for anything ending in <code>lab</code> — never forward those upstream, answer them yourself, and if you don't have the record, say NXDOMAIN." Add <code>host-record=</code> lines and you have a zone. Nobody delegated <code>lab</code> to you and no root server has heard of it; it is real because your clients are pointed at a server that says so — which is exactly the status of <code>cluster.local</code>.</li>
+<li><strong>Binding without a fight.</strong> Port 53 on this machine is already partly taken: <code>systemd-resolved</code> holds <code>127.0.0.53:53</code> (<a href="#cp-b10-7">B10.7</a>), and the kernel will not let a second process bind the wildcard <code>0.0.0.0:53</code> while any specific address on that port is in use. So dnsmasq's default configuration fails to start on Ubuntu, and the fix is not to disable resolved but to be specific: <code>listen-address=</code> plus <code>bind-interfaces</code> makes dnsmasq bind exactly one address. Two servers, two addresses, one port, no conflict.</li>
+<li><strong>Routing one zone without hijacking the machine.</strong> Rather than repointing everything at your new server, you give <code>systemd-resolved</code> a <em>routing domain</em> (<a href="#cp-b10-7">B10.7</a>): <code>Domains=~lab</code> with <code>DNS=10.20.0.1</code> means "queries ending in <code>lab</code> go to that server; everything else carries on as before." This is split-horizon DNS in two lines, and it is the same idea a cluster applies when it points pods at CoreDNS for <code>cluster.local</code> and lets CoreDNS forward the rest.</li>
+<li><strong>A namespace's own resolver configuration.</strong> <code>ip netns exec</code> has a feature made for exactly this: if <code>/etc/netns/&lt;name&gt;/resolv.conf</code> exists, it is bind-mounted over <code>/etc/resolv.conf</code> for commands run in that namespace. So a namespace can have its own nameserver and its own search list while sharing the rest of the filesystem — which is, structurally, what a pod gets.</li>
+</ul>
+<p>You will reuse <code>net-up.sh</code> from <a href="b9.html#cp-b9-19">B9.19</a> for the network: a bridge <code>cni0</code> at <code>10.20.0.1</code> and namespaces <code>pod1</code> (<code>10.20.0.2</code>) and <code>pod2</code> (<code>10.20.0.3</code>). The bridge address is what dnsmasq will listen on, which makes it reachable from the namespaces and from the host, and from nowhere else.</p>
+<div class="flow"><span>pod1 (10.20.0.2)</span><em>→ veth →</em><span>cni0 10.20.0.1</span><em>→</em><span class="hot">dnsmasq: authoritative for .lab</span><em>→ else →</em><span>upstream</span></div>
+<p>A private zone served on the bridge address, reachable from inside the namespaces and from the host — CoreDNS in miniature.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Rebuild the B9 network if it isn't up. This gives you the bridge address dnsmasq will bind and the namespaces that will query it.
+<pre class="cmd">multipass shell sandbox
+sudo ~/net-up.sh 2                      # from B9.19: cni0 at 10.20.0.1, pod1/pod2
+ip -br addr show cni0</pre>
+<pre class="out">cni0  UP  <b>10.20.0.1/24</b>          ← the address the resolver will live on
+  pod1 = 10.20.0.2
+  pod2 = 10.20.0.3</pre></li>
+<li>Write the zone. Four lines of configuration make dnsmasq authoritative for <code>lab</code>, give it two records, bind it to one address so it cannot collide with resolved, and set a cacheable TTL so <a href="#cp-b10-10">B10.10</a>'s countdown works on your own records.
+<pre class="cmd">sudo tee /etc/dnsmasq.d/lab.conf &gt;/dev/null &lt;&lt;'EOF'
+listen-address=10.20.0.1
+bind-interfaces
+local=/lab/
+local-ttl=300
+host-record=web.lab,10.20.0.2
+host-record=db.lab,10.20.0.3
+host-record=web.prod.lab,10.20.0.2
+host-record=web.dev.lab,10.20.0.3
+log-queries
+EOF
+sudo systemctl restart dnsmasq
+systemctl is-active dnsmasq; sudo ss -ulnp | grep ':53'</pre>
+<pre class="out">active
+UNCONN 0 0 <b>10.20.0.1:53</b>   0.0.0.0:* users:(("dnsmasq",pid=3412,...))   ← your server
+UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",...))     ← resolved, untouched</pre></li>
+<li>Query it directly, bypassing every resolver on the machine. This proves the server itself is right before any client configuration is involved — the tier-splitting habit from <a href="#cp-b10-5">B10.5</a>.
+<pre class="cmd">dig @10.20.0.1 +noall +answer web.lab A
+dig @10.20.0.1 nothing.lab | grep -E 'status:'</pre>
+<pre class="out">web.lab.  300  IN  A  10.20.0.2       ← your record, your TTL
+;; status: <b>NXDOMAIN</b>                   ← authoritative "no": local=/lab/ never forwards</pre></li>
+<li>Point the host at it for <code>.lab</code> only, using a drop-in rather than editing <code>/etc/resolv.conf</code> (<a href="#cp-b10-7">B10.7</a>). Everything else must keep resolving normally — check that too.
+<pre class="cmd">sudo mkdir -p /etc/systemd/resolved.conf.d
+sudo tee /etc/systemd/resolved.conf.d/50-lab.conf &gt;/dev/null &lt;&lt;'EOF'
+[Resolve]
+DNS=10.20.0.1
+Domains=~lab
+EOF
+sudo systemctl restart systemd-resolved
+resolvectl query web.lab | head -2
+resolvectl query example.com | head -1        # unaffected: still goes upstream</pre>
+<pre class="out">web.lab: 10.20.0.2                            ← routed to your server
+-- Information acquired via protocol DNS in 1.1ms.
+example.com: 23.220.75.232                     ← everything else untouched</pre></li>
+<li>Give the namespace its own resolver configuration and resolve from inside it. This is the pod-shaped part: <code>pod1</code> has a different <code>/etc/resolv.conf</code> from the host, with its own nameserver and its own search domain.
+<pre class="cmd">sudo mkdir -p /etc/netns/pod1
+printf 'nameserver 10.20.0.1\nsearch lab\n' | sudo tee /etc/netns/pod1/resolv.conf
+sudo ip netns exec pod1 cat /etc/resolv.conf        # the bind-mounted version
+sudo ip netns exec pod1 getent hosts web.lab
+sudo ip netns exec pod1 getent hosts web            # short name + search lab</pre>
+<pre class="out">nameserver 10.20.0.1
+search lab
+10.20.0.2       web.lab       ← resolved from inside the namespace
+10.20.0.2       web           ← the search domain completed the short name</pre></li>
+<li>Prove the query really crossed your virtual cable. Capture on the host-side veth for <code>pod1</code> while resolving from inside — the packet you see is DNS leaving a namespace and arriving at a server you wrote.
+<pre class="cmd"># window 1:
+sudo tcpdump -nn -i veth1 port 53
+# window 2:
+sudo ip netns exec pod1 dig +short web.lab</pre>
+<pre class="out">IP <b>10.20.0.2</b>.42311 &gt; <b>10.20.0.1</b>.53: 8821+ A? web.lab. (25)     ← the query, crossing the veth
+IP 10.20.0.1.53 &gt; 10.20.0.2.42311: 8821* 1/0/0 A 10.20.0.2 (41)  ← the answer, from your server</pre></li>
+<li>Read your server's own log. <code>log-queries</code> makes dnsmasq narrate every question it is asked and where the answer came from — the same visibility CoreDNS's log plugin gives you.
+<pre class="cmd">sudo journalctl -u dnsmasq -n 6 --no-pager</pre>
+<pre class="out">dnsmasq[3412]: query[A] web.lab from <b>10.20.0.2</b>       ← the namespace asked
+dnsmasq[3412]: config web.lab is 10.20.0.2                ← answered from your config</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Four things should now be true, and each has a one-command check. Your server answers authoritatively for its zone (<code>dig @10.20.0.1 web.lab</code> returns a record; <code>dig @10.20.0.1 nothing.lab</code> returns NXDOMAIN rather than forwarding). The host resolves <code>.lab</code> through it without changing anything else (<code>resolvectl query web.lab</code> works and <code>resolvectl query example.com</code> still works). The namespace has its own resolver configuration (<code>sudo ip netns exec pod1 cat /etc/resolv.conf</code> differs from the host's). And the query genuinely traverses the veth (your <code>tcpdump</code> showed <code>10.20.0.2 &gt; 10.20.0.1.53</code>). Then answer the concept question: what makes <code>lab</code> a real zone? (Nothing but the fact that the clients are pointed at a server that claims it — exactly the status of <code>cluster.local</code>.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If <code>dnsmasq</code> refuses to start, read the journal before changing anything: the overwhelmingly likely cause is the port-53 collision described above, and it appears as a bind failure. The fix is <code>listen-address=</code> plus <code>bind-interfaces</code>, which you already have — but note that <code>bind-interfaces</code> binds at start-up, so if <code>cni0</code> does not exist yet, dnsmasq will fail with "cannot assign requested address." Run <code>net-up.sh</code> first, then restart dnsmasq. The general shape of this problem — a daemon that must be started after the interface it binds — recurs constantly.</p>
+<p>Do not solve the collision by disabling <code>systemd-resolved</code> or setting <code>DNSStubListener=no</code>. It is the frequently-recommended answer online and it is the wrong lesson: it removes the machine's cache and its per-domain routing to fix a problem that a one-line bind address solves. Coexistence is both easy and the correct model — and it is the model a cluster uses, where CoreDNS and the node's own resolver both exist and each has a defined scope.</p>
+<p>Keep <code>/etc/netns/pod1/resolv.conf</code> in mind as a general tool. It is bind-mounted only for processes started via <code>ip netns exec</code>, so a process that entered the namespace some other way (<code>nsenter</code>, a container runtime) will see the host's file instead. If a namespace mysteriously uses the wrong nameserver, check <em>how</em> the process got into the namespace before doubting the file.</p>
+<p>Finally, leave this setup running — <a href="#cp-b10-13">B10.13</a> breaks exactly this rig three ways, and the cleanup instructions are at the end of that lesson.</p>
+<div class="k8s-link">
+<p>You have just built CoreDNS's job description. In a cluster: a DNS server runs as pods, is authoritative for a private zone (<code>cluster.local</code>) that nobody delegated and no root server knows, forwards everything else to upstream resolvers, and is reachable from inside every pod's network namespace at a fixed address written into that pod's own generated <code>/etc/resolv.conf</code> — with a search list that lets short names work. Every clause of that maps onto a step you just performed. The one thing your version lacks is automation: CoreDNS generates its records by watching the API for Services and pods instead of reading <code>host-record=</code> lines, which is the only substantive difference between your <code>lab</code> zone and a cluster's.</p>
+<p>CoreDNS's configuration, read plugin by plugin — <code>kubernetes</code> for the authoritative half, <code>forward</code> for the rest, <code>cache</code> for the TTLs — is <a href="w4.html#cp-4-15">W4.15</a>; the per-pod resolver file you just imitated with <code>/etc/netns/</code> is <a href="w4.html#cp-4-16">W4.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 dnsmasq</code> documents every option used here — <code>--local</code>, <code>--host-record</code>, <code>--listen-address</code>, <code>--bind-interfaces</code>, <code>--local-ttl</code>, <code>--log-queries</code> — and is unusually readable for a man page. <code>man 8 ip-netns</code> describes the <code>/etc/netns/&lt;name&gt;/</code> bind-mount mechanism in its "NETWORK NAMESPACE MANAGEMENT" section. <code>man 5 resolved.conf</code> for <code>DNS=</code> and the <code>~domain</code> routing syntax; <code>man 1 resolvectl</code> for verifying what took effect.</p>
+</article>
+
+<article class="lesson drill" id="cp-b10-13" data-id="b10-13">
+<div class="lesson-head"><span class="cp-id">B10.13</span><h4>Debugging drill — a wrong nameserver, a search-path rewrite, a stale cache</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Three faults, and the discipline is to name each from its <em>symptom</em> before you look at any configuration. They are chosen because they fail in three completely different ways: the first fails loudly and slowly, the second does not fail at all (it succeeds, wrongly), and the third fails while every piece of configuration on the machine is correct. Learn to tell them apart by their signature and DNS stops being weather. Each runs against the rig you built in <a href="#cp-b10-12">B10.12</a>.</p>
+<h5 class="verify">Symptom 1 — everything fails, slowly (a wrong nameserver)</h5>
+<ol class="lab">
+<li>Point the namespace at a nameserver that does not exist, then observe: <em>every</em> name fails, each attempt takes seconds rather than milliseconds, and nothing distinguishes one name from another.
+<pre class="cmd">multipass shell sandbox
+printf 'nameserver 192.0.2.53\nsearch lab\n' | sudo tee /etc/netns/pod1/resolv.conf   # plant the fault
+time sudo ip netns exec pod1 getent hosts web.lab; echo "exit=$?"
+time sudo ip netns exec pod1 getent hosts example.com; echo "exit=$?"</pre>
+<pre class="out">exit=2   (real ~5.0s)      ← the lab name fails, after a long wait
+exit=2   (real ~5.0s)      ← the external name fails identically
+    ← nothing resolves, everything is slow, all names behave the same</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>The configured nameserver is unreachable, so every query waits out its timeout and fails.</strong> The signature is the uniformity plus the duration: a name problem affects <em>some</em> names, a server problem affects <em>all</em> of them, and an unreachable server (as opposed to a wrong one) adds seconds of timeout to each attempt. Confirm in two moves — <code>dig @10.20.0.1 web.lab</code> succeeds, proving the data and the server are fine, while <code>dig web.lab</code> through the configured resolver hangs; and a <code>tcpdump -nn -i any port 53</code> shows queries leaving for <code>192.0.2.53</code> with no reply ever coming back. On a real system the same evidence appears as <code>SERVFAIL</code> or <code>connection timed out; no servers could be reached</code>. Fix by putting the right nameserver back: <code>printf 'nameserver 10.20.0.1\nsearch lab\n' | sudo tee /etc/netns/pod1/resolv.conf</code>. The reflex: <em>if every name fails and each failure is slow, stop looking at names and go look at the nameserver.</em></p></details>
+
+<h5 class="verify">Symptom 2 — it resolves, to the wrong host (a search-path rewrite)</h5>
+<ol class="lab">
+<li>Give the namespace two search domains in an order nobody double-checked, then ask for a short name. It resolves — instantly, successfully, with no error anywhere — to the wrong machine.
+<pre class="cmd">printf 'nameserver 10.20.0.1\nsearch dev.lab prod.lab\n' | sudo tee /etc/netns/pod1/resolv.conf
+sudo ip netns exec pod1 getent hosts web          # you meant web.prod.lab (10.20.0.2)
+sudo ip netns exec pod1 dig +short web.prod.lab.  # the trailing-dot control (B10.4)</pre>
+<pre class="out">10.20.0.3       web        ← succeeded — but that is <b>web.dev.lab</b>, not prod
+10.20.0.2                  ← the name you meant resolves correctly when fully qualified</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>The search list completed the short name against the first domain that had a match, which was not the one intended.</strong> This is the nastiest of the three precisely because nothing reports an error: the lookup succeeds, the address is valid, a host answers, and every monitoring check goes green while traffic goes to the wrong environment. The tell is that the fully-qualified form (with the trailing dot) gives a <em>different</em> answer from the short form — which is the one-command diagnosis from <a href="#cp-b10-4">B10.4</a>, and worth running reflexively whenever an answer is surprising rather than absent. Confirm with a capture: <code>tcpdump -nn -i veth1 port 53</code> shows the QUESTION as <code>web.dev.lab.</code>, not <code>web.</code>, which is the resolver telling you exactly what it did. Fix by ordering the search list deliberately (<code>search prod.lab dev.lab</code>) or, better, by using fully-qualified names in configuration and leaving short names to humans. The reflex: <em>when a name resolves to something surprising, read the QUESTION section — the name you asked is not always the name you typed.</em></p></details>
+
+<h5 class="verify">Symptom 3 — the resolver and the source disagree (a stale cached record)</h5>
+<ol class="lab">
+<li>Move a record at the source while a client is holding a cached copy. Every piece of configuration is now correct, and the client is still wrong — the DNS analogue of B9's stale conntrack entry.
+<pre class="cmd">resolvectl query web.lab | head -1                     # host caches it: 10.20.0.2, TTL 300
+sudo sed -i 's/^host-record=web.lab,.*/host-record=web.lab,10.20.0.9/' /etc/dnsmasq.d/lab.conf
+sudo systemctl restart dnsmasq                         # the source now says .9
+dig @10.20.0.1 +short web.lab                          # ask the source directly
+resolvectl query web.lab | head -1                     # ask the resolver</pre>
+<pre class="out">web.lab: 10.20.0.2                 ← cached before the change
+10.20.0.9                          ← the source: correct, updated
+web.lab: <b>10.20.0.2</b>                 ← the resolver: still serving the old answer</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A cached record is being served until its TTL expires, so the resolver and the authoritative source disagree while both are behaving correctly.</strong> The signature is precisely that disagreement: <code>dig @&lt;source&gt;</code> gives the new answer and the ordinary path gives the old one, with a <code>Query time: 0 msec</code> on the stale answer proving it came from memory (<a href="#cp-b10-9">B10.9</a>). Nothing is misconfigured — this is the system honouring the TTL contract from <a href="#cp-b10-10">B10.10</a>. Fix on this machine with <code>sudo resolvectl flush-caches</code>, then re-query and watch it agree; the general fix is to have lowered the TTL before the change, because you cannot flush anyone else's cache. The reflex: <em>when the resolver and the source disagree, you have a caching problem, not a data problem — check the query time and flush before you touch a single record.</em> This is the same lesson as B9's stale conntrack entry in a different layer: correct configuration plus remembered state equals wrong behaviour.</p></details>
+
+<h5 class="gotcha">Gotchas</h5>
+<p>The three faults escalate in how hard they are to <em>notice</em>, which is the real point of the ordering. The first announces itself — everything is broken and slow, and someone will file a ticket within a minute. The second announces nothing at all; it succeeds, and it can run in production for months routing a fraction of traffic to the wrong environment until someone notices data in the wrong database. The third announces itself only as a disagreement between two machines, which is easy to dismiss as "must be a fluke, it works from here." Ranked by how much damage they can do before discovery, the order is exactly reversed from how loudly they fail.</p>
+<p>Each has a one-command discriminator, and they are worth keeping together as a kit. <em>Everything fails, slowly</em> → suspect the nameserver; discriminate with <code>dig @&lt;server&gt;</code> to bypass it. <em>It resolves to the wrong thing</em> → suspect the search path; discriminate with a trailing dot. <em>Two machines disagree</em> → suspect a cache; discriminate with <code>Query time</code> and a flush. Three symptoms, three commands, and between them they cover the large majority of real resolution incidents.</p>
+<p>Restore the rig before you leave: put the good record back and flush, so nothing here surprises you later.</p>
+<pre class="cmd">sudo sed -i 's/^host-record=web.lab,.*/host-record=web.lab,10.20.0.2/' /etc/dnsmasq.d/lab.conf
+sudo systemctl restart dnsmasq
+printf 'nameserver 10.20.0.1\nsearch lab\n' | sudo tee /etc/netns/pod1/resolv.conf
+sudo resolvectl flush-caches
+resolvectl query web.lab | head -1</pre>
+<pre class="out">web.lab: 10.20.0.2        ← back to a known-good state</pre>
+<div class="k8s-link">
+<p>All three are everyday cluster incidents wearing cluster clothes. A wrong or unreachable nameserver is a pod whose <code>dnsPolicy</code> or <code>dnsConfig</code> points it somewhere useless, or CoreDNS pods that are down — everything fails, slowly, for that pod only. A search-path rewrite is a bare Service name resolving in the wrong namespace because the pod's namespace search domain matched first, which sends traffic to a same-named Service in a different environment with no error anywhere. And the resolver-versus-source disagreement is a stale cached answer, which is why <code>kubectl get svc</code> showing the right endpoint while a pod talks to the wrong one is a caching question rather than a Kubernetes question. You now have the by-hand version of all three signatures.</p>
+<p>The cluster DNS debug ladder that formalises these discriminators is <a href="w4.html#cp-4-18">W4.18</a>; the pod resolver settings that cause the first two are <a href="w4.html#cp-4-16">W4.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 resolv.conf</code> (the <code>search</code> and <code>ndots</code> semantics behind symptom 2), <code>man 1 dig</code> (<code>@server</code> to bypass a tier, the QUESTION section, <code>Query time</code>), <code>man 1 resolvectl</code> (<code>query</code>, <code>flush-caches</code>, <code>statistics</code>), <code>man 8 dnsmasq</code> (<code>--log-queries</code>, which shows you the questions your server was actually asked). Re-read <a href="#cp-b10-4">B10.4</a> for the trailing-dot control and <a href="#cp-b10-10">B10.10</a> for why the third fault is not a misconfiguration.</p>
+</article>
+
+</div><!-- /g-project -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B10 recall quiz</h3>
+<p>Answer out loud before revealing. If you can explain why a pod fires four failing queries before resolving <code>google.com</code>, and why a name can keep failing for ten minutes after it starts existing, this module has done its job.</p>
+<ol>
+<li>Which piece of software actually turns a hostname into an address for an ordinary program, and which file tells it where to look?
+<details class="reveal"><summary>Answer</summary><p>The C library's resolver, entered through <code>getaddrinfo()</code>. <code>/etc/nsswitch.conf</code>'s <code>hosts:</code> line lists the sources in order — typically <code>files</code> (read <code>/etc/hosts</code>) before <code>dns</code> (query a nameserver), sometimes with <code>resolve</code> (hand it to systemd-resolved) or <code>mdns4_minimal</code> in between. DNS is only one of several possible sources, which is why "the resolver" and "DNS" are not synonyms.</p></details></li>
+<li><code>ping myhost</code> works and <code>dig myhost</code> returns nothing. Who is wrong?
+<details class="reveal"><summary>Answer</summary><p>Neither. <code>ping</code> goes through the resolver library and may be answered by <code>/etc/hosts</code>, mDNS or a local cache with no DNS query ever leaving the machine; <code>dig</code> builds a DNS packet itself and asks a nameserver directly, correctly reporting that no DNS record exists. Test with <code>getent hosts NAME</code> when you want to know what the <em>application</em> will get, and <code>dig</code> when you want to know what <em>DNS</em> says.</p></details></li>
+<li>You have <code>search example.com corp.example.com</code> and <code>options ndots:1</code>. How many queries does the name <code>web</code> produce, and in what order?
+<details class="reveal"><summary>Answer</summary><p>Up to three: <code>web.example.com.</code>, then <code>web.corp.example.com.</code>, then the literal <code>web.</code> — because <code>web</code> has zero dots, which is fewer than <code>ndots:1</code>, so the search list is tried first. Each attempt is a real round trip. Writing <code>web.</code> with a trailing dot produces exactly one query.</p></details></li>
+<li>Why does a pod with <code>ndots:5</code> fire four failing queries before resolving <code>google.com</code>?
+<details class="reveal"><summary>Answer</summary><p><code>google.com</code> has one dot, which is fewer than five, so it counts as a "short" name and is walked through every search domain first — <code>google.com.default.svc.cluster.local</code>, <code>google.com.svc.cluster.local</code>, <code>google.com.cluster.local</code>, plus any node domain — before the literal query finally succeeds. It is the plain dot-counting rule with a high threshold, not a bug. A trailing dot or <code>dnsConfig</code> with <code>ndots:1</code> collapses it to one query.</p></details></li>
+<li>What is the difference between a recursive resolver and an authoritative server, and which flag proves which you're talking to?
+<details class="reveal"><summary>Answer</summary><p>A recursive resolver holds no records; it chases an answer through the tree on your behalf and caches it, for any zone — it sets <code>ra</code> (recursion available). An authoritative server holds the actual records for one zone and answers only about that zone, definitively — it sets <code>aa</code> (authoritative answer). Your <code>/etc/resolv.conf</code> always points at the recursive kind. CoreDNS is deliberately both: authoritative for <code>cluster.local</code>, a forwarder for everything else.</p></details></li>
+<li>In a <code>dig +trace</code>, what do the root and TLD servers actually return, and why are glue records needed?
+<details class="reveal"><summary>Answer</summary><p>Referrals, not answers: a set of NS records saying "not mine — these servers handle the next level down." Only the final, authoritative server returns an ANSWER section. Glue records are the referred nameservers' <em>addresses</em>, shipped in the ADDITIONAL section, so the resolver doesn't have to resolve <code>a.gtld-servers.net</code> before it can ask it anything — which would be circular.</p></details></li>
+<li>On Ubuntu 24.04, your <code>/etc/resolv.conf</code> says <code>nameserver 127.0.0.53</code>. What is that, and where are the real upstreams?
+<details class="reveal"><summary>Answer</summary><p>It's <code>systemd-resolved</code>'s local stub listener — a caching, per-domain-routing resolver running on this machine. The real upstreams are in resolved's per-link configuration, visible with <code>resolvectl status</code>, and never appear in <code>/etc/resolv.conf</code> (which is a generated symlink into <code>/run</code>, so hand-editing it silently reverts). Two consequences: a capture on the uplink shows nothing for a cache hit, and configuration belongs in <code>/etc/systemd/resolved.conf.d/</code>.</p></details></li>
+<li>Which record type carries a port number, and which one is an alias that restarts the lookup?
+<details class="reveal"><summary>Answer</summary><p>SRV carries priority, weight, <em>port</em> and target — the only common record with a port, which is how StatefulSet members find each other. CNAME is the alias: the resolver receives it and restarts the lookup at the target. A CNAME may not coexist with other records, which is why a zone apex can never be one — and why an <code>ExternalName</code> Service, which is just a CNAME answer, behaves the way it does.</p></details></li>
+<li><code>status: NOERROR</code> with <code>ANSWER: 0</code>. What happened, and how is it different from <code>NXDOMAIN</code>?
+<details class="reveal"><summary>Answer</summary><p>The name exists but has no record of the type you asked for — a successful query with an empty answer. <code>NXDOMAIN</code> means the name itself does not exist at all. Both look identical through <code>dig +short</code> (a blank line), which is why you read the <code>status:</code> line before concluding anything. And the routing rule: <code>NXDOMAIN</code> sends you to check the name and search path; <code>SERVFAIL</code> sends you to check the server and its upstreams.</p></details></li>
+<li>You query a name twice and the TTL goes from 3600 to 3590. What does that prove, and what would a jump back to 3600 mean?
+<details class="reveal"><summary>Answer</summary><p>A decreasing TTL proves you were served from a cache — you are watching a stored copy age. A jump back to the full value means the entry expired and was refetched from the source (or that you asked the authoritative server directly, which never counts down because it isn't caching). Corollary: to make a change propagate quickly, lower the TTL at least one old-TTL period <em>before</em> the change; doing both at once accomplishes nothing.</p></details></li>
+<li>A name starts failing before it exists, is then created correctly, and keeps failing on one machine for another nine minutes. Why, and where does the nine minutes come from?
+<details class="reveal"><summary>Answer</summary><p>Negative caching: the resolver cached the <code>NXDOMAIN</code>. The duration comes from the <code>minimum</code> field of the SOA record returned in the AUTHORITY section of that failure — not from any record's TTL, since there is no record. <code>resolvectl flush-caches</code> clears it on that machine; the durable fix is client-side, making retry logic re-resolve each attempt rather than reuse a resolution made before the name existed.</p></details></li>
+<li>What makes <code>lab</code> — or <code>cluster.local</code> — a real zone, given that no root server has heard of either?
+<details class="reveal"><summary>Answer</summary><p>Nothing but a server asserting it and clients being pointed at that server. In your project, <code>local=/lab/</code> told dnsmasq to answer for <code>lab</code> authoritatively and never forward, and a routing domain (<code>Domains=~lab</code>) sent those queries there while everything else carried on upstream. A cluster does exactly this: CoreDNS is declared authoritative for <code>cluster.local</code>, every pod's generated <code>resolv.conf</code> points at it, and external names are forwarded on. Private zones are assertions, not delegations.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Name the resolver library as the thing that actually resolves, read <code>/etc/nsswitch.conf</code>'s <code>hosts:</code> line, and diagnose a <code>ping</code>-versus-<code>dig</code> disagreement in one sentence instead of an argument.</li>
+<li>Use <code>getent hosts</code> to test what an application will experience and <code>dig</code> to test what DNS says — and know which question each answers.</li>
+<li>Use <code>/etc/hosts</code> deliberately, prove with <code>tcpdump</code> that it puts nothing on the wire, and check it first when one machine disagrees with all the others.</li>
+<li>Read <code>/etc/resolv.conf</code> line by line and predict, by counting dots against <code>ndots</code>, exactly which queries a given name will generate and in what order.</li>
+<li>Explain <code>ndots:5</code> and a cluster's four-domain search ladder as arithmetic rather than folklore, including why external lookups from a pod cost four extra queries.</li>
+<li>Stop a search-list fan-out on demand with a trailing dot, and use that as the one-command test that separates a search-path fault from a server or zone fault.</li>
+<li>Tell a recursive resolver from an authoritative server by the <code>ra</code> and <code>aa</code> flags, and halve any DNS problem by asking the authoritative server directly with <code>dig @server</code>.</li>
+<li>Walk the root → TLD → authoritative delegation with <code>dig +trace</code>, read referrals and glue, and explain why caching is structural rather than an optimisation.</li>
+<li>Explain the <code>127.0.0.53</code> stub, find the real upstreams with <code>resolvectl status</code>, capture on the right interface, and configure resolution with a drop-in instead of editing a generated file.</li>
+<li>Use routing domains (<code>~zone</code>) to hand one zone to one server without disturbing how the machine resolves anything else.</li>
+<li>Say what each record type is for — A, AAAA, CNAME, PTR, SRV, TXT, NS, SOA — and recognise Services, headless Services and <code>ExternalName</code> as three of them.</li>
+<li>Read a <code>dig</code> answer completely and route the investigation from the status alone: <code>NXDOMAIN</code> is a name problem, <code>SERVFAIL</code> is a server problem, <code>NOERROR</code>+0 is a type mismatch, <code>0 msec</code> is a cache.</li>
+<li>Prove a cache hit by watching a TTL count down, and plan a DNS change by lowering the TTL a full old-TTL period in advance.</li>
+<li>Explain negative caching from the SOA <code>minimum</code> field, and recognise "it started working on its own" as a cached failure expiring rather than a mystery.</li>
+<li>Run your own resolver: serve a private zone, coexist with <code>systemd-resolved</code> on port 53, route one domain to it, and resolve it from inside a network namespace with its own <code>resolv.conf</code>.</li>
+<li>Diagnose the three classic resolution faults from their signatures — all names failing slowly (nameserver), a surprising but successful answer (search path), two machines disagreeing (cache) — each with its own one-command discriminator.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b9.html">← B9 · Networking II: virtual networking &amp; packet filtering</a><a href="../beginner.html#b11">B11 · Service management — systemd, logs, boot →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-25. systemd 255 (<code>systemd-resolved</code>, <code>resolvectl</code>, stub listener on <code>127.0.0.53</code>), bind9-dnsutils 9.18 (<code>dig</code>), dnsmasq 2.90, iproute2 6.1 (<code>ip netns</code>, <code>ss</code>), tcpdump 4.99, glibc 2.39 (<code>getaddrinfo</code>, <code>getent</code>). Kubernetes facts checked against v1.35 (LF CKA target): CoreDNS is the default cluster DNS, pods receive <code>options ndots:5</code> with the <code>&lt;ns&gt;.svc.cluster.local svc.cluster.local cluster.local</code> search list, and per-pod overrides go through <code>dnsPolicy</code>/<code>dnsConfig</code>.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
