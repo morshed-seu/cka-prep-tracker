@@ -375,6 +375,373 @@ EOF</pre>
 </article>
 
 </div>
+
+<!-- ---------------- State and agreement ---------------- -->
+<div class="grp" id="g-state"><h3>State and agreement</h3>
+
+<article class="lesson" id="cp-b13-5" data-id="b13-5">
+<div class="lesson-head"><span class="cp-id">B13.5</span><h4>Stateless and stateful, and why only one of them is easy</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Almost every "just add another replica" story works beautifully or destroys data, and which one you get is decided entirely by this distinction. It is also the reason Kubernetes has two different objects for running copies of a program, and choosing the wrong one is a data-loss bug rather than a matter of taste.</p>
+<h5>The concept</h5>
+<p>A <strong>stateless</strong> service keeps nothing between requests that matters. Every instance is interchangeable: any copy can serve any request, a dead one can be replaced by a fresh one that knows nothing, and scaling is a matter of starting more. It is not that a stateless service has no data — it usually has plenty — but the data lives somewhere else, and the instance is a pure function of its inputs.</p>
+<p>A <strong>stateful</strong> service owns data that must survive its own restart. That single fact drags in three hard problems at once: the data must be <em>durable</em> (survive a crash), it must be <em>findable</em> (a replacement instance needs the same data, not a blank disk), and it must not be <em>corrupted by two writers</em> at the same time. The last one is the sharp edge, because it fails silently. Two processes doing read-modify-write on the same value will lose updates, and neither will report an error.</p>
+<p>The strategy every real system uses is to <strong>push state to the edges</strong>: make as much of the system stateless as possible, and concentrate the state in a small number of components that are designed for it — a database, a replicated log, etcd. Those components then take on replication (<a href="#cp-b13-6">B13.6</a>), consistency (<a href="#cp-b13-7">B13.7</a>) and agreement (<a href="#cp-b13-9">B13.9</a>), which is precisely why the rest of this module is about them.</p>
+<div class="flow"><span>stateless: any copy will do</span><em>vs</em><span class="hot">stateful: this copy owns something</span><em>→</em><span>durable · findable · one writer</span></div>
+<p>Push the state into as few places as you can; everything else becomes replaceable.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run a stateless service and prove instances are interchangeable. Kill one, start another, and nothing was lost because nothing was held.
+<pre class="cmd">mkdir -p ~/dist &amp;&amp; cd ~/dist
+python3 -m http.server 9100 --directory /etc &amp;&gt;/dev/null &amp; sleep 1
+curl -s -o /dev/null -w 'instance A: %{http_code}\n' localhost:9100/hostname
+kill %1; python3 -m http.server 9100 --directory /etc &amp;&gt;/dev/null &amp; sleep 1
+curl -s -o /dev/null -w 'instance B: %{http_code}\n' localhost:9100/hostname; kill %1</pre>
+<pre class="out">instance A: 200
+instance B: <b>200</b>          ← a brand-new process served the same request identically</pre></li>
+<li>Now make something stateful — a counter that lives in a file — and see that a replacement instance needs the data, not just the program.
+<pre class="cmd">echo 0 &gt; counter
+bump() { n=$(cat counter); echo $((n+1)) &gt; counter; }
+bump; bump; bump; cat counter</pre>
+<pre class="out">3          ← the value IS the service. A fresh instance with an empty dir is not equivalent.</pre></li>
+<li>Break it the way two writers break it. Run the same read-modify-write loop twice, concurrently, 500 increments each.
+<pre class="cmd">echo 0 &gt; counter
+for w in 1 2; do ( for i in $(seq 500); do n=$(cat counter); echo $((n+1)) &gt; counter; done ) &amp; done
+wait; echo "expected 1000, got: $(cat counter)"</pre>
+<pre class="out">expected 1000, got: <b>612</b>          ← ~390 updates silently lost. No error, anywhere.</pre></li>
+<li>See exactly where it went wrong. The gap between reading and writing is where the other writer slipped in — this is the lost-update problem in three commands.
+<pre class="cmd">echo "writer A reads 41 ─┐"; echo "writer B reads 41 ─┤ both compute 42"; echo "both write 42     ─┘ one increment vanished"</pre>
+<pre class="out">writer A reads 41 ─┐
+writer B reads 41 ─┤ both compute 42
+both write 42     ─┘ one increment vanished</pre></li>
+<li>Fix it with the only two tools available: serialise the writers, or make the operation atomic. A lock (<a href="b2.html#cp-b2-12">B2.12</a>) does the first.
+<pre class="cmd">echo 0 &gt; counter
+for w in 1 2; do ( for i in $(seq 500); do
+  flock counter.lock bash -c 'n=$(cat counter); echo $((n+1)) &gt; counter'
+done ) &amp; done
+wait; echo "expected 1000, got: $(cat counter)"</pre>
+<pre class="out">expected 1000, got: <b>1000</b>          ← one writer at a time; slower, and correct</pre></li>
+<li>Note the cost you just paid, because it is the trade the whole module is about.
+<pre class="cmd">cd ~/dist; rm -f counter.lock; echo "stateless: scale by adding copies"; echo "stateful : scale by adding coordination"</pre>
+<pre class="out">stateless: scale by adding copies
+stateful : scale by adding coordination          ← and coordination is what costs</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Define both terms in one sentence each, without using the word "state" in the definition — a stateless instance can be replaced by any identical copy at any moment; a stateful one owns data that must outlive it. Then explain the step-3 result: why did 1000 increments produce 612, and why was there no error message? Finally, name the two ways to fix it and what each costs (a lock serialises and therefore slows; an atomic operation avoids the gap entirely but limits what you can express).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Silent corruption is the point to take away. Step 3 produced a wrong number with no failure, no exception and no log line — every command "succeeded". Concurrency bugs on shared state do not announce themselves, which is why they are found weeks later by someone reconciling totals, and why "it worked when I tested it" is not evidence of anything: with one writer, the bug is invisible.</p>
+<p>The second trap is believing a service is stateless because it has no database. In-memory session data, an upload directory, a local cache that clients depend on, a lock file — each of these makes an instance non-interchangeable, and each one turns a routine restart into a user-visible failure. The test is not "does it have a database", it is "if I kill this instance right now and start a fresh one, does anyone notice?"</p>
+<div class="k8s-link">
+<p>This is the entire reason Kubernetes has both Deployments and StatefulSets. Deployment pods are treated as interchangeable: they get random name suffixes, start in any order, and a replacement is simply another copy. StatefulSet pods get <em>stable identity</em> — <code>db-0</code>, <code>db-1</code>, in that order — a stable network name, and their own persistent volume that follows the ordinal rather than the pod. That is the machinery for "findable data" and "this copy owns something", expressed as an API object. Choosing a Deployment for something stateful usually appears to work: the pods run, the service answers, and the data corruption or loss shows up on the first rescheduling event.</p>
+<p>The full workload zoo, including when a StatefulSet is the right answer, is <a href="w3.html#cp-3-10">W3.10</a>; why StatefulSets and DaemonSets roll differently from Deployments is <a href="w3.html#cp-3-9">W3.9</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 flock</code> for the serialising fix in step 5 — the same advisory-lock mechanism from <a href="b2.html#cp-b2-12">B2.12</a>. <code>man 2 open</code> for <code>O_EXCL</code> and <code>man 2 rename</code> for the atomic-replace pattern (<code>write to temp, rename over</code>), which is how most programs update a file safely without a lock at all. <code>man 7 pipe</code> if you want the other classic answer: hand the state to a single owner and talk to it.</p>
+</article>
+
+<article class="lesson" id="cp-b13-6" data-id="b13-6">
+<div class="lesson-head"><span class="cp-id">B13.6</span><h4>Leader/follower replication, and what "behind" costs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Replication is how stateful services survive losing a machine, and the leader/follower arrangement is by far the most common shape. Its behaviour under normal conditions is easy; what matters is knowing precisely what a follower being behind means for a reader, and what happens in the seconds after a leader dies. Both are measurable, and both explain Kubernetes behaviour you will otherwise find surprising.</p>
+<h5>The concept</h5>
+<p>One member is the <strong>leader</strong> (also called primary): it is the only member that accepts writes. Every write is applied there and then shipped to the <strong>followers</strong>, which apply the same changes in the same order. Followers can serve reads, which is often why the arrangement is chosen — read capacity scales with members even though write capacity does not.</p>
+<p>Two properties fall straight out of that design:</p>
+<ul>
+<li><strong>Replication lag.</strong> A follower is always at least a little behind — the time for the change to travel and be applied. A read from a follower is a read of the recent past. Usually that is milliseconds and nobody notices; under load or across a slow link it can be seconds, and then a user who writes a value and immediately reads it back sees the old one. This is the "I saved it and it didn't save" bug, and it is not a bug in the write path at all.</li>
+<li><strong>A failover window.</strong> When the leader dies, everything it had accepted but not yet shipped is gone. The remaining members promote one of themselves, and whatever the new leader never received simply did not happen — from the outside, acknowledged writes vanish. Systems that cannot tolerate that use <em>synchronous</em> replication instead: the leader does not acknowledge a write until a follower has it, which closes the window and adds a round trip to every write.</li>
+</ul>
+<p>So there is a knob, and it has exactly the shape you would expect: <strong>asynchronous</strong> replication is fast and can lose recent writes; <strong>synchronous</strong> replication is slower and does not. Consensus systems like etcd sit at the strict end — a write is not acknowledged until a majority has it on disk (<a href="#cp-b13-9">B13.9</a>) — which is why they are correct through a leader failure and why their write latency is bounded by the slowest member of that majority.</p>
+<div class="flow"><span>client</span><em>→</em><span class="hot">leader (writes)</span><em>→</em><span>follower (reads, behind)</span><em>·</em><span>lag = staleness · unshipped = loss window</span></div>
+<p>Reads from a follower are reads of the past; how far past is the number that matters.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set up a leader and a follower as two files, with a replicator process copying one to the other on an interval. The interval is the lag, made explicit.
+<pre class="cmd">cd ~/dist; echo 0 &gt; leader.db; echo 0 &gt; follower.db
+( while true; do cp leader.db follower.db; sleep 2; done ) &amp;
+echo "replicator pid $!"</pre>
+<pre class="out">replicator pid 6412          ← ships the leader's state to the follower every 2 s</pre></li>
+<li>Write to the leader and immediately read from the follower. This is the read-your-own-write failure, reproduced on demand.
+<pre class="cmd">echo 42 &gt; leader.db
+echo "leader:   $(cat leader.db)"; echo "follower: $(cat follower.db)"</pre>
+<pre class="out">leader:   42
+follower: <b>0</b>          ← the write happened, and the follower has not heard about it yet</pre></li>
+<li>Wait out the lag and read again. Nothing was broken — the follower was simply in the past.
+<pre class="cmd">sleep 2.5; echo "follower: $(cat follower.db)"</pre>
+<pre class="out">follower: <b>42</b>          ← caught up. "Eventually" is a real technical term (B13.7).</pre></li>
+<li>Measure the lag rather than assuming it. Write a timestamped value and time how long it takes to appear on the follower.
+<pre class="cmd">date +%s.%N &gt; leader.db
+while [ "$(cat follower.db)" != "$(cat leader.db)" ]; do sleep 0.05; done
+python3 -c "import time,sys; print(f'replication lag: {time.time()-float(sys.argv[1]):.2f} s')" "$(cat follower.db)"</pre>
+<pre class="out">replication lag: <b>1.31</b> s          ← a real number; this is what a follower read is behind by</pre></li>
+<li>Now kill the leader mid-flight and see the loss window. Writes accepted after the last replication cycle are gone.
+<pre class="cmd">echo 100 &gt; leader.db; echo 101 &gt; leader.db; echo 102 &gt; leader.db   # accepted by the leader
+kill %1                                                            # leader dies before shipping
+rm -f leader.db                                                    # its disk is gone with it
+echo "promoted follower now holds: $(cat follower.db)"</pre>
+<pre class="out">promoted follower now holds: <b>42</b>          ← three acknowledged writes vanished</pre></li>
+<li>Do it the synchronous way and watch the window close — at the cost of a slower write.
+<pre class="cmd">echo 42 &gt; leader.db
+sync_write() { echo "$1" &gt; leader.db; cp leader.db follower.db; }   # ack only after the follower has it
+time sync_write 103; echo "leader=$(cat leader.db) follower=$(cat follower.db)"</pre>
+<pre class="out">real    0m0.004s
+leader=103 follower=<b>103</b>          ← no window: the write was not "done" until both had it</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, without notes, what a follower read gives you and why that is not a bug. Then quantify the two costs: what does replication lag cost a user (a read of the recent past, most visibly right after their own write), and what does asynchronous replication cost during a failover (every write the leader accepted but had not shipped)? Finally, state the trade in one sentence — synchronous replication closes the loss window by adding a round trip to every write — and say which end of that trade etcd sits at.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Read-your-own-writes is the failure that gets misdiagnosed most often, because the symptom appears in the read path while the cause is in the replication topology. A user updates their profile, the write goes to the leader, the subsequent page load is served by a follower that has not caught up, and the application appears to have ignored the save. Nothing in the write path is faulty; the fix is to route reads that follow a write to the leader, or to wait for the follower to reach the write's position.</p>
+<p>The second trap is treating a follower's health as a green light. A follower that is up, connected and answering can still be minutes behind, and monitoring that checks liveness rather than lag will report everything as fine while readers get stale data. Lag is a separate metric and it is the one that matters — a replica that is up but hours behind is not a replica, it is a slow backup.</p>
+<div class="k8s-link">
+<p>etcd is a leader/follower system with the strict settings: one member is the leader, all writes go through it, and a write is not acknowledged until a majority of members have persisted it. That is why a Kubernetes control plane survives losing an etcd member without losing acknowledged data — there is no unshipped-writes window, because "acknowledged" is defined as "a majority already has it". The price is exactly the one this lesson predicts: every write costs a round trip to the slowest member of the majority, plus a disk sync, which is why etcd is so sensitive to disk and network latency (<a href="#cp-b13-4">B13.4</a>).</p>
+<p>Raft — the algorithm that turns leader/follower replication into something safe through a leader failure — is <a href="w1.html#cp-1-9">W1.9</a>; the revision counter that orders those replicated entries is <a href="w1.html#cp-1-10">W1.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">No single man page covers replication, so read the mechanisms instead: <code>man 2 fsync</code> and <code>man 2 fdatasync</code> for what "durably stored" costs on the leader, <code>man 1 rsync</code> for the shape of an incremental ship-the-difference protocol, and <code>man 5 systemd.timer</code> if you want the replicator loop from step 1 running as a real unit rather than a background shell (<a href="b11.html#cp-b11-2">B11.2</a>).</p>
+</article>
+
+<article class="lesson" id="cp-b13-7" data-id="b13-7">
+<div class="lesson-head"><span class="cp-id">B13.7</span><h4>Strong and eventual consistency, and CAP as a real choice</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>CAP is the most-quoted and least-usefully-understood idea in distributed systems, usually rendered as "pick two of three", which is not what it says. Stated properly it is a decision you make at a specific moment — when the network splits — and Kubernetes makes that decision differently in different components, on purpose. Knowing which is which explains why <code>kubectl get</code> can show you something out of date and be working perfectly.</p>
+<h5>The concept</h5>
+<p>Two consistency models, in plain words:</p>
+<ul>
+<li><strong>Strong consistency</strong> — every read returns the most recent write. To promise that, a read must be answered by someone who is certain they are current, which means waiting or coordinating. You pay in latency and in availability during trouble.</li>
+<li><strong>Eventual consistency</strong> — reads may return stale data for a while, and if writes stop, all replicas converge on the same value. You gain speed and the ability to keep answering when parts of the system cannot talk, and you accept that a reader may see the past (<a href="#cp-b13-6">B13.6</a>'s lag, promoted to a design decision).</li>
+</ul>
+<p><strong>CAP</strong> is the statement that makes the choice unavoidable. Its useful form: <em>when a network partition happens</em> — when some members cannot reach others — a system must choose between refusing to answer (staying consistent) and answering with possibly-stale data (staying available). It cannot do both, because the only way to be certain you are current is to hear from the others, and by assumption you cannot. When there is no partition there is no trade-off, which is why "pick two of three" misleads: partitions are not optional, so the real choice is only ever between the other two, and only during the partition.</p>
+<p>Kubernetes makes both choices deliberately, in different layers. <strong>etcd chooses consistency</strong>: lose quorum and writes stop rather than risk two halves diverging (<a href="#cp-b13-8">B13.8</a>). <strong>The controllers around it are eventually consistent by design</strong>: each works from a local cache that may be a moment out of date, acts on what it sees, and corrects itself on the next pass (<a href="#cp-b13-12">B13.12</a>). The combination is deliberate — one component that must never be wrong, surrounded by many that are allowed to be briefly out of date because they will re-check.</p>
+<div class="flow"><span>partition happens</span><em>→</em><span class="hot">refuse to answer (consistent)</span><em>or</em><span>answer possibly-stale (available)</span></div>
+<p>The choice only exists during a partition — and it is a choice, not a failure.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Rebuild the leader/follower pair with a heartbeat, so a reader can tell whether its data is fresh. The heartbeat is what makes the choice possible at all.
+<pre class="cmd">cd ~/dist; echo 42 &gt; leader.db; cp leader.db follower.db; date +%s &gt; follower.sync
+( while true; do cp leader.db follower.db; date +%s &gt; follower.sync; sleep 1; done ) &amp;
+sleep 2; echo "last sync $(( $(date +%s) - $(cat follower.sync) ))s ago"</pre>
+<pre class="out">last sync <b>0</b>s ago          ← the follower knows how current it is; that is the whole trick</pre></li>
+<li>Write a reader that implements <em>both</em> policies, choosing between them with a flag. Twelve lines, and it is the entire CAP decision.
+<pre class="cmd">cat &gt; read.sh &lt;&lt;'EOF'
+#!/bin/bash
+mode=$1; max_age=3
+age=$(( $(date +%s) - $(cat follower.sync) ))
+if [ "$mode" = strong ] &amp;&amp; [ "$age" -gt "$max_age" ]; then
+  echo "REFUSED: data is ${age}s old, cannot guarantee freshness"; exit 1
+fi
+echo "value=$(cat follower.db)  (age ${age}s)"
+EOF
+chmod +x read.sh; ./read.sh strong; ./read.sh eventual</pre>
+<pre class="out">value=42  (age 0s)
+value=42  (age 0s)          ← with no partition, both policies behave identically</pre></li>
+<li>Now partition the system — stop the replication and let the follower fall behind while the leader keeps taking writes.
+<pre class="cmd">kill %1 2&gt;/dev/null; echo 99 &gt; leader.db; sleep 4
+echo "leader has: $(cat leader.db)"; echo "follower has: $(cat follower.db)"</pre>
+<pre class="out">leader has: 99
+follower has: <b>42</b>          ← the two halves now disagree, and cannot talk</pre></li>
+<li>Ask both policies the same question during the partition. This is the trade-off, executing.
+<pre class="cmd">./read.sh strong; ./read.sh eventual</pre>
+<pre class="out"><b>REFUSED</b>: data is 5s old, cannot guarantee freshness       ← chose consistency: no answer
+value=42  (age 5s)                                        ← chose availability: a wrong answer</pre></li>
+<li>Heal the partition and watch convergence — the "eventual" in eventual consistency, arriving.
+<pre class="cmd">( while true; do cp leader.db follower.db; date +%s &gt; follower.sync; sleep 1; done ) &amp;
+sleep 2; ./read.sh strong</pre>
+<pre class="out">value=<b>99</b>  (age 0s)          ← converged; the strong reader answers again</pre></li>
+<li>State the choice each Kubernetes layer makes, then stop the replicator.
+<pre class="cmd">kill %1 2&gt;/dev/null
+echo "etcd        -> refuses writes without quorum   (consistency)"
+echo "controllers -> act on a cached view, re-check  (eventual)"</pre>
+<pre class="out">etcd        -> refuses writes without quorum   (consistency)
+controllers -> act on a cached view, re-check  (eventual)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State CAP in its useful form — during a partition, choose between refusing to answer and answering with possibly-stale data — and explain why "pick two of three" is a misleading summary. Then place both Kubernetes layers on that spectrum and justify each: etcd must never let two halves diverge, because the cluster's entire state lives there; controllers may safely act on stale data because their actions are re-evaluated on the next pass and are idempotent, so a mistake made from a stale view is corrected rather than compounded.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Eventually consistent" is often heard as "unreliable", and it is not. It is a precise promise: if writes stop, all replicas converge on the same value. What it does not promise is <em>when</em>, and that is where systems get into trouble — an eventual-consistency design with no bound on staleness, and no way for a reader to learn the age of what it is reading, gives you no way to distinguish "slightly behind" from "broken and stuck since Tuesday". Step 1's heartbeat exists for exactly this reason: expose the age, so someone can decide.</p>
+<p>The second is assuming strong consistency is simply the better choice when you can afford it. It costs availability at precisely the worst moment — during a partition, the consistent system stops answering, which for a user is indistinguishable from an outage. Whether that is right depends entirely on the data: a bank balance should refuse rather than lie, a cached product listing should absolutely keep serving.</p>
+<div class="k8s-link">
+<p>This is why a Kubernetes cluster degrades the way it does when etcd loses quorum: reads keep working from the API server's caches, and writes fail. That is consistency being chosen on your behalf — the cluster would rather stop accepting changes than let two partitions both accept them and diverge. Meanwhile the eventual-consistency half explains an everyday observation: <code>kubectl get pods</code> can show a pod that has already terminated, because the answer came from a watch cache that is a moment behind, and the next controller pass reconciles the difference. Neither is a fault; they are two deliberate settings in one system.</p>
+<p>What exactly still works when etcd stops answering is <a href="w6.html#cp-6-8">W6.8</a>; the controller pattern that makes eventual consistency safe — informer, queue, reconcile — is <a href="w1.html#cp-1-16">W1.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">CAP is a theorem rather than a tool, so the reading is conceptual: Brewer's original formulation, and Kleppmann's "Please stop calling databases CP or AP" for why the labels are less useful than the specific behaviour. Locally, <code>man 2 fsync</code> and <code>man 7 tcp</code> are still the mechanisms underneath — durability on one node, and the channel that partitions.</p>
+</article>
+
+<article class="lesson" id="cp-b13-8" data-id="b13-8">
+<div class="lesson-head"><span class="cp-id">B13.8</span><h4>Quorum arithmetic: why 3 and 5, and never 4</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the arithmetic behind every "how many members should this cluster have?" decision, and it takes two minutes to learn permanently. It also explains, exactly, why losing two of three control-plane nodes turns a Kubernetes cluster read-only rather than merely slower — a behaviour that looks like a bug until you have done the sum.</p>
+<h5>The concept</h5>
+<p>A <strong>quorum</strong> is the minimum number of members that must agree before the group may act. Use the canonical picture: a small committee that can only make decisions with a strict majority present. For N members, a majority is <code>floor(N/2) + 1</code>, and the number of failures the group tolerates is <code>N − quorum</code>.</p>
+<p>The reason it must be a <em>majority</em>, rather than any fixed number, is the property that makes the whole scheme work: <strong>two disjoint groups cannot both contain a majority.</strong> If the network splits the cluster in two, at most one side can have more than half the members, so at most one side can act. That single fact is what prevents two halves of a partitioned cluster from both accepting writes and diverging — the failure mode called <em>split brain</em> (<a href="#cp-b13-9">B13.9</a>).</p>
+<p>Now the odd-numbers result, which follows directly. With 3 members, quorum is 2, so 1 failure is tolerated. With 4 members, quorum is 3, so still only 1 failure is tolerated — you added a machine, added its failure probability to the pool, added its latency to every commit, and gained nothing. Even member counts always tie with the odd number below them. This is why real deployments are 3, 5 or 7, and why 5 is the usual practical ceiling: past that, the coordination cost of every write grows faster than the fault tolerance you are buying.</p>
+<p>One subtlety worth carrying: losing quorum is not data loss and not corruption. The remaining members still hold the data and can usually still serve reads; what they refuse to do is accept changes, because they cannot prove they are not the minority side of a split. Recovery is a matter of bringing members back, not of restoring from backup.</p>
+<div class="flow"><span>N members</span><em>→</em><span class="hot">quorum = ⌊N/2⌋+1</span><em>→</em><span>tolerates N−quorum failures</span><em>→</em><span>only one side of a split can act</span></div>
+<p>One formula, and everything about cluster sizing follows from it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the table rather than memorising it. Six lines of Python, and the pattern jumps out.
+<pre class="cmd">python3 -c "
+print(f'{\"N\":&gt;2} {\"quorum\":&gt;7} {\"tolerates\":&gt;10}')
+for n in range(1,8):
+    q = n//2 + 1
+    print(f'{n:&gt;2} {q:&gt;7} {n-q:&gt;10}')"</pre>
+<pre class="out"> N  quorum  tolerates
+ 1       1          0
+ 2       2          0          ← two members tolerate NOTHING: worse than one, and twice the cost
+ 3       2          1
+ <b>4       3          1</b>          ← same tolerance as 3, more machines, slower writes
+ 5       3          2
+ 6       4          2
+ 7       4          3</pre></li>
+<li>Prove the property the majority rule exists for: no two disjoint groups can both hold a majority.
+<pre class="cmd">python3 -c "
+n=5; q=n//2+1
+for a in range(n+1):
+    b=n-a
+    print(f'split {a}/{b}: side A can act={a&gt;=q}, side B can act={b&gt;=q}')"</pre>
+<pre class="out">split 0/5: side A can act=False, side B can act=True
+split 1/4: side A can act=False, side B can act=True
+split 2/3: side A can act=False, side B can act=<b>True</b>
+split 3/2: side A can act=True,  side B can act=False
+                                 ↑ never both. That is the whole point.</pre></li>
+<li>Simulate a three-member cluster losing members one at a time, and find the exact moment writes must stop.
+<pre class="cmd">cd ~/dist; for m in 1 2 3; do touch member$m.up; done
+status() { alive=$(ls member*.up 2&gt;/dev/null | wc -l);
+  [ "$alive" -ge 2 ] &amp;&amp; echo "$alive/3 alive: quorum HELD, writes accepted" \
+                     || echo "$alive/3 alive: quorum LOST, writes refused"; }
+status; rm member3.up; status; rm member2.up; status</pre>
+<pre class="out">3/3 alive: quorum HELD, writes accepted
+2/3 alive: quorum HELD, writes accepted          ← survived one failure, as predicted
+<b>1/3 alive: quorum LOST, writes refused</b>          ← the second failure is the cliff</pre></li>
+<li>Confirm the surviving member still has the data — losing quorum is a refusal to change, not a loss.
+<pre class="cmd">echo "the last member still holds: $(cat follower.db)"; touch member2.up member3.up; status</pre>
+<pre class="out">the last member still holds: 99
+3/3 alive: quorum HELD, writes accepted          ← recovery is bringing members back, not restoring</pre></li>
+<li>Answer the sizing question with the numbers in front of you: what does going from 3 to 4 buy?
+<pre class="cmd">python3 -c "
+for n in (3,4,5):
+    print(f'{n} members: tolerate {n-(n//2+1)} failures, every write needs {n//2+1} acks')"</pre>
+<pre class="out">3 members: tolerate 1 failures, every write needs 2 acks
+<b>4 members: tolerate 1 failures, every write needs 3 acks</b>          ← strictly worse than 3
+5 members: tolerate 2 failures, every write needs 3 acks</pre></li>
+<li>Tidy up the simulated members.
+<pre class="cmd">rm -f ~/dist/member*.up; echo cleaned</pre>
+<pre class="out">cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Compute quorum and failure tolerance for N = 3, 4, 5 and 7 in your head, and state the formula. Then answer the two questions that matter operationally: why is a two-member cluster worse than a one-member cluster (quorum is 2, so either failure stops it — you doubled the failure surface and tolerate nothing), and what exactly happens to a three-member etcd cluster that loses two members (writes are refused, reads generally still work, no data is lost, and recovery means restoring a member rather than a backup)?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most consequential misreading is treating "lost quorum" as "lost data". It is neither corruption nor loss: the surviving members hold everything, and the cluster is deliberately refusing to change state because it cannot prove it is the majority side. Reaching for a snapshot restore in that situation is how a recoverable incident becomes a real one — the correct move is almost always to bring a member back.</p>
+<p>The second is adding a member to "improve availability" without doing the arithmetic. Going from 3 to 4 adds no fault tolerance, adds a machine that can fail, and makes every write wait for one more acknowledgement. Adding members also slows the cluster in a way people find surprising, because commit latency is set by the slowest member of the required majority — so a 7-member cluster with one sluggish disk is slower than a 3-member cluster with good ones.</p>
+<div class="k8s-link">
+<p>This is why kubeadm's high-availability guidance is three or five control-plane nodes, and why nobody runs four. Each control-plane node carries an etcd member, so the etcd quorum and the control-plane count are the same number. Lose one of three and everything continues normally. Lose two of three and etcd refuses writes: the API server can still serve reads from etcd, so <code>kubectl get</code> keeps working, but every create, update and delete fails — and because controllers cannot write either, nothing self-heals. That is the read-only cluster people find so alarming, and it is the arithmetic above doing exactly what it was designed to do.</p>
+<p>Raft and the commit rule that makes quorum meaningful is <a href="w1.html#cp-1-9">W1.9</a>; the two HA control-plane topologies are <a href="w2.html#cp-2-11">W2.11</a>; and taking the etcd snapshot you would need if you genuinely did lose the data is <a href="w2.html#cp-2-16">W2.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">Quorum is arithmetic rather than tooling, so the reference is the etcd documentation's FAQ on cluster sizing — it states the odd-number rule and the failure-tolerance table directly. Locally, <code>man 1 etcdctl</code> is not present on a plain sandbox VM, but you will meet <code>etcdctl endpoint status</code> and <code>member list</code> in <a href="w1.html#cp-1-13">W1.13</a>, and both print exactly the numbers this lesson taught you to interpret.</p>
+</article>
+
+<article class="lesson" id="cp-b13-9" data-id="b13-9">
+<div class="lesson-head"><span class="cp-id">B13.9</span><h4>Consensus, Raft, and what split brain would cost</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Consensus is how a group of machines agrees on a single sequence of events despite failures, and Raft is the algorithm nearly everything you will touch uses — etcd above all, which means the entire Kubernetes control plane rests on it. You do not need to implement it, but being able to narrate a leader failure without notes is the difference between reading an etcd incident and guessing at one.</p>
+<h5>The concept</h5>
+<p>The problem: several machines must agree on an ordered log of changes, such that everyone applies the same changes in the same order, even though members crash and messages are lost. Raft solves it with three parts, and each is simple on its own.</p>
+<ul>
+<li><strong>Leader election.</strong> Time is divided into numbered <strong>terms</strong>. A member that has not heard from a leader for a randomised timeout becomes a <em>candidate</em>, increments the term, votes for itself and asks the others for votes. Each member votes at most once per term, so a candidate needs a majority (<a href="#cp-b13-8">B13.8</a>) to win. The randomised timeout matters: it makes simultaneous candidacies rare, so elections usually resolve in one round.</li>
+<li><strong>Log replication.</strong> The leader is the only member that accepts writes. It appends each change to its log and ships it to the followers, which append it in the same position.</li>
+<li><strong>Commit.</strong> An entry is <em>committed</em> once a majority of members have stored it. Only then is it applied and acknowledged to the client. That definition is the safety guarantee: a committed entry survives any minority failing, because a majority already holds it.</li>
+</ul>
+<p>What this prevents is <strong>split brain</strong> — two members both believing they lead, both accepting writes, and the data diverging into two irreconcilable histories. Two defences stack. Quorum makes it impossible for both sides of a partition to elect a leader, because both cannot hold a majority. And terms make a stale leader harmless: an old leader that was cut off and never learned about the election still thinks it leads, but its messages carry an outdated term number, so every member rejects them — and on seeing the newer term, it stands down. That last step is <strong>fencing</strong>: the deposed leader is actively prevented from continuing, rather than trusted to notice it should stop.</p>
+<p>One consequence worth carrying into operations: because a commit requires a majority to have <em>stored</em> the entry — durably, on disk — Raft's write latency is bounded by the slowest member of that majority. A single slow disk in a five-member cluster does not slow one member down; it slows every write in the whole system.</p>
+<div class="flow"><span>election (term + majority)</span><em>→</em><span>replication (leader appends, ships)</span><em>→</em><span class="hot">commit (majority stored)</span></div>
+<p>Three parts; the third one is where the safety guarantee actually lives.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a small Raft-shaped election simulator. It is not Raft — no logs, no persistence — but the election rule is the real one.
+<pre class="cmd">cd ~/dist; cat &gt; election.py &lt;&lt;'EOF'
+import sys, random
+members = {1: 'up', 2: 'up', 3: 'up'}          # id -> up | down
+term = 0
+
+def elect(reachable):
+    """One election round among the reachable, live members."""
+    global term
+    term += 1
+    live = [m for m in reachable if members[m] == 'up']
+    needed = len(members) // 2 + 1              # majority of ALL members, not of the live ones
+    if len(live) &gt;= needed:
+        leader = random.choice(live)
+        print(f'term {term}: {len(live)}/{len(members)} reachable, need {needed} -&gt; LEADER = member {leader}')
+        return leader
+    print(f'term {term}: {len(live)}/{len(members)} reachable, need {needed} -&gt; NO LEADER (minority)')
+    return None
+
+leader = elect([1, 2, 3])
+print('--- leader crashes ---')
+members[leader] = 'down'
+elect([1, 2, 3])
+print('--- network splits 2 | 1 ---')
+for m in members: members[m] = 'up'
+elect([1, 2]); elect([3])
+EOF
+python3 election.py</pre>
+<pre class="out">term 1: 3/3 reachable, need 2 -&gt; LEADER = member 2
+--- leader crashes ---
+term 2: 2/3 reachable, need 2 -&gt; <b>LEADER = member 3</b>          ← survived, new term, no data lost
+--- network splits 2 | 1 ---
+term 3: 2/3 reachable, need 2 -&gt; LEADER = member 1
+term 4: 1/3 reachable, need 2 -&gt; <b>NO LEADER (minority)</b>          ← split brain, prevented</pre></li>
+<li>Read the second half of that output again, because it is the entire safety argument. The minority side cannot elect a leader, so it cannot accept writes.
+<pre class="cmd">python3 -c "
+n=3; q=n//2+1
+print(f'{n} members, majority {q}: a 2|1 split gives one side {2&gt;=q} and the other {1&gt;=q}')"</pre>
+<pre class="out">3 members, majority 2: a 2|1 split gives one side True and the other False</pre></li>
+<li>Show what terms are for: a stale leader's messages are rejected because its term number is old. This is fencing, in four lines.
+<pre class="cmd">python3 -c "
+current_term = 4
+for msg_term in (3, 4, 5):
+    if msg_term &lt; current_term: print(f'msg term {msg_term}: REJECTED (stale leader) -&gt; it stands down')
+    elif msg_term == current_term: print(f'msg term {msg_term}: accepted (current leader)')
+    else: print(f'msg term {msg_term}: accepted, and I update my term to {msg_term}')"</pre>
+<pre class="out">msg term 3: <b>REJECTED (stale leader)</b> -&gt; it stands down
+msg term 4: accepted (current leader)
+msg term 5: accepted, and I update my term to 5</pre></li>
+<li>Model the commit rule and see why a slow member slows everyone. A commit waits for the majority, so it waits for the slowest member <em>in</em> that majority.
+<pre class="cmd">python3 -c "
+acks = {'m1': 2, 'm2': 45, 'm3': 8}          # ms to durably store the entry
+n=len(acks); q=n//2+1
+t=sorted(acks.values())[q-1]
+print(f'per-member fsync ms: {acks}')
+print(f'majority is {q}, so commit latency = {t} ms (the {q}th fastest, not the fastest)')"</pre>
+<pre class="out">per-member fsync ms: {'m1': 2, 'm2': 45, 'm3': 8}
+majority is 2, so commit latency = <b>8</b> ms (the 2th fastest, not the fastest)</pre></li>
+<li>Narrate a leader failure out loud, then check yourself against the simulator by running it a few more times.
+<pre class="cmd">for i in 1 2 3; do python3 election.py | head -1; done</pre>
+<pre class="out">term 1: 3/3 reachable, need 2 -&gt; LEADER = member 1
+term 1: 3/3 reachable, need 2 -&gt; LEADER = member 3
+term 1: 3/3 reachable, need 2 -&gt; LEADER = member 2
+                                        ↑ who leads is arbitrary; that it is exactly one is not</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Narrate a leader failure end to end without notes: the followers stop hearing heartbeats, one times out first (because the timeouts are randomised), it increments the term and requests votes, a majority grants them, and it becomes leader for the new term — with no committed entry lost, because every committed entry was already stored by a majority and any majority overlaps the voters. Then define split brain and name the two things that prevent it (quorum, so only one side can elect; and terms, so a stale leader's messages are rejected and it stands down — fencing). Finally, explain why one slow disk slows the whole cluster.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most common misconception is that the leader is a performance bottleneck to be worked around. It is not there for performance, it is there to impose an order — a single member deciding the sequence is what makes agreement tractable at all. Directing writes elsewhere does not distribute load; it produces a system with no defined order, which is the problem consensus exists to solve.</p>
+<p>The second is underestimating what "committed" costs. An entry is committed when a majority has it <em>on disk</em>, which means an <code>fsync</code> on each of those members before the client hears anything. This is why consensus systems are so unusually sensitive to disk latency, and why the standard advice is to give etcd its own fast disk: a shared or throttled volume turns every single object creation in the cluster into a slow operation, and the symptom appears several layers away as a sluggish API server.</p>
+<div class="k8s-link">
+<p>This is etcd, and therefore the foundation everything else stands on. Every object you have ever created in Kubernetes is a committed entry in a replicated Raft log — the Deployment, the Secret, the Lease that says a node is alive. The properties transfer directly: the control plane survives losing a minority of etcd members with no data loss; it refuses writes when it cannot assemble a majority (<a href="#cp-b13-8">B13.8</a>); and its write performance is bounded by <code>fsync</code> on the slowest member of the majority, which is why "the API server got slow" so often ends at a disk.</p>
+<p>Raft at explain-it-to-a-colleague depth, with the etcd specifics, is <a href="w1.html#cp-1-9">W1.9</a>; checking etcd's health and reading its latency metrics is <a href="w1.html#cp-1-13">W1.13</a>; and what a cluster looks like from the outside when etcd stops is <a href="w6.html#cp-6-8">W6.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The canonical reading is the Raft paper, "In Search of an Understandable Consensus Algorithm" (Ongaro &amp; Ousterhout) — it was written to be readable, and the figure-2 summary is the whole algorithm on one page. The interactive visualisation at <code>raft.github.io</code> is worth ten minutes: watch a leader fail, watch a partition, and narrate what you see. Locally, <code>man 2 fsync</code> is the operation that makes "committed" mean something.</p>
+</article>
+
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
