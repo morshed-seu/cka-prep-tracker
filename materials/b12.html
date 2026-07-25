@@ -877,6 +877,393 @@ sleep 1; echo | openssl s_client -connect localhost:4433 -CAfile ca.crt 2&gt;&am
 </article>
 
 </div>
+
+<!-- ---------------- Handling secrets ---------------- -->
+<div class="grp" id="g-secrets"><h3>Handling secrets</h3>
+
+<article class="lesson" id="cp-b12-13" data-id="b12-13">
+<div class="lesson-head"><span class="cp-id">B12.13</span><h4>How secrets leak: process listings, /proc/PID/environ, and file modes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Most secrets are not stolen; they are handed over by ordinary mechanisms working exactly as designed. A password on a command line is public to every user on the machine. An environment variable is copied into every child process. Neither of those requires an attacker to do anything clever, and both are avoidable once you have seen them happen.</p>
+<h5>The concept</h5>
+<p>There are three common ways to get a secret into a process, and they have very different blast radii.</p>
+<ul>
+<li><strong>Command-line argument</strong> — the worst. A process's arguments live in <code>/proc/PID/cmdline</code>, which is <strong>world-readable by design</strong>, because that is where <code>ps</code> gets its output. Any user on the machine can read the arguments of any process, no privileges required. Passing <code>--password=hunter2</code> publishes it.</li>
+<li><strong>Environment variable</strong> — better, and still leaky. <code>/proc/PID/environ</code> is readable only by the process's owner and root, so another unprivileged user cannot read it. But the environment is <strong>inherited by every child process</strong>, so a secret meant for one program reaches every shell-out, every helper, every crash handler it invokes. Environments are also routinely dumped into crash reports, debug logging and error trackers, which is how secrets end up in a bug database.</li>
+<li><strong>A file with mode 600</strong> — the best of the three. It is read by the one process that needs it, at the moment it needs it; it is not inherited; it does not appear in any listing; and it can be replaced on disk and re-read without restarting anything. Its weakness is the familiar one: root reads it anyway, and so does anything running as the same user (<a href="#cp-b12-1">B12.1</a>).</li>
+</ul>
+<p>Notice that the ranking is about <em>who else ends up holding a copy</em>, not about encryption — none of the three is encrypted. This is a blast-radius argument, and it is the same argument in every context where you will meet it again.</p>
+<div class="flow"><span>argv: everyone</span><em>→</em><span>environ: you, root, every child</span><em>→</em><span class="hot">file 600: you, root, on demand</span></div>
+<p>Same secret, three very different lists of who has it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Publish a secret the easy way, then read it as a completely unprivileged user. No exploit is involved — this is <code>ps</code> doing its job.
+<pre class="cmd">python3 -c 'import time; time.sleep(300)' --password=hunter2 &amp;
+sleep 1; sudo -u mallory ps -eo user,args --no-headers | grep '[p]assword'</pre>
+<pre class="out">ubuntu   python3 -c import time; time.sleep(300) <b>--password=hunter2</b>
+                                                  ← mallory read it with no privileges at all</pre></li>
+<li>Confirm where that came from and that the file is world-readable by design, so no permission change can fix it.
+<pre class="cmd">pid=$(pgrep -f 'time.sleep(300)' | head -1)
+stat -c '%n mode=%a' /proc/$pid/cmdline
+tr '\0' ' ' &lt; /proc/$pid/cmdline; echo</pre>
+<pre class="out">/proc/5231/cmdline mode=<b>444</b>          ← readable by everyone; ps depends on this
+python3 -c import time; time.sleep(300) --password=hunter2</pre></li>
+<li>Now try the environment variable version, and see the improvement — another user is refused.
+<pre class="cmd">kill %1; DB_PASSWORD=hunter2 python3 -c 'import time; time.sleep(300)' &amp;
+sleep 1; pid=$(pgrep -f 'time.sleep(300)' | head -1)
+stat -c 'environ mode=%a owner=%U' /proc/$pid/environ
+sudo -u mallory cat /proc/$pid/environ 2&gt;&amp;1 | head -1</pre>
+<pre class="out">environ mode=<b>400</b> owner=ubuntu
+cat: /proc/5288/environ: <b>Permission denied</b>          ← better than argv: not world-readable</pre></li>
+<li>Then see the two actors it does not stop: root, and every child the process ever starts.
+<pre class="cmd">sudo tr '\0' '\n' &lt; /proc/$pid/environ | grep DB_PASSWORD
+DB_PASSWORD=hunter2 bash -c 'bash -c "echo child sees: \$DB_PASSWORD"'</pre>
+<pre class="out">DB_PASSWORD=hunter2                    ← root reads it regardless
+child sees: <b>hunter2</b>                    ← two levels down, inherited without anyone asking</pre></li>
+<li>Do it the third way. The secret is in a mode-600 file, read at the moment of use, and never enters any listing or any child's environment.
+<pre class="cmd">kill %1 2&gt;/dev/null; install -m 600 /dev/null ~/db-pass &amp;&amp; echo -n 'hunter2' &gt; ~/db-pass
+python3 -c "open('/home/ubuntu/db-pass').read(); import time; time.sleep(300)" &amp;
+sleep 1; pid=$(pgrep -f 'time.sleep(300)' | head -1)
+sudo -u mallory ps -p $pid -o args --no-headers | grep -c hunter2
+sudo -u mallory cat ~/db-pass 2&gt;&amp;1 | head -1</pre>
+<pre class="out">0                                              ← nothing in the process listing
+cat: /home/ubuntu/db-pass: <b>Permission denied</b>   ← and nothing readable by another user</pre></li>
+<li>Clean up the demo processes and check nothing is left holding a secret.
+<pre class="cmd">kill %1 2&gt;/dev/null; pkill -f 'time.sleep(300)'; rm -f ~/db-pass; echo cleaned</pre>
+<pre class="out">cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Rank the three delivery mechanisms by blast radius and justify each position in one sentence: who can read a command-line argument (everyone), who can read an environment variable (the owner, root, and every descendant process), who can read a mode-600 file (the owner and root, and only when it is opened). Then answer the design question that follows: which of the three can be rotated without restarting the process, and why does that matter operationally?</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A great many tools still accept <code>--password</code> on the command line, and their own documentation often uses it in the examples. Where a tool offers an alternative — <code>--password-file</code>, a config file, an environment variable, or reading from stdin — take it. Where it does not, be aware that the secret is public to the machine for the lifetime of the process, and that shell history has it too.</p>
+<p>The second, subtler leak is that a secret placed in a file is only as private as everything the file passes through: the editor's swap file, the backup that runs at 02:00, the container image it was baked into, and the Git repository someone committed it to "temporarily". Mode <code>600</code> protects the file at that path, not every copy of its contents that exists elsewhere.</p>
+<div class="k8s-link">
+<p>This lesson is the concrete argument behind a recommendation you will meet constantly: <strong>mount Secrets as files, not as environment variables.</strong> A Secret consumed with <code>env:</code> or <code>envFrom:</code> lands in the container's environment, which means it is inherited by every process the container starts, visible in <code>kubectl exec … env</code>, and frequently swept up by crash reporters and log shippers. Mounted as a volume it is a file in a tmpfs, readable by the process that opens it and nothing else — and, crucially, a mounted Secret <em>updates in place</em> when the Secret object changes, while an environment variable is fixed at container start and can only change by restarting the pod. Same secret, materially different blast radius and materially different rotation story.</p>
+<p>The four ways a pod can consume a Secret or ConfigMap is <a href="w3.html#cp-3-21">W3.21</a>; the update-propagation rules that make volumes rotatable and env permanent are <a href="w3.html#cp-3-22">W3.22</a>; why the Secret's value itself is only base64 is <a href="w3.html#cp-3-23">W3.23</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 proc</code> is the page for both files — search it for <code>/proc/[pid]/cmdline</code> and <code>/proc/[pid]/environ</code>, including the note that the second is readable only by the owner. <code>man 1 ps</code> for where its output comes from, and <code>man 7 environ</code> for how the environment is inherited across <code>fork</code> and <code>exec</code> (<a href="b2.html#cp-b2-5">B2.5</a>).</p>
+</article>
+
+<article class="lesson" id="cp-b12-14" data-id="b12-14">
+<div class="lesson-head"><span class="cp-id">B12.14</span><h4>seccomp and AppArmor: the layers behind the permission check</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every control so far has answered "may this identity do this?" — and every one of them is bypassed the moment a process is running as the identity that <em>is</em> allowed. The two kernel layers in this lesson answer a different question: "regardless of who you are, is this program permitted to do this at all?" They are what stands behind the permission check when everything in front of it has already failed.</p>
+<h5>The concept</h5>
+<p>Standard Linux permissions are <strong>discretionary</strong>: the owner of a resource decides who may use it, and root may do anything. <strong>Mandatory access control</strong> is the opposite — a policy set by the administrator constrains a program no matter whose identity it runs under, including root. Ubuntu ships two, working at different levels:</p>
+<ul>
+<li><strong>seccomp</strong> filters <em>system calls</em> (<a href="b3.html#cp-b3-6">B3.6</a>). A seccomp profile is a list saying which of the ~350 syscalls a process may make; a call outside the list is refused, typically by killing the process with <code>SIGSYS</code>. It is narrow and extremely effective: a web server has no business calling <code>mount</code>, <code>kexec_load</code> or <code>ptrace</code>, and forbidding them removes whole categories of exploit even if the process is compromised.</li>
+<li><strong>AppArmor</strong> confines a <em>program</em> by path: which files it may read or write, which capabilities it may use, whether it may use the network. Profiles live in <code>/etc/apparmor.d/</code>, are attached to an executable's path, and run in one of two modes — <em>enforce</em> (violations blocked) or <em>complain</em> (violations logged only, which is how you develop a profile without breaking the service).</li>
+</ul>
+<p>Both are defense in depth in the exact sense of <a href="#cp-b12-2">B12.2</a>: they do nothing on a healthy day. Their value appears at the moment something else has already gone wrong — a parser bug, a compromised dependency, a stolen credential — and the attacker, now running with your service's full identity, tries to do something your service never does. That is when a profile that says "this program never calls <code>mount</code>" stops being paperwork.</p>
+<div class="flow"><span>uid/gid check</span><em>→</em><span>capability check</span><em>→</em><span class="hot">seccomp: which syscalls</span><em>·</em><span class="hot">AppArmor: which paths</span></div>
+<p>Four gates, and only the last two still apply once an attacker holds a legitimate identity.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See what is already confined on this machine. Ubuntu enforces AppArmor profiles out of the box on a surprising number of programs.
+<pre class="cmd">sudo aa-status | head -6</pre>
+<pre class="out">apparmor module is loaded.
+<b>44 profiles are loaded.</b>
+40 profiles are in enforce mode.
+   /usr/bin/man
+   /usr/lib/snapd/snap-confine
+4 profiles are in complain mode.</pre></li>
+<li>Read one profile. This is the whole vocabulary: paths, permission letters, capabilities — nothing exotic.
+<pre class="cmd">sudo grep -E '^\s+(/|capability|network)' /etc/apparmor.d/usr.bin.man | head -6</pre>
+<pre class="out">  capability setuid,
+  /usr/bin/man mr,
+  /etc/manpath.config r,
+  /var/cache/man/** rw,          ← "may read and write here"; anything unlisted is denied</pre></li>
+<li>Check which profile a running process is confined by. An unconfined process reports exactly that.
+<pre class="cmd">cat /proc/self/attr/current; echo
+man ls &gt;/dev/null 2&gt;&amp;1 &amp; sleep 0.3; cat /proc/$!/attr/current 2&gt;/dev/null; echo</pre>
+<pre class="out"><b>unconfined</b>                       ← your shell: no AppArmor profile applies
+/usr/bin/man (enforce)          ← man, running under its profile</pre></li>
+<li>Look at seccomp's status on a normal process. The <code>Seccomp</code> field in <code>/proc/PID/status</code> is 0 (off), 1 (strict) or 2 (a BPF filter is installed).
+<pre class="cmd">grep -E 'Seccomp' /proc/self/status</pre>
+<pre class="out">Seccomp:        <b>0</b>          ← no filter: this shell may make any syscall the kernel offers
+Seccomp_filters:        0</pre></li>
+<li>Install a filter and watch it bite. systemd's <code>SystemCallFilter=</code> is the easiest way to apply seccomp without writing BPF — here, everything except the mount-related calls.
+<pre class="cmd">sudo systemd-run --pty --quiet -p SystemCallFilter='~@mount' \
+  /bin/sh -c 'grep Seccomp: /proc/self/status; mount -t tmpfs none /mnt'</pre>
+<pre class="out">Seccomp:        <b>2</b>                     ← a BPF filter is installed
+sh: line 1: <b>Bad system call</b>           ← SIGSYS: the kernel refused mount(2) outright</pre></li>
+<li>Confirm the same command works without the filter, so you know the failure came from seccomp and not from permissions.
+<pre class="cmd">sudo /bin/sh -c 'mount -t tmpfs none /mnt &amp;&amp; echo mounted &amp;&amp; umount /mnt'</pre>
+<pre class="out">mounted          ← same user, same capability, same command — only the filter differed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Say what each layer constrains — seccomp the set of system calls, AppArmor the set of paths, capabilities and network operations available to a named program — and why both are described as <em>mandatory</em> rather than discretionary (the administrator sets them; the program's own identity, root included, cannot override them). Then explain what step 5 proved that step 6 could not have shown alone: the refusal came from the filter, not from a missing permission, and the process was killed rather than given an error.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>A seccomp violation does not look like a permission error. The default action is <code>SIGSYS</code>, so the process dies and the shell prints <em>Bad system call</em> — no <code>EACCES</code>, no log line from the program itself, nothing pointing at a policy. If a program dies instantly with that message, check <code>Seccomp:</code> in its status and the filter it was started under before you debug the program.</p>
+<p>AppArmor's failure mode is the opposite and just as confusing: a denial is logged to the journal (or <code>dmesg</code>) as <code>apparmor="DENIED"</code> while the program merely sees a file it cannot open, and reports something vague about a missing configuration file. When a service inexplicably cannot read a path that clearly exists with correct permissions, <code>journalctl -k | grep DENIED</code> is the check that ends the investigation in five seconds. This is also why <em>complain</em> mode exists — run the program through its real workload with the profile in complain mode, collect the denials, and only then enforce.</p>
+<div class="k8s-link">
+<p>Kubernetes surfaces both layers in a pod's <code>securityContext</code>, and the important one is chosen for you: <code>seccompProfile: {type: RuntimeDefault}</code> applies the container runtime's own curated filter, which blocks around 40 dangerous syscalls that essentially no workload needs. It is the single highest-value security setting available on a pod and it is off by default for backwards compatibility, which is why the <em>restricted</em> Pod Security Standard requires it. AppArmor is available too, through the <code>appArmorProfile</code> field (an annotation in older versions), pointing at a profile that must already be loaded on the node — which is the operational catch: the profile is a node-level artefact, so a pod that requires one will not start on a node where nobody installed it.</p>
+<p>These are CKS topics rather than CKA ones, so the advanced track does not drill them; what it does cover is where the confinement is applied — the kubelet handing the pod's spec to containerd over CRI, which is <a href="w1.html#cp-1-20">W1.20</a>, and what actually runs privileged on a node, <a href="w1.html#cp-1-2">W1.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 seccomp</code> for the syscall itself and the filter modes; <code>man 5 systemd.exec</code> for <code>SystemCallFilter=</code> and its <code>@</code>-prefixed syscall groups, which are the readable way to use seccomp. <code>man 5 apparmor.d</code> for profile syntax, <code>man 8 aa-status</code>, <code>man 8 aa-complain</code> and <code>man 8 aa-enforce</code> for the mode switches. <code>man 7 capabilities</code> remains the page for the gate immediately before these two.</p>
+</article>
+
+</div>
+
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b12-15" data-id="b12-15">
+<div class="lesson-head"><span class="cp-id">B12.15</span><h4>Mini project — mutual TLS between two local processes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Assembling the pieces yourself is what converts eleven lessons of vocabulary into something you can reason about under pressure. When you finish this, you will have built — from a private key upwards — the same arrangement that authenticates every component of a Kubernetes cluster to its API server, and you will have proved that an unauthenticated client cannot get in.</p>
+<h5>The concept</h5>
+<p>The target is two processes on one machine that each refuse to talk to anyone the other CA has not vouched for. You already have every piece: a CA (<a href="#cp-b12-8">B12.8</a>), a server certificate with correct SANs (<a href="#cp-b12-10">B12.10</a>), a client certificate carrying an identity (<a href="#cp-b12-12">B12.12</a>). What is left is to run the server as a real service rather than a foreground command — a systemd unit (<a href="b11.html#cp-b11-3">B11.3</a>) with its key material referenced by path — and then demonstrate the two outcomes that matter: an authorized client is admitted and its identity is read, and an unauthorized client is refused before any application data flows.</p>
+<p>Success criteria, all of which you should be able to show:</p>
+<ul>
+<li>The server runs as a systemd unit, is enabled, and survives a restart.</li>
+<li>A client presenting <code>client.crt</code>/<code>client.key</code> connects, and the server records the subject <code>CN=alice</code>.</li>
+<li>A client presenting no certificate is refused with <em>peer did not return a certificate</em>.</li>
+<li>A client presenting a certificate from a different CA is refused, with a different message.</li>
+<li>The client verifies the <em>server</em> too, and rejects it when given the wrong <code>-CAfile</code>.</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Put the key material where a service would keep it, with the permissions a service would need. The server reads its own key; nobody else should.
+<pre class="cmd">cd ~/ca
+sudo install -d -m 755 /etc/mtls-demo
+sudo install -m 644 ca.crt server.crt /etc/mtls-demo/
+sudo install -m 600 server.key /etc/mtls-demo/
+sudo ls -l /etc/mtls-demo</pre>
+<pre class="out">-rw-r--r-- 1 root root 1858 ca.crt
+-rw-r--r-- 1 root root 1310 server.crt
+-rw------- 1 root root 1704 <b>server.key</b>          ← only the key is restricted</pre></li>
+<li>Write the unit. Everything security-relevant is on the <code>ExecStart</code> line: the server's own identity, the CA it trusts for clients, and the flag that makes a client certificate mandatory.
+<pre class="cmd">sudo tee /etc/systemd/system/mtls-demo.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=B12 mutual-TLS demo server
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/bin/openssl s_server -accept 4433 \
+  -cert /etc/mtls-demo/server.crt -key /etc/mtls-demo/server.key \
+  -CAfile /etc/mtls-demo/ca.crt -Verify 1 -www
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now mtls-demo
+systemctl is-active mtls-demo</pre>
+<pre class="out">Created symlink /etc/systemd/system/multi-user.target.wants/mtls-demo.service → ...
+<b>active</b></pre></li>
+<li>Connect as an authorized client. Both directions verify: the client checks the server against the CA, the server checks alice against the same CA.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 -CAfile ca.crt \
+  -cert client.crt -key client.key 2&gt;/dev/null | grep -E 'Verify return code|Cipher'</pre>
+<pre class="out">Cipher    : TLS_AES_256_GCM_SHA384
+<b>Verify return code: 0 (ok)</b>          ← the client is satisfied with the server</pre></li>
+<li>Confirm the server read the client's identity, which is the whole point of mutual TLS. The journal has it (<a href="b11.html#cp-b11-10">B11.10</a>).
+<pre class="cmd">sudo journalctl -u mtls-demo --since '2 min ago' | grep -A1 'subject' | head -4</pre>
+<pre class="out">subject=<b>CN=alice, O=developers, O=oncall</b>
+issuer=CN=B12 Demo CA, O=sandbox          ← the server knows exactly who connected, from the cert</pre></li>
+<li>Prove the negative case — a client with no certificate is refused. This is the difference between mTLS and encryption.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 -CAfile ca.crt 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">40E7...:SSL routines::<b>peer did not return a certificate</b>          ← refused at the handshake</pre></li>
+<li>Prove the other negative case — a certificate from a CA the server does not trust. Issue one from <code>other-ca</code> and watch it fail differently.
+<pre class="cmd">openssl genrsa -out rogue.key 2048 2&gt;/dev/null
+openssl req -new -key rogue.key -out rogue.csr -subj '/CN=alice/O=developers' 2&gt;/dev/null
+openssl x509 -req -in rogue.csr -CA other-ca.crt -CAkey other-ca.key \
+  -CAcreateserial -days 30 -out rogue.crt 2&gt;/dev/null
+echo | openssl s_client -connect localhost:4433 -CAfile ca.crt \
+  -cert rogue.crt -key rogue.key 2&gt;&amp;1 | grep -iE 'alert|unknown ca' | head -2</pre>
+<pre class="out">SSL alert number 48
+40E7...:SSL routines::<b>tlsv1 alert unknown ca</b>
+     ← the name inside the certificate said alice; the signature is what was checked</pre></li>
+<li>Prove the client's own check is real, by pointing it at the wrong CA for the server. Both ends are verifying, and either can refuse.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 -CAfile other-ca.crt \
+  -cert client.crt -key client.key 2&gt;/dev/null | grep 'Verify return code'</pre>
+<pre class="out">Verify return code: <b>19 (self-signed certificate in certificate chain)</b>
+                    ← the client rejected the server this time</pre></li>
+<li>Confirm it survives a restart — the difference between a demo and a service — then leave it running for <a href="#cp-b12-16">B12.16</a>.
+<pre class="cmd">sudo systemctl restart mtls-demo; sleep 1
+echo | openssl s_client -connect localhost:4433 -CAfile ca.crt \
+  -cert client.crt -key client.key 2&gt;/dev/null | grep -c 'Verify return code: 0'</pre>
+<pre class="out">1          ← still mutually authenticated after a restart</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Walk the success-criteria list at the top and demonstrate each one. Then answer the question that proves you understand what you built: in step 6 the rogue certificate had the subject <code>CN=alice</code>, exactly like the real one — why was it refused? (Because the identity is not the string in the subject; it is the string in the subject <em>as vouched for by a signature the server trusts</em>. Anyone can write <code>CN=alice</code>; only your CA's key can make the server believe it.) That single sentence is the entire security model of a Kubernetes cluster.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If the unit fails to start, read <code>systemctl status mtls-demo</code> before touching the certificates. The two common causes are unrelated to TLS: a stale foreground <code>s_server</code> from <a href="#cp-b12-12">B12.12</a> still holding port 4433 (the log says <em>Address already in use</em>), or a path typo giving <code>203/EXEC</code> (<a href="b11.html#cp-b11-9">B11.9</a>). Certificate problems produce handshake errors at connection time, not start-up failures.</p>
+<p>The second is a trap worth meeting here rather than in production: <code>-Verify 1</code> makes a client certificate <em>mandatory</em>, while <code>-verify 1</code> makes it optional and lets an anonymous client straight through. If your step-5 test unexpectedly succeeds, you almost certainly typed the lowercase flag — and that same mistake, in a real service, is the difference between an authenticated API and an open one.</p>
+<div class="k8s-link">
+<p>What you have built is a small kube-apiserver, minus the API. The server's <code>-cert</code>/<code>-key</code> is <code>--tls-cert-file</code>/<code>--tls-private-key-file</code>; its <code>-CAfile</code> with <code>-Verify</code> is <code>--client-ca-file</code>, which is precisely what makes client certificates a valid authentication method for the cluster; and the subject the server logged is what the API server turns into a username and groups before RBAC ever sees the request. Your <code>client.crt</code>/<code>client.key</code> pair, base64-encoded into a YAML file with the server's address and <code>ca.crt</code>, <em>is</em> a kubeconfig — there is nothing else in one.</p>
+<p>Read the API server's own flags on a live cluster at <a href="w1.html#cp-1-5">W1.5</a>; dissect the kubeconfig those files become at <a href="w7.html#cp-7-2">W7.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-s_server</code> and <code>man 1 openssl-s_client</code> for every flag on the unit's <code>ExecStart</code>. <code>man 5 systemd.service</code> for <code>Restart=</code> and multi-line <code>ExecStart</code> continuation. <code>man 1 openssl-verify</code> for return codes 19, 20 and 21 — three ways of saying "I do not trust this", each with a different cause.</p>
+</article>
+
+<article class="lesson drill" id="cp-b12-16" data-id="b12-16">
+<div class="lesson-head"><span class="cp-id">B12.16</span><h4>Debugging drill — break mutual TLS four ways</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Certificate errors are where people guess, and guessing is expensive: it produces afternoons of regenerating things that were never broken. Each of the four failures below has a distinct message that names its cause precisely, and the point of this drill is to see all four in one sitting so that the strings become diagnostic rather than alarming. You will meet every one again as a kubeconfig failure.</p>
+<h5>The concept</h5>
+<p>Four independent things must hold for a mutual TLS connection to succeed, and each fails with its own signature:</p>
+<ul>
+<li><strong>Validity</strong> — now is between <em>Not Before</em> and <em>Not After</em>. Fails with <em>certificate has expired</em> (error 10) or <em>certificate is not yet valid</em> (error 9, usually a clock problem).</li>
+<li><strong>Name</strong> — the name the client asked for is in the SAN list. Fails with <em>Hostname mismatch</em> (error 62), or in Go programs <em>x509: certificate is valid for X, not Y</em>.</li>
+<li><strong>Chain</strong> — the certificate is signed by a CA the other end trusts. Fails with <em>unable to get local issuer certificate</em> (error 20) or, on the wire, <em>tlsv1 alert unknown ca</em>.</li>
+<li><strong>Key pairing</strong> — the private key matches the public key in the certificate. Fails at start-up, not at connection time, with <em>key values mismatch</em>.</li>
+</ul>
+<p>That last one is worth its own note because it is the odd one out: a mismatched key never produces a handshake error, because the service refuses to start at all. If a program dies immediately after a certificate change, check the pairing before you check anything else — the one-line test is that the modulus of the certificate and the modulus of the key must be identical.</p>
+<div class="flow"><span>expired → error 10</span><em>·</em><span>wrong SAN → error 62</span><em>·</em><span>unknown CA → error 20 / alert</span><em>·</em><span class="hot">key mismatch → won't start</span></div>
+<p>Four checks, four strings; nothing here needs guessing.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault 1 — expired.</strong> Rather than waiting a year, ask <code>openssl</code> to evaluate the certificate at a future moment with <code>-attime</code>. The error is identical to the real thing.
+<pre class="cmd">cd ~/ca
+openssl verify -CAfile ca.crt -attime $(date -d '+400 days' +%s) server.crt</pre>
+<pre class="out">C = , CN = localhost
+error <b>10</b> at 0 depth lookup: <b>certificate has expired</b>
+                              ← notAfter is in the past relative to the check time</pre></li>
+<li>Confirm the diagnosis the way you would in an incident: read the date, compare with now, done in five seconds (<a href="#cp-b12-11">B12.11</a>).
+<pre class="cmd">openssl x509 -in server.crt -noout -enddate; date -u</pre>
+<pre class="out">notAfter=Jul 25 10:11:03 2027 GMT
+Sat Jul 25 10:52:14 UTC 2026          ← genuinely valid today; only the simulated clock failed it</pre></li>
+<li><strong>Fault 2 — wrong SAN.</strong> Ask for a name the certificate does not cover. This is the load-balancer failure, and note that the chain is still perfectly fine.
+<pre class="cmd">openssl verify -CAfile ca.crt -verify_hostname api.example.com server.crt
+openssl x509 -in server.crt -noout -ext subjectAltName</pre>
+<pre class="out">error <b>62</b> at 0 depth lookup: <b>Hostname mismatch</b>
+X509v3 Subject Alternative Name:
+    DNS:localhost, DNS:sandbox, IP Address:127.0.0.1     ← the requested name simply isn't listed</pre></li>
+<li><strong>Fault 3 — unknown CA.</strong> Present a certificate signed by someone the server never trusted. Do it live against the running service from <a href="#cp-b12-15">B12.15</a>.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 -CAfile ca.crt \
+  -cert rogue.crt -key rogue.key 2&gt;&amp;1 | grep -i 'alert\|error' | head -2
+openssl verify -CAfile ca.crt rogue.crt 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">40E7...:SSL routines::<b>tlsv1 alert unknown ca</b>          ← what it looks like on the wire
+error <b>20</b> at 0 depth lookup: <b>unable to get local issuer certificate</b>   ← same cause, offline</pre></li>
+<li><strong>Fault 4 — mismatched key.</strong> Point the service at a key that does not belong to its certificate and watch it refuse to start. No connection is ever attempted.
+<pre class="cmd">sudo cp client.key /etc/mtls-demo/server.key
+sudo systemctl restart mtls-demo; sleep 1; systemctl is-active mtls-demo
+sudo journalctl -u mtls-demo -n 3 --no-pager | tail -2</pre>
+<pre class="out">failed
+openssl[6012]: ...:X509 certificate routines::<b>key values mismatch</b>
+systemd[1]: mtls-demo.service: Main process exited, code=exited, status=1/FAILURE</pre></li>
+<li>Diagnose fault 4 the fast way — compare the two moduli. Identical hashes mean the pair matches; different means you have the wrong key file.
+<pre class="cmd">openssl x509 -noout -modulus -in /etc/mtls-demo/server.crt | sha256sum | cut -c1-16
+sudo openssl rsa -noout -modulus -in /etc/mtls-demo/server.key | sha256sum | cut -c1-16
+sudo openssl rsa -noout -modulus -in ~/ca/server.key | sha256sum | cut -c1-16</pre>
+<pre class="out">a91f3c72b8e04d15          ← the certificate's public key
+<b>4e7d0a1188cc9f36</b>          ← the installed key: different, hence "key values mismatch"
+a91f3c72b8e04d15          ← the correct key, in ~/ca</pre></li>
+<li>Repair and confirm. Fixing the pairing is the whole remedy — nothing needed reissuing.
+<pre class="cmd">sudo install -m 600 ~/ca/server.key /etc/mtls-demo/server.key
+sudo systemctl restart mtls-demo; sleep 1
+echo | openssl s_client -connect localhost:4433 -CAfile ca.crt \
+  -cert client.crt -key client.key 2&gt;/dev/null | grep 'Verify return code'</pre>
+<pre class="out">Verify return code: <b>0 (ok)</b>          ← back to mutually authenticated</pre></li>
+<li>Write the card. Four strings, four causes, one place to look for each — this is the artefact the drill exists to produce.
+<pre class="cmd">cat &gt; ~/tls-errors.md &lt;&lt;'EOF'
+certificate has expired (10)             -> check notAfter AND the local clock
+Hostname mismatch (62)                   -> name not in SAN list; reissue with it
+unable to get local issuer certificate   -> wrong/missing CA file; not a cert problem
+tlsv1 alert unknown ca                   -> same, seen from the other end of the wire
+key values mismatch (won't start)        -> cert and key are not a pair; compare moduli
+peer did not return a certificate        -> client sent none; mTLS is required here
+EOF
+wc -l ~/tls-errors.md</pre>
+<pre class="out">6 /home/ubuntu/tls-errors.md          ← six strings that cover nearly every TLS failure you will meet</pre></li>
+<li>Tear down everything this module created, or roll back the snapshot from <a href="b0.html#cp-b0-9">B0.9</a> if you took one.
+<pre class="cmd">sudo systemctl disable --now mtls-demo
+sudo rm -rf /etc/systemd/system/mtls-demo.service /etc/mtls-demo
+sudo systemctl daemon-reload
+sudo userdel -r mallory 2&gt;/dev/null; sudo userdel toyweb 2&gt;/dev/null
+rm -f ~/.ssh/demo_key*; echo torn-down          # keep ~/ca and ~/tls-errors.md</pre>
+<pre class="out">torn-down</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Cover the card and reproduce it: given each of the four faults, name the error string, say whether it appears at start-up or at connection time, and name the one file you would open first. Then answer the discriminating question for each pair that gets confused — expired versus not-yet-valid (check the clock, not the certificate), and unknown CA versus wrong SAN (one is about <em>who signed it</em> and is fixed by the trust store, the other is about <em>what name it covers</em> and is fixed by reissuing).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Two of these four are routinely misdiagnosed as each other because both feel like "the certificate is wrong". <em>Unable to get local issuer certificate</em> means the certificate might be perfect and you simply do not have, or did not pass, the CA that signed it — the fix is on the verifying side. <em>Hostname mismatch</em> means the trust is fine and the name is wrong — the fix requires the CA to issue a new certificate. Reissuing for the first, or fiddling with trust stores for the second, is wasted effort in both directions.</p>
+<p>The third trap is <code>--insecure</code>. Every one of these errors can be silenced with <code>curl -k</code> or <code>kubectl --insecure-skip-tls-verify</code>, and the connection will work. What you have done is delete the identity check while keeping the encryption (<a href="#cp-b12-12">B12.12</a>) — turning a specific, diagnosable failure into a permanent, invisible exposure. Use it to confirm a diagnosis for ten seconds, never to resolve one.</p>
+<div class="k8s-link">
+<p>All six strings on your card appear verbatim in cluster troubleshooting. <em>Unable to connect to the server: x509: certificate signed by unknown authority</em> is error 20 — your kubeconfig's <code>certificate-authority-data</code> does not match the cluster's current CA, which happens routinely after a cluster is rebuilt. <em>x509: certificate has expired or is not yet valid</em> is error 10, and on a kubeadm cluster it is usually the one-year component certificates asking for <code>kubeadm certs renew all</code> — or a node whose clock has drifted. <em>x509: certificate is valid for 10.96.0.1, kubernetes.default…, not lb.example.com</em> is error 62, the SAN list missing a name someone added in front of the API server. And <code>tls: private key does not match public key</code> in a kubelet or API-server log is the key-pairing failure, which is why the control plane refuses to come up rather than serving badly.</p>
+<p>Certificate inspection on a live cluster is <a href="w2.html#cp-2-6">W2.6</a>; expiry and renewal is <a href="w2.html#cp-2-7">W2.7</a>; and the systematic "kubectl won't connect" triage that starts from exactly these strings is <a href="w6.html#cp-6-3">W6.3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-verify</code> is the single most useful page here — its <em>DIAGNOSTICS</em> section lists every numbered error with a one-line explanation, including 9, 10, 19, 20 and 62. <code>man 1 openssl-x509</code> for <code>-modulus</code>, <code>-enddate</code> and <code>-checkend</code>; <code>man 1 openssl-s_client</code> for reading a live handshake; <code>man 1 timedatectl</code> for the clock check that resolves half of all "expired" reports.</p>
+</article>
+
+</div>
+
+<div class="quiz" id="quiz"><h3>B12 recall quiz</h3>
+<p>Answer out loud before revealing. If you can name what a signature does and does not prove, and map four TLS error strings to four distinct causes, this module has done its job.</p>
+<ol>
+<li>What three things does a threat model name, and why is "is this secure?" unanswerable without them?
+<details class="reveal"><summary>Answer</summary><p>Assets (the concrete things worth protecting), actors (who might want them, described by position rather than motive) and trust boundaries (where control changes hands). Without them there is no "against whom", so a control cannot be judged — mode 600 is excellent against another logged-in user and irrelevant against root or against someone holding the disk.</p></details></li>
+<li>State least privilege and defense in depth as questions rather than slogans.
+<details class="reveal"><summary>Answer</summary><p>"What is the smallest set of permissions under which this still works?" and "if this one control fails, what is the next one?" On a systemd machine the first is <code>User=</code> plus a single <code>AmbientCapabilities=</code> entry instead of root; the second is <code>NoNewPrivileges=</code>, <code>ProtectSystem=strict</code>, <code>PrivateTmp=</code> — lines that do nothing on a healthy day.</p></details></li>
+<li>Why is "you are not in the sudoers file" proof that your password was correct?
+<details class="reveal"><summary>Answer</summary><p>Because it is an authorization failure, and authorization only runs on an established identity. Authentication (who are you?) succeeded; policy (may you?) declined. The Kubernetes version is the same fork: <code>401</code> means the credential was not accepted at all, <code>403</code> means you were recognised perfectly and RBAC said no — and only one of those is fixed by touching certificates.</p></details></li>
+<li>Hashing, encoding, encryption — which is base64, and what is the consequence for Kubernetes Secrets?
+<details class="reveal"><summary>Answer</summary><p>Encoding: reversible by anyone with no key, existing so bytes survive a text field. So a Secret's value is protected by nothing — <code>base64 -d</code> is the whole attack. Values are encrypted at rest only if an <code>EncryptionConfiguration</code> is set up on the API server; otherwise anyone who can read the object or read etcd can read the secret.</p></details></li>
+<li>Why does TLS use both symmetric and asymmetric cryptography in one connection?
+<details class="reveal"><summary>Answer</summary><p>Asymmetric solves key distribution — you can publish a public key and receive something only you can read, with no prior arrangement — but it is slow and cannot encrypt a payload larger than the key. Symmetric is fast and hardware-accelerated but needs a shared key first. So the handshake is asymmetric and exists purely to agree one symmetric session key; everything after is AES. Expensive introduction, cheap conversation.</p></details></li>
+<li>What does a valid signature prove, and what does it conspicuously not prove?
+<details class="reveal"><summary>Answer</summary><p>It proves origin (it was made by the holder of a specific private key) and integrity (the data has not changed since, because the signature is over the data's hash). It proves nothing about <em>who</em> that holder is — an impostor's own signature verifies perfectly against the impostor's own public key. Certificates exist precisely to bind a public key to a name via someone you already trust.</p></details></li>
+<li>What does <code>ssh-agent</code> hold, and what does reaching its socket get someone?
+<details class="reveal"><summary>Answer</summary><p>Your decrypted private key, in the memory of a running process, reachable through a mode-600 Unix socket. Anyone who can reach that socket can have it sign challenges — that is, log in anywhere the key is authorized — without ever learning the passphrase. That is also why <code>ssh -A</code> (agent forwarding) hands the same power to root on every host you hop through, and why <code>ProxyJump</code> is preferable.</p></details></li>
+<li>What makes a CA certificate a CA, and what exactly does holding <code>ca.key</code> mean?
+<details class="reveal"><summary>Answer</summary><p><code>basicConstraints: CA:TRUE</code> and <code>keyUsage: keyCertSign</code>; clients enforce both. Holding the key means being able to mint a certificate for any name that every client trusting that CA will believe. On a kubeadm cluster that is permanent cluster-admin regardless of RBAC, which is why <code>/etc/kubernetes/pki/ca.key</code> never leaves the control-plane node.</p></details></li>
+<li>What is in a CSR, what is deliberately absent, and why is the absence the point?
+<details class="reveal"><summary>Answer</summary><p>The requester's public key, the identity being requested, and a self-signature proving they hold the matching private key. The private key is absent and never needs to travel — so a CSR can be emailed or posted to an API safely. Anyone who sends you a private key has already broken the model. Kubernetes exposes this as the <code>CertificateSigningRequest</code> object plus <code>kubectl certificate approve</code>.</p></details></li>
+<li>Your certificate has <code>CN=localhost</code> and no SAN. What happens, and why?
+<details class="reveal"><summary>Answer</summary><p>Chain validation passes and name matching fails — <em>Hostname mismatch</em>, error 62. CN-as-hostname has been deprecated for years and is now ignored for matching by browsers, Go, curl and openssl alike; only the <code>subjectAltName</code> list is consulted. And a <code>DNS:</code> entry does not cover a connection made to the corresponding IP; that needs an <code>IP:</code> entry.</p></details></li>
+<li>The certificate file on disk shows a fresh expiry date and <code>s_client</code> shows an expired one. What happened?
+<details class="reveal"><summary>Answer</summary><p>The file was renewed and the process was never restarted — it is still serving the certificate it read at start-up. The wire is authoritative during an incident; the file is only a statement of intent. This is exactly why <code>kubeadm certs renew all</code> must be followed by the static-pod control plane actually restarting.</p></details></li>
+<li>In mutual TLS, where does the server get the client's identity from?
+<details class="reveal"><summary>Answer</summary><p>Straight out of the verified client certificate's subject: the <strong>CN becomes the username</strong> and each <strong>O becomes a group</strong>. No lookup, no user database — which is why Kubernetes has no User object, why the admin kubeconfig carries <code>O=kubeadm:cluster-admins</code>, and why the kubelet's certificate is <code>CN=system:node:node01, O=system:nodes</code>.</p></details></li>
+<li>Rank command-line arguments, environment variables and a mode-600 file by blast radius.
+<details class="reveal"><summary>Answer</summary><p>Arguments are worst — <code>/proc/PID/cmdline</code> is world-readable by design, so every user on the box can read them via <code>ps</code>. Environment variables are middling — <code>/proc/PID/environ</code> is owner-only, but the environment is inherited by every child and routinely dumped by crash handlers. A mode-600 file is best: read on demand, not inherited, not listed, and rotatable in place. That is the argument for mounting a Kubernetes Secret as a volume rather than as <code>env:</code>.</p></details></li>
+<li>What does seccomp constrain, what does AppArmor constrain, and why are both called mandatory?
+<details class="reveal"><summary>Answer</summary><p>seccomp filters which system calls a process may make (a violation is <code>SIGSYS</code> — the shell prints <em>Bad system call</em>, not a permission error). AppArmor confines a named program's paths, capabilities and network use. Both are mandatory because the administrator sets the policy and the process's own identity, root included, cannot override it — which is what makes them useful after every identity-based control has already been defeated.</p></details></li>
+<li>Map four TLS failures to their causes: expired, wrong SAN, unknown CA, mismatched key.
+<details class="reveal"><summary>Answer</summary><p><em>certificate has expired</em> (error 10) — check <code>notAfter</code> and the local clock. <em>Hostname mismatch</em> (62) — the name is not in the SAN list; reissue. <em>unable to get local issuer certificate</em> (20), or <em>tlsv1 alert unknown ca</em> on the wire — the verifying side lacks the right CA file; the certificate may be perfect. <em>key values mismatch</em> — the certificate and key are not a pair, which fails at start-up rather than at connection time; compare the moduli.</p></details></li>
+<li>Why is <code>--insecure</code> a worse outcome than the error it silences?
+<details class="reveal"><summary>Answer</summary><p>Because it removes the identity check while keeping the encryption. The traffic is still unreadable to a passive observer and you now have no idea who is on the other end — a specific, diagnosable failure converted into a permanent, silent exposure. It is a ten-second diagnostic tool, never a fix.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Threat-model something concrete in one page and say, for every control listed, which actor it stops and which walks past it.</li>
+<li>Turn least privilege and defense in depth into unit-file lines, and measure the result with <code>systemd-analyze security</code>.</li>
+<li>Route any refusal to the right place on the first try by asking which of the two questions failed — and read <code>401</code> versus <code>403</code> correctly.</li>
+<li>Tell hashing, encoding and encryption apart instantly, and explain why a base64 Secret is protected by nothing.</li>
+<li>Explain the hybrid design of TLS: an asymmetric handshake purely to agree a symmetric session key.</li>
+<li>Sign and verify a file, and state the one thing a valid signature never proves.</li>
+<li>Describe SSH key login as a signature challenge, and name what <code>ssh-agent</code> trades for convenience.</li>
+<li>Create a CA, and say precisely what possession of its private key is worth.</li>
+<li>Issue a certificate in two steps, knowing exactly what a CSR carries and what it must never carry.</li>
+<li>Get SAN lists right, and recognise <em>Hostname mismatch</em> as a name problem rather than a trust problem.</li>
+<li>Read any certificate's subject, issuer, dates and SANs from a file or off a live port, and turn expiry into a check with <code>-checkend</code>.</li>
+<li>Run one-way and mutual TLS with <code>openssl</code>, and know that <code>-Verify</code> and <code>-verify</code> differ by an entire security model.</li>
+<li>Choose how a secret reaches a process on blast-radius grounds, and argue for files over environment variables from evidence.</li>
+<li>Say what seccomp and AppArmor each confine, inspect a loaded profile, and recognise <em>Bad system call</em> as a filter rather than a bug.</li>
+<li>Stand up mutual TLS as a real service and prove that an unauthenticated client — and a rogue certificate claiming the same name — are both refused.</li>
+<li>Map six TLS error strings to six causes without guessing, and know that <code>--insecure</code> silences all of them and fixes none.</li>
+<li>Arrive at kubeadm's PKI, kubeconfig identities and CSR approval recognising every shape in front of you.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b11.html">← B11 · Service management: systemd, logs, boot</a><a href="../beginner.html#b13">B13 · Distributed systems fundamentals →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-25. OpenSSL 3.0.13 — note that <code>openssl x509 -req</code> has no <code>-not_before</code>/<code>-not_after</code> in this release, which is why <a href="#cp-b12-16">B12.16</a> simulates expiry with <code>openssl verify -attime</code> rather than issuing a back-dated certificate. systemd 255 for <code>systemd-run</code>, <code>SystemCallFilter=</code> and <code>systemd-analyze security</code>; AppArmor is Ubuntu's enabled-by-default LSM, so <code>aa-status</code> works out of the box while SELinux tooling is absent. Kubernetes facts checked against v1.35 (LF CKA target): client-certificate authentication maps <code>CN</code> to the username and each <code>O</code> to a group, kubeadm issues component certificates with a one-year lifetime (<code>kubeadm certs check-expiration</code>), Secrets are base64-encoded and are encrypted at rest only when an <code>EncryptionConfiguration</code> is configured, and <code>seccompProfile: RuntimeDefault</code> remains opt-in per pod rather than a cluster default.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
