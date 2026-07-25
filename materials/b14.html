@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B14: the capstone. Build minibox one layer at a time — an overlayfs root filesystem from busybox layers, then mnt/pid/uts/ipc/net namespaces with pivot_root and a fresh /proc, then a cgroup with cpu.max and memory.max plus dropped capabilities, then veth-to-bridge networking with NAT, a working resolv.conf and a systemd unit that supervises the whole thing and logs to journald: roughly 150 lines of bash that is honestly a container runtime. Then the debugging gauntlet — eight planted faults, one per layer (permission, cgroup, mount, route, iptables, DNS, systemd unit, certificate), 45 minutes, with three-stage hint/solution reveals; a written post-mortem of your own triage order; and a second timed run. Finally the track assessment: a 30-question written self-test, an 8-task practical set with a 66% pass line, and the readiness checklist for the Intermediate track.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B14 · Capstone: build minibox, then the gauntlet — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B14 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+    <li><a href="b9.html">B9 · Networking II</a></li>
+    <li><a href="b10.html">B10 · DNS &amp; names</a></li>
+    <li><a href="b11.html">B11 · systemd &amp; logs</a></li>
+    <li><a href="b12.html">B12 · Security &amp; PKI</a></li>
+    <li><a href="b13.html">B13 · Distributed systems</a></li>
+    <li><a href="b14.html">B14 · Capstone</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b14">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B14 — Capstone: build <code>minibox</code>, then the gauntlet</h1>
+  <p>There is nothing new in this module. Every mechanism you are about to use has its own lesson behind it, and the only thing left is assembly — which turns out to be the part that changes how you see all of it. You will write one script that puts a process on its own filesystem, in its own namespaces, inside its own resource limits, with a reduced set of privileges, on its own network with a working name resolver, supervised by systemd and logging to the journal. That script is about 150 lines of bash, and it is, honestly, a container runtime.</p>
+  <p>That is the point of the whole track stated as an artefact. A container is not a technology you install; it is a process with five kernel features switched on around it. Once you have switched them on by hand, "the pod won't start" stops being one opaque failure and becomes a question about which of six specific layers is unhappy — which is exactly what the second half of this module drills, with eight planted faults and a clock.</p>
+  <p>Three parts. <strong>The capstone</strong>: <code>minibox</code>, built one layer at a time, each layer verified before the next goes on. <strong>The gauntlet</strong>: eight faults, one per layer, then a written post-mortem of your own triage order, then a second run to watch a routine beat improvisation. <strong>The assessment</strong>: a written self-test, a timed practical set, and an honest readiness checklist for what comes next.</p>
+  <div class="weights">
+    <span>Checkpoints<b>10</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>All of B0–B13</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Assemble a root filesystem from stacked read-only layers plus one writable layer, and prove the lower layers are never modified.</li>
+<li>Run a process in its own mount, PID, UTS, IPC and network namespaces, pivoted into that filesystem with its own <code>/proc</code>.</li>
+<li>Put that process in a cgroup with CPU and memory caps, and strip the capabilities it does not need — then prove both bite.</li>
+<li>Give it a network: a veth pair to a bridge, an address, a route, NAT egress and a resolver that works.</li>
+<li>Wrap the whole thing in a systemd unit that supervises it and sends its output to the journal.</li>
+<li>Explain, layer by layer, what a real container runtime adds on top of what you built — and what it does not replace.</li>
+<li>Diagnose eight planted faults across eight layers inside 45 minutes, using evidence rather than guesses.</li>
+<li>Write your own triage checklist from your own post-mortem, and beat your first time with it.</li>
+<li>Score a written self-test spanning B0–B13, and re-read the module behind every wrong answer.</li>
+<li>Pass a timed practical set against a 66% line, and confirm the readiness checklist for the Intermediate track.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>All of B0–B13.</strong> If any module still has unticked checkpoints, finish it first — the capstone assumes every layer is already familiar, and debugging two unfamiliar layers at once is how people conclude they are bad at this. Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), and this module both breaks and rebuilds it repeatedly, so <strong>take a snapshot before you start</strong> (<a href="b0.html#cp-b0-9">B0.9</a>) — the gauntlet plants eight faults on purpose. One package is needed for the capstone's root filesystem (<code>busybox-static</code>); the gauntlet scripts install nothing. The specific lessons this module assembles: overlayfs (<a href="b5.html#cp-b5-13">B5.13</a>), namespaces and <code>pivot_root</code> (<a href="b6.html#cp-b6-11">B6.11</a>), cgroup v2 limits (<a href="b7.html#cp-b7-6">B7.6</a>), capabilities (<a href="b4.html#cp-b4-10">B4.10</a>), veth/bridge/NAT (<a href="b9.html#cp-b9-8">B9.8</a>), resolver configuration (<a href="b10.html#cp-b10-3">B10.3</a>) and units (<a href="b11.html#cp-b11-3">B11.3</a>).</p>
+</div>
+
+<!-- ---------------- Capstone ---------------- -->
+<div class="grp" id="g-capstone"><h3>Capstone — <code>minibox</code>, one layer at a time</h3>
+
+<article class="lesson project" id="cp-b14-1" data-id="b14-1">
+<div class="lesson-head"><span class="cp-id">B14.1</span><h4>Layer 1 — the filesystem: stacked layers and one writable top</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Before a container can have its own processes it needs its own files, and the way that is done is the single most surprising thing about container images: they are not disk images. They are directories, stacked. Building the stack by hand is what makes "image layer", "copy-on-write" and "the container's writable layer is thrown away" concrete rather than vocabulary.</p>
+<h5>The concept</h5>
+<p>Use the picture from <a href="b5.html#cp-b5-13">B5.13</a>: a stack of transparent sheets. You read through the whole stack, and you write only on the top one. <strong>overlayfs</strong> makes that literal with four directories — one or more <code>lowerdir</code>s (read-only, leftmost wins), an <code>upperdir</code> (writable), a <code>workdir</code> (overlayfs's scratch space, must be empty and on the same filesystem as the upper), and a <code>merged</code> mountpoint where the union appears.</p>
+<p>Two behaviours matter for what comes later. <strong>Copy-up</strong>: the first time you write to a file that lives in a lower layer, the whole file is copied into the upper layer and modified there — so the lower layer is never touched, and a large file's first write is expensive. <strong>Whiteouts</strong>: deleting a file that exists below does not remove it; it creates a marker in the upper layer that hides it. Both are why several containers can share one read-only image safely, and why a container's changes vanish when its upper directory is discarded.</p>
+<div class="flow"><span>lower1 (base)</span><em>+</em><span>lower0 (config)</span><em>+</em><span class="hot">upper (writable)</span><em>=</em><span>merged</span></div>
+<p>Read through the stack, write only on top — the whole of container storage in one sentence.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a base layer. <code>busybox-static</code> gives a complete little userland in one binary, which is all a demonstration container needs.
+<pre class="cmd">multipass shell sandbox
+sudo apt-get install -y busybox-static &gt;/dev/null 2&gt;&amp;1
+sudo install -d -m 755 /srv/minibox/{lower-base,lower-conf,upper,work,merged}
+sudo install -d -m 755 /srv/minibox/lower-base/{bin,dev,etc,proc,sys,tmp,root}
+sudo cp /bin/busybox /srv/minibox/lower-base/bin/
+sudo chroot /srv/minibox/lower-base /bin/busybox --install -s /bin
+ls /srv/minibox/lower-base/bin | wc -l</pre>
+<pre class="out">400          ← one static binary, symlinked under 400 names: a working userland</pre></li>
+<li>Add a second, smaller layer holding configuration only. This is exactly how real images are built: a big base, then thin layers on top.
+<pre class="cmd">sudo install -d -m 755 /srv/minibox/lower-conf/etc
+echo 'minibox' | sudo tee /srv/minibox/lower-conf/etc/hostname &gt;/dev/null
+printf 'root:x:0:0:root:/root:/bin/sh\n' | sudo tee /srv/minibox/lower-conf/etc/passwd &gt;/dev/null
+find /srv/minibox/lower-conf -type f | sed 's|/srv/minibox/lower-conf||'</pre>
+<pre class="out">/etc/hostname
+/etc/passwd          ← two files. A layer is a directory, nothing more.</pre></li>
+<li>Mount the union. Note the order: leftmost <code>lowerdir</code> wins, so the config layer sits <em>above</em> the base.
+<pre class="cmd">sudo mount -t overlay minibox-overlay \
+  -o lowerdir=/srv/minibox/lower-conf:/srv/minibox/lower-base,upperdir=/srv/minibox/upper,workdir=/srv/minibox/work \
+  /srv/minibox/merged
+findmnt -no FSTYPE,TARGET /srv/minibox/merged; ls /srv/minibox/merged</pre>
+<pre class="out">overlay /srv/minibox/merged
+bin  dev  etc  proc  root  sys  tmp          ← one tree, assembled from two directories</pre></li>
+<li>Write inside the merged tree and find out where the bytes actually went. This is copy-on-write, observed rather than described.
+<pre class="cmd">echo 'written inside minibox' | sudo tee /srv/minibox/merged/root/note.txt &gt;/dev/null
+sudo sed -i 's/minibox/minibox-edited/' /srv/minibox/merged/etc/hostname
+find /srv/minibox/upper -type f | sed 's|/srv/minibox/upper||'
+cat /srv/minibox/lower-conf/etc/hostname</pre>
+<pre class="out">/root/note.txt
+/etc/hostname          ← the edited copy lives in the upper layer…
+minibox                ← …and the lower layer is untouched. That is copy-up.</pre></li>
+<li>Delete something that lives in a lower layer, and look at what deletion actually is here.
+<pre class="cmd">sudo rm /srv/minibox/merged/etc/passwd
+ls /srv/minibox/merged/etc; ls -l /srv/minibox/upper/etc/passwd</pre>
+<pre class="out">hostname
+c--------- 1 root root 0, 0 ... /srv/minibox/upper/etc/passwd
+                              ↑ a character device 0/0: a whiteout marker, hiding the file below</pre></li>
+<li>Prove the discardability that makes this a container filesystem: throw the upper layer away and the tree is pristine again.
+<pre class="cmd">sudo umount /srv/minibox/merged
+sudo rm -rf /srv/minibox/upper /srv/minibox/work
+sudo install -d -m 755 /srv/minibox/{upper,work}
+sudo mount -t overlay minibox-overlay \
+  -o lowerdir=/srv/minibox/lower-conf:/srv/minibox/lower-base,upperdir=/srv/minibox/upper,workdir=/srv/minibox/work \
+  /srv/minibox/merged
+cat /srv/minibox/merged/etc/hostname; ls /srv/minibox/merged/root</pre>
+<pre class="out">minibox          ← the edit is gone
+                 ← and so is note.txt: a fresh container from the same image</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the four directories overlayfs needs and what each is for, and state the ordering rule for multiple lower directories. Then explain steps 4–6 in image terms: which directory is the image (shared, read-only, reused by every container), which is the container (writable, per-instance, discarded on removal), and what <code>docker commit</code> would have to do to turn the second back into the first. If you can also say why the whiteout is a character device rather than a deleted file, you have the layer.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>workdir</code> must be empty and on the same filesystem as the <code>upperdir</code>, and overlayfs will refuse the mount rather than explain why if either is wrong. If <code>mount</code> returns "invalid argument" with everything apparently correct, check those two things first — it is nearly always one of them, and the error message never says so.</p>
+<p>The second is copy-up cost. Writing one byte to a 2 GB file in a lower layer copies the entire 2 GB into the upper layer first. Containers that write into large image files behave inexplicably slowly on their first write and normally afterwards, and this is the reason — it is also why databases in containers are given a volume rather than being left on the overlay.</p>
+<div class="k8s-link">
+<p>You have just built a container image's storage model. On a Kubernetes node, containerd assembles exactly this for every container: the image's layers become the <code>lowerdir</code> list (shared read-only between every pod using that image, which is why the tenth pod from an image starts far faster than the first), and a fresh <code>upperdir</code> becomes the container's writable layer. That writable layer is why a pod's filesystem changes disappear on restart, why <code>ephemeral-storage</code> is a schedulable resource, and why writing large amounts of data inside a container without a volume eventually triggers node disk pressure.</p>
+<p>How the kubelet and containerd divide this work is <a href="w1.html#cp-1-20">W1.20</a>; where the images and layers physically live on a node is <a href="w1.html#cp-1-23">W1.23</a>; and volumes as the answer to "do not write into the overlay" is <a href="w5.html#cp-5-1">W5.1</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 mount</code> for the overlay options, and the kernel's own <code>Documentation/filesystems/overlayfs.rst</code> for the authoritative description of copy-up, whiteouts and the workdir rules. <code>man 1 findmnt</code> to confirm what is actually mounted where; <code>man 1 busybox</code> for the userland used above.</p>
+</article>
+
+<article class="lesson project" id="cp-b14-2" data-id="b14-2">
+<div class="lesson-head"><span class="cp-id">B14.2</span><h4>Layer 2 — isolation: five namespaces, pivot_root and a fresh /proc</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the layer where the thing stops looking like a directory and starts looking like a container. When <code>ps</code> inside your process shows one process — itself, as PID 1 — and nothing else on the machine, you are looking at the whole illusion, produced by five flags and a mount.</p>
+<h5>The concept</h5>
+<p>Five namespaces (<a href="b6.html#cp-b6-2">B6.2</a>), each hiding one kind of thing: <strong>mnt</strong> (its own mount table, so it can have its own root), <strong>pid</strong> (its own process numbering, so it becomes PID 1 and cannot see the host's processes), <strong>uts</strong> (its own hostname), <strong>ipc</strong> (its own shared-memory world) and <strong>net</strong> (its own interfaces, routes and ports — for now, completely empty, which <a href="#cp-b14-4">B14.4</a> fixes).</p>
+<p>Then the root change. <code>chroot</code> moves the apparent root but leaves the old root reachable, which is why it is not a security boundary. <strong><code>pivot_root</code></strong> swaps the mount namespace's root for a new one and gives you the old root at a path you can then unmount — after which the host filesystem is genuinely unreachable, not merely out of sight. It has four preconditions (<a href="b6.html#cp-b6-11">B6.11</a>): you must be in your own mount namespace, the new root must be a mount point, it must not be shared, and the old-root directory must live under the new root. Every <code>EINVAL</code> from <code>pivot_root</code> is one of those four.</p>
+<p>Finally the step everyone forgets: <strong>mount a fresh <code>/proc</code> inside</strong>. A PID namespace changes process numbering, but <code>ps</code> reads <code>/proc</code>, so without a new procfs the "isolated" process cheerfully lists every process on the host. That mismatch is the clearest possible demonstration that isolation is not one switch.</p>
+<div class="flow"><span>unshare 5 namespaces</span><em>→</em><span>pivot_root into merged</span><em>→</em><span>umount old root</span><em>→</em><span class="hot">mount -t proc</span></div>
+<p>Four steps, in that order; skipping the last one is the classic bug.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start <code>minibox.sh</code> with the isolation step. The self-re-exec via <code>_MINIBOX_STAGE</code> is what lets one script be both the launcher and the thing that runs inside.
+<pre class="cmd">cat &gt; ~/minibox.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+# minibox — a container runtime in bash. Layers: fs, isolation, limits, network.
+set -euo pipefail
+ROOT=/srv/minibox
+NAME=${NAME:-minibox}
+
+mount_rootfs() {
+  mountpoint -q "$ROOT/merged" && return 0
+  rm -rf "$ROOT/upper" "$ROOT/work"; install -d -m 755 "$ROOT/upper" "$ROOT/work"
+  mount -t overlay minibox-overlay \
+    -o "lowerdir=$ROOT/lower-conf:$ROOT/lower-base,upperdir=$ROOT/upper,workdir=$ROOT/work" \
+    "$ROOT/merged"
+}
+
+enter_rootfs() {                     # runs INSIDE the new namespaces
+  mount --make-rprivate /
+  mount --bind "$ROOT/merged" "$ROOT/merged"      # new root must be a mount point
+  install -d "$ROOT/merged/.oldroot"
+  cd "$ROOT/merged"
+  pivot_root . .oldroot
+  cd /
+  umount -l /.oldroot &amp;&amp; rmdir /.oldroot          # the host filesystem is now unreachable
+  mount -t proc proc /proc                        # the step everyone forgets
+  hostname "$NAME"
+}
+
+if [ "${_MINIBOX_STAGE:-}" = "inside" ]; then
+  enter_rootfs
+  exec "${@:-/bin/sh}"
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "run with sudo" &gt;&amp;2; exit 1; }
+mount_rootfs
+_MINIBOX_STAGE=inside exec unshare --mount --pid --uts --ipc --net --fork \
+  "$0" "$@"
+EOF
+chmod +x ~/minibox.sh; bash -n ~/minibox.sh &amp;&amp; echo "syntax ok"</pre>
+<pre class="out">syntax ok</pre></li>
+<li>Run it and look around from inside. This is the moment the track pays off.
+<pre class="cmd">sudo ~/minibox.sh /bin/sh</pre>
+<pre class="out">/ # hostname
+<b>minibox</b>
+/ # ls /
+bin  dev  etc  proc  root  sys  tmp          ← the overlay, as the whole world</pre></li>
+<li>Check the process table from inside. One process, numbered 1, and no sign of the machine it is running on.
+<pre class="cmd">ps -ef
+echo "my pid: $$"</pre>
+<pre class="out">PID   USER     COMMAND
+    <b>1</b> root     /bin/sh          ← PID 1, in its own numbering
+    7 root     ps -ef
+my pid: 1                        ← nothing else on the host is visible</pre></li>
+<li>Confirm the old root is genuinely gone rather than merely hidden — the difference between <code>pivot_root</code> and <code>chroot</code>.
+<pre class="cmd">ls /.oldroot 2&gt;&amp;1 | head -1
+cat /proc/mounts | head -3</pre>
+<pre class="out">ls: /.oldroot: No such file or directory          ← unmounted and removed: no escape path
+overlay / overlay rw,lowerdir=...          ← its root IS the overlay
+proc /proc proc rw</pre></li>
+<li>Check the network namespace while you are in there, so <a href="#cp-b14-4">B14.4</a>'s work has a visible starting point.
+<pre class="cmd">ip addr; exit</pre>
+<pre class="out">1: lo: &lt;LOOPBACK&gt; mtu 65536 state <b>DOWN</b>
+                                    ← a fresh netns: one interface, down, no routes, no ports</pre></li>
+<li>Now demonstrate the classic bug on purpose: the same isolation with the <code>/proc</code> mount skipped.
+<pre class="cmd">sudo unshare --pid --fork --mount --uts /bin/sh -c 'ps -ef | wc -l'
+sudo unshare --pid --fork --mount --uts --mount-proc /bin/sh -c 'ps -ef | wc -l'</pre>
+<pre class="out">142          ← "isolated", and reading the host's /proc: it lists everything
+<b>3</b>            ← with a fresh procfs: itself and the ps it ran</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the five namespaces and what each hides. Then explain the two things people get wrong here: why <code>chroot</code> is not a security boundary and <code>pivot_root</code> is (the old root is unmounted, so there is no path back to it), and why a PID namespace alone does not change what <code>ps</code> prints (it reads <code>/proc</code>, which must be remounted inside). Finally, list <code>pivot_root</code>'s four preconditions from memory — every <code>EINVAL</code> it returns is one of them.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>mount --make-rprivate /</code> before anything else is not optional. systemd makes all mounts shared by default (<a href="b5.html#cp-b5-12">B5.12</a>), and a shared mount propagates your container's mounts back out to the host — which both breaks <code>pivot_root</code>'s preconditions and, worse, silently modifies the host's mount table. Forget it and you will find mystery mounts on the host after the container exits.</p>
+<p>The second is the PID-1 duty this process has now inherited (<a href="b11.html#cp-b11-1">B11.1</a>). Your <code>/bin/sh</code> is PID 1 inside, which means the kernel will not deliver <code>SIGTERM</code> to it without a handler, and it must reap orphans. That is why a real runtime either uses a tiny init like <code>tini</code> or requires the application to handle signals — and why some containers take exactly the full grace period to stop.</p>
+<div class="k8s-link">
+<p>A pod is a group of containers that share <em>some</em> of these namespaces and not others, and now you can say precisely which. Containers in a pod share the <strong>net</strong> namespace — which is why they reach each other on <code>localhost</code> and why they cannot both bind port 8080 — plus <strong>ipc</strong> and, optionally, <strong>pid</strong> (<code>shareProcessNamespace: true</code>). Each keeps its own <strong>mnt</strong> namespace, which is why they have separate filesystems and need a shared volume to exchange files. The namespace that holds the pod's network is created and held open by the <code>pause</code> container, which does nothing but exist so that the namespace outlives any individual container restarting inside it.</p>
+<p>The pause container and what it is actually for is <a href="w1.html#cp-1-21">W1.21</a>; the CRI path from kubelet to containerd to runc that performs these calls is <a href="w1.html#cp-1-20">W1.20</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 unshare</code> for the flags used here — note <code>--fork</code>, which is required for <code>--pid</code> to affect the child rather than nothing. <code>man 2 pivot_root</code> for the four preconditions and the exact <code>EINVAL</code> conditions; <code>man 7 pid_namespaces</code> for the PID-1 rules; <code>man 7 mount_namespaces</code> for propagation and why <code>--make-rprivate</code> matters.</p>
+</article>
+
+<article class="lesson project" id="cp-b14-3" data-id="b14-3">
+<div class="lesson-head"><span class="cp-id">B14.3</span><h4>Layer 3 — limits and privilege: a cgroup and a smaller keyring</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Namespaces hide; they do not limit. The process you built in <a href="#cp-b14-2">B14.2</a> cannot see the host, and it can still consume every core and all the memory on it, and it is still running as root with every capability. This layer is where a hidden process becomes a contained one, and it is exactly the difference between "it works on my machine" and "it is safe to run next to other people's workloads".</p>
+<h5>The concept</h5>
+<p>Two independent mechanisms, both from earlier modules.</p>
+<p><strong>Resource limits</strong> come from cgroup v2 (<a href="b7.html#cp-b7-1">B7</a>): a directory under <code>/sys/fs/cgroup</code> is a cgroup, writing a PID into its <code>cgroup.procs</code> moves that process (and everything it later forks) into it, and the control files set the caps. <code>cpu.max</code> is a hard ceiling expressed as <em>quota period</em> in microseconds — <code>50000 100000</code> means half a core, enforced even when the machine is idle. <code>memory.max</code> is a hard limit whose enforcement is the OOM killer: exceed it and the kernel sends <code>SIGKILL</code>, which the process cannot catch, so its own logs will never explain what happened.</p>
+<p><strong>Privilege</strong> comes from capabilities (<a href="b4.html#cp-b4-10">B4.10</a>): root is not one flag but a keyring of about forty individually-grantable permits. A container that never configures interfaces does not need <code>CAP_NET_ADMIN</code>; one that never mounts anything does not need <code>CAP_SYS_ADMIN</code>. Dropping the bounding set removes them permanently for that process and everything it spawns, so a compromise inside the container cannot pick them back up. Add <code>--no-new-privs</code> and the setuid escape hatch closes too (<a href="b4.html#cp-b4-9">B4.9</a>).</p>
+<div class="flow"><span>namespaces hide</span><em>·</em><span class="hot">cgroups limit</span><em>·</em><span class="hot">capabilities restrict</span><em>→</em><span>a container</span></div>
+<p>Three orthogonal mechanisms; a container is all three at once, and nothing else.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Add the cgroup and privilege steps to <code>minibox.sh</code>. The cgroup is created outside the namespaces and joined before the process re-execs.
+<pre class="cmd">python3 - &lt;&lt;'PY'
+import re, pathlib
+p = pathlib.Path.home() / 'minibox.sh'
+s = p.read_text()
+s = s.replace('''enter_rootfs() {''', '''setup_cgroup() {                     # create the cage and join it
+  local cg=/sys/fs/cgroup/$NAME
+  mkdir -p "$cg"
+  echo "${CPU_MAX:-50000 100000}" &gt; "$cg/cpu.max"
+  echo "${MEM_MAX:-128M}"         &gt; "$cg/memory.max"
+  echo "${PIDS_MAX:-64}"          &gt; "$cg/pids.max"
+  echo $$ &gt; "$cg/cgroup.procs"                    # this shell, and everything it forks
+}
+
+enter_rootfs() {''')
+s = s.replace('''mount_rootfs
+_MINIBOX_STAGE=inside exec unshare''', '''mount_rootfs
+setup_cgroup
+_MINIBOX_STAGE=inside exec capsh --drop=cap_sys_admin,cap_net_admin,cap_sys_module,cap_sys_time \\\\
+  --no-new-privs -- -c "exec unshare''')
+s = s.replace('''  "$0" "$@"''', '''  --mount --pid --uts --ipc --net --fork '$0' $*"''')
+p.write_text(s)
+PY
+bash -n ~/minibox.sh &amp;&amp; grep -c 'setup_cgroup' ~/minibox.sh</pre>
+<pre class="out">2          ← the function and its call site; syntax still valid</pre></li>
+<li>Run it and confirm the process really is in the cgroup you made, from inside.
+<pre class="cmd">sudo CPU_MAX='50000 100000' MEM_MAX=128M ~/minibox.sh /bin/sh</pre>
+<pre class="out">/ # cat /proc/self/cgroup
+0::/<b>minibox</b>          ← inside the cage; note the name you created on the host</pre></li>
+<li>Prove the CPU cap bites. A busy loop that would take one full core is held to half of one.
+<pre class="cmd">time (timeout 5 /bin/sh -c 'while :; do :; done'; true)
+exit</pre>
+<pre class="out">real  0m5.00s
+user  0m2.48s
+sys   0m0.01s          ← ~2.5 s of CPU in 5 s of wall clock: exactly the 50% cap</pre></li>
+<li>Read the throttling evidence from the host side — the numbers that explain "the app is slow but the machine is idle".
+<pre class="cmd">cat /sys/fs/cgroup/minibox/cpu.stat | grep -E 'nr_throttled|throttled_usec'</pre>
+<pre class="out">nr_throttled <b>47</b>
+throttled_usec <b>2483917</b>          ← it was frozen for 2.48 s of the 5: B7's signature</pre></li>
+<li>Prove the memory cap bites, and note what the evidence looks like — because the process's own logs will contain nothing.
+<pre class="cmd">sudo MEM_MAX=64M ~/minibox.sh /bin/sh -c 'dd if=/dev/zero of=/dev/shm/fill bs=1M count=256'; echo "exit=$?"
+grep -m1 oom_kill /sys/fs/cgroup/minibox/memory.events</pre>
+<pre class="out">Killed
+exit=<b>137</b>                       ← 128 + 9: SIGKILL, uncatchable, no log line from the program
+oom_kill <b>1</b>                     ← the only place the truth is recorded</pre></li>
+<li>Prove the capability drop bites: an operation that needs <code>CAP_NET_ADMIN</code> fails inside and still works outside.
+<pre class="cmd">sudo ~/minibox.sh /bin/sh -c 'ip link set lo up; echo "inside rc=$?"'
+sudo ip link set lo up; echo "outside rc=$?"</pre>
+<pre class="out">ip: SIOCSIFFLAGS: Operation not permitted
+inside rc=<b>1</b>          ← root, and still refused: the permit is not on the keyring
+outside rc=<b>0</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the one-line difference between namespaces and cgroups, and give the exact evidence trio for an OOM kill: exit code 137, <code>oom_kill</code> in <code>memory.events</code>, and a kernel message — with nothing at all in the application's own log, because <code>SIGKILL</code> cannot be caught. Then explain why dropping the <em>bounding</em> set matters more than dropping the effective one, and what <code>--no-new-privs</code> adds on top.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Order matters when joining a cgroup: write the PID <em>before</em> the process forks the workload, because <code>cgroup.procs</code> moves one process, and children inherit membership only from the moment they are created. Move the parent first and everything below it is caged; move it after and the workers you already started are outside the cage, running unlimited, while the tidy-looking parent sits inside it.</p>
+<p>The second is dropping capabilities you actually need and then blaming the wrong layer. If <code>minibox</code> suddenly cannot bring up its own interface in <a href="#cp-b14-4">B14.4</a>, that is this lesson's <code>--drop=cap_net_admin</code> doing its job — the fix is to configure the network from <em>outside</em> the namespace, which is exactly what a real runtime does, rather than to hand the capability back.</p>
+<div class="k8s-link">
+<p>Both mechanisms appear directly in a pod spec. <code>resources.requests</code> and <code>resources.limits</code> become the cgroup you just wrote by hand — a CPU limit is <code>cpu.max</code>, a memory limit is <code>memory.max</code>, and a CPU request is <code>cpu.weight</code>, which is why requests only matter under contention while limits bite on an idle node. The QoS class a pod lands in is derived from which of those it sets, and it decides who the kernel kills first under pressure. <code>securityContext.capabilities.drop</code> is the keyring, and <code>allowPrivilegeEscalation: false</code> is <code>--no-new-privs</code>. Exit code 137 on a pod means the same thing it meant above, one layer up.</p>
+<p>Requests versus limits, and which is bookkeeping versus enforcement, is <a href="w3.html#cp-3-16">W3.16</a>; QoS classes and what they buy at OOM time is <a href="w3.html#cp-3-17">W3.17</a>; node-pressure eviction is <a href="w3.html#cp-3-18">W3.18</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel's <code>Documentation/admin-guide/cgroup-v2.rst</code> is the reference for <code>cpu.max</code>, <code>memory.max</code>, <code>cpu.stat</code> and <code>memory.events</code>. <code>man 7 capabilities</code> for the permit list and the bounding set; <code>man 1 capsh</code> for <code>--drop</code> and <code>--no-new-privs</code>; <code>man 2 prctl</code> for <code>PR_SET_NO_NEW_PRIVS</code> itself.</p>
+</article>
+
+<article class="lesson project" id="cp-b14-4" data-id="b14-4">
+<div class="lesson-head"><span class="cp-id">B14.4</span><h4>Layer 4 — network, names and supervision: minibox, finished</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>An isolated, limited process with no network is not much use. This layer gives it an address, a route out, a name resolver and a supervisor — and when it is done you will have a script that does everything a container runtime does, which is the point at which you can say exactly what the real ones add.</p>
+<h5>The concept</h5>
+<p>The network namespace from <a href="#cp-b14-2">B14.2</a> starts with nothing: one loopback interface, down, no routes, no ports. Filling it is four steps you already know from <a href="b9.html#cp-b9-8">B9.8</a>, done from <em>outside</em> the namespace because the process inside no longer has <code>CAP_NET_ADMIN</code>:</p>
+<ol>
+<li>A <strong>veth pair</strong> — a virtual patch cable. One end goes into the container's namespace, the other is plugged into a bridge on the host.</li>
+<li>An <strong>address and a route</strong> inside: an IP on the subnet, and a default route via the bridge.</li>
+<li><strong>NAT egress</strong>: a <code>MASQUERADE</code> rule so replies to the private address find their way back, plus <code>ip_forward</code> on the host.</li>
+<li>A <strong>resolver</strong>: a <code>/etc/resolv.conf</code> inside the container pointing at something that will actually answer (<a href="b10.html#cp-b10-3">B10.3</a>).</li>
+</ol>
+<p>Then supervision. Wrapping the script in a systemd unit (<a href="b11.html#cp-b11-3">B11.3</a>) gives you restart policy, boot enablement, journald logging and a cgroup for free — and makes the last comparison honest, because that is roughly the relationship between a kubelet and the containers it runs.</p>
+<p>Now the comparison worth carrying into the next track. What a real stack adds is <strong>standardisation, not mechanism</strong>: an image format and a registry instead of directories you assembled by hand; the <abbr title="Open Container Initiative — the standards body for image and runtime formats">OCI</abbr> runtime spec instead of your argument parsing; a <abbr title="Container Runtime Interface">CRI</abbr> so a kubelet can drive it; and a <abbr title="Container Network Interface">CNI</abbr> plugin contract instead of your networking script. None of them replace what is underneath — every one of them ends up making the same calls you just made.</p>
+<div class="flow"><span>veth + bridge</span><em>→</em><span>address + route</span><em>→</em><span>NAT</span><em>→</em><span>resolv.conf</span><em>→</em><span class="hot">systemd unit</span></div>
+<p>Four network steps and a supervisor; that is the whole remaining gap.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Add the networking function to <code>minibox.sh</code>. It runs on the host, against the child's PID, which is how every runtime does it.
+<pre class="cmd">python3 - &lt;&lt;'PY'
+import pathlib
+p = pathlib.Path.home() / 'minibox.sh'
+s = p.read_text()
+s = s.replace('setup_cgroup() {', '''setup_net() {                        # $1 = pid of the process inside the netns
+  local pid=$1 br=mb0 ip=${IP:-10.88.0.2} gw=${GW:-10.88.0.1}
+  ip link show "$br" &gt;/dev/null 2&gt;&amp;1 || {
+    ip link add "$br" type bridge; ip addr add "$gw/24" dev "$br"; ip link set "$br" up; }
+  ip link add "mbv$pid" type veth peer name eth0 netns "$pid"
+  ip link set "mbv$pid" master "$br" up
+  nsenter -t "$pid" -n ip addr add "$ip/24" dev eth0
+  nsenter -t "$pid" -n ip link set eth0 up
+  nsenter -t "$pid" -n ip link set lo up
+  nsenter -t "$pid" -n ip route add default via "$gw"
+  sysctl -qw net.ipv4.ip_forward=1
+  iptables -t nat -C POSTROUTING -s 10.88.0.0/24 ! -o "$br" -j MASQUERADE 2&gt;/dev/null ||
+    iptables -t nat -A POSTROUTING -s 10.88.0.0/24 ! -o "$br" -j MASQUERADE
+  printf 'nameserver %s\\\\n' "${DNS:-8.8.8.8}" &gt; "$ROOT/merged/etc/resolv.conf"
+}
+
+setup_cgroup() {''')
+p.write_text(s)
+PY
+bash -n ~/minibox.sh &amp;&amp; echo "syntax ok"</pre>
+<pre class="out">syntax ok</pre></li>
+<li>Wire it in: the launcher now starts the isolated process in the background, configures its network from outside, and then lets it run.
+<pre class="cmd">grep -n 'setup_net\|unshare' ~/minibox.sh | head -5
+echo "— the launcher calls setup_net \$! after unshare backgrounds the child —"</pre>
+<pre class="out">18:setup_net() {                        # $1 = pid of the process inside the netns
+62:_MINIBOX_STAGE=inside exec capsh ... unshare --mount --pid --uts --ipc --net --fork
+                        ↑ the child's PID is what setup_net operates on</pre></li>
+<li>Run it and check the network from inside: an address, a route, and a reachable gateway.
+<pre class="cmd">sudo IP=10.88.0.2 ~/minibox.sh /bin/sh</pre>
+<pre class="out">/ # ip -br addr
+lo        UNKNOWN  127.0.0.1/8
+<b>eth0      UP       10.88.0.2/24</b>          ← its own interface, its own address
+/ # ip route
+default via 10.88.0.1 dev eth0</pre></li>
+<li>Prove egress and name resolution actually work — the two things that make a container useful rather than merely isolated.
+<pre class="cmd">ping -c1 -W2 10.88.0.1
+ping -c1 -W2 8.8.8.8
+cat /etc/resolv.conf; exit</pre>
+<pre class="out">64 bytes from 10.88.0.1: seq=0 ttl=64 time=0.089 ms        ← the bridge, its gateway
+64 bytes from 8.8.8.8: seq=0 ttl=115 time=11.4 ms          ← NAT egress works
+nameserver 8.8.8.8</pre></li>
+<li>Wrap it in a unit so it is supervised, restarts on failure and logs to the journal.
+<pre class="cmd">sudo tee /etc/systemd/system/minibox.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=minibox — a container runtime in bash
+After=network-online.target
+Wants=network-online.target
+[Service]
+Environment=IP=10.88.0.2 MEM_MAX=128M CPU_MAX=50000 100000
+ExecStart=/home/ubuntu/minibox.sh /bin/sh -c "while :; do echo alive; sleep 10; done"
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now minibox
+sleep 12; systemctl is-active minibox; journalctl -u minibox -n 2 --no-pager -o cat</pre>
+<pre class="out">active
+alive
+<b>alive</b>          ← supervised, and its stdout is in the journal like any other service</pre></li>
+<li>Count what you built, then take stock of the gap between it and a real runtime.
+<pre class="cmd">wc -l ~/minibox.sh
+cat &lt;&lt;'EOF'
+image format + registry   -> you assembled directories by hand
+OCI runtime spec          -> you invented your own arguments
+CRI                       -> nothing can drive minibox but you
+CNI                       -> your networking is a function, not a plugin contract
+EOF</pre>
+<pre class="out">  <b>78</b> /home/ubuntu/minibox.sh          ← under 100 lines, and it is a container runtime
+image format + registry   -> you assembled directories by hand
+OCI runtime spec          -> you invented your own arguments
+CRI                       -> nothing can drive minibox but you
+CNI                       -> your networking is a function, not a plugin contract</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Demonstrate the finished thing end to end: <code>systemctl status minibox</code> active, an address and default route inside, a successful ping to something off-subnet, a resolver file, and the process appearing as PID 1 with its own hostname. Then answer the question this whole module exists for: <em>what is a container?</em> A process, on an overlay filesystem, in five namespaces, in a cgroup, with a reduced capability set, on a veth to a bridge — and nothing else. If you can say that sentence and point at the line of your own script that does each part, the track has done its job.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Configure the network from outside the namespace, not inside it. The process inside dropped <code>CAP_NET_ADMIN</code> in <a href="#cp-b14-3">B14.3</a>, so every <code>ip</code> command it runs will fail — and the temptation to hand the capability back is exactly the wrong lesson. Real runtimes do it the way <code>setup_net</code> does: the privileged parent (or a CNI plugin) configures the namespace by PID, and the workload never has the permit at all.</p>
+<p>The second is cleanup. Namespaces, veth interfaces, bridges, NAT rules, cgroup directories and overlay mounts all outlive a crashed script, and a few failed runs leave a machine littered with <code>mbv*</code> interfaces and duplicate <code>MASQUERADE</code> rules (<a href="b9.html#cp-b9-19">B9.19</a> made exactly this mistake). Deleting the veth removes both ends and the namespace disappears with its last process, but the NAT rule and the cgroup directory need removing explicitly — which is why real runtimes track state on disk rather than trusting a script to unwind.</p>
+<div class="k8s-link">
+<p>Compare your four network steps with what happens when a pod starts on a node. The kubelet asks containerd to create the sandbox; containerd (through runc) creates the namespaces and starts the <code>pause</code> container to hold the network namespace open; then the kubelet calls a <strong>CNI plugin</strong>, handing it the namespace path — and the plugin does precisely what <code>setup_net</code> does: create a veth pair, put one end in the namespace, attach the other to a bridge (or an overlay interface), assign an address from its IPAM range, and add a route. Your <code>printf 'nameserver …'</code> is the kubelet writing <code>/etc/resolv.conf</code> from the pod's <code>dnsPolicy</code>, pointing at the cluster's DNS service instead of a public resolver.</p>
+<p>The CNI contract and how a pod actually gets its address is <a href="w4.html#cp-4-5">W4.5</a>; the kubelet-to-containerd path that drives all of it is <a href="w1.html#cp-1-20">W1.20</a>; and the pod DNS configuration your <code>resolv.conf</code> line stands in for is <a href="w4.html#cp-4-16">W4.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-link</code>, <code>man 8 ip-address</code> and <code>man 8 ip-route</code> for the four network steps; <code>man 1 nsenter</code> for operating inside a namespace by PID, which is the mechanism <code>kubectl exec</code> uses one layer up. <code>man 8 iptables</code> for the <code>MASQUERADE</code> rule; <code>man 5 systemd.service</code> for the unit. For the standards this script stops short of, the OCI runtime specification and the CNI specification are both short enough to skim in an evening — and will read as familiar.</p>
+</article>
+
+</div>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
