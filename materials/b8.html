@@ -436,6 +436,255 @@ port 81: no service            ← but this port isn't served — ping told us n
 </article>
 </div><!-- /g-routing -->
 
+<!-- ---------------- Transport ---------------- -->
+<div class="grp" id="g-transport"><h3>Transport</h3>
+
+<article class="lesson" id="cp-b8-8" data-id="b8-8">
+<div class="lesson-head"><span class="cp-id">B8.8</span><h4>One TCP connection, end to end: handshake, data, teardown</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>TCP is the protocol under almost everything you care about — HTTP, SSH, database connections, the Kubernetes API — and watching one connection be born, carry data, and die demystifies all of them at once. The specific payoff is that the <em>shape</em> of a TCP failure tells you what went wrong: a connection <em>refused</em> instantly and one that <em>hangs</em> are two completely different diagnoses, and knowing which is which routes you straight to the cause. Capturing a real connection with <code>tcpdump</code> and naming each packet is the moment transport stops being abstract.</p>
+<h5>The concept</h5>
+<p>TCP gives you a <em>reliable, ordered byte stream</em> over an unreliable packet network, and it does that with a defined lifecycle you can watch packet by packet:</p>
+<ul>
+<li><strong>The handshake (three packets):</strong> the client sends <strong>SYN</strong> ("let's talk, here's my starting sequence number"), the server replies <strong>SYN-ACK</strong> ("okay, and here's mine"), the client sends <strong>ACK</strong> ("got it"). After these three, the connection is <code>ESTABLISHED</code> and either side may send data. This round-trip is why a new TCP connection always costs at least one there-and-back before any data flows.</li>
+<li><strong>Data with sequence numbers:</strong> every byte is numbered; the receiver <strong>ACK</strong>s the highest contiguous byte it has, so a lost segment is noticed (a gap in the numbers) and retransmitted. That's the "reliable, ordered" guarantee in action.</li>
+<li><strong>Teardown:</strong> each side sends a <strong>FIN</strong> when it's done writing, and the other <strong>ACK</strong>s it — the connection closes in each direction independently. (An abrupt <strong>RST</strong> is the other ending: "reset, forget this connection now," used for errors and refusals.)</li>
+</ul>
+<p>Here's the diagnostic gold. Because a connection begins with a SYN that must be answered, the <em>failure modes have distinct signatures</em>: a <strong>refused</strong> connection comes back <em>instantly</em> — the destination host is reachable but nothing is listening on that port, so its kernel immediately sends a <strong>RST</strong>, and you get "Connection refused" at once. A <strong>filtered</strong> connection <em>hangs</em> — the SYN vanished into a firewall (or a black hole) and nothing answers, so your side waits and eventually times out. Keep that pair permanently: <em>refused = reached the machine, no one home; timeout = something ate the packet.</em> In Kubernetes those map almost directly to "a Service with no ready endpoints" (refused/reset) versus "a NetworkPolicy or missing route dropping the packet" (timeout).</p>
+<div class="flow"><span>SYN →</span><em>·</em><span>← SYN-ACK</span><em>·</em><span>ACK →</span><em>= ESTABLISHED · refused=instant RST · filtered=hang</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Capture a real connection. In one terminal start a capture; in another run <code>curl</code>; then read the handshake and teardown in the capture.
+<pre class="cmd">multipass shell sandbox
+# terminal 1 — capture TCP to example.com's port 80
+sudo tcpdump -nn -i ens3 'tcp port 80 and host example.com' &amp;
+# terminal 2 (same shell is fine after backgrounding) — make one request
+curl -s -o /dev/null http://example.com
+sleep 1; sudo pkill tcpdump</pre>
+<pre class="out">IP 10.191.62.10.44xxx &gt; 93.184.x.x.80: Flags [<b>S</b>], seq 12...      ← SYN
+IP 93.184.x.x.80 &gt; 10.191.62.10.44xxx: Flags [<b>S.</b>], seq 98..., ack 13..  ← SYN-ACK
+IP 10.191.62.10.44xxx &gt; 93.184.x.x.80: Flags [<b>.</b>], ack 99...    ← ACK: established
+... Flags [P.] ...                                                 ← data (the HTTP GET)
+... Flags [<b>F.</b>] ...                                            ← FIN: teardown begins</pre></li>
+<li>Feel the <em>refused</em> signature: connect to a port with nothing listening on the local machine — an instant RST, not a wait.
+<pre class="cmd">time curl -s -o /dev/null http://127.0.0.1:9              # nothing listens on :9</pre>
+<pre class="out">curl: (7) Failed to connect to 127.0.0.1 port 9: <b>Connection refused</b>
+real    0m0.01s                       ← instant: the kernel sent a RST right back</pre></li>
+<li>Feel the <em>filtered</em> signature: connect to a routable address that silently drops the SYN (a firewalled/black-hole IP) and watch it hang until timeout.
+<pre class="cmd">time curl -s -m5 -o /dev/null http://10.255.255.1:80      # no one answers; drops SYN</pre>
+<pre class="out">curl: (28) Connection timed out after 5000 ms
+real    0m5.0s                        ← hang: the SYN vanished, nothing replied</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the three handshake packets in order and what state follows them. (SYN → SYN-ACK → ACK, after which the connection is <code>ESTABLISHED</code> and either side can send data.) Then: a connection attempt returns "Connection refused" instantly, while another hangs for 30 seconds and times out — what does each tell you? (Refused = you reached the host but nothing is listening on that port, so it sent a RST immediately; timeout = the SYN was dropped by a filter or black hole and nothing answered — the host may not even have seen it.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>In <code>tcpdump</code>'s flag notation, <code>[S]</code> is SYN, <code>[S.]</code> is SYN-ACK (the <code>.</code> means ACK is also set), <code>[.]</code> is a bare ACK, <code>[P.]</code> is push+ACK (data), <code>[F.]</code> is FIN+ACK, and <code>[R]</code>/<code>[R.]</code> is RST. The dot tripping people is that <code>.</code> <em>is</em> the ACK flag — so almost every packet after the initial SYN has a dot. Learn to read the bracket at a glance and the whole connection narrates itself. (This notation returns in B8.13.)</p>
+<p>"Connection refused" is genuinely good news when you're hunting reachability: it proves the network path all the way to the host works and the host's kernel is responding — only the service is absent. It's much more informative than a timeout, which leaves you unsure whether the packet even arrived. So when debugging, a refusal narrows the problem to "wrong port / service not started / not listening on that address," while a timeout keeps the whole path (route, firewall, host-down) in play. Prefer the diagnosis that gives you a refusal.</p>
+<div class="k8s-link">
+<p>The refused-vs-timeout split is one of the most useful reflexes in Kubernetes debugging. Curl a Service from a pod and get <em>connection refused</em> → you reached something (the node/kube-proxy rewrote you to an endpoint) but nothing was listening — often a Service whose pods aren't ready, or the wrong <code>targetPort</code>. Get a <em>timeout</em> → a packet is being dropped: a NetworkPolicy denying the traffic, a missing route between nodes, or a black-holed Service IP with no endpoints at all. The TCP handshake you just watched is also literally what a <code>tcpSocket</code> readiness probe performs — it opens a connection and closes it, and the SYN/SYN-ACK/ACK is the "ready" signal.</p>
+<p>Endpoints and readiness deciding who answers is <a href="w4.html#cp-4-11">W4.11</a>; NetworkPolicy drops (the timeout case) are <a href="w4.html#cp-4-23">W4.23</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 tcp</code> for the protocol, states, and socket options; <code>man 8 tcpdump</code> and its <code>pcap-filter</code> page for capture filters and flag notation. <code>man 2 connect</code> shows the syscall behind a client SYN and the errors (<code>ECONNREFUSED</code>, <code>ETIMEDOUT</code>) that map to the two signatures. In the exam docs, <code>tcpSocket</code> probes and Service/Endpoints behaviour are the Kubernetes surface.</p>
+</article>
+
+<article class="lesson" id="cp-b8-9" data-id="b8-9">
+<div class="lesson-head"><span class="cp-id">B8.9</span><h4>TCP states in ss: what CLOSE-WAIT and TIME-WAIT accuse</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Run <code>ss -tan</code> on any busy machine and you'll see a column of state names — <code>ESTAB</code>, <code>TIME-WAIT</code>, <code>CLOSE-WAIT</code> — and most people ignore them. That's a mistake, because two of those states are precise accusations: a pile of <code>CLOSE-WAIT</code> means <em>your program</em> has a bug, while a pile of <code>TIME-WAIT</code> is completely normal and needs no action. Knowing which states point at your code, which are harmless, and which point at the network saves you from both false alarms and missed real bugs.</p>
+<h5>The concept</h5>
+<p>A TCP connection moves through a state machine, and <code>ss -tan</code> shows the current state of each. The ones you'll actually see and what each means:</p>
+<ul>
+<li><strong><code>LISTEN</code></strong> — a server socket waiting for connections. Not a connection yet; a readiness to accept them.</li>
+<li><strong><code>SYN-SENT</code></strong> — a client sent a SYN and is waiting for the SYN-ACK. Stuck here = the handshake isn't completing (filtered, or the server isn't answering).</li>
+<li><strong><code>ESTABLISHED</code></strong> (shown <code>ESTAB</code>) — the connection is open and data can flow. The normal working state.</li>
+<li><strong><code>CLOSE-WAIT</code></strong> — <em>the peer</em> sent a FIN ("I'm done") and your side <em>hasn't closed its end yet</em>. The connection is waiting for <em>your</em> program to call <code>close()</code>. A few are transient; <strong>many, and growing, means your application forgot to close its sockets</strong> — the fix is always in your code, never the kernel.</li>
+<li><strong><code>TIME-WAIT</code></strong> — the side that <em>closed first</em> holds the connection in this state for ~1–2 minutes after it's fully closed, deliberately, so that any late duplicate packets from the old connection can't be mistaken for a new connection reusing the same 4-tuple. Thousands of these on a busy client are <strong>normal and harmless</strong>, not a leak.</li>
+</ul>
+<p>The crucial contrast is <code>CLOSE-WAIT</code> vs <code>TIME-WAIT</code>, because they look similar and mean opposite things. <code>CLOSE-WAIT</code> is <em>your</em> fault and accumulates when your code doesn't close sockets it should — a genuine resource leak that eventually exhausts file descriptors. <code>TIME-WAIT</code> is the kernel doing its job correctly on connections you <em>did</em> close, and it clears itself after the timer; trying to "fix" TIME-WAIT is almost always a mistake. Remember it as: <strong>CLOSE-WAIT = my bug; TIME-WAIT = working as intended.</strong></p>
+<div class="flow"><span>CLOSE-WAIT piling up</span><em>= your code forgot close() ·</em><span class="hot">fix the app</span><em>|</em><span>TIME-WAIT piling up</span><em>= normal, self-clears</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Take a census of connection states on the machine. On a quiet VM most are <code>LISTEN</code> and maybe some <code>ESTAB</code>/<code>TIME-WAIT</code>.
+<pre class="cmd">multipass shell sandbox
+ss -tan | awk 'NR&gt;1{print $1}' | sort | uniq -c | sort -rn</pre>
+<pre class="out">     12 LISTEN
+      3 ESTAB
+      1 TIME-WAIT               ← a recently-closed connection cooling off — normal</pre></li>
+<li>Generate <code>TIME-WAIT</code> deliberately and watch it appear then self-clear, proving it's benign. Make a few quick connections that close, then look.
+<pre class="cmd">for i in 1 2 3; do curl -s -o /dev/null http://example.com; done
+ss -tan state time-wait                       # connections we closed, now waiting</pre>
+<pre class="out">Recv-Q Send-Q  Local Address:Port   Peer Address:Port
+0      0       10.191.62.10:44xxx   93.184.x.x:80      ← TIME-WAIT: normal, clears in ~60s</pre></li>
+<li>Understand what <code>CLOSE-WAIT</code> would look like (a socket the local app hasn't closed after the peer finished). Filter for it — on a healthy machine there are none; a growing count here is the signal to fix application code.
+<pre class="cmd">ss -tan state close-wait
+echo "count: $(ss -tan state close-wait | grep -c ':')"</pre>
+<pre class="out">Recv-Q Send-Q  Local Address:Port  Peer Address:Port
+count: 0                          ← healthy; a rising count would accuse the local app</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You find thousands of <code>CLOSE-WAIT</code> sockets on a server — where is the bug and why? (In the local application: <code>CLOSE-WAIT</code> means the peer sent FIN and your side never called <code>close()</code>, so the sockets leak — the fix is in your code, not the kernel or network.) Then: you find thousands of <code>TIME-WAIT</code> on a busy client — is that a problem? (No — <code>TIME-WAIT</code> is the deliberate ~1–2 minute cooldown the closing side holds so old duplicate packets can't corrupt a new connection on the same 4-tuple; it's normal for a busy client and clears on its own.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>People try to "eliminate" <code>TIME-WAIT</code> with sysctls like <code>tcp_tw_reuse</code> or the old, removed <code>tcp_tw_recycle</code> — usually the wrong instinct, and <code>tcp_tw_recycle</code> was deleted from the kernel precisely because it broke connections behind NAT. If you're hitting a real limit from <code>TIME-WAIT</code> (ephemeral port exhaustion on a very busy client), the right fixes are connection pooling/reuse or widening the port range, not disabling the safety timer. Treat <code>TIME-WAIT</code> as correct until proven otherwise.</p>
+<p><code>ss</code> replaces the old <code>netstat</code> entirely and is faster and namespace-aware — <code>ss -tan</code> (TCP, all, numeric) is the everyday incantation; add <code>p</code> for the owning process (needs privilege) and <code>state &lt;name&gt;</code> to filter. <code>net-tools</code>' <code>netstat</code> isn't even installed on 24.04, and on a machine with network namespaces it couldn't see into them anyway. Build the <code>ss</code> habit; every state-inspection lab in this track and every node-debug in Kubernetes uses it.</p>
+<div class="k8s-link">
+<p>On a node, <code>ss -tanp</code> is how you see which process owns a connection and what state it's in — invaluable when a pod leaks sockets (<code>CLOSE-WAIT</code> climbing inside a container points at the app image's code, not Kubernetes) or when you're checking whether kube-proxy/kubelet connections to the apiserver are <code>ESTAB</code>. The <code>TIME-WAIT</code>-is-normal fact matters at cluster scale: a busy ingress or egress path generates enormous <code>TIME-WAIT</code> counts by design, and mistaking that for a leak sends people down pointless sysctl rabbit holes. Reading states correctly is a core node-triage skill in W6.</p>
+<p>Socket-owning processes and connection health on nodes recur in troubleshooting, <a href="w6.html">W6</a>; the socket-as-fd idea is from <a href="b3.html#cp-b3-7">B3.7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ss</code> for the state filters, columns, and options (<code>-t</code>, <code>-a</code>, <code>-n</code>, <code>-p</code>, <code>state</code>); <code>man 7 tcp</code> for the full state machine and the meaning of <code>TIME-WAIT</code>/<code>CLOSE-WAIT</code>. For the sysctls mentioned, <code>man 7 tcp</code> lists <code>tcp_tw_reuse</code> and the port-range knob <code>ip_local_port_range</code>. No exam-docs entry — this is node-level mechanism you apply under W6.</p>
+</article>
+
+<article class="lesson" id="cp-b8-10" data-id="b8-10">
+<div class="lesson-head"><span class="cp-id">B8.10</span><h4>UDP: no handshake, no promises — and why that's useful</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Not everything wants TCP's reliability, and the protocols that don't — DNS, VXLAN (the tunnel under many Kubernetes overlays), metrics agents — all choose UDP for specific reasons. Understanding UDP's deliberate lack of guarantees explains why "the packet just vanished" is a <em>normal</em> UDP outcome rather than a fault, which in turn explains a whole class of Kubernetes networking behaviour that looks broken but isn't. It's a short lesson with outsized payoff for reading overlay and DNS problems.</p>
+<h5>The concept</h5>
+<p><strong>UDP</strong> (User Datagram Protocol) is TCP's opposite number at the transport layer: it's just <em>addressed datagrams</em> with ports, and nothing else. No handshake (the first packet carries data immediately), no sequence numbers, no acknowledgements, no retransmission, no ordering, no connection state at all. You send a datagram to an IP and port; it arrives, or it doesn't, and UDP neither knows nor cares. If reliability is needed, the <em>application</em> must build it on top.</p>
+<p>That sounds worse than TCP, but the missing machinery is exactly why certain workloads choose it:</p>
+<ul>
+<li><strong>DNS</strong> — a query and its answer each fit in one small packet, and if a query is lost the resolver simply asks again. Paying for a three-packet TCP handshake before every tiny lookup would be absurd overhead; UDP's "just send it" is perfect, and retry-on-loss is cheap at the application level.</li>
+<li><strong>VXLAN</strong> (and other tunnels) — the overlay networks under many CNIs wrap pod packets inside UDP datagrams between nodes. The <em>inner</em> traffic is usually already TCP with its own reliability, so wrapping it in reliable TCP too would be pointless and slow (TCP-in-TCP meltdown); UDP is the right lightweight envelope.</li>
+<li><strong>Metrics/telemetry</strong> (e.g. statsd) — losing an occasional data point is fine, and you never want the metrics path to block the application waiting for acknowledgements.</li>
+</ul>
+<p>So "the packet was silently dropped" is a <em>normal UDP outcome</em>, not a malfunction — the protocol offers no delivery guarantee, by design. This reframes debugging: with UDP you can't infer "it was received" from "I sent it," and there's no connection state to inspect in <code>ss</code> the way TCP has. You verify UDP by checking the application got the datagram (a DNS answer came back, a metric appeared), not by looking for a handshake that never existed.</p>
+<div class="flow"><span>UDP datagram →</span><em>· arrives or doesn't · no ACK, no retry ·</em><span class="hot">app handles loss</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch a real UDP exchange: a DNS query and its answer, each a single datagram, no handshake. Capture while you resolve a name.
+<pre class="cmd">multipass shell sandbox
+sudo tcpdump -nn -i any 'udp port 53' &amp;
+dig +short example.com &gt;/dev/null
+sleep 1; sudo pkill tcpdump</pre>
+<pre class="out">IP 10.191.62.10.5xxxx &gt; 127.0.0.53.53: 12345+ A? example.com. (29)   ← query datagram
+IP 127.0.0.53.53 &gt; 10.191.62.10.5xxxx: 12345 1/0/0 A 93.184.x.x (45) ← answer datagram
+# two packets total — no SYN, no ACK, no teardown</pre></li>
+<li>Confirm UDP has no connection state to show. Unlike TCP, an idle UDP "connection" leaves nothing in <code>ss</code> — there's no state machine.
+<pre class="cmd">ss -uan | head -5             # -u = UDP; note: no ESTAB/TIME-WAIT states, just bindings</pre>
+<pre class="out">State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
+UNCONN  0       0       127.0.0.53:53       0.0.0.0:*        ← a listener, not a connection
+# UDP sockets are UNCONN (unconnected) — no per-conversation state exists</pre></li>
+<li>Feel the "silent drop is normal" property: send a UDP datagram into the void and note there's no error, no timeout, nothing — it's simply gone.
+<pre class="cmd">echo "hello?" | nc -u -w1 10.255.255.1 9999 ; echo "nc exit: $?"</pre>
+<pre class="out">nc exit: 0                    ← "success": UDP sent the datagram; whether it arrived is unknowable here</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>List what UDP does <em>not</em> provide that TCP does, and why DNS is happy without them. (No handshake, no ordering, no acknowledgements, no retransmission, no connection state — DNS queries/answers are tiny single packets, so a lost query is just re-asked at the application level, far cheaper than a handshake per lookup.) Then: why is "the packet was silently dropped" a normal UDP result rather than a bug? (UDP guarantees no delivery by design — it fires a datagram and neither retries nor reports loss; reliability, if needed, is the application's job.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Because UDP keeps no connection state, <code>ss</code> shows only <em>bindings</em> (who's listening), never per-conversation state — so you can't debug UDP by looking for an <code>ESTAB</code> row, and "is the datagram getting there?" is answered with <code>tcpdump</code> on both ends, not with <code>ss</code>. This trips up people who apply TCP habits: there's no connection to inspect, only traffic to capture. For UDP problems, reach for <code>tcpdump</code> first.</p>
+<p>UDP has no built-in flow control, so a fast sender can overwhelm a slow receiver and datagrams get dropped at the socket buffer with no signal to slow down — which is why high-rate UDP (large DNS responses, busy VXLAN) can suffer loss under load that TCP would have paced around. Large DNS answers actually fall back to TCP for this reason (the truncated-response <code>TC</code> flag tells the client "re-ask over TCP"). So UDP's simplicity has real edges; it's the right tool when messages are small and occasional loss is acceptable, and the wrong one when you need bulk reliable delivery.</p>
+<div class="k8s-link">
+<p>Two of Kubernetes' most important paths are UDP, and this lesson explains their quirks. Cluster <strong>DNS</strong> (CoreDNS) is queried over UDP, so an occasional lost query and retry is normal — and the famous <code>ndots:5</code> behaviour means one name lookup can fire <em>many</em> UDP queries, which is why DNS load and intermittent resolution failures are a recurring cluster topic. And overlay CNIs like <strong>Flannel VXLAN</strong> wrap every pod-to-pod packet in UDP between nodes (port 8472), so when cross-node pod traffic fails on an overlay, you're debugging UDP encapsulation — capture the UDP tunnel traffic on the node uplink, not just the inner connection. "Silent drop is normal for UDP" keeps you from misreading these.</p>
+<p>CoreDNS over UDP and the <code>ndots:5</code> query fan-out are <a href="w4.html#cp-4-16">W4.16</a>; VXLAN overlay encapsulation is the overlay datapath in <a href="w4.html#cp-4-7">W4.7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 udp</code> for the protocol and socket behaviour, <code>man 8 ss</code> (<code>-u</code> for UDP sockets, which show as <code>UNCONN</code>). <code>man 1 dig</code> for the DNS tool used above and its <code>+tcp</code> option (the fallback). <code>man 8 tcpdump</code> for capturing UDP. In the exam docs, DNS-for-Services and the cluster DNS concept pages are where UDP's role surfaces.</p>
+</article>
+
+<article class="lesson" id="cp-b8-11" data-id="b8-11">
+<div class="lesson-head"><span class="cp-id">B8.11</span><h4>The 4-tuple: what actually identifies a connection</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"How does one web server on port 443 handle thousands of simultaneous users without the connections getting mixed up?" is a question that seems to have no good answer until you learn what actually names a connection. It's not the port — it's the <strong>4-tuple</strong>, and once you see it, a pile of otherwise-mysterious things click into place at once: connection multiplexing, why NAT needs a table, and the hard ceiling on outbound connections that busy gateways hit.</p>
+<h5>The concept</h5>
+<p>A TCP (or UDP) connection is uniquely identified not by one port but by <strong>four values together — the 4-tuple</strong>: <em>source IP, source port, destination IP, destination port</em>. The kernel demultiplexes incoming packets by matching all four against its table of open connections. This is the answer to the multiplexing puzzle: a server listening on <code>:443</code> can hold thousands of connections at once because, although they all share the same <em>destination</em> (the server's IP and port 443), each has a <em>different client half</em> — a different source IP, or at least a different source port. Every client's OS picks an unused <strong>ephemeral port</strong> (a high-numbered temporary source port) for each outbound connection, so <code>(clientA:51001 → server:443)</code> and <code>(clientA:51002 → server:443)</code> are two distinct connections despite sharing three of the four values.</p>
+<p>Three consequences worth carrying forward:</p>
+<ul>
+<li><strong>One listening port, many connections</strong> — the server side of the tuple is fixed; the variety lives in the client side. This is why "the port is busy" almost never means "we've run out of connections."</li>
+<li><strong>NAT must keep a table</strong> — when a router rewrites addresses (B9), it changes part of the tuple, so it must remember the mapping to un-rewrite every reply against the right original connection. The 4-tuple is what that table is keyed on.</li>
+<li><strong>Ephemeral ports are a finite ceiling</strong> — a single source IP has only ~28,000 ephemeral ports (the default range is <code>32768–60999</code>). So from <em>one</em> source IP to <em>one</em> destination IP:port, you can have at most ~28,000 simultaneous connections — after that, no free source port, and new connections fail. This is the exact limit busy egress-NAT gateways hit under load and report as baffling intermittent connection failures.</li>
+</ul>
+<div class="flow"><span>src IP : src port</span><em>+</em><span>dst IP : dst port</span><em>=</em><span class="hot">the connection's identity</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See the 4-tuple in <code>ss</code>: the local and peer address:port columns are the four values. Open a couple of connections and note they share the destination but differ in source port.
+<pre class="cmd">multipass shell sandbox
+(curl -s -o /dev/null http://example.com &amp; curl -s -o /dev/null http://example.com &amp; \
+ sleep 0.3; ss -tanp 'dst example.com' 2&gt;/dev/null; wait) 2&gt;/dev/null</pre>
+<pre class="out">ESTAB 0 0  10.191.62.10:<b>44810</b>  93.184.x.x:80    ← same dst, source port 44810
+ESTAB 0 0  10.191.62.10:<b>44816</b>  93.184.x.x:80    ← same dst, source port 44816 — a different connection</pre></li>
+<li>Look at the ephemeral port range your kernel draws source ports from — the pool that bounds connections-per-destination.
+<pre class="cmd">cat /proc/sys/net/ipv4/ip_local_port_range
+echo "usable ephemeral ports: $(( 60999 - 32768 + 1 ))"</pre>
+<pre class="out">32768   60999
+usable ephemeral ports: 28232        ← ~28k connections to one dst IP:port from one src IP</pre></li>
+<li>Confirm the demux logic: a single listening socket (one local port) backs many established connections (many tuples). Count established connections against listeners.
+<pre class="cmd">ss -tan | awk '$1=="LISTEN"{l++} $1=="ESTAB"{e++} END{print l" listeners, "e" established"}'</pre>
+<pre class="out">12 listeners, 3 established     ← few ports listening, each able to hold many connections</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What four values identify a connection, and how does that let one server port serve thousands of clients? (Source IP, source port, destination IP, destination port; the connections share the destination IP:port but each client uses a distinct source IP and/or ephemeral source port, so every 4-tuple is unique and the kernel keeps them straight.) Then: why is there a ~28,000-connection ceiling from one source IP to one destination IP:port? (Only the source port varies within that pair, and a single IP has ~28,000 ephemeral ports — once they're all in use there's no unique tuple left, so new connections fail.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The ~28,000 ceiling is <em>per destination IP:port from one source IP</em>, not a global limit — a machine can hold vastly more total connections because different destinations give different tuples. People misremember it as "a server can only handle 28k connections," which is wrong (that's the <em>client-to-one-destination</em> limit). A server listening on one port is bounded by memory and file descriptors, not by 28k, because each connection differs in the <em>client</em> half of the tuple. Keep straight which side of the tuple is the constrained one.</p>
+<p>This ceiling is a real and under-appreciated production failure. A busy egress path where many clients share one NAT source IP (a corporate gateway, or a Kubernetes node doing SNAT for all its pods to one external service) can exhaust the ~28k ephemeral ports <em>to that one destination</em> and start failing new connections while everything looks healthy — plenty of CPU, plenty of memory, "just" no free source ports. The fixes are more source IPs, connection reuse/pooling, or spreading load across destinations. When "connections fail under high load to one service" with no resource pressure, suspect port exhaustion.</p>
+<div class="k8s-link">
+<p>The 4-tuple is the foundation of how Kubernetes Services work. A ClusterIP is virtual — kube-proxy rewrites a connection's <em>destination</em> (the Service IP:port) to a real pod IP:port via DNAT, and conntrack remembers the tuple mapping so replies get un-rewritten correctly (all B9 machinery). Source-port exhaustion is a genuine cluster failure mode: a node SNATs all its pods' egress behind its node IP, so many pods hammering one external service from one node can exhaust ephemeral ports to that destination — a classic "works at low traffic, fails at scale" incident. And the "one listening port, many connections" fact is why a single Service backend pod can serve a whole cluster's worth of clients.</p>
+<p>DNAT rewriting the destination tuple and conntrack tracking it are <a href="w4.html#cp-4-9">W4.9</a>–<a href="w4.html#cp-4-10">W4.10</a>; you build NAT and see the conntrack table by hand in B9.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 tcp</code> and <code>man 7 ip</code> for connection identity and <code>ip_local_port_range</code>; <code>man 8 ss</code> for reading the tuple columns and filtering by <code>src</code>/<code>dst</code>. The sysctl <code>net.ipv4.ip_local_port_range</code> (<code>man 7 ip</code>) is the ephemeral range. In the exam docs, Service networking and kube-proxy are where the tuple-rewriting shows up; the primitive itself is assumed.</p>
+</article>
+
+<article class="lesson" id="cp-b8-12" data-id="b8-12">
+<div class="lesson-head"><span class="cp-id">B8.12</span><h4>Listening vs established, and the 127.0.0.1 vs 0.0.0.0 bind</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The fifth and final rung of the ladder is "is anything actually listening, and can I reach it from where I am?" — and it hides one of the most common and frustrating bugs in all of networking: a service that <em>is</em> running and <em>is</em> listening, but on an address you can't reach. The <code>127.0.0.1</code>-versus-<code>0.0.0.0</code> distinction is responsible for an enormous share of "the port is open but I can't connect" confusion, in plain Linux and in Kubernetes alike. Reading a bind address correctly is the skill that closes the ladder.</p>
+<h5>The concept</h5>
+<p>Two different <code>ss</code> queries answer two different questions:</p>
+<ul>
+<li><strong><code>ss -ltnp</code></strong> — <em>l</em>istening, <em>t</em>cp, <em>n</em>umeric, <em>p</em>rocess. "Who is waiting for connections, on which address:port, and which process is it?" This is the listener rung: it proves a server exists and is bound.</li>
+<li><strong><code>ss -tnp</code></strong> (no <code>l</code>) — the currently <em>established</em> connections. "Who is actually connected right now?"</li>
+</ul>
+<p>The load-bearing detail is the <strong>bind address</strong> in the listener's local column, because a socket doesn't just listen on a port — it listens on a specific <em>address</em>:port, and that address controls who can reach it:</p>
+<ul>
+<li><strong><code>127.0.0.1:8080</code></strong> — bound to loopback only. Reachable <em>solely from the same machine</em>. Any connection attempt from another host never even arrives; the service is invisible off-box no matter how correct everything else is.</li>
+<li><strong><code>0.0.0.0:8080</code></strong> — bound to <em>all</em> interfaces (the wildcard). Reachable from anywhere that can route to any of the machine's addresses. This is what a service that should accept external traffic must bind.</li>
+</ul>
+<p>So "the port is open but I can't reach it from another machine" is very often not a firewall or a route — it's a service bound to <code>127.0.0.1</code> when it needed <code>0.0.0.0</code>. <code>ss -ltnp</code> shows this instantly: read the local address, and if it's <code>127.0.0.1</code> (or <code>::1</code> for IPv6), the service is loopback-only by design. This is the fifth rung, and it's the one people skip — they confirm "the process is running" and stop, without checking <em>which address</em> it bound.</p>
+<div class="flow"><span>127.0.0.1:8080</span><em>= this machine only ·</em><span class="hot">0.0.0.0:8080</span><em>= any interface, reachable off-box</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the listeners with their processes and bind addresses — the listener rung. Note which are loopback-only vs wildcard.
+<pre class="cmd">multipass shell sandbox
+sudo ss -ltnp</pre>
+<pre class="out">State  Local Address:Port  Process
+LISTEN <b>127.0.0.53</b>:53      users:(("systemd-resolve"...))   ← loopback-scope: this box only
+LISTEN <b>0.0.0.0</b>:22         users:(("sshd"...))              ← all interfaces: reachable off-box</pre></li>
+<li>Prove the difference. Start a tiny server bound to loopback, confirm you can reach it locally but that the same port on the machine's real address is unreachable.
+<pre class="cmd"># bind a server to 127.0.0.1 only
+python3 -m http.server 8080 --bind 127.0.0.1 &amp;
+sleep 1
+curl -s -o /dev/null -w 'via loopback: %{http_code}\n' http://127.0.0.1:8080
+MYIP=$(ip -o -4 addr show ens3 | awk '{print $4}' | cut -d/ -f1)
+curl -s -m3 -o /dev/null -w 'via real IP: %{http_code}\n' "http://$MYIP:8080" || echo 'via real IP: refused (bound to loopback only)'</pre>
+<pre class="out">via loopback: 200                     ← reachable from the machine itself
+via real IP: refused (bound to loopback only)   ← same port, but not on this address</pre></li>
+<li>Rebind to <code>0.0.0.0</code> and watch the real address become reachable — the fix for the classic bug. Then clean up.
+<pre class="cmd">kill %1 2&gt;/dev/null
+python3 -m http.server 8080 --bind 0.0.0.0 &amp;
+sleep 1
+curl -s -o /dev/null -w 'via real IP now: %{http_code}\n' "http://$MYIP:8080"
+kill %1 2&gt;/dev/null</pre>
+<pre class="out">via real IP now: 200                  ← now reachable off-box — bound to all interfaces</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What's the difference between <code>ss -ltnp</code> and <code>ss -tnp</code>? (<code>-l</code> shows <em>listening</em> sockets — servers waiting for connections, with their bind address and process; without <code>-l</code> you see currently <em>established</em> connections.) Then: a service is running and <code>ss -ltnp</code> shows it on <code>127.0.0.1:8080</code>, but nobody else can connect — why, and what's the fix? (It's bound to loopback, reachable only from the same machine; connections from other hosts never arrive. Bind it to <code>0.0.0.0</code> (all interfaces) instead so it accepts traffic on the machine's real addresses.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Always pass <code>-p</code> (and use <code>sudo</code>) when you need to know <em>which process</em> owns a listener — without it you see the port but not the culprit, and "what's on port 8080?" is only half-answered. The full triage incantation is <code>sudo ss -ltnp</code>: listening TCP sockets, numeric, with process names. Memorise it; it's the fastest answer to "is anything listening here and what is it?"</p>
+<p>The loopback-bind bug is insidious because <em>every local test passes</em> — you develop and test on the same machine, <code>curl 127.0.0.1</code> works perfectly, and it only breaks when something external tries to connect. So a service that "works on my machine" but is unreachable from anywhere else is the signature. Also watch for the IPv6 twist: a service on <code>::1</code> is loopback-only in IPv6, and <code>[::]:8080</code> is the IPv6 wildcard — the same distinction, different notation. Read the actual bind address, don't assume.</p>
+<div class="k8s-link">
+<p>This bug is <em>rampant</em> in Kubernetes and now you'll spot it instantly. A container that binds <code>127.0.0.1</code> is unreachable from any other pod or through any Service, no matter how perfect the Service and Endpoints are — because the pod's loopback belongs to its own network namespace (B6), so "localhost" inside the container reaches only that container. The fix is always to make the app bind <code>0.0.0.0</code>. "Service configured correctly but connections refused/time out, and the app logs look fine" very often ends at <code>ss -ltnp</code> inside the pod showing a <code>127.0.0.1</code> bind. It's the pod-level version of the exact rung you just learned, and it's the most common self-inflicted Service bug.</p>
+<p>The pod's own loopback living in its network namespace is <a href="b6.html#cp-b6-13">B6.13</a>; the Service <code>targetPort</code> that must match the container's real bind is <a href="w4.html#cp-4-14">W4.14</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ss</code> for <code>-l</code>/<code>-t</code>/<code>-n</code>/<code>-p</code> and address filtering; <code>man 7 ip</code> for the meaning of binding to <code>INADDR_ANY</code> (<code>0.0.0.0</code>) vs a specific address; <code>man 2 bind</code> for the syscall. In the exam docs, Service <code>targetPort</code> and the common "container binds localhost" gotcha are the Kubernetes surface — this is the primitive under <a href="w4.html#cp-4-14">W4.14</a>.</p>
+</article>
+</div><!-- /g-transport -->
+
 <!-- ---------------- Quiz ---------------- -->
 <div class="quiz" id="quiz"><h3>B8 recall quiz</h3>
 <p>Answer out loud before revealing. If you can climb the five-rung ladder from memory and say what each rung's tool proves, this module has done its job.</p>
