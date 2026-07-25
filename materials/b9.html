@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B9: build a private network by hand out of namespaces, veth pairs and a bridge, then route and NAT it to the outside and filter it with netfilter — network namespaces revisited (own interfaces, routing table, port space, loopback); veth pairs as virtual patch cables; a bridge as a virtual switch; addressing the private subnet and proving two namespaces talk with ping and tcpdump on both ends; ip_forward and the host as a router; SNAT/MASQUERADE/DNAT; masqueraded egress; conntrack and why NAT needs state; the netfilter hooks and packet path; tables/chains/rules/targets; filter-vs-nat and 'ping works but curl doesn't'; nftables as the real backend on 24.04 and iptables-nft; rule-order debugging with counters; DNAT + -m statistic as a round-robin load balancer (kube-proxy's iptables mode); host port forwarding as a NodePort; unix domain sockets (stream vs datagram, filesystem permissions, abstract namespace) and why containerd.sock is root; a CNI-v0.1 mini project in two scripts; and a debugging drill for filter-vs-nat, a DNAT rule that never matches, and a stale conntrack entry.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B9 · Networking II: virtual networking &amp; packet filtering — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B9 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+    <li><a href="b9.html">B9 · Networking II</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b9">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B9 — Networking II: virtual networking &amp; packet filtering</h1>
+  <p>This is the module the whole beginner track has been climbing toward. By the end of it you will have built, with your own hands and out of nothing but namespaces, virtual cables, a switch and a handful of firewall rules, the two things people find most mysterious about Kubernetes: a <strong>pod network</strong> (private machines that all reach each other and the outside world) and a <strong>load-balanced Service</strong> (one address that fans traffic out across several backends). You will build both <em>before either word is used</em> — so that when Kubernetes later says "pod network" and "ClusterIP," you recognise machinery you already assembled rather than magic you have to trust. Nothing in a cluster's data path is more advanced than what is in this module; there is just more of it, automated.</p>
+  <p>We build bottom-up, in four movements. <strong>Virtual wiring</strong>: a network namespace as a private network stack, the <code>veth</code> pair as a patch cable, the bridge as a switch, and proving two namespaces can talk by watching one packet at two points. <strong>Getting out</strong>: turning the host into a router, the three flavours of NAT, giving the private subnet real internet access, and why NAT needs a memory (<code>conntrack</code>). <strong>Netfilter</strong>: where in the kernel a packet can be caught, the tables/chains/rules/targets vocabulary under every Linux firewall, the <code>filter</code>-vs-<code>nat</code> split that explains "ping works but curl doesn't," and reading rules by their packet counters. <strong>Load balancing and sockets</strong>: DNAT plus a statistics match as a round-robin balancer (this <em>is</em> kube-proxy), publishing a host port (this <em>is</em> a NodePort), and unix domain sockets — the filesystem-based endpoints that explain why access to the runtime socket is root. Then you assemble it all into a hand-built CNI and diagnose three faults by rule and by state.</p>
+  <div class="weights">
+    <span>Checkpoints<b>20</b></span>
+    <span>Hours<b>~8</b></span>
+    <span>Prerequisites<b>B6, B8</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Create a network namespace and explain what it gets its own of — interfaces, routing table, netfilter rules, port space and loopback — and why that means a pod gets a whole IP.</li>
+<li>Build a <code>veth</code> pair as a virtual patch cable and a bridge as a virtual switch, and move one end of a veth into a namespace.</li>
+<li>Address a private subnet deliberately — bridge as gateway, an address per namespace, a default route — the way a CNI's IPAM does for every pod.</li>
+<li>Connect two namespaces and prove the path by capturing the same packet at two points with <code>tcpdump</code>.</li>
+<li>Turn the host into a router with <code>ip_forward</code>, and explain SNAT, MASQUERADE and DNAT by what each rewrites.</li>
+<li>Give a private subnet masqueraded egress to the internet, and explain why removing the rule stops replies while requests still leave.</li>
+<li>Explain <code>conntrack</code> — why NAT needs state — and read the table with <code>conntrack -L</code>, including the "rule changed mid-flow does nothing" consequence.</li>
+<li>Draw the netfilter hooks (prerouting, input, forward, output, postrouting) and the to-host vs through-host paths, and say why DNAT lives in prerouting.</li>
+<li>Name the tables/chains/rules/targets vocabulary and write one rule of each target kind by hand.</li>
+<li>Reproduce "ping works but curl doesn't" from a <code>filter</code> DROP, and read DROP (hang) vs REJECT (instant) from the timing.</li>
+<li>Know that the backend on 24.04 is nftables and <code>iptables</code> is <code>iptables-nft</code>, and view the same ruleset both ways.</li>
+<li>Debug by rule order and packet counters — find which rule traffic actually hits, and prove a later rule is dead.</li>
+<li>Build a round-robin load balancer from DNAT + <code>-m statistic --mode random</code> — kube-proxy's iptables mode, not an analogy for it.</li>
+<li>Publish a host port into a private namespace with DNAT in prerouting — a NodePort, by hand.</li>
+<li>Explain unix domain sockets — stream vs datagram, filesystem permissions, the abstract namespace — and why access to <code>containerd.sock</code> is equivalent to root.</li>
+<li>Assemble a CNI v0.1 in two scripts, and diagnose filter-vs-nat, a DNAT rule that never matches, and a stale conntrack entry.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B6</strong> gave you namespaces as an isolation primitive; <strong>B8</strong> gave you addresses, routes, ARP, TCP and <code>tcpdump</code>. This module fuses the two: it wires namespaces together into real networks and watches packets cross them. Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster. <strong>This module deliberately breaks its own connectivity</strong> — you will add and delete addresses, flip <code>ip_forward</code>, install firewall rules that drop traffic, and masquerade egress — so take a snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>) and you can always roll back to a clean machine. Install the tools once up front: <code>sudo apt-get install -y tcpdump conntrack nftables socat netcat-openbsd</code> (<code>iproute2</code> and <code>iptables</code> are already present on 24.04). Almost every command here needs <code>root</code>, so most labs use <code>sudo</code>; your uplink interface is <code>ens3</code> on a typical Multipass VM (substitute the name <code>ip -br link</code> shows if it differs).</p>
+</div>
+
+<!-- ---------------- Virtual wiring ---------------- -->
+<div class="grp" id="g-wiring"><h3>Virtual wiring</h3>
+
+<article class="lesson" id="cp-b9-1" data-id="b9-1">
+<div class="lesson-head"><span class="cp-id">B9.1</span><h4>A network namespace is a private, empty network stack</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>B6 introduced namespaces as an isolation trick in the abstract. Now that B8 has given you the vocabulary — interfaces, addresses, routes, ports — you can see what a <em>network</em> namespace actually hands you: a whole second network stack, conjured from nothing, that shares not one thing with the machine's real one. This is the single atom every container network is built from. A pod is, at bottom, exactly one of these namespaces with some containers living inside it — which is why the containers in a pod reach each other on <code>localhost</code> but a pod gets its own IP. Build one by hand and the rest of Kubernetes networking stops being magic.</p>
+<h5>The concept</h5>
+<p>A <strong>network namespace</strong> is the kernel keeping a separate, private copy of "everything network" for a group of processes. Run <code>ip netns add red</code> and you get a namespace called <code>red</code> that has its <em>own</em>: set of network interfaces, routing table, <abbr title="the firewall/NAT rule engine in the Linux kernel">netfilter</abbr> rules, <strong>port space</strong>, and loopback device. Nothing in <code>red</code> can see or collide with anything in the host's network stack or any other namespace. This is the hotel room's own everything — same building, but its own wiring, its own phone list, its own locks.</p>
+<p>Two facts fall straight out of "its own," and both matter for the rest of your career:</p>
+<ul>
+<li><strong>Its own port space.</strong> Two processes in two different network namespaces can both <code>bind</code> port 80 with no conflict, because the port numbers live in separate universes. This is precisely why every pod gets a whole IP address of its own rather than a share of the node's ports — the namespace <em>is</em> the reason ports don't clash between pods.</li>
+<li><strong>It starts with nothing — not even loopback.</strong> A fresh namespace has exactly one interface, <code>lo</code>, and it is <em>down</em>. So the first surprise is that even <code>ping 127.0.0.1</code> fails until you explicitly bring loopback up with <code>ip link set lo up</code>. A namespace is genuinely empty; every wire you want, you add.</li>
+</ul>
+<p>You run a command inside a namespace with <code>ip netns exec red &lt;command&gt;</code> — the command executes with <code>red</code>'s network stack as its world. That one verb, <code>exec</code>, is how you'll do everything from here on: address interfaces, add routes, run <code>ping</code> and <code>tcpdump</code>, all <em>inside</em> the namespace you're building.</p>
+<div class="flow"><span>ip netns add red</span><em>→</em><span class="hot">own interfaces · routes · netfilter · ports · lo</span><em>· reaches nothing until you wire it</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a namespace and look inside it. It has only a down loopback and can reach nothing — the empty room before you run any wire to it.
+<pre class="cmd">multipass shell sandbox
+sudo ip netns add red
+sudo ip netns exec red ip addr show        # what interfaces does red have?</pre>
+<pre class="out">1: lo: &lt;LOOPBACK&gt; mtu 65536 <b>state DOWN</b> ...    ← one interface, and it is down
+    # no inet line: loopback has no address yet either</pre></li>
+<li>Prove it is genuinely empty: even pinging its own loopback fails, because <code>lo</code> is down. Then bring <code>lo</code> up and watch the same ping succeed — you just added the first working wire.
+<pre class="cmd">sudo ip netns exec red ping -c1 -W1 127.0.0.1 2&gt;&amp;1 | tail -1
+sudo ip netns exec red ip link set lo up          # bring loopback up
+sudo ip netns exec red ping -c1 127.0.0.1 | tail -2</pre>
+<pre class="out">ping: connect: Network is unreachable        ← lo down: not even localhost works
+64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.03 ms   ← lo up: localhost works now
+1 packets transmitted, 1 received, 0% packet loss</pre></li>
+<li>See the "own port space" fact directly: list the namespace's listening sockets — a separate, empty set from the host's.
+<pre class="cmd">sudo ip netns exec red ss -ltn        # red's listeners (none)
+ss -ltn | head -3                      # the host's listeners (its own, separate set)</pre>
+<pre class="out">State  Recv-Q Send-Q Local Address:Port      ← red: header only, nothing listening
+LISTEN 0      4096   127.0.0.53%lo:53         ← host: its own listeners, a different universe</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name at least four things a network namespace has its own copy of, and state the consequence of "its own port space." (Its own interfaces, routing table, netfilter rules, port space and loopback; because the port space is separate, two processes in different namespaces can both bind the same port — which is why each pod gets a whole IP.) Then: why does <code>ping 127.0.0.1</code> fail in a brand-new namespace? (Because a fresh namespace's only interface is <code>lo</code> and it starts <em>down</em> — loopback must be brought up with <code>ip link set lo up</code> before even localhost works.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>ip netns</code> command makes <em>named</em> namespaces, which persist as files under <code>/var/run/netns/</code> and outlive the process that made them — handy for labs. A container runtime instead makes an <em>anonymous</em> per-pod namespace tied to the pod's lifetime, so you won't see pod namespaces in <code>ip netns list</code> by default. The mechanism is identical; only the bookkeeping differs. (You can make a runtime's namespace visible to <code>ip netns</code> by bind-mounting its <code>/proc/&lt;pid&gt;/ns/net</code>, which is exactly what debugging tools do.)</p>
+<p>Deleting a namespace (<code>ip netns del red</code>) destroys every interface that lived only inside it, and moves any interface that had a physical backing back to the default namespace. So a veth end left inside a deleted namespace vanishes with it — which is the tidy way to clean up a whole experiment, but also a way to lose an interface you meant to keep. Delete deliberately.</p>
+<div class="k8s-link">
+<p>A pod <em>is</em> a network namespace. The "pause" (sandbox) container a runtime starts first exists mainly to hold that namespace open; every real container in the pod is then placed into the <em>same</em> namespace, which is why containers in one pod share an IP and reach each other over <code>localhost</code>, while different pods are fully isolated with their own port spaces. The "each pod gets its own IP" rule that all of Kubernetes networking assumes is nothing more than "each pod gets its own network namespace," which you just created by hand.</p>
+<p>Building a pod's namespace, veth and bridge by hand is <a href="w4.html#cp-4-2">W4.2</a>; the runtime's pod-sandbox and CRI flow are <a href="w1.html#cp-1-20">W1.20</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-netns</code> is the whole toolset — <code>add</code>, <code>del</code>, <code>list</code>, <code>exec</code>, and how named namespaces map to <code>/var/run/netns</code>. <code>man 7 network_namespaces</code> explains what is and isn't isolated. For the syscall underneath, <code>man 2 unshare</code> and <code>man 2 setns</code> (the <code>CLONE_NEWNET</code> flag from B6). In the exam docs, this is assumed under "Cluster Networking" — no page teaches it directly, which is exactly why you learn it here.</p>
+</article>
+
+<article class="lesson" id="cp-b9-2" data-id="b9-2">
+<div class="lesson-head"><span class="cp-id">B9.2</span><h4>A veth pair is a virtual patch cable</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A namespace that reaches nothing is useless; to connect it to anything you need a wire, and the wire is a <strong>veth pair</strong>. It is the single most important virtual device in all of container networking — every pod on every node in every Kubernetes cluster is attached to the world by one of these. Understand it as an ordinary patch cable with a plug at each end and the rest of the module has a physical intuition to hang on.</p>
+<h5>The concept</h5>
+<p>A <strong>veth pair</strong> (virtual Ethernet) is two linked interfaces that behave like the two ends of a single cable: whatever goes in one end comes out the other, and nowhere else. You create both ends at once — there is no such thing as half a veth pair — with <code>ip link add veth0 type veth peer name veth1</code>. That gives you <code>veth0</code> and <code>veth1</code>, both currently in the host namespace, both <em>down</em> and unaddressed. This is the hotel phone wire from the analogy: one end is the handset in the room, the other is a plug in the wiring closet.</p>
+<p>The move that makes it useful is relocating <em>one</em> end into a namespace: <code>ip link set veth1 netns red</code>. Now the cable straddles a boundary — <code>veth0</code> hangs in the host, <code>veth1</code> lives inside <code>red</code> — and it is the only path in or out of the namespace. Send a packet into <code>veth1</code> from inside <code>red</code> and it emerges from <code>veth0</code> on the host, ready to be handed to a bridge, a route, or another namespace. This is precisely what a container runtime builds for every pod: one end named <code>eth0</code> <em>inside</em> the pod's namespace, the other hanging on the node with an auto-generated name like <code>vethb3f1a2</code>.</p>
+<div class="flow"><span>veth0 (host)</span><em>⟷ one cable, two plugs ⟷</em><span class="hot">veth1 → moved into red</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a veth pair and confirm both ends exist on the host, linked to each other. The <code>@</code> notation names each end's peer.
+<pre class="cmd">multipass shell sandbox
+sudo ip link add veth0 type veth peer name veth1
+ip -br link show type veth</pre>
+<pre class="out">veth1@veth0  DOWN  ...        ← veth1, whose peer is veth0
+veth0@veth1  DOWN  ...        ← veth0, whose peer is veth1  (a linked pair)</pre></li>
+<li>Move one end into the <code>red</code> namespace and watch it disappear from the host and reappear inside. The cable now straddles the boundary.
+<pre class="cmd">sudo ip link set veth1 netns red
+ip -br link show type veth                       # host now shows only veth0
+sudo ip netns exec red ip -br link show          # red now has veth1</pre>
+<pre class="out"># host:
+veth0@if5  DOWN  ...          ← only one end left here; its peer is now "if5" (inside red)
+# inside red:
+lo           DOWN ...
+veth1@if6    DOWN ...         ← the other end arrived in the namespace</pre></li>
+<li>Prove they are inseparable: delete the host end and the namespace end vanishes too. (Re-create it afterwards for the next lesson.)
+<pre class="cmd">sudo ip link del veth0                            # delete one end...
+sudo ip netns exec red ip -br link show          # ...the other is gone from red too
+sudo ip link add veth0 type veth peer name veth1 && sudo ip link set veth1 netns red   # rebuild</pre>
+<pre class="out">lo  DOWN ...                 ← veth1 is gone: deleting either end destroys both</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Where does a packet sent into one end of a veth pair come out, and what happens to one end if you delete the other? (It comes out the paired end and nowhere else — a veth is a point-to-point cable; deleting either end destroys both, because there is no such thing as half a pair.) Then: after <code>ip link set veth1 netns red</code>, where does each end live? (<code>veth0</code> stays in the host namespace; <code>veth1</code> is now inside <code>red</code> — the cable straddles the boundary and is the namespace's only link to the outside.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both ends start <code>DOWN</code> and without an address — creating and moving a veth wires nothing up by itself. You must <code>ip link set … up</code> each end and assign addresses before a single packet flows, which is the next lesson's job. A very common "my namespace can't reach anything" is simply an end left down.</p>
+<p>The <code>@ifN</code> suffix in <code>ip link</code> output is the kernel telling you the peer's interface index, and once the peer is in another namespace it shows as a bare index (<code>@if5</code>) because the name isn't resolvable from here. That's normal, not a fault — it's how you match the two ends of a cable that spans a namespace boundary, and it's exactly how you'll later pair a node-side <code>vethXXXX</code> with the <code>eth0</code> inside a specific pod.</p>
+<div class="k8s-link">
+<p>Every pod is joined to its node by exactly one veth pair: <code>eth0</code> inside the pod's namespace, and a host-side end (named <code>vethXXXX</code>) enslaved to the node's bridge or handed to a routing CNI. Finding <em>which</em> host veth belongs to a given pod — by matching the peer interface index you just saw — is a routine node-debugging step, and capturing on that specific veth is how you watch one pod's traffic in isolation. The "delete one end, both die" property is why a crashed pod's veth cleans itself up.</p>
+<p>Locating a real pod's veth peer on a live node is <a href="w4.html#cp-4-3">W4.3</a>; the veth is built into the by-hand pod network in <a href="w4.html#cp-4-2">W4.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 4 veth</code> for the device itself, <code>man 8 ip-link</code> for <code>add … type veth</code>, <code>set … netns</code>, and reading the <code>@peer</code> notation. The peer-index trick (matching ends across namespaces) uses <code>ip -br link</code> and <code>ethtool -S</code> or reading <code>/sys/class/net/*/iflink</code>. No exam-docs page covers veth directly — it lives under the CNI implementation you'll meet in W4.</p>
+</article>
+
+<article class="lesson" id="cp-b9-3" data-id="b9-3">
+<div class="lesson-head"><span class="cp-id">B9.3</span><h4>A bridge is a virtual switch</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A veth pair joins exactly two points, but a network needs <em>many</em> machines able to reach each other — and a cable can't do that. The device that connects many wires and forwards between them is a switch, and Linux has one in software: the <strong>bridge</strong>. It is what every pod on a bridge-style node plugs into, so building one by hand is building the centre of a node's network.</p>
+<h5>The concept</h5>
+<p>A <strong>bridge</strong> is a switch implemented in the kernel. You create one with <code>ip link add br0 type bridge</code>, then <em>enslave</em> interfaces to it with <code>ip link set veth0 master br0</code> — "master" meaning the bridge is now in charge of that port. Once two or more veth host-ends are enslaved to the same bridge, it does exactly what the metal switch box under a desk does: it <strong>learns</strong> which MAC address (B8.2) it has seen on which port, records that in a forwarding table, and forwards each frame only out the port where its destination lives (flooding to all ports only when it hasn't learned the destination yet). This is the switchboard the room wires plug into.</p>
+<p>One extra move turns the switch into something more: give the bridge itself an IP address, and it stops being <em>only</em> a switch and becomes the <strong>gateway</strong> the attached namespaces route through. A bridge is allowed to have its own address because it is a real interface on the host as well as a switch for its ports; that dual role — switch for the pods, router-facing address for the host — is exactly how a node's pod bridge works. On a Kubernetes node with a bridge-style CNI this device really exists, usually named <code>cni0</code> or <code>docker0</code>, and <code>bridge link</code> lists one port per running pod.</p>
+<div class="flow"><span>veth0</span><em>↘</em><span class="hot">br0 (learns MAC→port, forwards)</span><em>↙</em><span>veth-blue</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create the bridge, bring it up, and enslave the host end of the veth from B9.2. <code>bridge link</code> then shows the veth as a port of the bridge.
+<pre class="cmd">multipass shell sandbox
+sudo ip link add br0 type bridge
+sudo ip link set br0 up
+sudo ip link set veth0 up
+sudo ip link set veth0 master br0        # enslave veth0 to br0
+bridge link</pre>
+<pre class="out">6: veth0@if6: ... master <b>br0</b> state forwarding ...   ← veth0 is now a bridge port</pre></li>
+<li>Read the bridge's learned forwarding database — the MAC-to-port table it builds automatically as frames arrive. It may be sparse until traffic flows (next lessons).
+<pre class="cmd">bridge fdb show br br0 | head -4          # forwarding database: which MAC on which port
+ip -br link show master br0                 # every interface enslaved to br0</pre>
+<pre class="out">52:54:00:aa:bb:cc dev veth0 ...           ← a learned MAC and the port it lives behind
+veth0@if6  UP  ...                          ← ports enslaved to br0</pre></li>
+<li>Confirm the bridge is itself an addressable interface on the host (it appears in <code>ip addr</code>), which is what lets it also be a gateway once you give it an IP in the next lesson.
+<pre class="cmd">ip -br addr show br0</pre>
+<pre class="out">br0  UP     ← up, no address yet; B9.4 gives it 10.10.0.1/24 to make it the gateway</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What does a bridge learn, and what does it do with what it learns? (It learns which MAC address is reachable on which port and records that in a forwarding database, then forwards each frame only out the port where its destination lives — flooding to all ports only for destinations it hasn't learned yet; it is a learning switch.) Then: what changes when you give the bridge an IP address? (It stops being only a switch and becomes a gateway — an interface the attached namespaces can route through — because a bridge is simultaneously a switch for its ports and a real, addressable interface on the host.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>An enslaved port's own IP address is ignored for bridging — the bridge switches at the MAC (link) layer, so addresses belong either on the bridge itself or on the far end of each veth, not on the host-side veth you enslaved. Putting an address on a bridged port is a classic confusion that appears to do nothing; move it to the bridge or the namespace end.</p>
+<p>Both the bridge and every enslaved port must be <code>UP</code>, and the port must be enslaved <em>before</em> traffic will forward through it. A bridge that is down, or a veth end left down, silently drops everything — and because there's no error, it reads as a higher-layer problem until you check <code>bridge link</code> and the interface flags. When a "pod" can't reach its neighbour, "is every port up and enslaved?" is the bridge-layer version of B8's link rung.</p>
+<div class="k8s-link">
+<p>On a node running a bridge-mode CNI (flannel's default, Docker's <code>docker0</code>, kindnet), this exact device is the heart of pod networking: every pod's host-side veth is enslaved to it, the bridge holds the gateway address the pods route through, and <code>bridge link</code> on the node lists one port per pod. When you later debug "pods on this node can't reach each other," you'll check the very things you just built — is the bridge up, are the veths enslaved, is the forwarding database learning the pods' MACs.</p>
+<p>The node's pod bridge is inspected in flannel's moving parts (<a href="w4.html#cp-4-6">W4.6</a>) and built by hand in <a href="w4.html#cp-4-2">W4.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-link</code> for <code>add … type bridge</code> and <code>set … master</code>; <code>man 8 bridge</code> for <code>bridge link</code> (ports), <code>bridge fdb</code> (the learned MAC table) and per-port options. Kernel bridging behaviour and options live under <code>Documentation/networking/bridge.rst</code>. In the exam docs this is assumed under cluster networking; the concept surfaces as "the CNI bridge" in flannel/kindnet discussions.</p>
+</article>
+
+<article class="lesson" id="cp-b9-4" data-id="b9-4">
+<div class="lesson-head"><span class="cp-id">B9.4</span><h4>Address the private network: subnet, gateway, route</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have wires and a switch, which move <em>frames</em> — but nothing can be <em>reached</em> until it has an address to aim at and a route to choose an exit. Assigning those is where a network stops being cabling and becomes usable. And the three decisions you make here — which subnet this network owns, which address each namespace gets, and which gateway it points at — are exactly the three a CNI plugin's IPAM makes for every pod it ever creates. Do it once by hand and "IP address management" loses its mystique.</p>
+<h5>The concept</h5>
+<p>Pick a subnet for the private network — say <code>10.10.0.0/24</code> (the CIDR math from B8.3: 256 addresses, <code>.1</code>–<code>.254</code> usable). Then make three assignments:</p>
+<ul>
+<li><strong>The bridge gets the gateway address:</strong> <code>10.10.0.1/24</code>. By convention the first usable address is the gateway; giving it to the bridge makes the bridge the door out of this subnet.</li>
+<li><strong>Each namespace end gets an address in the subnet:</strong> <code>red</code> gets <code>10.10.0.2/24</code> on its <code>veth1</code>. This is the namespace's identity on the network.</li>
+<li><strong>Each namespace gets a default route via the gateway:</strong> <code>ip route add default via 10.10.0.1</code> inside <code>red</code>. An address says "this is me"; a route says "to reach anything not on my own subnet, hand it to <code>10.10.0.1</code>." Without the route, <code>red</code> can reach neighbours on <code>10.10.0.0/24</code> but has no idea how to reach anything else.</li>
+</ul>
+<p>Don't forget to bring every interface up — both veth ends <em>and</em> loopback inside the namespace. <strong>IPAM</strong> — the "IP address management" half of any CNI plugin — is nothing grander than keeping a record of which addresses in the chosen subnet are already handed out, so it never gives two pods the same one. You are being the IPAM here, by choosing <code>.2</code> for <code>red</code> and remembering it's taken.</p>
+<div class="flow"><span>br0 = 10.10.0.1/24 (gateway)</span><em>·</em><span>red veth1 = 10.10.0.2/24</span><em>·</em><span class="hot">red default route via .1</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Give the bridge the gateway address and bring it up — the door out of the subnet now has an address.
+<pre class="cmd">multipass shell sandbox
+sudo ip addr add 10.10.0.1/24 dev br0
+sudo ip link set br0 up
+ip -br addr show br0</pre>
+<pre class="out">br0  UP  <b>10.10.0.1/24</b>        ← the bridge is now the gateway for 10.10.0.0/24</pre></li>
+<li>Inside <code>red</code>: bring loopback and the veth end up, give the veth an address, and add the default route via the gateway. These four commands turn an empty namespace into a reachable host.
+<pre class="cmd">sudo ip netns exec red ip link set lo up
+sudo ip netns exec red ip link set veth1 up
+sudo ip netns exec red ip addr add 10.10.0.2/24 dev veth1
+sudo ip netns exec red ip route add default via 10.10.0.1</pre>
+<pre class="out"># no output on success — verify in the next step</pre></li>
+<li>Prove <code>red</code> can now reach its gateway: ping the bridge address from inside the namespace. This confirms address + route + the veth-to-bridge path all work.
+<pre class="cmd">sudo ip netns exec red ip route            # red's routing table: local subnet + default
+sudo ip netns exec red ping -c2 10.10.0.1  # can red reach the gateway?</pre>
+<pre class="out">default via 10.10.0.1 dev veth1               ← the default route
+10.10.0.0/24 dev veth1 proto kernel scope link src 10.10.0.2   ← the on-link subnet
+64 bytes from 10.10.0.1: icmp_seq=1 ttl=64 time=0.05 ms        ← red reaches the gateway ✓</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What three assignments turn the wired-up namespace into a reachable host, and which CNI job do they mirror? (Give the bridge the gateway address, give the namespace an address in the subnet, and give the namespace a default route via the gateway — the three IPAM decisions a CNI makes per pod: which subnet, which address, which gateway.) Then: with an address but <em>no</em> default route, what can the namespace reach and what can't it? (Only hosts on its own subnet — those are directly on-link; anything off the subnet has no route, so it fails with "Network is unreachable" until a default route points at the gateway.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Forgetting <code>ip link set lo up</code> <em>inside</em> the namespace is the quiet killer: local-only services and anything that talks to <code>127.0.0.1</code> break even though your external addressing is perfect. Loopback is per-namespace and starts down (B9.1) — bring it up as reflexively as you bring up the veth.</p>
+<p>Put the address on the <em>bridge</em>, not on the host-side veth you enslaved to it — a bridged port's address is ignored (B9.3). And the mask must match on both ends: give the bridge a <code>/24</code> and the namespace a <code>/25</code> and you've recreated B8's wrong-netmask fault, where one side thinks the other is on a different subnet and won't ARP for it. Keep the prefix length identical across everything on the same subnet.</p>
+<div class="k8s-link">
+<p>These three assignments are literally what a CNI plugin does when a pod is created: it picks the node's pod-CIDR slice, allocates the next free address in it for this pod (IPAM), sets the pod's <code>eth0</code> to that address, and installs a default route pointing at the node's bridge or gateway. The "which addresses are taken" bookkeeping you did in your head is the IPAM state a CNI persists on disk. When a pod comes up with no IP or no route, this is the step that failed.</p>
+<p>The three CIDRs a cluster juggles (pod, service, node) and where each is set are <a href="w4.html#cp-4-4">W4.4</a>; the CNI contract that automates this addressing is <a href="w4.html#cp-4-5">W4.5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-address</code> (<code>add</code>/<code>del</code>, prefix lengths), <code>man 8 ip-route</code> (<code>add default via</code>, reading the table), <code>man 8 ip-link</code> (<code>set … up</code>). For the CIDR arithmetic behind your subnet choice, re-read <a href="b8.html#cp-b8-3">B8.3</a>. In the exam docs, pod/service CIDRs appear in the kubeadm <code>ClusterConfiguration</code> and the CNI's own config.</p>
+</article>
+
+<article class="lesson" id="cp-b9-5" data-id="b9-5">
+<div class="lesson-head"><span class="cp-id">B9.5</span><h4>Connect two namespaces and prove the path at two points</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A single namespace on a bridge is inert. The payoff is <em>two</em> namespaces that can talk — the smallest real network — and, more valuable still, the technique you use to prove it: capturing the same packet at two points on its path. That "watch it at hop 1, then at hop 2" habit is the one the rest of this module leans on entirely. When a packet appears at one point and not the next, you have localised the fault to a single device without a single guess — which is exactly how you'll later discover whether a pod's traffic died inside the pod, on the bridge, or in a NAT rule.</p>
+<h5>The concept</h5>
+<p>Add a second namespace, <code>blue</code>, the same way you built <code>red</code>: a veth pair, one end moved into <code>blue</code>, the host end enslaved to <code>br0</code>, an address (<code>10.10.0.3/24</code>) and a default route inside. Now both namespaces hang off the same bridge, on the same subnet, so <code>blue</code> can ping <code>red</code>: the ICMP echo leaves <code>blue</code>'s <code>veth</code>, crosses the bridge (which forwards it to <code>red</code>'s port after ARP resolves <code>red</code>'s MAC), and arrives at <code>red</code>'s <code>veth</code>. A reply retraces the path.</p>
+<p>The skill to build is <strong>capturing at two points at once</strong>. Run one <code>tcpdump</code> on the bridge (<code>br0</code>, on the host) and another on the <code>veth</code> <em>inside</em> <code>red</code>, then ping from <code>blue</code>. The same echo request should appear in both captures — proof the packet reached the bridge <em>and</em> was delivered into <code>red</code>. If it showed up on the bridge but never inside <code>red</code>, the fault is between them (a down port, an unenslaved veth); if it never reached the bridge, the fault is on <code>blue</code>'s side. Two capture points turn "it doesn't work" into "it fails <em>here</em>."</p>
+<div class="flow"><span>blue veth</span><em>→</em><span>br0 (capture 1)</span><em>→</em><span class="hot">red veth (capture 2)</span><em>· same packet at both = path proven</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build <code>blue</code> exactly as you built <code>red</code>: namespace, veth pair, one end inside, host end on the bridge, address, routes, everything up.
+<pre class="cmd">multipass shell sandbox
+sudo ip netns add blue
+sudo ip link add vethb0 type veth peer name vethb1
+sudo ip link set vethb1 netns blue
+sudo ip link set vethb0 up && sudo ip link set vethb0 master br0
+sudo ip netns exec blue sh -c '
+  ip link set lo up; ip link set vethb1 up
+  ip addr add 10.10.0.3/24 dev vethb1
+  ip route add default via 10.10.0.1'</pre>
+<pre class="out"># no output on success</pre></li>
+<li>Prove the two namespaces can talk: ping <code>red</code> (<code>10.10.0.2</code>) from inside <code>blue</code>. The reply confirms the bridge forwarded frames both ways.
+<pre class="cmd">sudo ip netns exec blue ping -c2 10.10.0.2</pre>
+<pre class="out">64 bytes from 10.10.0.2: icmp_seq=1 ttl=64 time=0.06 ms   ← blue → bridge → red → back ✓
+2 packets transmitted, 2 received, 0% packet loss</pre></li>
+<li>Now the two-point capture. In one terminal capture on the bridge; in another, capture on the veth inside <code>red</code>; then ping from <code>blue</code> and watch the <em>same</em> echo appear at both hops.
+<pre class="cmd"># terminal A — capture on the bridge (host side):
+sudo tcpdump -nn -i br0 icmp -c 2 &amp;
+# terminal B — capture inside red, on its veth end:
+sudo ip netns exec red tcpdump -nn -i veth1 icmp -c 2 &amp;
+sleep 1; sudo ip netns exec blue ping -c1 10.10.0.2 &gt;/dev/null; wait</pre>
+<pre class="out"># on br0:   IP 10.10.0.3 &gt; 10.10.0.2: ICMP echo request ...   ← packet reached the bridge
+# in red:   IP 10.10.0.3 &gt; 10.10.0.2: ICMP echo request ...   ← same packet delivered into red ✓</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Why capture the same packet at two points instead of one? (Because the point where the packet is <em>present</em> and the next point where it's <em>absent</em> bracket the failing device — it localises a fault to one hop with evidence instead of a guess.) Then: an echo request appears on <code>br0</code> but never inside <code>red</code> — what does that tell you, and where is the fault? (The bridge received it but didn't deliver it into <code>red</code>, so the fault is between them — <code>red</code>'s host-side veth not enslaved or down, or the wrong port — not on <code>blue</code>'s side and not addressing.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The very first ping between the namespaces may show a brief delay or a single dropped packet while ARP resolves the peer's MAC (B8.2) — that's the neighbour lookup happening, not a fault. Add <code>arp or icmp</code> to a <code>tcpdump</code> filter and you can watch the who-has/is-at exchange precede the first echo. After that the MAC is cached and pings are instant.</p>
+<p>Capturing inside a namespace needs the capture to run <em>in</em> that namespace: <code>ip netns exec red tcpdump …</code>, not a plain <code>tcpdump</code> on the host, which can't see the namespace's private interfaces. This is the same "where does this traffic actually flow, and from which vantage point can I see it?" discipline from B8's interface-choice lesson — in a namespaced world you must also choose the right <em>namespace</em> to watch from.</p>
+<div class="k8s-link">
+<p>Two pods on one node talking to each other is exactly this: two namespaces, two veths, one bridge, ARP then ICMP/TCP across it. And the two-point-capture technique is <em>the</em> CNI-debugging method — when pod-to-pod traffic vanishes, you capture on the source pod's veth, then the node bridge, then the destination pod's veth, and the first hop where the packet stops appearing is the broken device. You just practised the single most useful skill for diagnosing a cluster's data plane, on a network small enough to hold in your head.</p>
+<p>Breaking the CNI and reading the signatures by capturing at each hop is <a href="w4.html#cp-4-8">W4.8</a>; the by-hand pod network these two namespaces model is <a href="w4.html#cp-4-2">W4.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-netns</code> (<code>exec</code> to run tools inside a namespace), <code>man 8 tcpdump</code> (<code>-i</code> interface choice, filters — re-read <a href="b8.html#cp-b8-13">B8.13</a>), <code>man 8 bridge</code> (<code>fdb</code> to see the MACs the bridge learned during the ping). No exam-docs page — this is the manual version of "kubectl exec into a pod and tcpdump the datapath," a standard cluster-debugging move.</p>
+</article>
+
+</div><!-- /g-wiring -->
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
