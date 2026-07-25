@@ -4,7 +4,7 @@ Dependency-free static site (GitHub Pages) that takes a user from zero to passin
 
 | Track | Tracker | Lessons | Plan | Status |
 |---|---|---|---|---|
-| **Beginner** — the Linux/networking/distributed-systems machinery Kubernetes is built from | `beginner.html` | `materials/b0…b14.html` | [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) | in progress (B-S1…B-S19) |
+| **Beginner** — the Linux/networking/distributed-systems machinery Kubernetes is built from | `beginner.html` | `materials/b0…b14.html` | [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) | ✅ complete (B-S1…B-S19; 225 checkpoints) |
 | **Intermediate** — composing that machinery into containers, runtimes, images, CNI | `intermediate.html` | — | — | future |
 | **Advanced** — Kubernetes itself, through the CKA | `index.html` | `materials/w0…w8.html` | [`docs/PLAN.md`](docs/PLAN.md) | ✅ complete |
 
@@ -83,7 +83,9 @@ Full spec: [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) — 15 modules (B0
 | B-S16 | `materials/b11.html` — Service management: init/PID 1, unit types, writing a unit, Restart/Type, After-vs-Requires, systemctl verbs, drop-ins, EnvironmentFile, exit-code-vs-signal, journalctl, journal persistence, targets/blame/cgls, supervisor-to-unit project + drill (14 cp) | ✅ done |
 | B-S17 | `materials/b12.html` — Security fundamentals: threat modelling, least privilege/defense in depth, authn-vs-authz, hashing-vs-encoding-vs-encryption, symmetric/asymmetric, signatures, SSH keys + agent, run a CA, CSR, SANs, reading certs + chain verification, TLS then mutual TLS, secret leakage via argv/environ, seccomp + AppArmor, mTLS project + four-fault drill (16 cp) | ✅ done |
 | B-S18 | `materials/b13.html` — Distributed systems: why distribute, partial failure, no shared clock, the eight fallacies + latency ladder, stateless-vs-stateful, leader/follower replication, strong-vs-eventual + CAP, quorum arithmetic, Raft + split brain + fencing, idempotency, backoff + jitter, the reconciliation loop + watch-vs-poll, leases/heartbeats, reconciler + quorum project, two-fault drill (15 cp) | ✅ done |
-| B-S19 | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA | ⬜ next (final phase) |
+| B-S19 | `materials/b14.html` (minibox capstone, gauntlet, assessment — 10 cp) + `labs/beginner/*.sh` (8 faults + runner) + `mock/beginner-final.html` &amp; `-solutions.html` + cross-track QA | ✅ done — **beginner track complete** |
+
+**The beginner track is complete** as of B-S19 (2026-07-25): 15 module pages (`materials/b0…b14.html`), 225 checkpoints, ~74 hours, plus `labs/beginner/` (8 gauntlet fault scripts + a runner) and `mock/beginner-final.html` / `beginner-final-solutions.html` (30 recall questions + 8 practical tasks, 100 points, 66 to pass). Cross-track QA at the end of B-S19 confirmed: 225 beginner + 171 advanced checkpoints, the track switcher on every page, zero broken links or dangling anchors site-wide, and every module page's pager `next` now pointing at its sibling (b14's leaves the track for `index.html`). The next thing to build on this site is the **Intermediate track**, which is not yet designed — it restarts from B14's `minibox` capstone (bash → OCI runtime spec + `runc`) and B9's networking script (→ the CNI ADD/DEL contract). Do not start building it without a spec session first.
 
 **Resume recipe for any beginner-track session:** read this table → read the target module's section in `docs/BEGINNER-TRACK.md` → `git log --oneline -8` (what actually landed, vs. just marked done) → run the three checkers for a green baseline → do the work → checkers → commit → tick the row here and update the `cka-materials-plan` memory.
 

@@ -708,12 +708,14 @@ tick the `CLAUDE.md` row and update the `cka-materials-plan` memory.
 | **B-S5** | `materials/b0.html` — **the pattern-setter**: establishes lesson anatomy, `k8s-link`, `langpair`, project/outcome blocks — ✅ done |
 | **B-S6** | `materials/b1.html` — shell, files, filesystem tree (16 checkpoints) — ✅ done |
 | **B-S7** | `materials/b2.html` — processes, threads, signals (18 checkpoints) — ✅ done |
-| **B-S8 … B-S18** | `materials/b3.html` … `materials/b13.html`, one module per session |
-| **B-S19** | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA |
+| **B-S8 … B-S18** | `materials/b3.html` … `materials/b13.html`, one module per session — ✅ done |
+| **B-S19** | `materials/b14.html` + `labs/beginner/*.sh` + `mock/beginner-final*.html` + cross-track QA — ✅ done, **track complete** |
 
 **Publishing a module** (last step of its session): add its number to `beginner.html`'s `PUBLISHED`
 array, add its entry to the beginner sidebar list on every `materials/b*.html`, run the checkers.
 Also repoint the *previous* module page's pager `next` link from the tracker anchor to the new file.
+(Done retroactively for b2–b13 in B-S19's QA pass — every module page now links straight to its
+sibling, and only `b14.html` leaves the track, pointing at `index.html`.)
 
 **Splitting a module across commits.** A full module page runs 1000–1500 lines, well past the
 global ≤500-added-lines-per-code-commit rule, so it takes 3–4 commits. `check-links.sh` globs
