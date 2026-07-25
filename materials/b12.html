@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B12: security fundamentals — threat modelling in one page (assets, actors, trust boundaries) applied to a real SSH key; least privilege and defense in depth turned into decisions you can check with systemd-analyze security; authentication versus authorization and why 401 and 403 send you to different places; hashing vs encoding vs encryption and why base64 protects nothing; symmetric and asymmetric keys and why TLS uses both; signatures as the keypair used backwards; SSH keys and ssh-agent as the everyday example; running your own certificate authority; key, CSR and signature; SAN extensions and why CN alone stopped working; reading a certificate with openssl x509 -text and verifying a chain; real TLS with s_server and s_client, then mutual TLS with -Verify; how secrets leak through ps and /proc/PID/environ; seccomp and AppArmor at one-profile depth; a mini project running mutual TLS between two local processes; and a debugging drill that breaks that mTLS four ways — expired, wrong SAN, unknown CA, mismatched key — until each error string means one specific thing.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B12 · Security fundamentals: trust, crypto, PKI — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B12 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+    <li><a href="b9.html">B9 · Networking II</a></li>
+    <li><a href="b10.html">B10 · DNS &amp; names</a></li>
+    <li><a href="b11.html">B11 · systemd &amp; logs</a></li>
+    <li><a href="b12.html">B12 · Security &amp; PKI</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b12">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B12 — Security fundamentals: trust, crypto, PKI</h1>
+  <p>Almost everything people call "a security feature" is one of two questions being answered: <em>who are you?</em> and <em>are you allowed to do this?</em> The machinery around those two questions — passwords, keys, signatures, certificates, permission files — looks enormous from outside and turns out to be small once you have built each piece yourself. That is what this module does. You will run your own certificate authority, issue certificates to yourself, make two programs prove their identities to each other, and then break that arrangement four different ways so that each error message becomes a specific accusation rather than a wall of noise.</p>
+  <p>Kubernetes is an unusually good reason to learn this properly, because a cluster is held together by certificates end to end. Every component authenticates to the API server with one. Every kubeconfig is a certificate plus an address. Every "my kubectl suddenly stopped working" is, underneath, one of the four failures you will deliberately cause in the last lesson. People who have never issued a certificate by hand experience this as bad luck; people who have, read the error and know which file to look at.</p>
+  <p>Four movements. <strong>Framing</strong>: the questions that make a security decision answerable — what are you protecting, from whom, and where does control change hands — plus the authentication/authorization split that decides where you go looking when something is refused. <strong>Crypto in plain terms</strong>: hashing, encoding and encryption told apart for good, the two key models, signatures, and SSH keys as the example already in your hands. <strong>PKI hands-on</strong>: a CA, a CSR, subject alternative names, chain verification, a real TLS server and mutual TLS — all with <code>openssl</code>, all on one machine. <strong>Handling secrets</strong>: how a secret leaks on a shared box even when nobody is malicious, and the two kernel layers that stand behind file permissions when everything else has failed.</p>
+  <div class="weights">
+    <span>Checkpoints<b>16</b></span>
+    <span>Hours<b>~5</b></span>
+    <span>Prerequisites<b>B4, B8</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Threat-model something concrete in one page: name its assets, its plausible actors, and every trust boundary it crosses.</li>
+<li>Turn "least privilege" and "defense in depth" from slogans into decisions you can check, and measure one with <code>systemd-analyze security</code>.</li>
+<li>Keep authentication and authorization strictly apart, and route a refusal to the right file on the first try.</li>
+<li>Tell hashing, encoding and encryption apart on sight, and explain in one sentence why base64 protects nothing.</li>
+<li>Choose between symmetric and asymmetric keys, and explain why TLS uses both in the same connection.</li>
+<li>Sign a file and verify it, and say exactly what a valid signature proves and what it does not.</li>
+<li>Explain SSH key login as a signature challenge, and what <code>ssh-agent</code> trades away for convenience.</li>
+<li>Create a certificate authority — a key plus a self-signed certificate — and say precisely what holding that key means.</li>
+<li>Issue a certificate in the two proper steps: a key and a CSR from the subject, a signature from the CA.</li>
+<li>Get subject alternative names right, and recognise the failure mode of a certificate whose CN is perfect and whose SAN list is wrong.</li>
+<li>Read a certificate with <code>openssl x509 -text</code>, verify a chain with <code>openssl verify</code>, and find an expiry date in five seconds.</li>
+<li>Run a TLS server and client with <code>openssl</code>, then require a client certificate so both ends prove identity.</li>
+<li>Demonstrate how secrets leak through process listings and <code>/proc/PID/environ</code>, and argue for files over environment variables from evidence.</li>
+<li>Say what seccomp and AppArmor each confine, and inspect one loaded profile.</li>
+<li>Build mutual TLS between two local processes, each verifying the other against your CA.</li>
+<li>Break that mTLS four ways and map every error string to one cause without guessing.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B4</strong> is the real prerequisite: a private key is protected by a file mode and nothing else, so the permission check (<a href="b4.html#cp-b4-5">B4.5</a>) and the fact that root walks past it entirely (<a href="b4.html#cp-b4-10">B4.10</a>) are the ground this module stands on. <strong>B8</strong> matters because every TLS lab here is an ordinary TCP connection — <code>ss</code>, <code>curl -v</code> and <code>tcpdump</code> (<a href="b8.html#cp-b8-13">B8.13</a>) are still the tools, and the handshake you are about to read happens right after the three-way handshake you already know (<a href="b8.html#cp-b8-8">B8.8</a>). Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster, and nothing needs installing: <code>openssl</code>, <code>ssh-keygen</code> and <code>aa-status</code> all ship with Ubuntu. You will create a user named <code>mallory</code>, a working directory <code>~/ca</code>, and a couple of throwaway units; the last lesson tells you how to remove them. Take a snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>) if you would rather roll back than clean up. One warning worth stating once: the CA you build here is a teaching CA on a disposable VM. Never use these keys, or these one-line commands, for anything real.</p>
+</div>
+
+<!-- ---------------- Framing ---------------- -->
+<div class="grp" id="g-framing"><h3>Framing</h3>
+
+<article class="lesson" id="cp-b12-1" data-id="b12-1">
+<div class="lesson-head"><span class="cp-id">B12.1</span><h4>Threat modelling in one page: assets, actors, trust boundaries</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Is this secure?" is an unanswerable question, and answering it anyway is how people end up with elaborate controls protecting nothing. The answerable version has three parts bolted on: secure <em>for what</em>, <em>against whom</em>, and <em>at which boundary</em>. Threat modelling is just the discipline of writing those three down before you choose a control. It takes fifteen minutes, it needs no tools, and it is the difference between "we enabled TLS" and "we know what TLS did and did not fix here."</p>
+<h5>The concept</h5>
+<p>Three words carry the whole exercise, and each one is ordinary:</p>
+<ul>
+<li><strong>Assets</strong> — the things that would hurt to lose, leak or have altered. Be specific: not "the server" but "the private key in <code>~/.ssh/id_ed25519</code>", "the database's contents", "the ability to run commands as root". A list of concrete nouns beats a paragraph of intent.</li>
+<li><strong>Actors</strong> — who might want them, described by their <em>position</em> rather than their motive. "An internet scanner with no account", "a logged-in user on this machine", "a process running as the same user", "someone holding the disk". The position is what determines which controls are even relevant.</li>
+<li><strong>Trust boundaries</strong> — the lines where control changes hands. Every time data or authority crosses from one party to another — user to kernel, one machine to another, your process to a library it loaded, host to container — that crossing is a boundary, and it is where controls belong. Nothing is a "security control" except at a boundary.</li>
+</ul>
+<p>The point of naming boundaries out loud is that once they are on paper, a lot of arguments end. Consider the container runtime socket from <a href="b9.html#cp-b9-18">B9.18</a>: <code>/run/containerd/containerd.sock</code> is root-owned because whoever can write to it can start a container with any mount and any privilege — that socket <em>is</em> a trust boundary. Draw it once and "just mount the runtime socket into the pod, it's easier" stops sounding like a convenience and starts sounding like what it is: handing the thing on the other side of the boundary everything the thing on this side has.</p>
+<p>A useful habit while modelling: for each control you already have, ask which actor it stops. A file mode of <code>600</code> stops another logged-in user. It does not stop root, it does not stop a process running as you, and it does nothing at all once the disk is out of the machine. That is not a criticism of file modes — it is what "against whom" means, and writing it down is how you notice the actor you had not covered.</p>
+<div class="flow"><span>asset</span><em>→</em><span>who wants it</span><em>→</em><span class="hot">boundary it crosses</span><em>→</em><span>control at that boundary</span></div>
+<p>Controls chosen in any other order tend to protect the wrong crossing.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Pick one concrete asset and look at the only thing currently protecting it. If you have no key yet, make one — you will need it again in <a href="#cp-b12-7">B12.7</a>.
+<pre class="cmd">multipass shell sandbox
+ls -l ~/.ssh/id_ed25519 2&gt;/dev/null || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+stat -c '%n  mode=%a  owner=%U:%G' ~/.ssh/id_ed25519</pre>
+<pre class="out">/home/ubuntu/.ssh/id_ed25519  mode=<b>600</b>  owner=ubuntu:ubuntu     ← one file mode is the entire control</pre></li>
+<li>Introduce a second actor — an ordinary logged-in user with no privileges — and test the boundary the file mode draws. This is the actor <code>600</code> exists to stop.
+<pre class="cmd">sudo adduser --disabled-password --gecos '' mallory
+sudo -u mallory cat ~/.ssh/id_ed25519</pre>
+<pre class="out">cat: /home/ubuntu/.ssh/id_ed25519: <b>Permission denied</b>     ← the control works against this actor</pre></li>
+<li>Now test the actor it does <em>not</em> stop. Root does not consult the permission bits at all (<a href="b4.html#cp-b4-10">B4.10</a>), so anyone who can become root has already crossed this boundary.
+<pre class="cmd">sudo head -c 40 ~/.ssh/id_ed25519; echo</pre>
+<pre class="out">-----BEGIN OPENSSH PRIVATE KEY-----      ← root reads it regardless of mode 600</pre></li>
+<li>Write the model down. One page, three headings — the artefact is the point, because a model in your head cannot be checked by anyone else.
+<pre class="cmd">cat &gt; ~/threat-model.md &lt;&lt;'EOF'
+# Asset: SSH private key ~/.ssh/id_ed25519
+## Actors
+- other logged-in user on sandbox      (stopped by: mode 600)
+- any process running AS ubuntu        (NOT stopped: same uid, e.g. a bad npm package)
+- root / anyone who can sudo           (NOT stopped: root ignores modes)
+- holder of the disk image or snapshot (NOT stopped: encrypt the key with a passphrase)
+## Trust boundaries crossed
+1. disk -> my process        (file permissions)
+2. my process -> ssh-agent   (agent holds it decrypted in memory)
+3. my machine -> remote host (only a SIGNATURE crosses; the key never does)
+EOF
+grep -c . ~/threat-model.md</pre>
+<pre class="out">14        ← the model exists as a file; boundary 3 is the one B12.7 explains</pre></li>
+<li>Sanity-check the model against reality: boundary 3 claims the private key never leaves the machine. Confirm what the server actually holds is the <em>public</em> half.
+<pre class="cmd">ssh-keygen -y -f ~/.ssh/id_ed25519 | cut -c1-40</pre>
+<pre class="out">ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI       ← this half is what goes into authorized_keys</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without looking at your file, name the three headings and produce one entry under each for a different asset — say, the <code>sudo</code> ability on this VM. Then answer the question that makes a model useful: for each control you listed, which actor does it stop, and which actor walks straight past it? If every control on your page stops the same actor, you have found a real gap — that is defense in depth's absence, and it is the subject of the next lesson.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most common failure is modelling the actor you find interesting rather than the actor you actually have. Elaborate defenses against a remote attacker are routine on machines where the real exposure is a hundred people with <code>sudo</code> and no audit trail. Position, not drama: list who genuinely has a foothold today, and cover those first.</p>
+<p>The second is treating a boundary as a control. Naming <code>/run/containerd/containerd.sock</code> as a trust boundary does not protect it; it tells you that whatever protects it — file mode, group membership, not mounting it into workloads — is load-bearing, and that changes to it are security changes even when the commit message says "convenience". A boundary is where you must decide, not the decision.</p>
+<div class="k8s-link">
+<p>Kubernetes has a small set of boundaries that carry nearly all of its security weight, and they are worth naming now because the rest of the advanced track keeps crossing them. The API server is the boundary between "anyone on the network" and "the cluster's state" — which is why every request through it is authenticated then authorized. The node is the boundary between the control plane and untrusted workloads, which is why a pod that can read the kubelet's credentials or the container runtime socket has effectively escaped. And etcd is the boundary behind everything: direct read access to it is equivalent to reading every Secret in the cluster, because that is literally where they are stored.</p>
+<p>The etcd trust domain and why it is treated as a separate one is <a href="w2.html#cp-2-5">W2.5</a>; how a pod's identity reaches the API server at all is <a href="w7.html#cp-7-4">W7.4</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">There is no <code>man</code> page for threat modelling — the useful searches are the artefacts. <code>man 7 credentials</code> for the identities an actor can hold on a Linux box, and <code>man 2 access</code> for the check that decides a boundary crossing at the filesystem. For the container-shaped boundaries, <code>man 7 namespaces</code> and <code>man 7 capabilities</code> are the two pages that define what "inside" and "outside" mean.</p>
+</article>
+
+<article class="lesson" id="cp-b12-2" data-id="b12-2">
+<div class="lesson-head"><span class="cp-id">B12.2</span><h4>Least privilege and defense in depth, as decisions you can check</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>These two phrases appear in every security document ever written, which has drained them of meaning. Both are actually testable questions about a specific program: <em>what is the smallest set of permissions under which this still works?</em> and <em>if this one control fails, what is the next one?</em> Asked about a real service, they produce a concrete list of changes — and on a systemd machine you can watch a score move as you make them.</p>
+<h5>The concept</h5>
+<p><strong>Least privilege</strong> means a program holds only the authority it needs, for only as long as it needs it. The trap is that "needs" is usually assumed rather than measured. A web server needs to bind port 80; historically that required root, so web servers ran as root, so a bug in the request parser gave an attacker the whole machine. The privilege that mattered was one narrow thing — bind a port below 1024 — and root was simply the only way anyone knew to ask for it. Linux has had a better answer for years: <abbr title="a single, individually-grantable piece of root's authority">capabilities</abbr> (<a href="b4.html#cp-b4-10">B4.10</a>) split root into a keyring of individually-issued permits, and <code>CAP_NET_BIND_SERVICE</code> is exactly the one permit here.</p>
+<p><strong>Defense in depth</strong> means assuming any single control will fail and asking what stands behind it. Not because you expect to be attacked in layers, but because controls fail in ordinary ways: a mode gets changed by a deployment script, a validation is skipped on one code path, a dependency is compromised. The question is never "is this control good enough", it is "what happens the day it isn't".</p>
+<p>Both become concrete on a service. Take a program that must serve on port 80 and read one config file, and walk it down the privilege ladder — running as root, then as an unprivileged user with the one capability it needs, then with the rest of the machine taken away from it. On systemd every rung is a line in a unit file (<a href="b11.html#cp-b11-4">B11.4</a>): <code>User=</code> drops the identity, <code>AmbientCapabilities=</code> grants the single permit, <code>NoNewPrivileges=</code> forbids regaining anything through a setuid binary (<a href="b4.html#cp-b4-9">B4.9</a>), <code>ProtectSystem=strict</code> makes the filesystem read-only for it, <code>PrivateTmp=</code> gives it a mount namespace of its own (<a href="b6.html#cp-b6-3">B6.3</a>). None of those is new machinery — they are B4's and B6's primitives with unit-file names.</p>
+<div class="flow"><span>root, everything</span><em>→</em><span>own user + one capability</span><em>→</em><span>no new privileges</span><em>→</em><span class="hot">read-only fs, private /tmp</span></div>
+<p>Least privilege picks the rung; defense in depth is the reason you keep descending after it already works.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the naive version first — the one that works and gives away everything. It runs as root purely to bind a low port.
+<pre class="cmd">sudo tee /etc/systemd/system/web.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Toy web server
+[Service]
+ExecStart=/usr/bin/python3 -m http.server 80 --directory /srv/toy
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo mkdir -p /srv/toy &amp;&amp; echo hi | sudo tee /srv/toy/index.html &gt;/dev/null
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl start web
+curl -s localhost:80; ps -o user,args -C python3 --no-headers | head -1</pre>
+<pre class="out">hi
+<b>root</b>     /usr/bin/python3 -m http.server 80 --directory /srv/toy    ← full root, to bind one port</pre></li>
+<li>Measure it before changing anything. <code>systemd-analyze security</code> scores a unit's exposure from 0 (locked down) to 10 (nothing between it and the machine) — a rare case of a security question with a number attached.
+<pre class="cmd">systemd-analyze security web.service | tail -3</pre>
+<pre class="out">→ Overall exposure level for web.service: <b>9.6 UNSAFE</b> 😨      ← the naive unit</pre></li>
+<li>Apply least privilege: give the service its own identity and exactly one piece of root's authority instead of all of it.
+<pre class="cmd">sudo useradd --system --no-create-home --shell /usr/sbin/nologin toyweb
+sudo mkdir -p /etc/systemd/system/web.service.d
+sudo tee /etc/systemd/system/web.service.d/10-drop.conf &gt;/dev/null &lt;&lt;'EOF'
+[Service]
+User=toyweb
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart web
+curl -s localhost:80; ps -o user,args -C python3 --no-headers | head -1</pre>
+<pre class="out">hi                                                       ← still works
+<b>toyweb</b>   /usr/bin/python3 -m http.server 80 ...          ← not root any more</pre></li>
+<li>Confirm the permit is real and narrow by reading the process's capability sets straight out of <code>/proc</code> (<a href="b4.html#cp-b4-12">B4.12</a>) rather than trusting the unit file.
+<pre class="cmd">pid=$(systemctl show -p MainPID --value web); grep -E 'CapEff|CapBnd' /proc/$pid/status
+capsh --decode=$(awk '/CapEff/{print $2}' /proc/$pid/status)</pre>
+<pre class="out">CapBnd: 0000000000000400
+CapEff: 0000000000000400
+0x0000000000000400=cap_net_bind_service      ← one permit on the keyring, not the master key</pre></li>
+<li>Now add depth: layers that do nothing today and matter the day the program is compromised. Each line takes away something it never needed.
+<pre class="cmd">sudo tee -a /etc/systemd/system/web.service.d/10-drop.conf &gt;/dev/null &lt;&lt;'EOF'
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/srv/toy
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart web
+curl -s localhost:80; systemd-analyze security web.service | tail -1</pre>
+<pre class="out">hi
+→ Overall exposure level for web.service: <b>2.8 OK</b> 🙂       ← same behaviour, far less reachable</pre></li>
+<li>Prove one of the layers actually bites, rather than believing the score. The service can still serve its files and can no longer write anywhere on the system.
+<pre class="cmd">sudo -u toyweb touch /srv/toy/evidence 2&gt;&amp;1 | head -1
+sudo systemctl stop web; sudo rm -rf /etc/systemd/system/web.service /etc/systemd/system/web.service.d
+sudo systemctl daemon-reload; echo cleaned</pre>
+<pre class="out">touch: cannot touch '/srv/toy/evidence': <b>Permission denied</b>
+cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the least-privilege answer for the toy server in one sentence — which single capability it needs and why root was ever involved — and then name three layers you added that do nothing on a healthy day. Check your reasoning with the tool: <code>systemd-analyze security web.service</code> before and after should differ by several points, and the service should behave identically. If a lockdown line breaks the service, that is the useful outcome too; it tells you the program needed something you assumed it didn't.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>AmbientCapabilities=</code> without <code>CapabilityBoundingSet=</code> is half a job. The ambient set grants the permit; the bounding set is the ceiling on what the process could ever acquire, and leaving it at the default means a setuid binary or a <code>File</code> capability could still hand it more later. Set both, and add <code>NoNewPrivileges=yes</code> so the setuid route is closed outright.</p>
+<p><code>ProtectSystem=strict</code> makes the entire filesystem read-only for the service, which is exactly what you want and will absolutely break a program that writes a pid file, a cache or a log to disk. The fix is not to weaken it back to <code>full</code> but to name the one path it needs with <code>ReadWritePaths=</code> or <code>StateDirectory=</code> — which is least privilege doing its job by forcing you to enumerate what the program actually writes.</p>
+<p>Finally: a low exposure score is not safety. <code>systemd-analyze security</code> knows about sandboxing options and nothing about your application's bugs, its credentials, or what it is allowed to reach on the network. It is a checklist that happens to have a number, useful for comparing a unit against itself before and after — not a verdict.</p>
+<div class="k8s-link">
+<p>Every line you just wrote has a direct counterpart in a pod's <code>securityContext</code>, because it is the same kernel machinery reached through a different configuration language. <code>User=</code> is <code>runAsUser</code> and <code>runAsNonRoot</code>. <code>AmbientCapabilities=</code>/<code>CapabilityBoundingSet=</code> are <code>capabilities.add</code> and <code>capabilities.drop</code> — and <code>drop: ["ALL"]</code> plus one <code>add</code> is exactly the keyring argument above. <code>NoNewPrivileges=</code> is <code>allowPrivilegeEscalation: false</code>. <code>ProtectSystem=strict</code> is <code>readOnlyRootFilesystem: true</code>, with <code>ReadWritePaths=</code> becoming an <code>emptyDir</code> mounted where the app writes. Kubernetes bundles these into named tiers — the Pod Security Standards <em>privileged</em>, <em>baseline</em> and <em>restricted</em> — and the <em>restricted</em> tier is essentially this lesson's final unit expressed as policy. (Those fields are a CKS topic rather than a CKA one, so the advanced track does not drill them; the machinery is the same regardless of which exam asks about it.)</p>
+<p>Least privilege in its CKA-relevant form is RBAC: the smallest Role that still works, bound as narrowly as possible — <a href="w7.html#cp-7-6">W7.6</a>. What actually runs privileged on a node, and why the kubelet and the static pods are in a different position from your workloads, is <a href="w1.html#cp-1-2">W1.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.exec</code> is the page for every sandboxing option used here — search it for <code>ProtectSystem</code>, <code>NoNewPrivileges</code>, <code>AmbientCapabilities</code>. <code>man 1 systemd-analyze</code> documents the <code>security</code> verb and how the exposure score is assembled. <code>man 7 capabilities</code> for the permit list and the ambient/bounding set rules, and <code>man 1 capsh</code> for decoding the hex you read out of <code>/proc</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b12-3" data-id="b12-3">
+<div class="lesson-head"><span class="cp-id">B12.3</span><h4>Authentication vs authorization: two questions, two files</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>When something is refused, there are exactly two possibilities: the system did not believe you are who you claim, or it believed you completely and decided you may not do that. They are fixed in different places by different people, and confusing them is the single most expensive triage mistake in this whole subject — it is why people regenerate certificates for hours when the answer was one line of policy, and vice versa.</p>
+<h5>The concept</h5>
+<p><strong>Authentication</strong> (often abbreviated <em>authn</em>) answers <em>who are you?</em> It ends in an identity or in nothing at all. The evidence can be something you know (a password), something you hold (a private key, a certificate) or something a trusted third party asserts (a signed token). Its failure mode is total: the system has no idea who is asking.</p>
+<p><strong>Authorization</strong> (<em>authz</em>) answers <em>may this identity do this particular thing?</em> It starts from an established identity and consults a policy — a file, a table, a set of rules — to reach yes or no. Its failure mode is specific: the system knows exactly who you are and is declining this action.</p>
+<p>The keycard analogy holds all the way through, so use it: authentication is the guard confirming the photo on your ID is you; authorization is whether your card opens <em>that</em> door. Two different systems, two different people to complain to, and — importantly — an authorization failure is proof that authentication succeeded. If you are being told "you may not", the system already knows who you are, so nothing about your credentials needs fixing.</p>
+<p><code>sudo</code> is the local example, and it separates the two cleanly enough to demonstrate. Your password authenticates you to <code>sudo</code>; <code>/etc/sudoers</code> then authorizes what that identity may run. You can watch the failures happen in order: get the password wrong and you never reach the policy; get it right without a sudoers entry and you are told, in different words, that you are recognised and refused.</p>
+<div class="flow"><span>request</span><em>→</em><span>authn: who are you?</span><em>→</em><span class="hot">identity</span><em>→</em><span>authz: may you?</span><em>→</em><span>allow / deny</span></div>
+<p>The identity in the middle is the handoff — everything left of it is credentials, everything right of it is policy.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Give the <code>mallory</code> user from <a href="#cp-b12-1">B12.1</a> a password so she can attempt to authenticate at all.
+<pre class="cmd">echo 'mallory:practice-only' | sudo chpasswd
+sudo -u mallory whoami</pre>
+<pre class="out">mallory        ← the identity exists; nothing has been authenticated yet</pre></li>
+<li>Watch an authentication failure. Log in as her and run <code>sudo</code> with the wrong password — the request never reaches any policy.
+<pre class="cmd">su - mallory        # password: practice-only
+sudo id             # deliberately type a WRONG password three times</pre>
+<pre class="out">[sudo] password for mallory:
+Sorry, try again.
+[sudo] password for mallory:
+sudo: <b>3 incorrect password attempts</b>          ← authn failed: no identity was established</pre></li>
+<li>Now authenticate successfully and watch the <em>second</em> question fail. Same command, correct password, completely different message.
+<pre class="cmd">sudo id             # type the CORRECT password: practice-only</pre>
+<pre class="out">[sudo] password for mallory:
+<b>mallory is not in the sudoers file.</b>  This incident will be reported.
+                                        ← authn succeeded; authz refused</pre></li>
+<li>Fix it in the right place. The credential was never the problem, so the change goes in the policy — group membership, which <code>/etc/sudoers</code> grants to.
+<pre class="cmd">exit                                     # back to the ubuntu user
+sudo grep -E '^%sudo' /etc/sudoers
+sudo usermod -aG sudo mallory</pre>
+<pre class="out">%sudo   ALL=(ALL:ALL) ALL       ← the policy line: members of group sudo may run anything</pre></li>
+<li>Confirm the same credential now passes both stages. Group membership is read at login, so a fresh session is required — the policy changed, the identity did not.
+<pre class="cmd">su - mallory        # password: practice-only
+id -nG; sudo id</pre>
+<pre class="out">mallory <b>sudo</b>                                      ← identity now carries the group
+[sudo] password for mallory:
+uid=0(root) gid=0(root) groups=0(root)              ← authenticated, then authorized</pre></li>
+<li>Ask <code>sudo</code> to show you the policy for the identity it just authenticated — the closest thing to "print my permissions" a Linux box offers.
+<pre class="cmd">sudo -l | tail -3; exit</pre>
+<pre class="out">User mallory may run the following commands on sandbox:
+    (ALL : ALL) ALL                                 ← the authz answer, stated in full</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain out loud, without notes, why "you are not in the sudoers file" is proof that your password was correct. Then do the translation you will use constantly later: given a refusal, say which of the two questions failed and which file you would open. A rejected password, an expired certificate and an unknown signing authority are all the first question; a recognised user without a matching rule is the second. If you cannot tell which one an error is, the error message itself is the thing to read more carefully — the two are almost always worded differently on purpose.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Some systems deliberately blur the line to avoid leaking information. A login form that says "invalid username or password" is refusing to tell you which of the two failed, because saying "no such user" would let an attacker enumerate accounts. That is a reasonable design and an annoying one to debug: when a system won't tell you which question failed, the server-side log usually will, and that is where to look rather than at the message you were shown.</p>
+<p>The other trap is fixing the wrong side because the wrong side is easier to change. Regenerating a credential is fast and satisfying; editing a policy needs someone's approval. That asymmetry is exactly why people burn afternoons reissuing certificates for what was, from the first error message, a policy decision. Read the refusal before touching anything.</p>
+<div class="k8s-link">
+<p>This split <em>is</em> the shape of the API server's request pipeline: every request goes through authentication, then authorization, then admission, in that order, and each stage can refuse for its own reasons. The two HTTP status codes tell you which stage spoke. <code>401 Unauthorized</code> — badly named, it means <em>unauthenticated</em> — says your certificate, token or kubeconfig was not accepted at all, so the fix is in your credentials or the cluster's CA trust. <code>403 Forbidden</code> says the API server knows precisely who you are, printed your username and groups in the message, and RBAC found no rule permitting the verb on that resource; the fix is a Role and a RoleBinding, and your credentials are fine. Learning to read those two numbers correctly saves more time than any other single habit in cluster troubleshooting.</p>
+<p>The full authn → authz → admission pipeline in order is <a href="w1.html#cp-1-4">W1.4</a>; the three credential types the cluster accepts for the first question are <a href="w7.html#cp-7-1">W7.1</a>, the authorizer chain that answers the second is <a href="w7.html#cp-7-5">W7.5</a>, and <code>kubectl auth can-i</code> — the direct equivalent of <code>sudo -l</code> — is <a href="w7.html#cp-7-8">W7.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 sudo</code> for the two stages in one program and the <code>-l</code> flag that prints the policy; <code>man 5 sudoers</code> for the rule syntax and the <code>%group</code> form used above. <code>man 8 pam</code> and <code>man 5 pam.conf</code> if you want to see where Linux authentication is actually implemented — PAM is the layer that <code>sudo</code>, <code>login</code> and <code>sshd</code> all delegate the first question to.</p>
+</article>
+
+</div>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
