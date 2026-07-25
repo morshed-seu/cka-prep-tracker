@@ -494,6 +494,261 @@ sudo conntrack -L -p tcp 2&gt;/dev/null | grep -m1 'dport=80' || echo '(flow alr
 
 </div><!-- /g-egress -->
 
+<!-- ---------------- Netfilter ---------------- -->
+<div class="grp" id="g-netfilter"><h3>Netfilter</h3>
+
+<article class="lesson" id="cp-b9-10" data-id="b9-10">
+<div class="lesson-head"><span class="cp-id">B9.10</span><h4>Where a packet can be caught: the netfilter hooks</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Nearly every "my firewall rule does nothing" is the same mistake: the rule is placed where the packet never goes. The Linux packet-filtering framework, <strong>netfilter</strong>, intercepts packets at exactly five points in the kernel, and each rule is attached to one of them. Learn the five points and the two paths a packet can take through them, and rules stop being voodoo you tweak until something works — you place each rule where its packets actually pass, deliberately.</p>
+<h5>The concept</h5>
+<p><strong>netfilter</strong> is a set of <strong>hooks</strong> — fixed points in the kernel's packet path where rules can inspect or modify a packet. There are five:</p>
+<ul>
+<li><strong>prerouting</strong> — the packet has just arrived, <em>before</em> the kernel decides where it's going.</li>
+<li><strong>input</strong> — the routing decision said "this is for me," on its way up to a local process.</li>
+<li><strong>forward</strong> — the routing decision said "this is for somewhere else," passing through this box.</li>
+<li><strong>output</strong> — a locally-generated packet, on its way down and out.</li>
+<li><strong>postrouting</strong> — any packet about to leave on the wire, after routing.</li>
+</ul>
+<p>The crucial thing is <em>where the routing decision sits</em>: right after prerouting. That single fork produces the two paths you must be able to draw:</p>
+<ul>
+<li><strong>To this host:</strong> prerouting → (routing: for me) → input → local process.</li>
+<li><strong>Through this host:</strong> prerouting → (routing: for elsewhere) → forward → postrouting → out.</li>
+</ul>
+<p>Two payoffs follow. First, it explains the NAT placement from B9.7: <strong>DNAT must run in prerouting</strong> because it changes the destination, and the change has to happen <em>before</em> the routing decision so the kernel routes on the new address; SNAT runs in postrouting, after routing, on the way out. Second, and the one that fixes most mistakes: <strong>traffic destined for a container is <em>forwarded</em>, so it traverses <code>forward</code> and never touches <code>input</code>.</strong> A rule you put in the <code>input</code> chain to affect pod traffic is inspected by no packet you care about — the packets took the through-this-host path and skipped <code>input</code> entirely.</p>
+<div class="flow"><span>prerouting</span><em>→ route? →</em><span>input (for me)</span><em>/</em><span class="hot">forward (through me)</span><em>→ postrouting → out</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See the base chains and which hook each is attached to. In nftables a chain names its hook directly, which makes the mapping explicit.
+<pre class="cmd">multipass shell sandbox
+sudo nft 'add table ip demo'
+sudo nft 'add chain ip demo fwd { type filter hook forward priority 0; }'
+sudo nft 'add chain ip demo inp { type filter hook input priority 0; }'
+sudo nft list table ip demo</pre>
+<pre class="out">table ip demo {
+  chain fwd { type filter hook <b>forward</b> priority 0; }     ← catches through-this-host traffic
+  chain inp { type filter hook <b>input</b> priority 0; }       ← catches to-this-host traffic
+}</pre></li>
+<li>Prove forwarded traffic hits <code>forward</code> and not <code>input</code>: add a counter to each chain, ping <em>through</em> the box from <code>red</code> to the internet, and see only the forward counter move.
+<pre class="cmd">sudo nft 'add rule ip demo fwd counter'
+sudo nft 'add rule ip demo inp counter'
+sudo ip netns exec red ping -c3 1.1.1.1 &gt;/dev/null
+sudo nft list table ip demo | grep counter</pre>
+<pre class="out">chain fwd { ... counter packets <b>6</b> bytes 504 }     ← forwarded pings counted here (3 out + 3 back)
+chain inp { ... counter packets <b>0</b> bytes 0 }       ← input saw none: this traffic isn't "for me"</pre></li>
+<li>Clean up the demo table.
+<pre class="cmd">sudo nft 'delete table ip demo'</pre>
+<pre class="out"># removed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Draw the two paths a packet can take through the hooks. (To this host: prerouting → input → local process. Through this host: prerouting → forward → postrouting → out — the routing decision after prerouting chooses which.) Then: why must DNAT run in prerouting, and why is a rule in <code>input</code> useless for affecting pod (forwarded) traffic? (DNAT changes the destination, which must happen before routing so the kernel routes on the new address; forwarded traffic goes prerouting → forward → postrouting and never enters <code>input</code>, so an <code>input</code> rule inspects none of it.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The single most common wasted hour in firewalling is a correct-looking rule in the wrong chain — usually <code>input</code> when the traffic is forwarded, or <code>forward</code> when the traffic is actually terminating locally. Before writing any rule, ask "is this packet <em>for</em> this host, or passing <em>through</em> it?" and pick the chain from the answer. The counters trick in the lab (add a bare <code>counter</code> to a chain, generate traffic, see if it moves) is the fastest way to confirm which chain a given packet actually traverses.</p>
+<p>Priorities matter when multiple base chains share a hook: NAT, filter and mangle can all attach to <code>prerouting</code>, and they run in priority order (DNAT at a negative priority runs before filtering, for instance). You rarely set priorities by hand, but it's why several tools' rules coexist on one hook without a fight — and why kube-proxy, a CNI, and your own rules can all live on <code>prerouting</code> at once.</p>
+<div class="k8s-link">
+<p>This is why a rule meant to affect pod traffic must live in <code>forward</code>, <code>prerouting</code> or <code>postrouting</code>, never <code>input</code> — pod traffic is routed <em>through</em> the node, not <em>to</em> it. kube-proxy hangs its Service machinery off <code>prerouting</code> (and <code>output</code>, for traffic a pod sends to a Service on its own node) precisely because DNAT must precede routing; NetworkPolicy enforcement lives in <code>forward</code>. When you later read where the <code>KUBE-</code> chains attach, the hook each uses is dictated by exactly the routing-decision placement you just drew.</p>
+<p>Walking the kube-proxy chains and seeing which hooks they attach to is <a href="w4.html#cp-4-10">W4.10</a>; the NetworkPolicy enforcement path is <a href="w4.html#cp-4-23">W4.23</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 nft</code> for base chains, hooks (<code>prerouting</code>/<code>input</code>/<code>forward</code>/<code>output</code>/<code>postrouting</code>), types and priorities; the netfilter project's "packet flow" diagram is the canonical picture. <code>man 8 iptables</code> maps the same hooks onto its built-in chain names. The kernel docs under <code>Documentation/networking/</code> cover the architecture. No exam-docs page teaches hooks; it's assumed under kube-proxy internals.</p>
+</article>
+
+<article class="lesson" id="cp-b9-11" data-id="b9-11">
+<div class="lesson-head"><span class="cp-id">B9.11</span><h4>The vocabulary under every Linux firewall: tables, chains, rules, targets</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every firewall command on Linux — every <code>iptables</code> line, every <code>nft</code> statement, every one of the thousands of rules kube-proxy writes — is built from four nested pieces. Learn those four words precisely and a wall of rules that looked like line noise resolves into "which job, at which hook, matching what, doing what." It's the grammar; once you have it, you can read anyone's ruleset, including Kubernetes'.</p>
+<h5>The concept</h5>
+<p>From outside in:</p>
+<ul>
+<li><strong>Table</strong> — <em>which job.</em> <code>filter</code> decides pass-or-drop; <code>nat</code> rewrites addresses; <code>mangle</code> edits other packet fields; <code>raw</code> opts flows out of connection tracking. A rule lives in exactly one table, chosen by what it's for.</li>
+<li><strong>Chain</strong> — <em>which hook.</em> A chain is a list of rules attached to one of the five hooks from B9.10 (a built-in chain like <code>PREROUTING</code>), or a user-defined chain you jump to (a labelled subroutine).</li>
+<li><strong>Rule</strong> — <em>the match criteria.</em> The conditions a packet must meet: <code>-p tcp --dport 80</code>, <code>-s 10.10.0.0/24</code>, <code>-i ens3</code>, and so on. A rule with no match conditions matches every packet.</li>
+<li><strong>Target</strong> — <em>what to do</em> when the rule matches: <code>ACCEPT</code> (let it pass), <code>DROP</code> (discard silently), <code>REJECT</code> (discard with an error back to the sender), <code>MASQUERADE</code>/<code>DNAT</code>/<code>SNAT</code> (the rewrites from B9.7), or a <strong>jump</strong> to another chain (hand the packet to a subroutine of more rules).</li>
+</ul>
+<p>So a rule reads as: <em>in this table, on this chain, packets matching this get this target.</em> <code>iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o ens3 -j MASQUERADE</code> is table <code>nat</code>, chain <code>POSTROUTING</code>, match "from that subnet leaving that interface," target <code>MASQUERADE</code> — the exact rule from B9.8, now fully parsed. Targets that <em>terminate</em> (ACCEPT/DROP/REJECT) stop the packet's traversal of the chain; a <em>jump</em> is non-terminating in the sense that if the jumped-to chain doesn't decide the packet's fate, traversal returns to the next rule after the jump. This jump-to-a-chain mechanism is how big rulesets stay organised — and how kube-proxy builds its per-Service and per-endpoint chains.</p>
+<div class="flow"><span>table (job)</span><em>→</em><span>chain (hook)</span><em>→</em><span>rule (match)</span><em>→</em><span class="hot">target (action)</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write one rule of each terminating target on a throwaway custom chain, so you handle ACCEPT, DROP and REJECT by hand. A custom chain keeps the experiment off the real built-in chains.
+<pre class="cmd">multipass shell sandbox
+sudo iptables -N DEMO 2&gt;/dev/null                    # create a user-defined chain
+sudo iptables -A DEMO -p tcp --dport 81 -j ACCEPT     # match + ACCEPT target
+sudo iptables -A DEMO -p tcp --dport 82 -j DROP       # match + DROP target
+sudo iptables -A DEMO -p tcp --dport 83 -j REJECT     # match + REJECT target
+sudo iptables -L DEMO -n --line-numbers</pre>
+<pre class="out">Chain DEMO (0 references)
+1  ACCEPT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:81     ← rule 1: match dport 81 → ACCEPT
+2  DROP    tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:82     ← rule 2: match dport 82 → DROP
+3  REJECT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:83     ← rule 3: match dport 83 → REJECT</pre></li>
+<li>Add a <em>jump</em> target — the fourth kind — wiring the custom chain into a built-in one. This is the subroutine mechanism kube-proxy leans on.
+<pre class="cmd">sudo iptables -A INPUT -j DEMO      # from INPUT, jump into the DEMO chain
+sudo iptables -L INPUT -n | grep DEMO</pre>
+<pre class="out">DEMO  all  --  0.0.0.0/0  0.0.0.0/0     ← INPUT now jumps to DEMO (a chain used as a target)</pre></li>
+<li>Tear the experiment down cleanly — detach the jump, flush and delete the custom chain.
+<pre class="cmd">sudo iptables -D INPUT -j DEMO
+sudo iptables -F DEMO &amp;&amp; sudo iptables -X DEMO
+echo removed</pre>
+<pre class="out">removed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Define table, chain, rule and target in one phrase each. (Table = which job — filter/nat/mangle/raw; chain = which hook, or a user subroutine; rule = the match criteria; target = the action on a match — ACCEPT/DROP/REJECT/a rewrite/or a jump to another chain.) Then: which table decides whether a packet is allowed through, and which rewrites its addresses? (The <code>filter</code> table decides pass-or-drop; the <code>nat</code> table rewrites addresses — they are separate jobs, which is the whole point of B9.12.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Every built-in chain has a <strong>default policy</strong> (ACCEPT or DROP) that applies to any packet no rule in the chain decided — the implicit last word. On many hosts the <code>filter</code> <code>INPUT</code>/<code>FORWARD</code> policy is <code>DROP</code>, so "I added an ACCEPT and it still doesn't work" can be a different chain's policy dropping the return traffic, or the packet never reaching your ACCEPT. Always check the policy (shown in the <code>Chain … (policy DROP)</code> header) alongside the rules.</p>
+<p><code>-A</code> <em>appends</em> a rule to the end of a chain and <code>-I</code> <em>inserts</em> at the top (or a chosen position). Because order decides which rule matches first (B9.14), appending a rule after an existing terminating rule can leave it permanently unreached. When a freshly-added rule seems to do nothing, its <em>position</em> — not its correctness — is the first suspect.</p>
+<div class="k8s-link">
+<p>kube-proxy's iptables output is nothing but this vocabulary at scale: a top-level <code>KUBE-SERVICES</code> chain (in the <code>nat</code> table) that jumps to a per-Service <code>KUBE-SVC-xxxx</code> chain, which jumps to per-endpoint <code>KUBE-SEP-xxxx</code> chains that carry the DNAT targets. Every line is table + chain + match + target, and the jump-to-a-chain mechanism you just used by hand is exactly how it organises hundreds of Services without one unreadable flat list. Reading those chains is just applying this grammar.</p>
+<p>Walking the real <code>KUBE-SERVICES</code> → <code>KUBE-SVC</code> → <code>KUBE-SEP</code> chain structure is <a href="w4.html#cp-4-10">W4.10</a>; the ClusterIP DNAT those chains carry is <a href="w4.html#cp-4-9">W4.9</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> for tables, built-in chains, <code>-N</code>/<code>-X</code> (custom chains), <code>-A</code>/<code>-I</code>/<code>-D</code>, and policies (<code>-P</code>); <code>man 8 iptables-extensions</code> for match modules and targets. The nftables equivalents (tables, chains, rules, verdicts) are in <code>man 8 nft</code>. In the exam docs, this grammar is assumed wherever kube-proxy or CNI rules are discussed.</p>
+</article>
+
+<article class="lesson" id="cp-b9-12" data-id="b9-12">
+<div class="lesson-head"><span class="cp-id">B9.12</span><h4>filter vs nat: "ping works but curl doesn't"</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the single most useful firewall symptom to recognise on sight, and it trips people constantly: a host answers <code>ping</code> but a <code>curl</code> to it hangs. It looks like a contradiction — how can the machine be reachable and unreachable at once? — but it's the ordinary behaviour of a <code>filter</code> rule that drops TCP while leaving ICMP alone. Reproduce it once, deliberately, and you'll never again mistake "ping works" for "the service is reachable." As a bonus you'll learn to read the <em>timing</em> of a failure to know which kind of block you're behind before you've read a single rule.</p>
+<h5>The concept</h5>
+<p>The <code>filter</code> table's job is pass-or-drop; the <code>nat</code> table's job is rewrite. They're independent, and a <code>filter</code> rule can target one protocol while ignoring another. <code>ping</code> uses ICMP; <code>curl</code> to a web server uses TCP to port 80. So a single rule — <em>drop TCP to port 80</em> — silently eats the TCP SYN while ICMP echo sails through untouched. The host is genuinely reachable at the network layer (ping proves it) and genuinely blocked at the transport layer for that one service. "Ping works but curl doesn't" isn't a paradox; it's a precise statement that the network layer is fine and something is filtering that TCP port — exactly the layered thinking from B8.</p>
+<p>There's a second, equally useful reading in <em>how</em> the block refuses:</p>
+<ul>
+<li><strong><code>DROP</code></strong> discards the packet with no reply. The client hears nothing, so it waits out its full timeout and eventually gives up — the connection <strong>hangs</strong>, then fails after seconds.</li>
+<li><strong><code>REJECT</code></strong> discards but sends back an ICMP error (or a TCP reset). The client is told "no" immediately, so it fails <strong>instantly</strong>.</li>
+</ul>
+<p>The timing therefore diagnoses the block before you read any rule: a hang means a <code>DROP</code> (or a black hole) is silently eating packets; an instant failure means something actively refused. And this exact reading carries into Kubernetes: a <strong>NetworkPolicy</strong> denies by dropping, so blocked traffic <em>hangs</em>; a Service with <strong>no ready endpoints</strong> (or a closed port) refuses with a reset, so it fails <em>instantly</em>. Same two signatures, one level up.</p>
+<div class="flow"><span>DROP → client hears nothing → hangs, then times out</span><em>·</em><span class="hot">REJECT → error returned → fails instantly</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Stand up a web server and confirm both <code>ping</code> and <code>curl</code> to it work — the healthy baseline.
+<pre class="cmd">multipass shell sandbox
+python3 -m http.server 80 &amp;&gt;/dev/null &amp; sleep 1
+ping -c1 127.0.0.1 &gt;/dev/null &amp;&amp; echo 'ping: ok'
+curl -s -o /dev/null -w 'curl: %{http_code}\n' -m3 http://127.0.0.1</pre>
+<pre class="out">ping: ok
+curl: 200            ← both work: network layer and the TCP service are fine</pre></li>
+<li>Add a <code>filter</code> rule that DROPs TCP to port 80. Now ping still works, but curl <em>hangs</em> until its timeout — the classic split, with the tell-tale delay.
+<pre class="cmd">sudo iptables -I INPUT -p tcp --dport 80 -j DROP
+ping -c1 127.0.0.1 &gt;/dev/null &amp;&amp; echo 'ping: still ok'
+time curl -s -o /dev/null -m3 http://127.0.0.1; echo "curl exit=$?"</pre>
+<pre class="out">ping: still ok                          ← ICMP untouched: network layer fine
+curl exit=28                            ← exit 28 = timeout; and 'time' shows it took ~3s: a DROP
+real  0m3.0s                            ← it HUNG for the full timeout — the DROP signature</pre></li>
+<li>Swap DROP for REJECT and watch the same curl now fail <em>instantly</em> — the timing alone tells you the block changed from silent to active. Then remove the rule.
+<pre class="cmd">sudo iptables -D INPUT -p tcp --dport 80 -j DROP
+sudo iptables -I INPUT -p tcp --dport 80 -j REJECT
+time curl -s -o /dev/null -m3 http://127.0.0.1; echo "curl exit=$?"
+sudo iptables -D INPUT -p tcp --dport 80 -j REJECT      # remove; kill the server: kill %1</pre>
+<pre class="out">curl exit=7                             ← exit 7 = connection refused, returned immediately
+real  0m0.0s                            ← instant: the REJECT signature (contrast the 3s DROP)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Why can <code>ping</code> succeed to a host while <code>curl</code> to it fails? (ping is ICMP and curl is TCP to a port; a <code>filter</code> rule dropping that TCP port blocks the service while leaving ICMP untouched — the network layer is fine, one transport-layer service is filtered.) Then: a connection <em>hangs</em> for several seconds and then fails, versus one that fails <em>instantly</em> — which block is each, and what are the Kubernetes analogues? (Hang = <code>DROP</code>/black hole silently eating packets ≈ a NetworkPolicy deny; instant = <code>REJECT</code>/reset actively refusing ≈ a Service with no ready endpoints or a closed port.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Because "ping works" only proves the <em>network</em> layer, never conclude a service is reachable from a successful ping — it's the most common false-positive in network debugging. Test the actual port with <code>curl</code>, <code>nc -vz host port</code>, or <code>ss</code>, not with <code>ping</code>. Conversely, ping <em>failing</em> is weak evidence too, since many hosts drop ICMP by policy while serving TCP fine. Ping tells you about ICMP and the network layer, and nothing more — that's the whole B8 lesson, and this symptom is its sharpest edge.</p>
+<p>The DROP-hangs / REJECT-instant timing is reliable but has one caveat: a hang can also be a routing black hole or an MTU problem (B8.18), not only a DROP — so "it hangs" narrows it to "something is silently eating packets," of which a <code>filter</code> DROP is the most common but not the only cause. Pair the timing read with a quick rule check (<code>iptables -L -n -v</code>, next lesson) to confirm which silent eater you've got.</p>
+<div class="k8s-link">
+<p>This timing read is a daily Kubernetes diagnostic. A pod-to-Service call that <em>hangs</em> and then times out points at a NetworkPolicy dropping the traffic (deny = DROP) or a black-holed route; a call that's refused <em>instantly</em> points at a Service with no ready endpoints, the wrong <code>targetPort</code>, or an app that isn't listening (all of which yield a reset). Before reading a single YAML, the failure's timing has already halved your search space — the exact habit you just built with <code>DROP</code> vs <code>REJECT</code>.</p>
+<p>The default-deny/additive-allow NetworkPolicy model (which drops, hence hangs) is <a href="w4.html#cp-4-23">W4.23</a>; the classic policies proven by observing this behaviour are <a href="w4.html#cp-4-24">W4.24</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> for the <code>filter</code> table and <code>-j DROP</code>; <code>man 8 iptables-extensions</code> for <code>REJECT</code> and its <code>--reject-with</code> options (which ICMP error, or TCP reset). Re-read the layer bisection in <a href="b8.html#cp-b8-1">B8.1</a> and the refused-vs-filtered timing in <a href="b8.html#cp-b8-8">B8.8</a>. In the exam docs, this behaviour underlies every "debug a Service/NetworkPolicy" task.</p>
+</article>
+
+<article class="lesson" id="cp-b9-13" data-id="b9-13">
+<div class="lesson-head"><span class="cp-id">B9.13</span><h4>What's really running: nftables and iptables-nft</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You've been typing <code>iptables</code>, but on Ubuntu 24.04 <code>iptables</code> is not the thing actually enforcing your rules — it's a compatibility front-end over a newer engine, <strong>nftables</strong>. That gap matters the moment something looks missing: rules can be present in one tool's view and invisible in another's, and a half-view will convince you a rule is absent when it's merely written in the other dialect. Knowing which tool is really running, and how to see the whole truth, saves you from chasing rules that were there all along.</p>
+<h5>The concept</h5>
+<p>Linux has two firewall engines. The old one, <em>iptables-legacy</em>, had its own in-kernel machinery. The modern one is <strong>nftables</strong>, a single unified engine. On 24.04 the <code>iptables</code> command is actually <strong><code>iptables-nft</code></strong>: it accepts the familiar iptables syntax but <em>translates</em> it into nftables rules underneath. So when you ran all the <code>iptables</code> commands in this module, nftables did the enforcing. You can confirm it: <code>iptables -V</code> prints <code>(nf_tables)</code>, not <code>(legacy)</code>.</p>
+<p>The practical consequence is that the <em>same</em> ruleset can be viewed two ways — the iptables-shaped view (<code>iptables -t nat -L -n -v</code>) and the native nftables view (<code>nft list ruleset</code>) — and they show the same underlying rules in different dialects. The <code>nft</code> view is the ground truth: it shows <em>everything</em> in the unified engine, including rules added by either front-end. This is why, when a rule seems to have vanished, <code>nft list ruleset</code> is the command that ends the argument — it can't be fooled by a front-end that only shows its own additions.</p>
+<div class="flow"><span>iptables … (familiar syntax)</span><em>→ iptables-nft translates →</em><span class="hot">nftables engine (the real enforcer)</span><em>· see the truth: nft list ruleset</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm which engine is really behind <code>iptables</code>: the version banner says so outright.
+<pre class="cmd">multipass shell sandbox
+sudo iptables -V</pre>
+<pre class="out">iptables v1.8.10 (<b>nf_tables</b>)      ← the "nf_tables" tag: this is iptables-nft, not legacy</pre></li>
+<li>Add a rule with the <code>iptables</code> syntax, then find that <em>same</em> rule in the native nftables view — proof both are windows onto one engine.
+<pre class="cmd">sudo iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o ens3 -j MASQUERADE 2&gt;/dev/null || true
+sudo nft list ruleset | grep -A3 -i 'postrouting' | head -6</pre>
+<pre class="out">chain POSTROUTING {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 10.10.0.0/24 oifname "ens3" <b>masquerade</b>   ← the iptables rule, seen natively in nft
+}</pre></li>
+<li>See the two dialects of the same rule side by side — different words, one rule.
+<pre class="cmd">sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE
+echo '--- vs native nft ---'
+sudo nft list chain ip nat POSTROUTING 2&gt;/dev/null | grep masquerade</pre>
+<pre class="out">MASQUERADE  all  --  ...  10.10.0.0/24  ...   ← iptables dialect
+ip saddr 10.10.0.0/24 oifname "ens3" masquerade   ← nft dialect (same rule)</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>On Ubuntu 24.04, what is the <code>iptables</code> command really, and how do you confirm it? (It's <code>iptables-nft</code> — a compatibility front-end that translates iptables syntax into nftables rules enforced by the nftables engine; <code>iptables -V</code> printing <code>(nf_tables)</code> confirms it.) Then: why is <code>nft list ruleset</code> the command that settles "is this rule really there?" (Because it shows the whole unified engine's ruleset regardless of which front-end added a rule, so it can't be fooled by a partial, front-end-specific view the way a plain <code>iptables -L</code> can.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both <code>iptables-legacy</code> and <code>iptables-nft</code> can exist on a system, selected via <code>update-alternatives</code>. If some tool wrote rules through the <em>legacy</em> path while you're viewing through <em>nft</em> (or vice-versa), each sees only its own — the textbook "the rule is definitely there / no it isn't" standoff. On a mixed host, check both (<code>iptables-legacy -L</code> and <code>nft list ruleset</code>) before concluding anything is missing. Modern distros standardise on nft, but you'll still meet legacy in older images and some appliances.</p>
+<p>Editing kube-proxy-style rulesets by hand is risky precisely because a front-end can't always represent everything the engine holds — a rule written natively in nft may show only partially through the iptables view, so an <code>iptables-save</code>/<code>restore</code> round-trip can silently lose it. For anything you'll modify, read and write in the <em>same</em> dialect, and treat <code>nft list ruleset</code> as the authoritative dump.</p>
+<div class="k8s-link">
+<p>Kubernetes lives in exactly this transition. kube-proxy's default mode still writes <em>iptables-style</em> rules, which — on a modern node — land in nftables underneath, which is why <code>nft list ruleset</code> on a Kubernetes node prints thousands of <code>KUBE-</code> chains even though kube-proxy "uses iptables." (There's also a newer native <em>nftables</em> mode for kube-proxy, GA since Kubernetes 1.33, but iptables remains the default mode, so most clusters you meet are the translated-through-nft case.) When you go hunting for a Service's rules on a node, knowing they may be visible only through the right dialect is what keeps you from concluding they're missing.</p>
+<p>Reading the actual <code>KUBE-</code> chains on a node — through whichever dialect shows them — is <a href="w4.html#cp-4-10">W4.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> (note the <code>nf_tables</code> vs <code>legacy</code> variants), <code>man 8 nft</code> for the native syntax and <code>list ruleset</code>, and <code>man 1 update-alternatives</code> for how the <code>iptables</code> symlink is chosen. <code>man 8 iptables-translate</code> converts an iptables line to its nft form — a good way to learn the mapping. In the exam docs, kube-proxy modes (iptables/ipvs/nftables) are described on the kube-proxy reference page.</p>
+</article>
+
+<article class="lesson" id="cp-b9-14" data-id="b9-14">
+<div class="lesson-head"><span class="cp-id">B9.14</span><h4>Debug by rule order: first match wins, read the counters</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Within a chain, rules are tried in order and the <strong>first match wins</strong> — so a perfectly correct rule can do nothing simply because an earlier rule already decided the packet's fate. This is the most common "but my rule is <em>right</em>!" failure, and it has a definitive cure: every rule carries <strong>packet counters</strong>, so you can stop arguing about which rule <em>should</em> match and <em>measure</em> which one actually does. Turning firewall debugging from theory into measurement is a skill that pays off the same way whether the chain has three rules or three thousand.</p>
+<h5>The concept</h5>
+<p>A chain is an ordered list. For each packet the kernel walks the rules top to bottom and applies the <em>first</em> whose match conditions fit; if that rule's target is terminating (<code>ACCEPT</code>/<code>DROP</code>/<code>REJECT</code>), traversal stops there and later rules never see the packet. So a later rule can be <strong>shadowed</strong> — permanently unreached — by a broader rule above it. Because <code>-A</code> appends to the <em>end</em>, a rule you add can easily land <em>after</em> a terminating rule that already catches its traffic, which is why "I added it and nothing changed" is so often an ordering problem, not a correctness one.</p>
+<p>The tool that ends the guessing is <code>iptables -L -n -v</code> (or <code>-L -v --line-numbers</code>): the <code>-v</code> adds two columns, <strong>packets</strong> and <strong>bytes</strong>, counting how many packets have hit each rule. Now you can <em>see</em> reality: generate traffic and watch which rule's counter climbs. A rule whose counter stays at <strong>zero</strong> while matching traffic is flowing is either shadowed by something above it or sitting in a chain that traffic never enters — a dead rule, proven dead by measurement. (<code>iptables -Z</code> zeroes the counters so you can attribute a fresh burst of traffic cleanly.)</p>
+<div class="flow"><span>walk top→bottom</span><em>· first match wins ·</em><span class="hot">counter stays 0 = shadowed or wrong chain</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a shadowing situation on a custom chain: a broad <code>ACCEPT</code> above a specific <code>DROP</code>, so the DROP can never be reached.
+<pre class="cmd">multipass shell sandbox
+sudo iptables -N ORDER 2&gt;/dev/null; sudo iptables -F ORDER
+sudo iptables -A ORDER -p tcp -j ACCEPT               # broad: accept ALL tcp (rule 1)
+sudo iptables -A ORDER -p tcp --dport 80 -j DROP      # specific: drop tcp/80 (rule 2, shadowed)
+sudo iptables -A INPUT -p tcp --dport 80 -j ORDER     # send tcp/80 into ORDER
+sudo iptables -Z ORDER                                 # zero counters for a clean read</pre>
+<pre class="out"># rule 2 (DROP dport 80) sits BELOW rule 1 (ACCEPT all tcp): it can never match</pre></li>
+<li>Generate traffic to port 80, then read the counters: the broad ACCEPT climbs, the specific DROP stays at zero — proof it's dead, not merely inactive.
+<pre class="cmd">python3 -m http.server 80 &amp;&gt;/dev/null &amp; sleep 1
+for i in 1 2 3; do curl -s -o /dev/null -m2 http://127.0.0.1; done
+sudo iptables -L ORDER -n -v --line-numbers; kill %1 2&gt;/dev/null</pre>
+<pre class="out">num  pkts bytes target  ...
+1    <b>6</b>    360   ACCEPT  tcp  --  ... 0.0.0.0/0                 ← this rule claimed every packet
+2    <b>0</b>    0     DROP    tcp  --  ... tcp dpt:80                ← counter zero: shadowed, dead rule</pre></li>
+<li>Fix it by order — insert the specific DROP <em>above</em> the broad ACCEPT — and watch the counters flip, confirming the DROP now claims the traffic.
+<pre class="cmd">sudo iptables -I ORDER 1 -p tcp --dport 80 -j DROP    # insert at the TOP now
+sudo iptables -Z ORDER
+python3 -m http.server 80 &amp;&gt;/dev/null &amp; sleep 1
+curl -s -o /dev/null -m2 http://127.0.0.1; echo "exit=$?"
+sudo iptables -L ORDER -n -v --line-numbers | head -3; kill %1 2&gt;/dev/null
+sudo iptables -D INPUT -p tcp --dport 80 -j ORDER; sudo iptables -F ORDER; sudo iptables -X ORDER</pre>
+<pre class="out">exit=28                                              ← now the DROP takes effect (curl times out)
+1    1  60  DROP  tcp  --  ... tcp dpt:80             ← the DROP's counter now moves: it's live</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Within a chain, which rule decides a packet's fate, and what does that imply about a rule added with <code>-A</code>? (The first rule whose match fits, walking top to bottom — so a rule appended after an existing terminating rule that already catches the traffic is shadowed and never reached; order, not just correctness, decides.) Then: how do you prove a specific rule is dead rather than merely guessing? (List with counters — <code>iptables -L -n -v</code> — generate matching traffic, and if the rule's packet counter stays at zero while traffic flows, it's shadowed or in a chain the traffic never enters: dead, by measurement.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Not every target is terminating: <code>LOG</code> and a bare <code>counter</code> (and returning from a jumped-to user chain without a verdict) let traversal <em>continue</em> to the next rule, so a packet can hit several non-terminating rules before a terminating one decides it. When reading counters, remember that a climbing counter on a <code>LOG</code> rule doesn't mean the packet stopped there — it logged and moved on. Only ACCEPT/DROP/REJECT (and a jump whose chain decides) end the walk.</p>
+<p>Counters are cumulative since the last zero (<code>-Z</code>) or since boot, so a non-zero counter might be old traffic. For a clean experiment, <code>-Z</code> the chain, generate a known burst, and read — attributing exactly that burst to the rule that caught it. This zero-then-measure discipline is what makes counter-reading trustworthy instead of "well, it's non-zero, so probably."</p>
+<div class="k8s-link">
+<p>Reading a kube-proxy chain is this skill at scale: the <code>KUBE-SERVICES</code> chain is walked top-down, and the rule that claims your packet is the first whose match (a Service's ClusterIP and port) fits — anything below it for that packet is irrelevant. When a Service isn't behaving, listing the relevant chain <em>with counters</em> shows whether packets are even reaching its rule or being claimed by something earlier, turning "why doesn't this Service work" into a measured walk down the chain. The first-match-wins instinct and the read-the-counters habit are exactly what that investigation needs.</p>
+<p>Walking the kube-proxy chains top-down (and reading which rule claims a packet) is <a href="w4.html#cp-4-10">W4.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> for <code>-L -v</code> (counters), <code>-Z</code> (zero), <code>--line-numbers</code>, and <code>-I</code>/<code>-A</code>/<code>-R</code> (insert/append/replace to control order). The nftables equivalent is a <code>counter</code> statement in a rule plus <code>nft list ruleset</code>. Re-read the target vocabulary in <a href="#cp-b9-11">B9.11</a>. In the exam docs, counter-reading is the practical core of the kube-proxy troubleshooting guidance.</p>
+</article>
+
+</div><!-- /g-netfilter -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
