@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B11: service management with systemd — what an init system is for and why PID 1 is special; the unit types you actually meet (service, socket, timer, target, mount); writing a unit file from scratch and where unit files live in precedence order; the [Service] keys that decide behaviour (ExecStart, Restart, RestartSec, User, Type=); After vs Requires vs Wants and the boot races that come from merging them; the systemctl verbs that matter and start-vs-enable; drop-ins instead of editing vendor units, including the ExecStart= reset trap; EnvironmentFile and why editing it needs a restart; reading a failure from systemctl status — exit code vs signal; journalctl fluency (-u, -f, --since, -p, -b); journal persistence; boot targets, systemd-analyze blame and the slice/scope cgroup tree; a mini project promoting B2's supervisor into a real unit with a .timer; and a debugging drill covering a unit that won't start and a Restart=always loop hiding a config error.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B11 · Service management: systemd, logs, boot — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B11 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+    <li><a href="b9.html">B9 · Networking II</a></li>
+    <li><a href="b10.html">B10 · DNS &amp; names</a></li>
+    <li><a href="b11.html">B11 · systemd &amp; logs</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b11">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B11 — Service management: systemd, logs, boot</h1>
+  <p>Something has to be in charge. When a machine boots, the kernel starts exactly one process and hands it the entire job of turning a bare kernel into a working system: start the things that should run, in an order that works, restart them when they die, collect what they printed, and keep doing all of that until someone turns the power off. On a modern Linux box that process is <strong>systemd</strong>, and the units it manages are the vocabulary in which every service on every server you will ever touch is described. This is the building superintendent: they get the boiler running and the lights on before any tenant office can open its doors.</p>
+  <p>The reason this module sits here, after processes and cgroups, is that a systemd unit turns out to be made entirely of things you already understand. A unit's status is a process, an exit code and a signal (<a href="b2.html#cp-b2-8">B2.8</a>) formatted into a paragraph. Its restart policy is the supervisor loop you wrote by hand in <a href="b2.html#cp-b2-17">B2.17</a>. Its resource limits are the cgroup files from <a href="b7.html#cp-b7-1">B7</a>, written by systemd on your behalf. Its logs are the stdout and stderr of a program that never learned what a log file is. Nothing here is new machinery; it is a management layer over machinery you have already built, and once you see that, the entire <code>systemctl</code>/<code>journalctl</code> surface stops being a set of incantations.</p>
+  <p>We go in three movements. <strong>Units</strong>: what init is for, the unit types you actually meet, writing one from scratch, the keys that decide behaviour, and the ordering-versus-requirement distinction behind most "works on reboot, fails at boot" bugs. <strong>Operating</strong>: the verbs that matter, overriding without editing, keeping configuration out of the unit, and reading a failure from <code>systemctl status</code> alone. <strong>Logs and boot</strong>: <code>journalctl</code> fluency, making sure your logs survive the crash you need them for, and the boot-target and cgroup-slice picture that turns out to be the whole layout of a Kubernetes node on one screen. By the end, <code>systemctl status kubelet</code> and <code>journalctl -u kubelet</code> — the two commands you will run on every broken node for the rest of your career — read as ordinary prose.</p>
+  <div class="weights">
+    <span>Checkpoints<b>14</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>B2, B7</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Say what an init system is for, why PID 1 is special, and why the orphan-reaping duty from B2 is the same duty a container's PID 1 usually fails at.</li>
+<li>Recognise the unit types you will actually meet — <code>.service</code>, <code>.socket</code>, <code>.timer</code>, <code>.target</code>, <code>.mount</code> — and say what each one is for.</li>
+<li>Write a working unit file from scratch with its three sections, and know which directory wins when the same unit name exists in two of them.</li>
+<li>Choose <code>Restart=</code>, <code>RestartSec=</code> and <code>Type=</code> deliberately, and explain which <code>Type=</code> mistake makes systemd supervise a process that has already exited.</li>
+<li>Distinguish ordering (<code>After=</code>) from requirement (<code>Requires=</code>/<code>Wants=</code>) and explain the boot race that comes from treating them as one setting.</li>
+<li>Use the <code>systemctl</code> verbs fluently, and never again confuse <code>start</code> with <code>enable</code> or <code>restart</code> with <code>reload</code>.</li>
+<li>Override a vendor unit with a drop-in instead of editing it, including the empty-assignment trick needed to replace <code>ExecStart</code>.</li>
+<li>Keep configuration out of the unit with <code>EnvironmentFile=</code>, and explain why editing that file changes nothing until the service restarts.</li>
+<li>Read a failure from <code>systemctl status</code> alone and tell an exit code from a signal — the fork in the road between "read the app's logs" and "look outside the app".</li>
+<li>Use <code>journalctl</code> with intent: one unit, follow, since, priority, this boot versus the previous one.</li>
+<li>Check whether the journal survives a reboot and make it persistent deliberately, before the crash you need it for.</li>
+<li>Read the boot picture — the default target, what took the longest, and the slice/scope cgroup tree that places every process on the machine.</li>
+<li>Promote a hand-written supervisor into a real unit with a restart policy, an environment file, journald logging and boot enablement, then schedule a job with a <code>.timer</code>.</li>
+<li>Diagnose a unit that will not start and a <code>Restart=always</code> loop that hides a config error behind an endless restart.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B2</strong> is the real prerequisite: a unit's status line is nothing but a process, an exit code and a signal (<a href="b2.html#cp-b2-8">B2.8</a>) with a nicer font, and the restart policy you will configure here is the supervisor loop you already wrote by hand (<a href="b2.html#cp-b2-17">B2.17</a>) — this module's project promotes that very script. <strong>B7</strong> matters because systemd is what puts every service into a cgroup: the slices and scopes you met in <a href="b7.html#cp-b7-12">B7.12</a> are systemd's doing, and the resource keys you can set on a unit are the <code>cgroup</code> files from that module with friendlier names. Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster. Nothing here needs installing — <code>systemctl</code>, <code>journalctl</code>, <code>systemd-analyze</code> and <code>systemd-cgls</code> all ship with the system. You will be writing files under <code>/etc/systemd/system/</code> and restarting services, so most commands need <code>sudo</code>; the labs create units named <code>hello</code>, <code>supervisor</code> and <code>sysreport</code>, and the last lesson tells you how to remove them all. Take a snapshot first (<a href="b0.html#cp-b0-9">B0.9</a>) if you would rather roll back than clean up.</p>
+</div>
+
+<!-- ---------------- Units ---------------- -->
+<div class="grp" id="g-units"><h3>Units</h3>
+
+<article class="lesson" id="cp-b11-1" data-id="b11-1">
+<div class="lesson-head"><span class="cp-id">B11.1</span><h4>What an init system is for, and why PID 1 is special</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A booted Linux machine is not a natural state; it is a state something worked to produce. The kernel finishes initialising hardware and then starts exactly one program, and from that moment everything else on the machine — every daemon, every login, every network interface being configured — exists because that one program, or something it started, made it exist. Knowing what that program is responsible for is what lets you answer questions like "why did this start before that?", "who restarted my service?" and, eventually, "why is the kubelet the only Kubernetes component that systemd knows about?"</p>
+<h5>The concept</h5>
+<p>The kernel starts one userspace process, gives it <strong>PID 1</strong>, and gets out of the way. That process is the <strong>init</strong> system, and it has three duties that nothing else can do:</p>
+<ul>
+<li><strong>Bring the machine up.</strong> Start the services that should run, in an order that works, and keep going until the system has reached a defined working state. "Working state" is a real, named thing here, not a feeling — <a href="#cp-b11-12">B11.12</a> shows you the target that defines it.</li>
+<li><strong>Keep it up.</strong> Supervise: notice when something dies, decide whether that was expected, and restart it if not. This is the loop from <a href="b2.html#cp-b2-17">B2.17</a>, running for every service on the machine at once.</li>
+<li><strong>Adopt the orphans.</strong> When a process's parent dies before it does, the kernel reparents the child to PID 1 (<a href="b2.html#cp-b2-9">B2.9</a>). PID 1 therefore inherits strangers continuously, and must <code>wait()</code> on them so they don't accumulate as zombies. This is not optional politeness; it is a structural duty that comes with the PID.</li>
+</ul>
+<p>PID 1 is also special to the kernel in a way worth knowing: <strong>signals with a default action are not delivered to it unless it has installed a handler</strong>. Send <code>SIGTERM</code> to a normal process with no handler and it dies; send it to PID 1 with no handler and nothing happens at all. The kernel is protecting itself — a machine whose PID 1 dies panics — but the consequence bites elsewhere, as you will see in a moment.</p>
+<p><strong>systemd</strong> is the init system on Ubuntu and on essentially every distribution a Kubernetes node runs. It took on a great deal beyond the three duties above, which is both why it is powerful and why it is argued about: it is simultaneously the supervisor, the logger (<a href="#cp-b11-10">B11.10</a>), the cgroup manager (<a href="#cp-b11-12">B11.12</a>), a socket activator, a timer daemon and a mount manager. For our purposes that consolidation is good news, because it means one vocabulary — the <strong>unit</strong> — describes all of it.</p>
+<p>Now the part that pays off later. A container also has a PID 1: the process you told it to run, which lands as PID 1 inside its own PID namespace (<a href="b6.html#cp-b6-5">B6.5</a>). That process inherits both duties above and usually implements neither. It does not reap orphans, so a container that spawns subprocesses can slowly fill with zombies; and it typically has no <code>SIGTERM</code> handler, so the kernel refuses to deliver the polite stop signal at all and the process only dies when the grace period expires and <code>SIGKILL</code> arrives. That is the entire explanation for why some containers take exactly ten seconds to stop, and why small init programs like <code>tini</code> exist.</p>
+<div class="flow"><span>kernel boots</span><em>→</em><span class="hot">PID 1 = systemd</span><em>→</em><span>start units</span><em>·</em><span>supervise</span><em>·</em><span>reap orphans</span></div>
+<p>One process is started by the kernel; everything else on the machine descends from it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find out what is in charge of your machine, and confirm it really is process number one.
+<pre class="cmd">multipass shell sandbox
+ps -p 1 -o pid,comm,args --no-headers</pre>
+<pre class="out">      1 <b>systemd</b> /sbin/init                ← PID 1 is systemd (/sbin/init is a symlink to it)</pre></li>
+<li>See that everything descends from it. The process tree has exactly one root, and it is the process you just identified.
+<pre class="cmd">ps -eo pid,ppid,comm --no-headers | awk '$2==0 {print "kernel-parented:", $0}'
+pstree -p 1 | head -6</pre>
+<pre class="out">kernel-parented:  1  0 systemd        ← the only process whose parent is the kernel
+systemd(1)─┬─cron(812)
+           ├─dbus-daemon(789)
+           ├─sshd(1024)───sshd(1301)───bash(1310)      ← your own shell, several generations down
+           └─systemd-journal(312)</pre></li>
+<li>Watch the adoption duty happen. Start a process whose parent exits immediately, then look at who its parent has become — you will find PID 1 has quietly taken responsibility for a process it never started.
+<pre class="cmd">bash -c 'nohup sleep 300 &amp;' ; sleep 1
+ps -eo pid,ppid,comm | grep '[s]leep 300\|[0-9] sleep'</pre>
+<pre class="out">   2451      <b>1</b> sleep          ← PPID 1: the original parent exited, systemd adopted it</pre></li>
+<li>Prove the PID-1 signal rule, safely, using a container-shaped experiment rather than the real PID 1. Run a shell as PID 1 inside its own PID namespace (<a href="b6.html#cp-b6-5">B6.5</a>) and try to <code>SIGTERM</code> it from outside.
+<pre class="cmd">sudo unshare --pid --fork --mount-proc sleep 60 &amp;
+sleep 1; pid=$(pgrep -f 'sleep 60' | head -1)
+sudo kill -TERM "$pid"; sleep 1
+ps -p "$pid" -o pid,comm --no-headers &amp;&amp; echo "still alive"</pre>
+<pre class="out">   2698 sleep
+<b>still alive</b>        ← SIGTERM had no effect: no handler installed, and it is PID 1 in its namespace
+    # sudo kill -KILL "$pid"   ← only SIGKILL, which cannot be ignored, ends it</pre></li>
+<li>Clean up the leftovers from the experiments above.
+<pre class="cmd">sudo pkill -KILL -f 'sleep 60'; pkill -f 'sleep 300'; echo cleaned</pre>
+<pre class="out">cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Answer three things without looking. What starts PID 1, and what happens to the machine if PID 1 exits? (The kernel starts it; if it exits the kernel panics, which is why the kernel protects it from unhandled default-action signals.) Why must PID 1 reap orphans? (Because the kernel reparents every orphan to it, so it accumulates children it never started and must <code>wait()</code> on them or leak zombies.) And why does a container process that ignores <code>SIGTERM</code> take the full grace period to stop? (It is PID 1 in its own PID namespace with no handler installed, so the kernel does not deliver the signal at all; only the later <code>SIGKILL</code> ends it.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The PID-1 signal rule catches people precisely because it is invisible when it works and baffling when it does not. A program that handles <code>SIGTERM</code> perfectly well as an ordinary process becomes unstoppable-by-TERM the moment it is PID 1 without a handler, because the kernel silently declines to deliver the signal rather than reporting an error. If a process is ignoring a signal you are certain you sent, check whether it is PID 1 in some namespace before you doubt your <code>kill</code> command.</p>
+<p>The second trap is treating "init system" as a synonym for systemd. It is one implementation of the role; others exist (<code>sysvinit</code>, <code>OpenRC</code>, <code>runit</code>, and inside containers, <code>tini</code> or <code>dumb-init</code>). What is universal is the <em>role</em> — PID 1, adoption, supervision — and that is what transfers when you meet a system that does not run systemd. Learn the role first and the specific tool second.</p>
+<div class="k8s-link">
+<p>On a Kubernetes node, systemd runs exactly <strong>one</strong> Kubernetes component: the kubelet. Everything else — the API server, the scheduler, the controller manager, etcd on a control-plane node — runs as a <em>static pod</em>, started by the kubelet from YAML files on disk rather than by systemd. That arrangement exists because of a chicken-and-egg problem: the API server cannot be scheduled by the machinery that only exists once the API server is running. So the boot order on a control-plane node is systemd → kubelet → everything else, which is why "restart the API server" means moving a file, not running <code>systemctl restart</code>. This single fact reshapes how you troubleshoot a node, and it is the reason this module exists.</p>
+<p>How each component actually runs on the node, static pods and mirror pods included, is <a href="w1.html#cp-1-2">W1.2</a>; the kubelet's own supervision loop and its three pod sources is <a href="w1.html#cp-1-19">W1.19</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 systemd</code> is the top-level page and describes the init role and PID 1's special treatment; <code>man 1 init</code> redirects there on this system. <code>man 7 signal</code> for the rule that default-action signals are not delivered to PID 1 without a handler. <code>man 5 systemd.unit</code> is the page you will return to for the rest of this module. For the container side, <code>man 7 pid_namespaces</code> explains why every container has a PID 1 of its own.</p>
+</article>
+
+<article class="lesson" id="cp-b11-2" data-id="b11-2">
+<div class="lesson-head"><span class="cp-id">B11.2</span><h4>The unit types you will actually meet</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>systemd manages eleven kinds of thing, which sounds like a lot until you notice that five of them cover almost everything you will ever touch. Knowing which is which saves you from the two most common confusions: looking for a service that is actually a timer, and wondering why <code>multi-user.target</code> has no process attached to it. It also explains why a filesystem, a scheduled job and a daemon are managed with the same three commands.</p>
+<h5>The concept</h5>
+<p>A <strong>unit</strong> is systemd's word for "a thing I manage." The file's extension declares its type, and the type determines what the file may contain. The five that matter:</p>
+<ul>
+<li><strong><code>.service</code></strong> — a process to run and supervise. This is the overwhelming majority of what you will write and read: a daemon, a one-shot script, a database, the kubelet.</li>
+<li><strong><code>.socket</code></strong> — a listening socket that systemd holds open on a service's behalf, starting the service on the first connection. This is <em>socket activation</em>: the port is bound at boot, but the program only starts when someone actually connects, and connections that arrive during start-up wait rather than being refused.</li>
+<li><strong><code>.timer</code></strong> — a schedule that starts another unit. This is systemd's replacement for cron, and its advantages are concrete: the job's output goes to the journal automatically, a missed run can be caught up after downtime, and the job is a unit like any other, so it gets status, logs and resource limits for free.</li>
+<li><strong><code>.target</code></strong> — a named group of units, with no process of its own. A target is a synchronisation point and a goal: <code>multi-user.target</code> means "the set of units that constitutes a working multi-user system." Targets replaced the old numbered runlevels with something you can actually read.</li>
+<li><strong><code>.mount</code></strong> — a filesystem mount, managed as a unit. Every line in <code>/etc/fstab</code> (<a href="b5.html#cp-b5-4">B5.4</a>) is silently turned into one of these at boot, which is why a failed mount shows up in <code>systemctl</code> at all.</li>
+</ul>
+<p>The remaining types exist and are worth recognising rather than learning: <code>.path</code> (act when a file appears or changes), <code>.slice</code> (a cgroup branch for resource management — <a href="#cp-b11-12">B11.12</a>), <code>.scope</code> (a cgroup for processes systemd did not start, like a login session), <code>.device</code>, <code>.swap</code> and <code>.automount</code>.</p>
+<p>Two naming conventions will otherwise confuse you. A <strong>templated unit</strong> has an <code>@</code> in its name: <code>getty@tty1.service</code> is an instance of the template <code>getty@.service</code>, with <code>tty1</code> passed in as the instance name — one file, many instances. And a <code>.timer</code> by default starts the <code>.service</code> with the same base name, which is why timers and services come in pairs: <code>sysreport.timer</code> starts <code>sysreport.service</code> unless told otherwise.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the services running right now. This is the type you will spend nearly all your time with.
+<pre class="cmd">systemctl list-units --type=service --state=running --no-pager | head -8</pre>
+<pre class="out">UNIT                     LOAD   ACTIVE SUB     DESCRIPTION
+cron.service             loaded active running Regular background program processing daemon
+dbus.service             loaded active running D-Bus System Message Bus
+<b>ssh.service</b>              loaded active running OpenBSD Secure Shell server
+systemd-journald.service loaded active running Journal Service
+systemd-resolved.service loaded active running Network Name Resolution        ← B10's resolver</pre></li>
+<li>Now look at the other types on the same machine. Sockets, timers and targets are all already in use here whether or not anyone told you.
+<pre class="cmd">systemctl list-units --type=socket --no-pager | head -4
+systemctl list-timers --no-pager | head -4
+systemctl list-units --type=target --state=active --no-pager | head -5</pre>
+<pre class="out">systemd-journald.socket   loaded active running Journal Socket
+<b>NEXT</b>                        LEFT       LAST                        UNIT
+Sat 2026-07-25 06:14:00 UTC 7h left    Fri 2026-07-24 06:12:33 UTC <b>apt-daily.timer</b>
+<b>multi-user.target</b>         loaded active active System and Service Manager   ← the boot goal
+network-online.target      loaded active active Network is Online</pre></li>
+<li>See a <code>.mount</code> unit and confirm it corresponds to a real filesystem. Every mount on the machine has one, generated automatically.
+<pre class="cmd">systemctl list-units --type=mount --no-pager | head -4
+findmnt -no TARGET,SOURCE / | head -1</pre>
+<pre class="out">-.mount        loaded active mounted Root Mount            ← "-" is systemd's name for /
+boot-efi.mount loaded active mounted /boot/efi
+/  /dev/sda1                                                ← the same filesystem, seen by findmnt</pre></li>
+<li>Meet a templated unit. One file on disk serves every instance, with the text after the <code>@</code> passed in as a parameter.
+<pre class="cmd">systemctl list-units 'getty@*' --no-pager | head -3
+ls /usr/lib/systemd/system/getty@.service</pre>
+<pre class="out">getty@tty1.service  loaded active running Getty on tty1      ← the instance
+/usr/lib/systemd/system/<b>getty@.service</b>                     ← one template file behind it</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the five types and what each manages, then answer two questions from them. Why does <code>multi-user.target</code> have no process? (A target is a named group of units and a synchronisation point, not something to run.) And if you find a <code>backup.timer</code> on a machine, what other unit almost certainly exists and why? (<code>backup.service</code> — a timer starts the service with the same base name by default, so timers come in pairs.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The commonest confusion is looking in the wrong place for a scheduled job. If someone says "the nightly backup runs at 2am," <code>systemctl status backup.service</code> will usually show it as <em>inactive</em> — which is correct and not a fault, because the service only runs when the timer starts it. Check <code>systemctl list-timers</code> for when it last ran and when it will run next; the service being idle between runs is the design.</p>
+<p>The second is assuming a socket unit's service must be running for the port to be open. With socket activation the socket unit holds the port while the service is stopped, so <code>ss -ltnp</code> shows something listening and <code>systemctl status</code> shows the service inactive, and both are telling the truth. This is exactly how <code>systemd-journald</code> and, on many systems, <code>sshd</code> are arranged.</p>
+<div class="k8s-link">
+<p>On a Kubernetes node you will meet only two of these types in anger, but you will meet them constantly: <code>kubelet.service</code> and <code>containerd.service</code>, both ordinary <code>.service</code> units. Everything else Kubernetes-shaped on that node is <em>not</em> a systemd unit at all — pods are managed by the kubelet, and the containers inside them are managed by containerd, neither of which registers anything with systemd. The one place the other types show up is the cgroup tree: <code>kubepods.slice</code> is a <code>.slice</code> unit, which is how a node's pod resources are carved out of the machine's (<a href="#cp-b11-12">B11.12</a> and <a href="b7.html#cp-b7-12">B7.12</a>).</p>
+<p>What actually runs as a systemd unit on a node versus as a static pod is <a href="w1.html#cp-1-2">W1.2</a>; the kubelet's relationship with containerd over CRI is <a href="w1.html#cp-1-20">W1.20</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.unit</code> lists every unit type and the sections common to all of them. Then one page per type as you need it: <code>man 5 systemd.service</code>, <code>man 5 systemd.socket</code>, <code>man 5 systemd.timer</code>, <code>man 5 systemd.target</code>, <code>man 5 systemd.mount</code>, <code>man 5 systemd.slice</code>. <code>man 1 systemctl</code> for <code>list-units</code>, <code>list-timers</code> and the <code>--type</code>/<code>--state</code> filters used above.</p>
+</article>
+
+<article class="lesson" id="cp-b11-3" data-id="b11-3">
+<div class="lesson-head"><span class="cp-id">B11.3</span><h4>Write a unit file from scratch — three sections, nothing more</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A unit file looks intimidating in the wild because real ones are long. Written from scratch it is about six lines, and writing those six lines yourself is what converts <code>systemctl</code> from a set of memorised commands into something you understand. It is also a genuinely useful skill: turning "this script needs to keep running" into a supervised, logged, boot-surviving service is a ten-minute job once you have done it once.</p>
+<h5>The concept</h5>
+<p>A <code>.service</code> file has three sections, and each answers one question:</p>
+<ul>
+<li><strong><code>[Unit]</code></strong> — <em>what is this and how does it relate to other units?</em> A <code>Description=</code> (which is what <code>systemctl status</code> prints), plus the ordering and dependency keys covered in <a href="#cp-b11-5">B11.5</a>.</li>
+<li><strong><code>[Service]</code></strong> — <em>what do I run and how do I supervise it?</em> <code>ExecStart=</code> and the behaviour keys covered in <a href="#cp-b11-4">B11.4</a>. This section only exists for <code>.service</code> units.</li>
+<li><strong><code>[Install]</code></strong> — <em>what should happen when someone enables this?</em> Almost always a single <code>WantedBy=multi-user.target</code>, meaning "when the machine boots to a working multi-user state, want me too." If you omit this section the unit can still be started by hand but cannot be enabled, which is a confusing failure the first time it happens.</li>
+</ul>
+<p>Where you put the file decides who wins. systemd reads unit files from several directories in a fixed precedence order, and a file in a higher-priority directory <em>completely replaces</em> the same-named file in a lower one:</p>
+<ul>
+<li><code>/etc/systemd/system/</code> — <strong>yours</strong>, the administrator's. Highest priority. This is where you write new units and where package upgrades never touch.</li>
+<li><code>/run/systemd/system/</code> — runtime, generated, lives in memory, vanishes at reboot.</li>
+<li><code>/usr/lib/systemd/system/</code> — <strong>the vendor's</strong>, installed by packages. Lowest priority. On Ubuntu 24.04 <code>/lib</code> is a symlink to <code>/usr</code>, so <code>/lib/systemd/system/</code> is the same directory under an older name.</li>
+</ul>
+<p>That ordering is the whole reason for the classic mistake: editing a unit in <code>/usr/lib/systemd/system/</code> works perfectly until the next <code>apt upgrade</code> replaces the file and silently reverts your change. Write to <code>/etc/systemd/system/</code>, or better, use a drop-in (<a href="#cp-b11-7">B11.7</a>) so you override one key instead of owning the whole file.</p>
+<p>One rule catches everyone once: after creating or editing a unit file, systemd does not notice by itself. You must run <code>systemctl daemon-reload</code> to make it re-read the files from disk. Forget it and you will restart a service repeatedly, watch nothing change, and doubt your own file.</p>
+<div class="flow"><span>write /etc/systemd/system/hello.service</span><em>→</em><span class="hot">systemctl daemon-reload</span><em>→</em><span>systemctl start hello</span><em>→</em><span>systemctl status hello</span></div>
+<p>The four-step cycle you will repeat for every unit you ever write; skipping step two is the classic first mistake.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write something for the unit to run. A script that prints and sleeps is enough to be supervised, and printing to stdout means you get logging for free (<a href="#cp-b11-10">B11.10</a>).
+<pre class="cmd">multipass shell sandbox
+cat &gt; /home/ubuntu/hello.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+while true; do
+  echo "hello from pid $$ at $(date -Is)"
+  sleep 5
+done
+EOF
+chmod +x /home/ubuntu/hello.sh</pre>
+<pre class="out">                       # no output; the script is ready</pre></li>
+<li>Write the unit itself — three sections, six meaningful lines. Note that <code>ExecStart</code> takes an <strong>absolute path</strong>: systemd does not run a shell for you, so there is no <code>PATH</code> lookup and no <code>~</code> expansion.
+<pre class="cmd">sudo tee /etc/systemd/system/hello.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=A hello service, written by hand
+
+[Service]
+ExecStart=/home/ubuntu/hello.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload</pre>
+<pre class="out">                       # daemon-reload is silent when it succeeds</pre></li>
+<li>Start it and read its status. This output is the one you will read thousands of times — take a moment over each line.
+<pre class="cmd">sudo systemctl start hello
+systemctl status hello --no-pager</pre>
+<pre class="out">● hello.service - A hello service, written by hand        ← your Description=
+     Loaded: loaded (/etc/systemd/system/hello.service; <b>disabled</b>; preset: enabled)
+     <b>Active: active (running)</b> since Sat 2026-07-25 09:14:02 UTC; 3s ago
+   Main PID: 4412 (hello.sh)
+      Tasks: 2 (limit: 4613)
+     CGroup: /system.slice/hello.service           ← B7's cgroup, created for you
+             ├─4412 /bin/bash /home/ubuntu/hello.sh
+             └─4429 sleep 5
+Jul 25 09:14:02 sandbox hello.sh[4412]: hello from pid 4412 at 2026-07-25T09:14:02+00:00</pre></li>
+<li>Notice what the status said: <code>disabled</code>. The service is running now but would not come back after a reboot. Enable it and watch what enabling actually <em>does</em> — it is one symlink, driven by your <code>[Install]</code> section.
+<pre class="cmd">sudo systemctl enable hello
+ls -l /etc/systemd/system/multi-user.target.wants/hello.service</pre>
+<pre class="out">Created symlink /etc/systemd/system/multi-user.target.wants/hello.service → /etc/systemd/system/hello.service.
+lrwxrwxrwx 1 root root 36 ... <b>hello.service -> /etc/systemd/system/hello.service</b>
+    ← "enabled" is literally this symlink: multi-user.target now wants your unit</pre></li>
+<li>Prove the precedence rule rather than believing it. Ask systemd which file it actually loaded, and confirm the vendor directory is a different place.
+<pre class="cmd">systemctl show hello -p FragmentPath
+ls /usr/lib/systemd/system/ | head -3</pre>
+<pre class="out">FragmentPath=<b>/etc/systemd/system/hello.service</b>     ← yours, the highest-priority location
+apt-daily.service                                     ← the vendor directory, full of package units
+console-getty.service
+cron.service</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>systemctl status hello</code> should show <code>active (running)</code>, and after the <code>enable</code> the <code>Loaded:</code> line should say <code>enabled</code> rather than <code>disabled</code>. You should be able to state what each of the three sections is for in one phrase each, what <code>enable</code> physically created (a symlink in <code>multi-user.target.wants/</code>), and what happens if you edit a unit file without running <code>daemon-reload</code> (nothing — systemd keeps using the version it read last). Leave <code>hello.service</code> running; the next few lessons modify it.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Forgetting <code>daemon-reload</code> is the mistake everyone makes, and its symptom is uniquely misleading: the restart succeeds, systemd reports no error, and the old behaviour continues. If a change to a unit file appears to have no effect, run <code>daemon-reload</code> before investigating anything else. (systemd will usually warn you with "Warning: The unit file … changed on disk" on the next <code>systemctl</code> command, but only after you have already been confused once.)</p>
+<p>The second is expecting a shell. <code>ExecStart=</code> is not a shell command line: there is no <code>PATH</code> search (use an absolute path), no <code>~</code> expansion, no pipes, no redirection, no globbing and no <code>&amp;&amp;</code>. If you genuinely need shell features, be explicit about it — <code>ExecStart=/bin/sh -c 'foo | bar &gt; /tmp/out'</code> — rather than writing something that looks like shell and silently is not. A unit whose <code>ExecStart</code> contains a pipe character will start a program with a literal <code>|</code> as an argument.</p>
+<p>Third, do not edit files in <code>/usr/lib/systemd/system/</code>. It works, which is what makes it dangerous — the next package upgrade overwrites your change with no warning and the service quietly reverts to vendor behaviour, often weeks later when nobody connects the two events. Put your own units in <code>/etc/systemd/system/</code> and override vendor units with drop-ins (<a href="#cp-b11-7">B11.7</a>).</p>
+<div class="k8s-link">
+<p><code>kubelet.service</code> is a unit file exactly like the one you just wrote — a <code>[Unit]</code> with a description and ordering, a <code>[Service]</code> with an <code>ExecStart</code> pointing at <code>/usr/bin/kubelet</code>, and an <code>[Install]</code> with <code>WantedBy=multi-user.target</code>. When you eventually run <code>systemctl cat kubelet</code> on a node, you will be reading the same three sections, with the interesting part being how kubeadm adds its flags — through a drop-in rather than by editing the file, for exactly the precedence reason above.</p>
+<p>Reading how the node's components are actually launched, kubelet unit included, is <a href="w1.html#cp-1-2">W1.2</a>; the kubelet's own directory of state and configuration is <a href="w1.html#cp-1-23">W1.23</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.unit</code> covers the <code>[Unit]</code> and <code>[Install]</code> sections and — importantly — the "Unit File Load Path" section that lists the precedence order above. <code>man 5 systemd.service</code> covers <code>[Service]</code>. <code>man 5 systemd.syntax</code> explains the file format itself (sections, comments, line continuation). <code>man 1 systemctl</code> for <code>daemon-reload</code>, <code>enable</code>, <code>show -p</code> and <code>cat</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b11-4" data-id="b11-4">
+<div class="lesson-head"><span class="cp-id">B11.4</span><h4>The [Service] keys that decide behaviour — Restart, RestartSec and Type</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Your unit currently runs a program. These keys turn it into a <em>supervised</em> program: one that comes back when it dies, waits sensibly before retrying, runs as the right user, and — the one that produces genuinely baffling failures — is correctly understood by systemd to be "up." <code>Type=</code> in particular is the key that, set wrong, makes systemd supervise a process that has already exited and restart the wrong thing forever.</p>
+<h5>The concept</h5>
+<p>The keys worth knowing, in rough order of how often they matter:</p>
+<ul>
+<li><strong><code>ExecStart=</code></strong> — the command, absolute path, no shell (<a href="#cp-b11-3">B11.3</a>). Siblings: <code>ExecStartPre=</code> and <code>ExecStartPost=</code> run before and after, and <code>ExecStop=</code>/<code>ExecReload=</code> define what <code>stop</code> and <code>reload</code> mean if the defaults won't do.</li>
+<li><strong><code>Restart=</code></strong> — when to bring it back. <code>no</code> (the default — nothing is restarted unless you ask for it), <code>on-failure</code> (a non-zero exit, a signal, a timeout — the sane choice for most services), <code>always</code> (even a clean exit 0), plus the narrower <code>on-abnormal</code>, <code>on-abort</code> and <code>on-watchdog</code>. This is the decision your B2.17 supervisor made in its own code; here it is one word.</li>
+<li><strong><code>RestartSec=</code></strong> — how long to wait before restarting. The default is 100ms, which is fast enough that a program crashing on start-up will spin. Set it to something human (<code>2s</code>, <code>5s</code>) whenever a restart involves reconnecting to anything.</li>
+<li><strong><code>User=</code> / <code>Group=</code></strong> — run as somebody other than root. Free, and the single cheapest security improvement available to a unit; this is exactly what system users exist for (<a href="b4.html#cp-b4-3">B4.3</a>).</li>
+<li><strong><code>WorkingDirectory=</code></strong> — the directory the process starts in. Without it you inherit <code>/</code>, which is why relative paths inside a script behave differently under systemd than in your shell.</li>
+<li><strong><code>Type=</code></strong> — how systemd decides the service is <em>up</em>. This one deserves its own paragraph.</li>
+</ul>
+<p><code>Type=</code> answers "when may I consider start-up finished and move on to units ordered after me?" The values you will meet:</p>
+<ul>
+<li><strong><code>simple</code></strong> (the default) — the process systemd started <em>is</em> the service; consider it up immediately.</li>
+<li><strong><code>exec</code></strong> — like <code>simple</code>, but wait until the <code>exec()</code> has actually succeeded, so a typo'd binary path is reported as a start failure rather than a silent later death. A better default than <code>simple</code> when you have the choice.</li>
+<li><strong><code>forking</code></strong> — the program forks a background child and the original exits; treat the <em>child</em> as the service. Old-style daemons do this. Usually paired with <code>PIDFile=</code> so systemd knows which process to watch.</li>
+<li><strong><code>oneshot</code></strong> — the process is expected to run and exit; the service is "up" once it has finished successfully. Right for scripts that do a job rather than stay resident, and the type a <code>.timer</code>'s service almost always uses. Pair with <code>RemainAfterExit=yes</code> if "done" should count as "active."</li>
+<li><strong><code>notify</code></strong> — the program tells systemd when it is ready, over a socket. The most accurate option, and only available if the program was written to support it.</li>
+</ul>
+<p>The failure mode to remember: declare <code>Type=simple</code> for a daemon that <em>forks</em>, and systemd will supervise the original process, which exits immediately after forking. systemd sees the service die a fraction of a second after start, restarts it per your policy, and the real daemon accumulates in the background, unmanaged, one copy per restart. The symptom — "systemd keeps restarting it but it is clearly running" — is unmistakable once you have seen it, and the fix is <code>Type=forking</code>.</p>
+<p>One more key belongs here because it saves the drill in <a href="#cp-b11-14">B11.14</a> from being infinite: systemd rate-limits restarts. <code>StartLimitIntervalSec=</code> (default 10s) and <code>StartLimitBurst=</code> (default 5) live in <code>[Unit]</code>, and if a unit starts more than <em>burst</em> times within the interval, systemd gives up and puts it in the failed state with the message <em>"start request repeated too quickly."</em> That message means the restart loop was stopped by the rate limiter, not that the last start failed differently — a distinction people misread constantly.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Give your unit a restart policy and a user, then reload. Note that changing a unit file needs <code>daemon-reload</code> <em>and</em> a restart for the running instance to pick it up.
+<pre class="cmd">sudo tee /etc/systemd/system/hello.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=A hello service, written by hand
+
+[Service]
+Type=exec
+ExecStart=/home/ubuntu/hello.sh
+Restart=always
+RestartSec=2s
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart hello
+systemctl show hello -p Restart -p RestartUSec -p User -p Type</pre>
+<pre class="out">Restart=<b>always</b>
+RestartUSec=<b>2s</b>
+User=<b>ubuntu</b>
+Type=<b>exec</b></pre></li>
+<li>Watch the supervision actually work. Kill the process the way an outsider would, and watch systemd bring it back two seconds later with a new PID — the loop from B2.17, now written as one word of configuration.
+<pre class="cmd">pid=$(systemctl show hello -p MainPID --value); echo "before: $pid"
+sudo kill -KILL "$pid"; sleep 3
+echo "after:  $(systemctl show hello -p MainPID --value)"
+systemctl show hello -p NRestarts</pre>
+<pre class="out">before: 4412
+after:  <b>4501</b>            ← a different PID: it was restarted, not resurrected
+NRestarts=<b>1</b>              ← systemd counts restarts for you; remember this for B11.14</pre></li>
+<li>See the difference <code>Restart=</code> makes by asking for a clean exit. Stop the service properly and confirm systemd does <em>not</em> fight you — an operator-requested stop is never restarted, whatever the policy says.
+<pre class="cmd">sudo systemctl stop hello; sleep 3
+systemctl is-active hello; echo "---"; sudo systemctl start hello</pre>
+<pre class="out">inactive        ← Restart=always does not mean "un-stoppable"; a deliberate stop wins</pre></li>
+<li>Reproduce the rate limiter, because you will meet its message on a real machine. Point a unit at a program that fails instantly and watch systemd give up after five tries.
+<pre class="cmd">sudo tee /etc/systemd/system/flap.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=A service that fails immediately
+
+[Service]
+ExecStart=/bin/false
+Restart=always
+RestartSec=100ms
+EOF
+sudo systemctl daemon-reload; sudo systemctl start flap; sleep 6
+systemctl is-active flap; systemctl status flap --no-pager | tail -3</pre>
+<pre class="out">failed
+flap.service: Scheduled restart job, restart counter is at 5.
+flap.service: <b>Start request repeated too quickly.</b>
+flap.service: Failed with result 'exit-code'.     ← the rate limiter stopped the loop</pre></li>
+<li>Clean up the flapping unit; <code>hello</code> stays for the next lessons.
+<pre class="cmd">sudo systemctl reset-failed flap; sudo rm /etc/systemd/system/flap.service
+sudo systemctl daemon-reload; echo removed</pre>
+<pre class="out">removed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You should have watched a killed process come back with a different PID, and a deliberately stopped service stay stopped. Explain in one sentence each: what <code>Type=</code> decides (when systemd considers start-up complete, and therefore which process it supervises), what goes wrong if you declare <code>Type=simple</code> for a forking daemon (systemd watches the parent, which exits immediately, so it restarts forever while the real daemon piles up unmanaged), and what "start request repeated too quickly" means (the restart rate limiter gave up — <code>StartLimitBurst</code> starts within <code>StartLimitIntervalSec</code>).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>Restart=always</code> is not the safe default it looks like. It hides failures: a service that cannot possibly work — bad config, missing file, wrong permissions — will restart forever, presenting as "active" for a fraction of every second and never producing an alert, while the journal fills with the same error at whatever rate the rate limiter allows. That is precisely the second fault in <a href="#cp-b11-14">B11.14</a>. Prefer <code>Restart=on-failure</code>, which restarts real crashes and respects a clean exit as a decision rather than a problem.</p>
+<p>The default <code>RestartSec=100ms</code> is too fast for almost anything real. A service that reconnects to a database or waits for the network will retry ten times a second, hammer whatever it depends on, and hit the start limiter within a second or two — turning a transient dependency problem into a hard failure. Set an explicit <code>RestartSec</code> whenever a restart does more than re-exec a trivial process.</p>
+<p>Finally, <code>User=</code> changes more than the uid. The process gets that user's privileges, and anything the unit touches — working directory, files it writes, sockets it binds — must be reachable by that user. A unit that works as root and fails with <code>User=someone</code> is almost always a permission problem on a path (<a href="b4.html#cp-b4-6">B4.6</a> — remember that traversing a directory needs <code>x</code> on every component), and the journal will say so plainly if you look.</p>
+<div class="k8s-link">
+<p><code>Restart=</code> is the node-level ancestor of a pod's <code>restartPolicy</code>, and the resemblance is not superficial: <code>Always</code>, <code>OnFailure</code> and <code>Never</code> mean here what they mean there, and both use exponential backoff so a crash loop cannot become a busy loop. When you later meet <code>CrashLoopBackOff</code>, you are looking at exactly this mechanism one layer up — a supervisor restarting a failing process with a growing delay — and the debugging move is the same one you just did: get the exit status, then read the logs of the <em>previous</em> attempt rather than the current one. systemd's <code>NRestarts</code> counter is the direct analogue of a pod's restart count.</p>
+<p>Container states and the three status vocabularies are <a href="w3.html#cp-3-1">W3.1</a>; CrashLoopBackOff, <code>--previous</code> and the exit-code alphabet are <a href="w6.html#cp-6-16">W6.16</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.service</code> is the page — read the <code>Type=</code> and <code>Restart=</code> entries in full, they are short and they are the entire content of this lesson. <code>man 5 systemd.exec</code> covers <code>User=</code>, <code>WorkingDirectory=</code>, environment handling and the sandboxing keys you will meet in B12. <code>man 5 systemd.unit</code> for <code>StartLimitIntervalSec=</code> and <code>StartLimitBurst=</code> (they live in <code>[Unit]</code>, not <code>[Service]</code> — a common source of "why is my setting ignored").</p>
+</article>
+
+<article class="lesson" id="cp-b11-5" data-id="b11-5">
+<div class="lesson-head"><span class="cp-id">B11.5</span><h4>Ordering is not requirement: After, Requires and Wants</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>These three keys look like variations on one idea and are in fact two completely independent ideas that happen to be written next to each other. Merging them is the direct cause of nearly every "it works when I restart it by hand, but fails at boot" bug — the kind that reproduces only on a cold machine, at the worst possible time, and vanishes the moment you try to investigate it interactively.</p>
+<h5>The concept</h5>
+<p>systemd separates two questions that most people ask as one:</p>
+<ul>
+<li><strong>Requirement</strong> — <em>must that other unit be running?</em> Answered by <code>Requires=</code> (yes: if it fails or is stopped, I am stopped too) and <code>Wants=</code> (preferably: try to start it, but carry on regardless if it fails). This is about dependency.</li>
+<li><strong>Ordering</strong> — <em>in what sequence?</em> Answered by <code>After=</code> ("do not start me before that unit has finished starting") and <code>Before=</code> (the mirror image). This is about time.</li>
+</ul>
+<p>Crucially, <strong>neither implies the other</strong>. A unit with <code>Requires=postgresql.service</code> and no <code>After=</code> is telling systemd "start Postgres too" — and systemd, being a parallel starter, will happily start both at the same instant. Your service then races Postgres and loses roughly whenever the machine is cold and slow, which is to say at boot. Add <code>After=postgresql.service</code> and the race disappears. The pairing you almost always want is <em>both</em>:</p>
+<pre class="cmd">[Unit]
+Wants=postgresql.service
+After=postgresql.service</pre>
+<p><code>Wants=</code> + <code>After=</code> is the workhorse combination: pull the dependency in, and wait for it, but do not make my service collapse if it has a bad day. Reserve <code>Requires=</code> for genuine "there is no point in me existing without it" cases, and know its sharp edge — <code>Requires=</code> propagates <em>stops</em> as well as failures, so stopping the dependency stops you too, which is occasionally a nasty surprise during maintenance.</p>
+<p>Two more mechanisms complete the picture. <code>BindsTo=</code> is <code>Requires=</code> with teeth: it also stops you if the other unit stops for <em>any</em> reason, including the device behind it disappearing. And targets act as ordering landmarks — <code>After=network-online.target</code> is how you say "once the network is genuinely usable," which is subtly different from <code>network.target</code> (meaning "networking has been configured," which can be true before any address is reachable). If a service needs to make an outbound connection at start-up, <code>network-online.target</code> is the one you want, and it needs a corresponding <code>Wants=</code> to actually be pulled in.</p>
+<div class="flow"><span>Wants= (pull it in)</span><em>+</em><span class="hot">After= (wait for it)</span><em>=</em><span>the combination that survives a cold boot</span></div>
+<p>Dependency and sequence are separate switches; almost every boot race is one of them being set without the other.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at a real unit's relationships. <code>ssh.service</code> is a good specimen because it expresses both kinds of key.
+<pre class="cmd">systemctl show ssh -p Wants -p Requires -p After -p Before | tr ' ' '\n' | grep -v '^$' | head -12</pre>
+<pre class="out">Wants=network.target
+After=network.target
+After=auditd.service
+Requires=sshd-keygen.target        ← a genuine "cannot work without" dependency
+    ← note the same unit appearing under both Wants= and After=: pull in AND wait</pre></li>
+<li>Create the race deliberately, so you can see that requirement alone does not order anything. Make a slow unit and a second unit that requires it without waiting for it.
+<pre class="cmd">sudo tee /etc/systemd/system/slow.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=A dependency that takes its time
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'sleep 5; echo slow is ready'
+EOF
+sudo tee /etc/systemd/system/racer.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Requires slow, but does not wait for it
+Requires=slow.service
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo racer ran at $(date +%T); systemctl is-active slow.service'
+EOF
+sudo systemctl daemon-reload; sudo systemctl start racer</pre>
+<pre class="out">                       # returns quickly — suspiciously quickly</pre></li>
+<li>Read the journal and see the race in the timestamps: the racer ran and finished while its stated requirement was still starting.
+<pre class="cmd">journalctl -u racer -u slow --since '2 min ago' --no-pager -o short-precise | tail -6</pre>
+<pre class="out">09:31:02.114 sandbox sh[5012]: <b>racer ran at 09:31:02</b>
+09:31:02.121 sandbox sh[5013]: <b>activating</b>            ← slow.service was still starting
+09:31:07.140 sandbox sh[5001]: slow is ready             ← five seconds later
+    ← Requires= pulled slow in; nothing told systemd to wait for it</pre></li>
+<li>Fix it with the missing half — one line — and watch the ordering appear.
+<pre class="cmd">sudo mkdir -p /etc/systemd/system/racer.service.d
+printf '[Unit]\nAfter=slow.service\n' | sudo tee /etc/systemd/system/racer.service.d/10-order.conf
+sudo systemctl daemon-reload
+sudo systemctl stop slow; sudo systemctl start racer
+journalctl -u racer --since '1 min ago' --no-pager -o short-precise | tail -2</pre>
+<pre class="out">09:33:41.882 sandbox sh[5120]: racer ran at 09:33:41
+09:33:41.889 sandbox sh[5121]: <b>active</b>          ← now slow.service was finished first</pre></li>
+<li>Remove the demonstration units.
+<pre class="cmd">sudo rm -rf /etc/systemd/system/racer.service /etc/systemd/system/racer.service.d /etc/systemd/system/slow.service
+sudo systemctl daemon-reload; echo removed</pre>
+<pre class="out">removed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the two independent questions and which keys answer each (requirement: <code>Requires=</code>/<code>Wants=</code>; ordering: <code>After=</code>/<code>Before=</code>). Then explain why a unit with <code>Requires=</code> and no <code>After=</code> can start before the thing it requires (systemd starts units in parallel; requirement pulls the other unit in but says nothing about sequence), and give the combination you should reach for by default (<code>Wants=</code> plus <code>After=</code> on the same unit). You should have watched exactly that failure and its one-line fix in the journal timestamps.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The reason this bug is so expensive is that it does not reproduce interactively. When you restart the service by hand, its dependency has been running for hours, so the race is won trivially every time and everything looks correct. It only fails on a cold boot, when both units start together and the slow one loses — which means the failure appears at reboot, in production, usually at 3am, and cannot be reproduced by the person investigating. If a service works on restart but fails on boot, look at <code>After=</code> before anything else.</p>
+<p><code>Requires=</code> propagating stops is the second surprise. Stop the dependency for maintenance and everything that <code>Requires=</code> it stops too, immediately and without asking. That is correct behaviour and rarely what the person typing <code>systemctl stop</code> expected. Use <code>Wants=</code> unless you truly mean "I cannot exist without this," and know that <code>BindsTo=</code> is stricter still.</p>
+<p>Finally, <code>network-online.target</code> is not free: it is only reached if something pulls it in, so <code>After=network-online.target</code> alone can order you after a target that never activates. The idiom is <code>Wants=network-online.target</code> together with <code>After=network-online.target</code> — the same pairing as everything else in this lesson, which is a good sign you have understood the rule.</p>
+<div class="k8s-link">
+<p>The kubelet unit is the working example of this pairing on a node: it needs the container runtime to be reachable before it can do anything useful, and getting the ordering right is the difference between a node that comes up cleanly and one that logs runtime-connection errors for the first minute after every reboot. Those errors are harmless-but-alarming and turn up in real incident reviews constantly — now you know they are an ordering artefact rather than a fault. Kubernetes has no equivalent of these keys for pods, incidentally: pod start-up ordering is expressed with init containers and readiness probes instead, which is a deliberate design choice worth noticing.</p>
+<p>How the kubelet and containerd relate on a node is <a href="w1.html#cp-1-20">W1.20</a>; the NotReady ladder you will walk when that relationship breaks is <a href="w6.html#cp-6-10">W6.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.unit</code> is the reference for all of these — read the entries for <code>Requires=</code>, <code>Wants=</code>, <code>BindsTo=</code>, <code>After=</code> and <code>Before=</code> together, and note the explicit sentence that ordering and requirement dependencies are orthogonal. <code>man 7 systemd.special</code> describes the standard targets including <code>network.target</code> versus <code>network-online.target</code> and when each is reached. <code>systemd-analyze critical-chain &lt;unit&gt;</code> (see <a href="#cp-b11-12">B11.12</a>) shows the ordering chain that actually applied at boot.</p>
+</article>
+
+</div><!-- /g-units -->
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
