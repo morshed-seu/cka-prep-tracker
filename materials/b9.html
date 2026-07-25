@@ -749,6 +749,180 @@ sudo iptables -D INPUT -p tcp --dport 80 -j ORDER; sudo iptables -F ORDER; sudo 
 
 </div><!-- /g-netfilter -->
 
+<!-- ---------------- Load balancing and sockets ---------------- -->
+<div class="grp" id="g-lb"><h3>Load balancing and sockets</h3>
+
+<article class="lesson" id="cp-b9-15" data-id="b9-15">
+<div class="lesson-head"><span class="cp-id">B9.15</span><h4>A load balancer from two rules: DNAT + statistic</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Here is the checkpoint where the module's payoff becomes undeniable: with two firewall rules you build a working round-robin load balancer, and it is not a <em>model</em> of how Kubernetes Services work — it <em>is</em> how they work, rule for rule. Understanding this once dissolves the mystery of the ClusterIP, an address that exists on no machine yet somehow answers. When you later see <code>KUBE-SVC-*</code> chains full of probability rules, you'll recognise the exact construction you built by hand.</p>
+<h5>The concept</h5>
+<p>A <strong>ClusterIP is a virtual address</strong> — it exists nowhere. No interface holds it, nothing answers ARP for it, no machine "is" it. The only thing that makes traffic to it work is a <strong>DNAT</strong> rule that rewrites its destination to a <em>real</em> backend address before the packet is routed. Load-balancing across several backends is just making that DNAT probabilistic: send a fraction of connections to backend A, the rest to backend B.</p>
+<p>You express the fraction with iptables' <code>statistic</code> match: <code>-m statistic --mode random --probability 0.5</code> matches a random half of packets. So two rules balance two backends — <em>"with probability 0.5, DNAT to A; otherwise (the fallthrough) DNAT to B."</em> For more backends the probabilities are <strong>chained</strong>, not equal: with three backends the first rule uses <code>0.333</code> (1/3), the second <code>0.5</code> (half of the remaining two-thirds = 1/3), and the third catches the rest (1/3) — so the split comes out even. That chained-probability structure is <em>exactly</em> what you'll read inside a Kubernetes Service chain, because kube-proxy's iptables mode generates precisely these rules. Build it here and you've built kube-proxy's data path.</p>
+<div class="flow"><span>virtual IP (exists nowhere)</span><em>→ DNAT p=0.5 → backend A</em><em>/</em><span class="hot">else → backend B</span><em>· conntrack pins each flow</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Give the two namespaces distinct web content so you can tell which backend answered, and start a server in each. (<code>red</code> and <code>blue</code> from earlier; the filesystem is shared, so use per-backend directories.)
+<pre class="cmd">multipass shell sandbox
+mkdir -p /tmp/red /tmp/blue; echo RED &gt;/tmp/red/id; echo BLUE &gt;/tmp/blue/id
+sudo ip netns exec red  bash -c 'cd /tmp/red  &amp;&amp; python3 -m http.server 80 &amp;&gt;/dev/null &amp;'
+sudo ip netns exec blue bash -c 'cd /tmp/blue &amp;&amp; python3 -m http.server 80 &amp;&gt;/dev/null &amp;'
+sleep 1; curl -s http://10.10.0.2/id; curl -s http://10.10.0.3/id   # prove each backend directly</pre>
+<pre class="out">RED
+BLUE           ← two distinct backends, reachable at their real addresses</pre></li>
+<li>Create the virtual service address with two DNAT rules: half of connections to <code>red</code>, the rest to <code>blue</code>. Nothing holds <code>10.99.99.99</code> — it's made real only by these rules (in <code>OUTPUT</code>, since the test curl is locally generated).
+<pre class="cmd">sudo iptables -t nat -A OUTPUT -d 10.99.99.99 -p tcp --dport 80 \
+  -m statistic --mode random --probability 0.5 -j DNAT --to-destination 10.10.0.2:80
+sudo iptables -t nat -A OUTPUT -d 10.99.99.99 -p tcp --dport 80 \
+  -j DNAT --to-destination 10.10.0.3:80</pre>
+<pre class="out"># 10.99.99.99 now "exists" purely as these two rewrite rules — a ClusterIP by hand</pre></li>
+<li>Hit the virtual address twenty times and count the split — roughly half each, from an address that is nowhere.
+<pre class="cmd">for i in $(seq 20); do curl -s http://10.99.99.99/id; done | sort | uniq -c</pre>
+<pre class="out">     11 BLUE
+      9 RED        ← ~50/50 across two backends: a working round-robin load balancer</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What actually makes a ClusterIP work, given that no machine holds the address? (A DNAT rule that rewrites the virtual destination to a real backend address before routing — the address exists only as rewrite rules; nothing answers ARP for it.) Then: why are the probabilities <em>chained</em> (1/3, 1/2, 1) rather than equal for three backends? (Each rule's probability is applied only to the packets that fell through the rules above it, so 1/3 then 1/2-of-the-remaining-2/3 then all-the-rest yields an even one-third split — the exact structure in a <code>KUBE-SVC</code> chain.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Once a connection is balanced to a backend, <em>conntrack</em> (B9.9) pins every subsequent packet of that connection to the same backend — the random choice happens once, at connection start, not per packet. That's essential (you can't have a single TCP connection's packets split across two servers) and it's why long-lived connections don't rebalance when backends change. It's also why testing with many <em>separate</em> <code>curl</code> calls shows the split, while one persistent connection would stick to one backend.</p>
+<p>Order and fallthrough matter: the <em>last</em> backend rule has no probability match — it's the unconditional catch-all for whatever the probabilistic rules didn't claim. Get the probabilities wrong (e.g. two rules both at <code>0.5</code> with no plain fallthrough) and the split skews or some connections match nothing. The chained-probability arithmetic is fiddly by hand, which is precisely why kube-proxy generates it for you — but knowing the pattern is what lets you read and trust the generated rules.</p>
+<div class="k8s-link">
+<p>This <em>is</em> kube-proxy's iptables mode, not an analogy for it. A Service's ClusterIP is an address on no interface; kube-proxy makes it work by writing a <code>KUBE-SVC-xxxx</code> chain whose rules use <code>-m statistic --mode random --probability</code> with exactly the chained fractions you just saw, each jumping to a <code>KUBE-SEP-xxxx</code> chain that DNATs to one pod's IP. conntrack pins each connection to its chosen pod. When you read those chains in W4, you're reading the two-rule construction from this lab, multiplied by the number of endpoints.</p>
+<p>The ClusterIP-as-rewrite-rules idea is <a href="w4.html#cp-4-9">W4.9</a>; walking the real <code>KUBE-SVC</code>/<code>KUBE-SEP</code> chains that contain these probability rules is <a href="w4.html#cp-4-10">W4.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables-extensions</code> for the <code>statistic</code> match (<code>--mode random --probability</code>, and the <code>nth</code> mode as an alternative) and the <code>DNAT</code> target. Re-read <a href="#cp-b9-9">B9.9</a> for the conntrack pinning that makes per-connection stickiness work. In the exam docs, the kube-proxy reference and "Virtual IPs and Service Proxies" describe this exact mechanism.</p>
+</article>
+
+<article class="lesson" id="cp-b9-16" data-id="b9-16">
+<div class="lesson-head"><span class="cp-id">B9.16</span><h4>Publish a private service on a host port</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>So far the private namespaces can reach <em>out</em>; now you make one reachable from <em>outside the machine entirely</em> — a real end-to-end publication, not a loopback trick. This one rule is a NodePort built by hand, and doing it yourself explains a fact that puzzles newcomers: why a NodePort works when you hit <em>any</em> node's IP, even a node that runs none of the Service's pods.</p>
+<h5>The concept</h5>
+<p>Publishing means: traffic arriving at the host's own address on some port should be redirected to a backend inside a private namespace. That's a <strong>DNAT</strong> in the <code>PREROUTING</code> chain — <em>for TCP arriving on the host's port 8080, rewrite the destination to <code>10.10.0.2:80</code></em> — placed in prerouting (B9.10) because the rewrite must happen before routing so the kernel then forwards the packet to <code>red</code>. Because it's in prerouting rather than output, it catches traffic coming <em>from other machines</em>, which is what makes it a genuine external publication. The reply retraces the path: <code>red</code> answers toward the host (its gateway), conntrack un-DNATs it, and it returns to the external client looking as if the host itself served port 8080.</p>
+<p>Test it from <em>outside</em> the VM — from the machine running Multipass, hitting the VM's address on 8080 — so you prove the whole forward-and-rewrite path, not just a same-host shortcut. This is precisely a Kubernetes <strong>NodePort</strong>: the same rule shape, with the host port drawn from the <code>30000–32767</code> range and the DNAT jumping into the Service's balancing chain. And because the rule lives on <em>every</em> node (kube-proxy writes it everywhere), hitting any node's IP works even if that node hosts none of the pods — the DNAT there simply forwards the packet on to a node that does.</p>
+<div class="flow"><span>external client → host:8080</span><em>→ DNAT in prerouting →</em><span class="hot">10.10.0.2:80 (inside red)</span><em>→ forwarded, reply un-NAT'd back</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Add the publish rule: DNAT the host's TCP 8080 to <code>red</code>'s web server, in prerouting so it catches external traffic. (Ensure a server is running in <code>red</code> from B9.15, and <code>ip_forward=1</code>.)
+<pre class="cmd">multipass shell sandbox
+sudo iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 10.10.0.2:80
+ip -br addr show ens3 | awk '{print "VM address:", $3}'   # note this for the outside test
+exit   # leave the VM to test from outside</pre>
+<pre class="out">VM address: 10.191.62.10/24        ← the address an external client will hit on :8080</pre></li>
+<li>From <em>outside</em> the VM — on the machine running Multipass — hit the VM's address on 8080 and receive <code>red</code>'s content. This proves the packet crossed into the VM, was DNAT'd, forwarded into the namespace, and answered.
+<pre class="cmd"># run this on the Multipass HOST, not inside the VM:
+curl -s http://10.191.62.10:8080/id</pre>
+<pre class="out">RED           ← an external client reached a service inside a private namespace: a NodePort by hand</pre></li>
+<li>Back inside the VM, confirm the rule is carrying traffic by reading its counter, then leave it in place (the mini project reuses this).
+<pre class="cmd">multipass shell sandbox
+sudo iptables -t nat -L PREROUTING -n -v | grep 8080</pre>
+<pre class="out">1  60  DNAT  tcp  --  ... tcp dpt:8080 to:10.10.0.2:80    ← non-zero counter: it forwarded the request</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Which chain does the publish DNAT go in, and why there rather than <code>OUTPUT</code>? (In <code>PREROUTING</code>, because the traffic arrives from other machines and the destination must be rewritten before routing so the kernel forwards it to the backend; <code>OUTPUT</code> would only catch packets the host itself generates.) Then: why does a Kubernetes NodePort respond on <em>any</em> node's IP, including nodes running none of the Service's pods? (The same DNAT rule is written on every node, so a hit on any node is rewritten and forwarded on to a node that hosts a pod — the entry point isn't tied to where the pods actually run.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Publishing external traffic needs the rule in <code>PREROUTING</code>; publishing traffic the host <em>itself</em> originates (a <code>curl</code> from the VM to its own <code>:8080</code>) needs a matching rule in <code>OUTPUT</code>, because locally-generated packets skip prerouting (B9.10). This is exactly why kube-proxy installs its Service jumps in <em>both</em> chains — so a pod reaching a Service on its own node works the same as external traffic. If your publish works from outside but not from the host itself, the missing <code>OUTPUT</code> rule is why.</p>
+<p>Forwarding must be on (B9.6) and, on a hardened host, the <code>FORWARD</code> filter policy must permit the forwarded traffic — a correct DNAT with a blocking <code>FORWARD</code> policy publishes nothing. And "hairpin" cases (a backend reaching the service IP that maps back to itself) need source NAT too, or the reply's addresses won't match the request's flow — the same masquerade-on-the-way-in subtlety kube-proxy handles with its hairpin rules.</p>
+<div class="k8s-link">
+<p>This rule is a NodePort. <code>type: NodePort</code> makes kube-proxy write, on every node, a DNAT from a high port (30000–32767) into the Service's balancing chain — identical in shape to what you just built, just with the load-balancing step from B9.15 in the middle. The "any node's IP works" property, the both-chains (<code>PREROUTING</code> and <code>OUTPUT</code>) placement, and the forwarding requirement are all things you can now explain from first principles rather than accept as configuration.</p>
+<p>All four Service types (including NodePort) from memory are <a href="w4.html#cp-4-12">W4.12</a>; the <code>port</code>/<code>targetPort</code>/<code>nodePort</code> distinction and its most-planted bug are <a href="w4.html#cp-4-14">W4.14</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 iptables</code> (<code>-t nat</code>, <code>PREROUTING</code>/<code>OUTPUT</code>) and <code>man 8 iptables-extensions</code> (<code>DNAT</code>, <code>REDIRECT</code>). Re-read <a href="#cp-b9-10">B9.10</a> for why the chain choice is forced by the routing-decision placement. In the exam docs, NodePort and the port fields are covered under "Service" and the kube-proxy reference.</p>
+</article>
+
+<article class="lesson" id="cp-b9-17" data-id="b9-17">
+<div class="lesson-head"><span class="cp-id">B9.17</span><h4>Unix domain sockets: endpoints in the filesystem</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Not every conversation between programs goes over the network. When two processes on the <em>same</em> machine talk — a client to <code>containerd</code>, the kubelet to a CSI driver, almost anything to <code>systemd</code> — they usually use a <strong>unix domain socket</strong>: an endpoint that lives in the filesystem instead of on a port. Understanding these explains a large fraction of the plumbing on a Linux node, and it sets up the security fact in the next lesson — that access to the right socket file is equivalent to root.</p>
+<h5>The concept</h5>
+<p>A <strong>unix domain socket</strong> (UDS) is a communication endpoint identified by a filesystem path (like <code>/run/containerd/containerd.sock</code>) rather than by an IP address and port. No IP stack is involved at all: the kernel simply copies bytes between two processes on the same host. That makes it faster than a loopback TCP connection and — crucially — governed by <strong>ordinary file permissions</strong> on the socket path, not by firewall rules. If you can't read/write the socket file, you can't connect; the access model is the filesystem's, which you already know from B4.</p>
+<p>Three details complete the picture:</p>
+<ul>
+<li><strong>Stream vs datagram.</strong> A stream socket (<code>SOCK_STREAM</code>) is reliable and ordered, like TCP; a datagram socket (<code>SOCK_DGRAM</code>) is message-based, like UDP — the same two shapes as the network transports in B8, minus the network.</li>
+<li><strong>The abstract namespace.</strong> A UDS name can instead start with a NUL byte, giving it <em>no file on disk at all</em> — it's shown with a leading <code>@</code> in tools. Abstract sockets have <em>no filesystem permissions</em>; their visibility is scoped to the network namespace instead (which matters for containers — an abstract socket doesn't cross a netns boundary).</li>
+<li><strong>Finding them.</strong> <code>ss -lx</code> lists listening unix sockets — you'll see the node's real machinery: <code>systemd</code>, D-Bus, journald, and any runtime.</li>
+</ul>
+<div class="flow"><span>path-based UDS → file permissions gate it</span><em>·</em><span class="hot">@abstract UDS → no file, scoped to netns</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the real unix sockets the machine is already using. Note the mix of <em>path</em> sockets (a filesystem path) and <em>abstract</em> ones (a leading <code>@</code>, no file).
+<pre class="cmd">multipass shell sandbox
+sudo ss -lxn | awk '{print $1, $5}' | grep -E '/run|@' | head -8</pre>
+<pre class="out">u_str /run/systemd/private          ← a path socket: gated by that file's permissions
+u_str /run/dbus/system_bus_socket   ← D-Bus, over a UDS in the filesystem
+u_str @/tmp/.X11-unix/X0            ← an abstract socket (leading @): no file on disk</pre></li>
+<li>See that a path socket is a real filesystem object with a mode — a special file type <code>s</code> — whose permissions decide who may connect.
+<pre class="cmd">ls -l /run/dbus/system_bus_socket</pre>
+<pre class="out"><b>s</b>rwxrwxrwx 1 root root 0 ... /run/dbus/system_bus_socket
+# leading 's' = socket file; the rwx bits are the access control, exactly like any file (B4)</pre></li>
+<li>Contrast with a network listener: a TCP socket has an address and port and shows under <code>ss -ltn</code>; a UDS has a path and shows under <code>ss -lx</code>. Different worlds, different access models.
+<pre class="cmd">echo 'TCP listeners (address:port, gated by firewall/binds):'; sudo ss -ltn | head -3
+echo 'UNIX listeners (filesystem path, gated by file permissions):'; sudo ss -lxn | head -3</pre>
+<pre class="out">TCP:  LISTEN 0.0.0.0:22 ...            ← reachable over the network, subject to netfilter
+UNIX: u_str /run/systemd/private ...   ← local only, subject to file permissions</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What identifies a unix domain socket, and what governs who may connect to a path-based one? (A filesystem path rather than an IP:port; access is governed by ordinary file permissions on the socket file — no IP stack and no firewall is involved, the kernel just copies bytes between local processes.) Then: how does an <em>abstract</em> unix socket differ, and why does that matter for containers? (It has no file on disk — its name starts with a NUL byte (shown as <code>@</code>) — so it has no filesystem permissions and is instead scoped to the network namespace, which means it doesn't cross a container's netns boundary.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Because a path socket <em>is</em> a file, a stale one left behind by a crashed server can block the next start with "address already in use" until it's removed — which is why daemons often <code>unlink</code> the path before binding. And the path has a surprisingly short length limit (~108 bytes on Linux), so deeply-nested socket paths can fail to bind for a reason that has nothing to do with permissions. Both are "it's a file" consequences that surprise people expecting network-socket behaviour.</p>
+<p>A server can go beyond file permissions and ask the kernel <em>who</em> is connected via <code>SO_PEERCRED</code>, which reveals the peer's uid/gid/pid — this is how privileged daemons authorise clients precisely (e.g. "only uid 0 may call this method"). So the security of a UDS is file permissions <em>plus</em>, optionally, peer-credential checks — but the file permissions are the first and most important gate, and the one you can see with <code>ls -l</code>.</p>
+<div class="k8s-link">
+<p>A huge amount of a node's control plane talks over unix sockets in <code>/run</code> precisely because they're local and file-permission-gated rather than network-exposed: the kubelet talks to the container runtime over <code>/run/containerd/containerd.sock</code> (the CRI socket), CSI drivers expose sockets the kubelet dials, and device plugins register the same way. "Where does the kubelet actually connect to containerd?" is answered by <code>ss -lx</code>, not <code>ss -ltn</code> — there's no port, just a socket file whose permissions are the entire access policy, which is the setup for the next lesson's security point.</p>
+<p>The kubelet → containerd → shim → runc path over the CRI socket is <a href="w1.html#cp-1-20">W1.20</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 unix</code> is the essential read — stream vs datagram, the abstract namespace, <code>SO_PEERCRED</code>, and path length. <code>man 8 ss</code> for <code>-x</code>/<code>-l</code> (listing unix sockets). <code>man 2 socket</code> and <code>man 2 bind</code> for the syscalls. Re-read <a href="b4.html">B4</a> for the file-permission model that gates them. No exam-docs page covers UDS directly; it underlies the CRI and CSI socket paths.</p>
+</article>
+
+<article class="lesson" id="cp-b9-18" data-id="b9-18">
+<div class="lesson-head"><span class="cp-id">B9.18</span><h4>Talk over a socket, and why containerd.sock is root</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Send a message over a unix socket by hand, look at the socket's permissions, and one of the most important security facts in all of container infrastructure falls out on its own: <strong>access to the container runtime's socket is equivalent to root on the node.</strong> This isn't a rule to memorise — it's a conclusion you can derive, and deriving it is what makes "just mount the docker socket into the pod" recognisable as a full compromise rather than a convenience.</p>
+<h5>The concept</h5>
+<p>A unix socket is just an endpoint you can read from and write to, which you can prove with <code>socat</code>: one invocation <em>listens</em> on a socket path, another <em>connects</em> to it, and bytes flow between them. The socket file's mode — visible with <code>ls -l</code> as a leading <code>s</code> plus the usual <code>rwx</code> bits — is exactly what decides who may connect, no differently from any other file (B4).</p>
+<p>Now apply that reasoning to <code>/run/containerd/containerd.sock</code>. That socket is the container runtime's control interface: whoever can write to it can tell containerd to <strong>start a container</strong> — and they can ask for a container with the <em>host's</em> filesystem mounted inside it, running as root, with every capability granted and every namespace shared. In other words, anyone who can connect to that socket can obtain a fully-privileged shell on the host. Therefore <strong>write access to the runtime socket is equivalent to root on the node</strong> — the socket's permissions <em>are</em> the node's security boundary. This is the concrete reason that mounting the Docker/containerd socket into a pod (a depressingly common "just let CI build images" shortcut) hands that pod the entire node, and through it, frequently the whole cluster. It's also why B12 spends real time on trust boundaries: many of them come down to which processes can reach which socket.</p>
+<div class="flow"><span>write to containerd.sock</span><em>→ "run a container, host FS, privileged" →</em><span class="hot">root on the node</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Talk over a socket you create. One <code>socat</code> listens (echoing input back), another connects and sends a line — proving a UDS is just a read/write endpoint.
+<pre class="cmd">multipass shell sandbox
+socat UNIX-LISTEN:/tmp/demo.sock,fork SYSTEM:'cat' &amp; sleep 1
+echo 'hello over a unix socket' | socat - UNIX-CONNECT:/tmp/demo.sock
+kill %1 2&gt;/dev/null</pre>
+<pre class="out">hello over a unix socket        ← the listener received it and echoed it back over the socket</pre></li>
+<li>Look at the socket's permissions — the entire access control. Reason: who could connect to <em>this</em> one?
+<pre class="cmd">socat UNIX-LISTEN:/tmp/demo.sock,fork SYSTEM:'cat' &amp; sleep 1
+ls -l /tmp/demo.sock; kill %1 2&gt;/dev/null; rm -f /tmp/demo.sock</pre>
+<pre class="out"><b>s</b>rwxr-xr-x 1 ubuntu ubuntu 0 ... /tmp/demo.sock
+# leading 's' = socket; here anyone can connect (o+rwx via the x) — permissions are the whole gate</pre></li>
+<li>Now the real one: inspect the container runtime socket and read its owner, group and mode. Reason about exactly who has been granted node-root-equivalent access.
+<pre class="cmd">ls -l /run/containerd/containerd.sock 2&gt;/dev/null || echo '(no containerd on sandbox — inspect on a k8s node)'
+# on a Kubernetes node it looks like:
+echo 'srw-rw---- 1 root root 0 ... /run/containerd/containerd.sock'</pre>
+<pre class="out">srw-rw---- 1 root root 0 ... /run/containerd/containerd.sock
+# mode srw-rw----: only root and the root group can write → only they hold node-root-equivalent power</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>How does a unix socket decide who may connect, and how did you inspect it? (By its file permissions — the leading <code>s</code> and the <code>rwx</code> bits shown by <code>ls -l</code>; connecting requires write access to the socket file, exactly like any file.) Then: why is write access to <code>containerd.sock</code> equivalent to root on the node? (Because whoever can write to it can instruct the runtime to start a container with the host filesystem mounted, running privileged with all capabilities — i.e. obtain a root shell on the host — so the socket's permissions <em>are</em> the node's security boundary, and mounting it into a pod hands that pod the node.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The danger isn't the socket file's <em>path</em>, it's <em>write access</em> to it — group membership counts. A socket that is <code>root root</code> mode <code>0660</code> is safe from ordinary users, but adding a user to the runtime's group (or the classic <code>docker</code> group) silently grants that user node-root-equivalent power without ever typing <code>sudo</code>. "Add me to the docker group so I don't need sudo" and "give me root" are, on a node, the same request — a fact worth stating plainly to anyone who asks for the former.</p>
+<p>The same logic extends to any privileged socket: the kubelet's own socket, a CSI driver's socket, D-Bus system methods. Before exposing or bind-mounting any socket, ask "what can the daemon on the other end be told to do, and does that amount to more authority than the caller should have?" For the runtime socket the answer is always "everything," which is why it's the canonical example — but the <em>question</em> is the transferable skill.</p>
+<div class="k8s-link">
+<p>This is the reasoning behind a whole category of Kubernetes hardening rules. A pod that bind-mounts the host's <code>containerd.sock</code> (or <code>docker.sock</code>) via a <code>hostPath</code> volume can start privileged containers on the node and escape to the host — so it's effectively cluster-admin, and admission controllers and Pod Security Standards exist partly to stop exactly this. "Access to the runtime socket = root on the node" is the single sentence behind why the kubelet↔runtime channel is a trust boundary and why CI-in-cluster image builds moved to rootless builders. B12 builds the trust-boundary model on top of this.</p>
+<p>The kubelet↔containerd CRI channel this socket carries is <a href="w1.html#cp-1-20">W1.20</a>; the runtime socket as a trust boundary is developed in B12.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 socat</code> for <code>UNIX-LISTEN</code>/<code>UNIX-CONNECT</code> and the address forms; <code>man 7 unix</code> for the permission and peer-credential model; <code>man 1 nc</code> (netcat-openbsd) also speaks UDS with <code>-U</code>. For the runtime socket specifically, the containerd and CRI docs describe its default path and permissions. In the exam docs, Pod Security Standards and admission control are where the "don't mount the socket" guidance lives.</p>
+</article>
+
+</div><!-- /g-lb -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
