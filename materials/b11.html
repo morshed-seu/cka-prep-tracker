@@ -470,6 +470,369 @@ sudo systemctl daemon-reload; echo removed</pre>
 
 </div><!-- /g-units -->
 
+<!-- ---------------- Operating ---------------- -->
+<div class="grp" id="g-operating"><h3>Operating</h3>
+
+<article class="lesson" id="cp-b11-6" data-id="b11-6">
+<div class="lesson-head"><span class="cp-id">B11.6</span><h4>The systemctl verbs that matter — and two pairs people merge</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>systemctl</code> has around eighty subcommands and you need about ten of them. Two pairs within those ten are routinely confused, and each confusion produces a specific, common, embarrassing outcome: a service that vanishes after a reboot, and a service that "was enabled" but never actually started. Getting these straight takes five minutes and removes a whole category of self-inflicted incident.</p>
+<h5>The concept</h5>
+<p>The first pair is about <strong>now versus at boot</strong>, and they are completely independent switches:</p>
+<ul>
+<li><code>start</code> / <code>stop</code> — act on the <em>running</em> system, right now. They have no memory: nothing about them survives a reboot.</li>
+<li><code>enable</code> / <code>disable</code> — act on the <em>next</em> boot, by creating or removing the symlink you saw in <a href="#cp-b11-3">B11.3</a>. They do not touch the running system at all.</li>
+</ul>
+<p>So "I started it and it was gone after the reboot" is <code>start</code> without <code>enable</code>, and "I enabled it and nothing happened" is <code>enable</code> without <code>start</code>. Both are correct behaviour. The shorthand for "do both" is <code>enable --now</code> (and <code>disable --now</code> for the reverse), which is what you almost always mean.</p>
+<p>The second pair is about <strong>how violently to apply a change</strong>:</p>
+<ul>
+<li><code>restart</code> — stop the process and start a new one. Always works; always drops whatever the service was doing, including open connections.</li>
+<li><code>reload</code> — ask the running process to re-read its configuration without restarting, by sending it a signal (<a href="b2.html#cp-b2-12">B2.12</a>) or running <code>ExecReload=</code>. Preserves connections — but only works if the unit defines it, and only reloads what that program chose to make reloadable.</li>
+<li><code>reload-or-restart</code> — reload if the unit supports it, otherwise restart. The pragmatic middle.</li>
+</ul>
+<p>Then the reading verbs, which are where the real value is:</p>
+<ul>
+<li><code>status</code> — the human summary: state, main PID, cgroup tree, and the last few journal lines. Your default.</li>
+<li><code>cat</code> — <strong>the effective unit file, including every drop-in</strong>, printed with the source path above each fragment. This is the only honest answer to "what is this service actually configured to do," and it is the most underrated command in the set.</li>
+<li><code>show</code> — every property systemd holds for the unit, machine-readable. <code>show -p Restart --value</code> answers one precise question without prose.</li>
+<li><code>list-units</code> / <code>list-unit-files</code> — what is loaded now versus what exists on disk and its enablement state. The second is how you find a unit you have not started yet.</li>
+<li><code>is-active</code> / <code>is-enabled</code> / <code>is-failed</code> — one word out, useful exit codes, made for scripts.</li>
+<li><code>--failed</code> — <code>systemctl --failed</code> lists everything currently in a failed state. First command to run on a machine somebody says is "acting strange."</li>
+</ul>
+<p>Two more worth having: <code>daemon-reload</code> (re-read unit files from disk — <a href="#cp-b11-3">B11.3</a>) and <code>reset-failed</code> (clear the failed state and the restart counter, which you need after fixing a unit that hit the start limiter).</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Prove the two switches are independent by reading both states separately. Your <code>hello</code> unit is currently both enabled and running; take away one and watch the other stay.
+<pre class="cmd">multipass shell sandbox
+systemctl is-enabled hello; systemctl is-active hello
+sudo systemctl disable hello
+systemctl is-enabled hello; systemctl is-active hello</pre>
+<pre class="out">enabled
+active
+Removed "/etc/systemd/system/multi-user.target.wants/hello.service".
+<b>disabled</b>          ← will not start at next boot
+<b>active</b>            ← but is still running right now: the two are independent</pre></li>
+<li>Use the shorthand that means what you usually mean, and confirm both states change together.
+<pre class="cmd">sudo systemctl enable --now hello
+systemctl is-enabled hello; systemctl is-active hello</pre>
+<pre class="out">enabled
+active            ← enable --now does both jobs in one command</pre></li>
+<li>Read the effective configuration with <code>cat</code>. Right now it prints one fragment; after <a href="#cp-b11-7">B11.7</a> adds a drop-in it will print two, which is the whole point of the command.
+<pre class="cmd">systemctl cat hello</pre>
+<pre class="out"># /etc/systemd/system/hello.service        ← the source path is part of the output
+[Unit]
+Description=A hello service, written by hand
+[Service]
+Type=exec
+ExecStart=/home/ubuntu/hello.sh
+Restart=always
+...</pre></li>
+<li>Ask precise questions with <code>show</code>, which is what you want in a script or when <code>status</code> is too chatty.
+<pre class="cmd">systemctl show hello -p MainPID -p ActiveState -p SubState -p ExecMainStartTimestamp
+systemctl show hello -p Restart --value</pre>
+<pre class="out">MainPID=4501
+ActiveState=active
+SubState=running
+ExecMainStartTimestamp=Sat 2026-07-25 09:20:11 UTC
+always                          ← --value prints just the value, ideal for scripts</pre></li>
+<li>Find out whether anything on this machine is broken. On a healthy box this is empty, and that emptiness is worth confirming before you go looking for trouble elsewhere.
+<pre class="cmd">systemctl --failed --no-pager
+systemctl list-unit-files --state=enabled --no-pager | head -5</pre>
+<pre class="out">0 loaded units listed.                        ← nothing failed
+UNIT FILE                  STATE   PRESET
+cron.service               enabled enabled
+<b>hello.service              enabled disabled</b>     ← yours: enabled by you, not by the package preset
+ssh.service                enabled enabled</pre></li>
+<li>See the difference between restart and reload on a unit that supports both. <code>ssh</code> defines <code>ExecReload=</code>, so reloading it re-reads its config without dropping your session — which is why you are still connected afterwards.
+<pre class="cmd">systemctl show ssh -p ExecReload --value | head -1
+sudo systemctl reload ssh &amp;&amp; echo "reloaded, and your session survived"
+sudo systemctl reload hello 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -t ; ... }   ← ssh defines a reload
+reloaded, and your session survived
+Failed to reload hello.service: Job type reload is not applicable for unit hello.service.
+    ← your unit has no ExecReload=, so reload is simply not available</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Say what each pair does without hedging: <code>start</code>/<code>stop</code> act now and are forgotten at reboot; <code>enable</code>/<code>disable</code> act on the next boot and do nothing to the running system; <code>enable --now</code> does both. <code>restart</code> replaces the process and drops connections; <code>reload</code> asks the running process to re-read configuration and only exists if the unit defines it. Then name the command that answers "what is this service actually configured to do, including overrides" (<code>systemctl cat</code>) and the one that lists everything currently broken (<code>systemctl --failed</code>).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>reload</code> is not a gentler <code>restart</code> — it is a different operation with different coverage. Even where it exists, it reloads only what the program chose to make reloadable; many daemons re-read their config file but will not rebind a port or change a user on reload. So "I reloaded and the change did not take" is usually not a bug: the setting you changed simply is not in the reloadable set. When a change must definitely apply, restart and accept the interruption.</p>
+<p><code>systemctl status</code> truncates. It shows the last ten journal lines, which is exactly enough to be misleading during a crash loop where every attempt logs the same three lines — you see three copies of one failure and conclude it happened three times, when it happened forty. Treat <code>status</code> as the summary and <code>journalctl -u &lt;unit&gt;</code> (<a href="#cp-b11-10">B11.10</a>) as the record.</p>
+<p>Finally, a failed unit stays failed after you fix it. systemd remembers the failure and the restart counter until you clear them, so a unit can show <code>failed</code> when the underlying problem is long gone — run <code>systemctl reset-failed &lt;unit&gt;</code> after a fix, or you will chase a ghost. This matters most after hitting the start limiter from <a href="#cp-b11-4">B11.4</a>, which refuses to start the unit again until the state is reset.</p>
+<div class="k8s-link">
+<p>These verbs are the entire node-side toolkit for the one Kubernetes component systemd manages. <code>systemctl status kubelet</code> tells you whether the node's agent is alive; <code>systemctl cat kubelet</code> shows you its real configuration including kubeadm's drop-in; <code>systemctl restart kubelet</code> is the remedy for a surprising number of node problems; and <code>systemctl --failed</code> on a misbehaving node often finds the answer before Kubernetes is involved at all. Note what is <em>not</em> here: there is no <code>systemctl restart kube-apiserver</code>, because that is a static pod and not a unit — restarting it means moving its manifest file.</p>
+<p>Which components are units and which are static pods is <a href="w1.html#cp-1-2">W1.2</a>; the NotReady ladder, where <code>systemctl status kubelet</code> is an early rung, is <a href="w6.html#cp-6-10">W6.10</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 systemctl</code> is the reference; skim the "Unit Commands" section once in full so you know what exists, then remember the ten. Note <code>--no-pager</code> (used throughout these labs so output does not open <code>less</code>), <code>--value</code> for scripting, and the <code>--state=</code> filters. <code>man 5 systemd.service</code> for <code>ExecReload=</code> and what reload can and cannot do.</p>
+</article>
+
+<article class="lesson" id="cp-b11-7" data-id="b11-7">
+<div class="lesson-head"><span class="cp-id">B11.7</span><h4>Override without editing: drop-ins</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Sooner or later you need to change one setting on a unit that a package installed — give it more memory, change a flag, add a dependency. Editing the vendor file works and is wrong, because the next upgrade silently reverts it (<a href="#cp-b11-3">B11.3</a>). A drop-in changes one key, survives upgrades, is self-documenting, and is exactly the mechanism kubeadm uses to configure the kubelet — so learning it here means reading a real node's configuration later without surprise.</p>
+<h5>The concept</h5>
+<p>For any unit <code>foo.service</code>, systemd also reads every <code>*.conf</code> file in a directory named <code>foo.service.d/</code> — under <code>/etc/systemd/system/</code> for your overrides, and under <code>/usr/lib/systemd/system/</code> for the vendor's own. Those files are <strong>merged over</strong> the main unit file rather than replacing it: you write only the sections and keys you want to change, and everything else stays as the vendor wrote it. Files are applied in alphabetical order, which is why the convention is to prefix them with numbers (<code>10-</code>, <code>20-</code>) so the order is visible and controllable.</p>
+<p>The mechanism has one sharp edge that catches everyone exactly once. Most keys are <strong>last-one-wins</strong>: set <code>Restart=on-failure</code> in a drop-in and it replaces the vendor's <code>Restart=always</code>. But some keys are <strong>list-valued and accumulate</strong> — <code>ExecStart=</code>, <code>ExecStartPre=</code>, <code>Environment=</code>, <code>After=</code> and friends. Adding <code>ExecStart=/usr/bin/mine</code> in a drop-in does not replace the vendor's <code>ExecStart</code>; it <em>appends a second one</em>, and systemd refuses the unit with an error about multiple commands. The fix is to clear the list first with an empty assignment, then set your value:</p>
+<pre class="cmd">[Service]
+ExecStart=
+ExecStart=/usr/bin/mine --with --my --flags</pre>
+<p>That first bare <code>ExecStart=</code> means "empty the list." It looks like a typo and is load-bearing. The same trick applies to any accumulating key.</p>
+<p>You can create drop-ins two ways. By hand: <code>mkdir /etc/systemd/system/foo.service.d/</code>, write a <code>.conf</code> file, <code>daemon-reload</code>. Or with <code>systemctl edit foo</code>, which opens an editor on a drop-in called <code>override.conf</code>, creates the directory for you, and runs <code>daemon-reload</code> on save. <code>systemctl edit --full foo</code> instead copies the whole vendor unit into <code>/etc/</code> for you to edit — occasionally what you want, but it opts you out of future vendor improvements, so prefer the drop-in. Either way, <code>systemctl cat foo</code> afterwards shows the merged result with each fragment's path, which is how you confirm your value actually won.</p>
+<div class="flow"><span>vendor unit</span><em>+</em><span>10-a.conf</span><em>+</em><span class="hot">20-b.conf</span><em>=</em><span>systemctl cat shows the merge</span></div>
+<p>Drop-ins layer over the vendor file in alphabetical order; nothing is replaced except the keys you name.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Override one key on your own unit with a hand-written drop-in. Change the restart policy without touching the unit file at all.
+<pre class="cmd">sudo mkdir -p /etc/systemd/system/hello.service.d
+sudo tee /etc/systemd/system/hello.service.d/10-restart.conf &gt;/dev/null &lt;&lt;'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart hello
+systemctl show hello -p Restart -p RestartUSec</pre>
+<pre class="out">Restart=<b>on-failure</b>          ← the drop-in won; the unit file still says always
+RestartUSec=<b>5s</b></pre></li>
+<li>Confirm the merge with <code>cat</code>. Both fragments are printed, each under its own path — this is the command that ends every "but what is it actually set to" argument.
+<pre class="cmd">systemctl cat hello</pre>
+<pre class="out"># /etc/systemd/system/hello.service
+[Unit]
+Description=A hello service, written by hand
+[Service]
+Type=exec
+ExecStart=/home/ubuntu/hello.sh
+<b>Restart=always</b>                                       ← the original, still there
+...
+<b># /etc/systemd/system/hello.service.d/10-restart.conf</b>  ← the drop-in, applied after
+[Service]
+Restart=on-failure
+RestartSec=5s</pre></li>
+<li>Now walk into the accumulating-key trap on purpose, so you recognise the error message when it happens for real.
+<pre class="cmd">printf '[Service]\nExecStart=/home/ubuntu/hello.sh\n' | \
+  sudo tee /etc/systemd/system/hello.service.d/20-exec.conf
+sudo systemctl daemon-reload; sudo systemctl restart hello 2&gt;&amp;1 | tail -2
+systemctl status hello --no-pager | head -3</pre>
+<pre class="out">Job for hello.service failed because the control process exited with error code.
+hello.service: <b>Service has more than one ExecStart= setting, which is only allowed for
+Type=oneshot services.</b> Refusing.                    ← the drop-in appended, it did not replace</pre></li>
+<li>Fix it with the empty assignment — the one-line difference between a broken override and a working one.
+<pre class="cmd">printf '[Service]\nExecStart=\nExecStart=/home/ubuntu/hello.sh --loud\n' | \
+  sudo tee /etc/systemd/system/hello.service.d/20-exec.conf
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart hello
+systemctl show hello -p ExecStart --value | head -1
+systemctl is-active hello</pre>
+<pre class="out">{ path=/home/ubuntu/hello.sh ; argv[]=/home/ubuntu/hello.sh --loud ; ... }
+active           ← one ExecStart, and it is yours</pre></li>
+<li>Do the same thing the interactive way, so you know both routes. <code>systemctl edit</code> handles the directory, the filename and the reload for you.
+<pre class="cmd">sudo SYSTEMD_EDITOR=tee systemctl edit hello &lt;&lt;'EOF'
+[Unit]
+Description=A hello service, overridden
+EOF
+systemctl show hello -p Description --value
+ls /etc/systemd/system/hello.service.d/</pre>
+<pre class="out">A hello service, overridden
+10-restart.conf  20-exec.conf  <b>override.conf</b>     ← systemctl edit's own file</pre></li>
+<li>Tidy back to a single clean drop-in for the lessons that follow.
+<pre class="cmd">sudo rm -f /etc/systemd/system/hello.service.d/20-exec.conf /etc/systemd/system/hello.service.d/override.conf
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart hello &amp;&amp; systemctl is-active hello</pre>
+<pre class="out">active</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>systemctl cat hello</code> should show the unit file followed by <code>10-restart.conf</code>, and <code>systemctl show hello -p Restart</code> should report <code>on-failure</code> even though the unit file says <code>always</code>. Explain why a drop-in is better than editing the vendor unit (it survives package upgrades and changes only the keys you name), and state the rule for replacing an accumulating key like <code>ExecStart=</code> (assign it empty once to clear the list, then assign your value).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>ExecStart=</code> trap is worth internalising because its error message names the symptom rather than the cause: "Service has more than one ExecStart= setting" sounds like you wrote the same key twice in one file, when in fact you wrote it once in a drop-in and the vendor wrote it once in the unit. Any time you are <em>replacing</em> rather than adding, clear the list first. The same applies to <code>Environment=</code>, <code>ExecStartPre=</code>, and the dependency keys.</p>
+<p>Alphabetical order means <code>20-foo.conf</code> beats <code>10-foo.conf</code> for last-one-wins keys, and that <code>override.conf</code> (from <code>systemctl edit</code>) sorts after any numbered file. Mixing hand-written drop-ins with <code>systemctl edit</code> on the same unit is therefore a good way to confuse yourself later. Pick one convention per unit, and use <code>systemctl cat</code> whenever the effective value surprises you — it prints fragments in application order, so the last occurrence of a key is the winner.</p>
+<p>And drop-ins still need <code>daemon-reload</code>. <code>systemctl edit</code> does it for you; writing the file by hand does not. A drop-in that "has no effect" is, nine times out of ten, a drop-in systemd has not read yet.</p>
+<div class="k8s-link">
+<p>This is precisely how a kubeadm-built node configures its kubelet. The kubelet package ships a plain unit, and kubeadm adds <code>/etc/systemd/system/kubelet.service.d/10-kubeadm.conf</code> — a drop-in that clears <code>ExecStart=</code> with an empty assignment and sets its own, pulling flags from environment files. When you run <code>systemctl cat kubelet</code> on a real node, that two-fragment output is exactly what you just built by hand, down to the <code>10-</code> prefix and the empty-assignment trick. It is also why changing a kubelet flag means editing a drop-in and running <code>daemon-reload</code>, never editing the shipped unit. (Kubernetes has been moving the same idea into the kubelet itself: as of v1.35 the kubelet's own configuration drop-in directory, <code>--config-dir</code>, is generally available — the same layering principle applied to its YAML config rather than its unit file.)</p>
+<p>Reading the node's real kubelet configuration is part of <a href="w1.html#cp-1-2">W1.2</a>; the kubelet's config and state directory is <a href="w1.html#cp-1-23">W1.23</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.unit</code>'s "Unit File Load Path" and the drop-in discussion immediately after it describe the <code>.d/</code> directories and merge order, including the empty-assignment rule for list-valued settings. <code>man 1 systemctl</code> for <code>edit</code>, <code>edit --full</code>, <code>edit --drop-in=NAME</code> and <code>cat</code>. <code>man 5 systemd.service</code> notes which settings accumulate — the ones documented as accepting multiple assignments.</p>
+</article>
+
+<article class="lesson" id="cp-b11-8" data-id="b11-8">
+<div class="lesson-head"><span class="cp-id">B11.8</span><h4>Keep configuration out of the unit: EnvironmentFile</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A unit file describes <em>how to run</em> a service; it should not also hold every knob the service happens to need. Separating the two means an operator can change behaviour by editing an obvious file of <code>KEY=value</code> lines and restarting, without touching systemd configuration, without <code>daemon-reload</code>, and without the risk of breaking the unit itself. This is how nearly every packaged service on a Linux machine is arranged, and it is the pattern kubeadm uses to pass flags to the kubelet.</p>
+<h5>The concept</h5>
+<p><code>EnvironmentFile=/path/to/file</code> in <code>[Service]</code> tells systemd to read that file before starting the process and put its contents into the process's environment. The file is a list of <code>KEY=value</code> lines — no <code>export</code>, no shell, comments with <code>#</code>. You then reference the values in <code>ExecStart=</code> with <code>$NAME</code> or <code>${NAME}</code>. A leading dash — <code>EnvironmentFile=-/etc/default/hello</code> — means "ignore this if the file does not exist," which is what packaged units use so a missing optional config is not a start failure.</p>
+<p>For one or two fixed values, <code>Environment="KEY=value"</code> inline in the unit does the same job without a separate file. Use the file when the values are things an operator should edit; use the inline form for things that belong to the unit's definition.</p>
+<p>Now the part that produces real confusion, and it is worth getting exactly right because it looks like shell and is not. systemd performs <strong>variable substitution, not shell expansion</strong>, and the two forms differ in one specific way:</p>
+<ul>
+<li><strong><code>$NAME</code></strong> — the value is substituted and then <em>split on whitespace into separate arguments</em>. This is what you want for a variable holding a list of flags.</li>
+<li><strong><code>${NAME}</code></strong> — the value is substituted as a <em>single argument</em>, whitespace included. This is what you want for a path or a value that might contain spaces.</li>
+</ul>
+<p>The systemd manual's own example makes it concrete: with <code>ONE=one</code> and <code>TWO=two two</code>, the line <code>ExecStart=/bin/echo $ONE $TWO ${TWO}</code> passes four arguments — <code>one</code>, <code>two</code>, <code>two</code>, and <code>two two</code>. Nothing else shell-like works: no command substitution, no globbing, no <code>$(...)</code>, no <code>&amp;&amp;</code>, and an undefined variable becomes an empty string rather than an error.</p>
+<p>The consequence people trip over is timing. The environment file is read <strong>when the service starts</strong>, so editing it changes nothing at all until you restart the service — the running process has its copy of the environment and nothing can push a new one into it. That is not a systemd quirk; it is how process environments work everywhere, and it is exactly why a Kubernetes pod's environment variables never update when their ConfigMap changes while mounted volumes do.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make the script take its behaviour from the environment rather than from hard-coded values.
+<pre class="cmd">cat &gt; /home/ubuntu/hello.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+GREETING="${GREETING:-hello}"
+INTERVAL="${INTERVAL:-5}"
+while true; do
+  echo "$GREETING from pid $$ (every ${INTERVAL}s)"
+  sleep "$INTERVAL"
+done
+EOF
+chmod +x /home/ubuntu/hello.sh</pre>
+<pre class="out">                       # the script now reads two variables, with defaults</pre></li>
+<li>Write the environment file and point the unit at it with a drop-in — configuration in one place, unit definition in another.
+<pre class="cmd">sudo tee /etc/default/hello &gt;/dev/null &lt;&lt;'EOF'
+# operator-editable settings for hello.service
+GREETING=good morning
+INTERVAL=3
+EOF
+sudo tee /etc/systemd/system/hello.service.d/30-env.conf &gt;/dev/null &lt;&lt;'EOF'
+[Service]
+EnvironmentFile=-/etc/default/hello
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart hello
+journalctl -u hello -n 2 --no-pager -o cat</pre>
+<pre class="out"><b>good morning</b> from pid 5310 (every <b>3</b>s)      ← both values came from the file
+good morning from pid 5310 (every 3s)</pre></li>
+<li>Inspect the environment systemd actually built for the service. This is the ground truth when a variable "isn't being picked up."
+<pre class="cmd">systemctl show hello -p Environment --value
+sudo tr '\0' '\n' &lt; /proc/$(systemctl show hello -p MainPID --value)/environ | grep -E 'GREETING|INTERVAL'</pre>
+<pre class="out">GREETING=good morning INTERVAL=3        ← what systemd will pass
+<b>GREETING=good morning</b>                    ← what the running process actually has (B3's /proc)
+<b>INTERVAL=3</b></pre></li>
+<li>Now demonstrate the timing rule, which is the lesson people remember. Edit the file and watch absolutely nothing happen until you restart.
+<pre class="cmd">sudo sed -i 's/^GREETING=.*/GREETING=good evening/' /etc/default/hello
+sleep 4; journalctl -u hello -n 1 --no-pager -o cat       # still the old value
+sudo systemctl restart hello; sleep 1
+journalctl -u hello -n 1 --no-pager -o cat                # now it changed</pre>
+<pre class="out">good morning from pid 5310 (every 3s)      ← file edited, process unchanged
+<b>good evening</b> from pid 5402 (every 3s)      ← only a restart re-reads the environment</pre></li>
+<li>See the <code>$VAR</code> versus <code>${VAR}</code> splitting rule directly, because it decides whether your flags arrive as flags or as one long string.
+<pre class="cmd">sudo tee /etc/systemd/system/argtest.service &gt;/dev/null &lt;&lt;'EOF'
+[Service]
+Type=oneshot
+Environment="ONE=one" "TWO=two two"
+ExecStart=/usr/bin/printf 'arg:[%s]\n' $ONE $TWO ${TWO}
+EOF
+sudo systemctl daemon-reload; sudo systemctl start argtest
+journalctl -u argtest -n 4 --no-pager -o cat</pre>
+<pre class="out">arg:[one]
+arg:[two]          ← $TWO split into two separate arguments
+arg:[two]
+arg:[<b>two two</b>]      ← ${TWO} stayed as one argument</pre></li>
+<li>Remove the demonstration unit; <code>hello</code> and its environment file stay.
+<pre class="cmd">sudo rm /etc/systemd/system/argtest.service; sudo systemctl daemon-reload; echo removed</pre>
+<pre class="out">removed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Your service should be printing values that came from <code>/etc/default/hello</code>, and you should have watched an edit to that file have no effect until a restart. Explain why (the environment is copied into the process at start; nothing can change a running process's environment from outside), and state the difference between <code>$VAR</code> and <code>${VAR}</code> in a unit (the first splits on whitespace into multiple arguments, the second stays one argument). Then say what the leading dash in <code>EnvironmentFile=-/path</code> means (ignore the file if it does not exist, rather than failing to start).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The environment file is not a shell script, however much it looks like one. <code>KEY=$(hostname)</code> sets the literal string <code>$(hostname)</code>; <code>export KEY=value</code> sets a variable whose name is <code>export KEY</code> or fails outright; quoting rules are systemd's, not bash's. If you need a value computed at start-up, compute it in an <code>ExecStartPre=</code> script that writes the file, or accept a wrapper script as your <code>ExecStart</code>.</p>
+<p>Undefined variables silently become empty. A typo in <code>ExecStart=/usr/bin/foo --port=$PROT</code> does not fail — it runs <code>foo --port=</code>, which the program may accept, reject confusingly, or interpret as a default. When a service starts but behaves as though a setting is missing, print the effective command with <code>systemctl show &lt;unit&gt; -p ExecStart</code> before suspecting the program.</p>
+<p>Finally, be careful about what you put in these files. Everything in a process's environment is readable via <code>/proc/PID/environ</code> by the owning user and by root, and it is shown in <code>systemctl show</code> output. An environment file is a fine place for a port number and a poor place for a password — which is the same lesson Kubernetes teaches when it distinguishes ConfigMaps from Secrets, and then admits Secrets are only base64.</p>
+<div class="k8s-link">
+<p>Two direct parallels. First, this is how kubeadm passes flags to the kubelet: its drop-in reads <code>/var/lib/kubelet/kubeadm-flags.env</code> and <code>/etc/default/kubelet</code>, then references those variables in <code>ExecStart</code> — the exact pattern you just built, which is why changing a kubelet flag is "edit the env file, restart the service." Second, the timing rule is identical to a pod's: environment variables taken from a ConfigMap are copied in at container start and <em>never</em> update when the ConfigMap changes, while a mounted ConfigMap volume does update. Same mechanism, same reason, one layer up — a process's environment is fixed at exec time.</p>
+<p>The four ways to consume a ConfigMap are <a href="w3.html#cp-3-21">W3.21</a>; the update-propagation rules that make env the exception are <a href="w3.html#cp-3-22">W3.22</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.exec</code> is the page for <code>Environment=</code>, <code>EnvironmentFile=</code> and the environment-file format, including the quoting rules. <code>man 5 systemd.service</code>'s "Command Lines" section documents the <code>$VAR</code> versus <code>${VAR}</code> splitting behaviour with the example used above, and lists what is <em>not</em> supported (no globbing, no command substitution). <code>man 5 proc_pid_environ</code> for reading a live process's environment.</p>
+</article>
+
+<article class="lesson" id="cp-b11-9" data-id="b11-9">
+<div class="lesson-head"><span class="cp-id">B11.9</span><h4>Read a failure from systemctl status: exit code versus signal</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the single highest-value skill in the module. A service has failed, and <code>systemctl status</code> is telling you why in a format most people skim. Buried in it is one distinction that decides where you look next: did the program <em>decide</em> to exit, or was it <em>killed</em>? Those point in opposite directions — one says read the application's logs, the other says stop reading them and look at what else is on the machine — and getting it right saves the twenty minutes people routinely spend reading logs that were never going to contain the answer.</p>
+<h5>The concept</h5>
+<p><code>systemctl status</code> has a fixed shape, and four lines carry almost all the information:</p>
+<ul>
+<li><strong><code>Loaded:</code></strong> — which file it came from, and whether it is enabled. A unit that is <code>not-found</code> or <code>bad-setting</code> never got as far as running.</li>
+<li><strong><code>Active:</code></strong> — the state and how long it has held it. <code>active (running)</code>, <code>inactive (dead)</code>, <code>failed (Result: …)</code>, or <code>activating (auto-restart)</code> — that last one meaning "currently in a restart loop," which is the fault in <a href="#cp-b11-14">B11.14</a>.</li>
+<li><strong><code>Main PID:</code> / <code>Process:</code></strong> — the process, and in parentheses <em>how it ended</em>. This is the load-bearing part.</li>
+<li>The last few journal lines, which are the application's own account of events (and truncated — see <a href="#cp-b11-6">B11.6</a>).</li>
+</ul>
+<p>The parenthesised ending takes one of two shapes, and they mean completely different things — this is <a href="b2.html#cp-b2-8">B2.8</a>'s exit-status distinction, surfaced by systemd:</p>
+<ul>
+<li><strong><code>(code=exited, status=1/FAILURE)</code></strong> — the program ran, decided it could not continue, and <em>chose</em> to exit with that code. The program knows why. <strong>Read its logs.</strong> The status number is the program's own vocabulary: 1 is generic failure, 2 is often a usage error, 78 might mean bad configuration; the meaning is the program's to define.</li>
+<li><strong><code>(code=killed, signal=KILL)</code></strong> — the program did not decide anything; something ended it from outside. The program's logs will contain <em>nothing</em> about it, because it had no chance to write anything. <strong>Look outside the program.</strong> Who killed it? The OOM killer (<a href="b7.html#cp-b7-9">B7.9</a>), an operator, a timeout systemd itself enforced, or a supervisor higher up.</li>
+</ul>
+<p>The <code>Result:</code> field on the <code>Active:</code> line summarises the same thing in one word and is often faster to read: <code>exit-code</code>, <code>signal</code>, <code>oom-kill</code>, <code>timeout</code>, <code>core-dump</code>, <code>start-limit-hit</code>. <code>Result: oom-kill</code> in particular tells you in one glance what would otherwise take a <code>dmesg</code> hunt.</p>
+<p>A special case worth recognising: <strong><code>status=203/EXEC</code></strong> means systemd could not even execute the command — a wrong path, a missing interpreter, or a file without the execute bit. The program never ran, so its logs do not exist, and no amount of reading them will help. Its siblings <code>200/CHDIR</code> (bad <code>WorkingDirectory=</code>) and <code>217/USER</code> (unknown <code>User=</code>) are the same class of failure: systemd failed during set-up, before your code existed.</p>
+<div class="flow"><span>code=exited</span><em>→ the program chose to stop →</em><span class="hot">read its logs</span><em>·</em><span>code=killed</span><em>→ something ended it →</em><span class="hot">look outside it</span></div>
+<p>One line of status decides which half of the machine you investigate next.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Produce a clean exit-code failure and read it. The program runs, decides it cannot continue, and says so.
+<pre class="cmd">sudo tee /etc/systemd/system/failer.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Exits with an error on purpose
+[Service]
+ExecStart=/bin/sh -c 'echo "config file missing, giving up" &gt;&amp;2; exit 78'
+EOF
+sudo systemctl daemon-reload; sudo systemctl start failer 2&gt;/dev/null
+systemctl status failer --no-pager | grep -E 'Active:|Process:|giving up'</pre>
+<pre class="out">Active: <b>failed (Result: exit-code)</b> since Sat 2026-07-25 10:02:11 UTC
+Process: 5601 ExecStart=/bin/sh -c ... (<b>code=exited, status=78</b>)
+sandbox sh[5601]: <b>config file missing, giving up</b>      ← the program explained itself</pre></li>
+<li>Now produce a signal death and notice what is <em>absent</em>. The service says nothing, because it never got the chance.
+<pre class="cmd">sudo tee /etc/systemd/system/victim.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Waits to be killed
+[Service]
+ExecStart=/bin/sleep 300
+EOF
+sudo systemctl daemon-reload; sudo systemctl start victim
+sudo kill -KILL "$(systemctl show victim -p MainPID --value)"; sleep 1
+systemctl status victim --no-pager | grep -E 'Active:|Main PID:'</pre>
+<pre class="out">Active: <b>failed (Result: signal)</b> since Sat 2026-07-25 10:04:33 UTC
+Main PID: 5644 (code=<b>killed, signal=KILL</b>)     ← no message from the program: there wasn't one</pre></li>
+<li>Produce the specific signal death you will meet most often on a real node: an OOM kill, using B7's memory limit as a unit property rather than a cgroup file.
+<pre class="cmd">sudo tee /etc/systemd/system/hog.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Allocates more memory than it is allowed
+[Service]
+MemoryMax=32M
+ExecStart=/usr/bin/python3 -c "b=[]; [b.append(bytearray(1048576)) for _ in iter(int,1)]"
+EOF
+sudo systemctl daemon-reload; sudo systemctl start hog 2&gt;/dev/null; sleep 3
+systemctl status hog --no-pager | grep -E 'Active:|Main PID:'
+sudo journalctl -k -n 2 --no-pager | grep -i 'killed process' | tail -1</pre>
+<pre class="out">Active: failed (<b>Result: oom-kill</b>)              ← systemd names the cause outright
+Main PID: 5702 (code=killed, signal=KILL)
+kernel: Killed process 5702 (python3) total-vm:... anon-rss:33120kB   ← B7.9's evidence</pre></li>
+<li>Meet the set-up failures, which are a third category: the program never existed at all.
+<pre class="cmd">sudo tee /etc/systemd/system/typo.service &gt;/dev/null &lt;&lt;'EOF'
+[Service]
+ExecStart=/usr/bin/definitely-not-a-real-binary
+EOF
+sudo systemctl daemon-reload; sudo systemctl start typo 2&gt;/dev/null
+systemctl status typo --no-pager | grep -E 'Active:|Process:'</pre>
+<pre class="out">Active: failed (Result: exit-code)
+Process: 5760 ExecStart=/usr/bin/definitely-not-a-real-binary (code=exited, <b>status=203/EXEC</b>)
+    ← 203/EXEC: systemd could not execute it. No program logs exist to read.</pre></li>
+<li>Remove the demonstration units and clear their failed states.
+<pre class="cmd">for u in failer victim hog typo; do sudo systemctl reset-failed $u 2&gt;/dev/null; sudo rm -f /etc/systemd/system/$u.service; done
+sudo systemctl daemon-reload; systemctl --failed --no-pager | tail -1</pre>
+<pre class="out">0 loaded units listed.</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Given only a status line, say where you would look next. <code>(code=exited, status=1)</code> → the program chose to stop, so read its logs. <code>(code=killed, signal=KILL)</code> → something outside ended it, so look at the OOM killer, an operator or a timeout — its own logs will be silent. <code>Result: oom-kill</code> → a memory limit, confirmed in the kernel log. <code>status=203/EXEC</code> → systemd could not run the command at all; check the path, the interpreter and the execute bit. You should have produced all four and read each one.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The failure that wastes the most time is reading application logs after a signal death. The logs are silent, so people read further back, then read more carefully, then start doubting the logging configuration — when the correct conclusion was available in the first line of status: <em>the program did not fail, it was killed.</em> Train yourself to look at the parenthesised ending before you look at any log line at all.</p>
+<p>Exit code numbers are the program's vocabulary, not a standard. <code>status=1</code> tells you the program failed and nothing about why; <code>status=78</code> means whatever that program's documentation says it means. The two exceptions are systemd's own set-up codes (<code>203/EXEC</code>, <code>200/CHDIR</code>, <code>217/USER</code> and friends, which are systemd's and are documented in <code>man 5 systemd.exec</code>) and the shell convention that a process killed by signal <em>N</em> reports as <em>128 + N</em> when a shell reports it (<a href="b2.html#cp-b2-8">B2.8</a>) — which is why 137 means SIGKILL and 143 means SIGTERM.</p>
+<p>Finally, <code>status</code> shows the <em>most recent</em> attempt. During a restart loop that is the least informative one, because you are looking at attempt forty of an identical sequence. Use <code>journalctl -u &lt;unit&gt;</code> to see the whole history, and check <code>NRestarts</code> to find out how many attempts you are actually looking at the tail of.</p>
+<div class="k8s-link">
+<p>This is the same fork in the road as a pod's <code>Error</code> versus <code>OOMKilled</code>, and Kubernetes derives its version from exactly the same underlying information. A container that exits non-zero gives you <code>lastState.terminated.exitCode</code> — the program's own decision, so read the container logs. A container killed for exceeding its memory limit gives you <code>reason: OOMKilled</code> and exit code 137 (128 + 9), and its logs will be empty for the same reason yours were: SIGKILL cannot be caught, so nothing was written. When you meet the exit-code alphabet in the advanced track, you will already know why 137 is special and why reading the app's logs after it is a waste of time.</p>
+<p>The three status vocabularies and container states are <a href="w3.html#cp-3-1">W3.1</a>; CrashLoopBackOff, <code>--previous</code> and the exit-code alphabet are <a href="w6.html#cp-6-16">W6.16</a>; QoS classes and who gets killed first at OOM time are <a href="w3.html#cp-3-17">W3.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 systemctl</code> documents the <code>status</code> output fields. <code>man 5 systemd.exec</code> has the table of systemd's own exit codes (<code>200/CHDIR</code>, <code>203/EXEC</code>, <code>217/USER</code> and the rest) — worth bookmarking, since these are the ones that are genuinely standard. <code>man 5 systemd.resource-control</code> for <code>MemoryMax=</code> and the other cgroup keys usable in a unit (the friendly names for <a href="b7.html#cp-b7-8">B7.8</a>'s files). <code>man 7 signal</code> for the signal numbers behind <code>128 + N</code>.</p>
+</article>
+
+</div><!-- /g-operating -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
