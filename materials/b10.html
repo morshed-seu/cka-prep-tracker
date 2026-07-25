@@ -491,6 +491,262 @@ Global
 
 </div><!-- /g-system -->
 
+<!-- ---------------- Records and caching ---------------- -->
+<div class="grp" id="g-records"><h3>Records and caching</h3>
+
+<article class="lesson" id="cp-b10-8" data-id="b10-8">
+<div class="lesson-head"><span class="cp-id">B10.8</span><h4>The record types, learned by their job: A, AAAA, CNAME, PTR, SRV, TXT, NS</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>DNS is often described as "the phone book of the internet," which undersells it: it is a general key-value store for names, and the value's <em>type</em> says what kind of question you asked. Knowing the handful of types that matter — and specifically what each one is <em>for</em> — turns a wall of <code>dig</code> output into a sentence you can read. It also removes the surprise from several Kubernetes features that are, quite literally, nothing more than one of these record types being served.</p>
+<h5>The concept</h5>
+<p>Every record is a four-part statement: a <strong>name</strong>, a <strong>TTL</strong> (how long it may be cached, <a href="#cp-b10-10">B10.10</a>), a <strong>class</strong> (always <code>IN</code>, for Internet — the others are historical), and a <strong>type</strong>, followed by type-specific data. You ask for a name <em>and</em> a type; asking for the wrong type gets you an empty answer even though the name exists perfectly well, which is a trap worth meeting early.</p>
+<ul>
+<li><strong>A</strong> — name → one IPv4 address. The workhorse. A name may have several A records, and a resolver typically returns them all; clients pick one, often rotating, which is the oldest form of load balancing there is.</li>
+<li><strong>AAAA</strong> — name → one IPv6 address ("quad-A"). Modern clients ask for both A and AAAA and prefer IPv6 when it works. This is why a broken AAAA record produces the maddening "slow for some users" symptom: they try IPv6 first, wait for it to fail, then fall back.</li>
+<li><strong>CNAME</strong> — <em>canonical name</em>: "this name is an alias for that name." The resolver, on receiving one, restarts the lookup at the target. The rules are strict: a name with a CNAME may have no other records, and therefore the top of a zone (the "apex", e.g. <code>example.com</code> itself) cannot be a CNAME, because it must carry NS and SOA records. That single restriction is why so many hosting providers invent proprietary "ALIAS" records.</li>
+<li><strong>PTR</strong> — address → name, the reverse direction. Reverse lookups don't magically invert the forward tree; they live in a special zone (<code>in-addr.arpa</code> for IPv4) where the address is written backwards. There is no rule that forward and reverse must agree, and often they don't.</li>
+<li><strong>SRV</strong> — <em>service</em>: name → host <strong>and port</strong>, with priority and weight. This is the only common record that carries a port number, which makes it the right answer for "where is this service, and on which port?" without hard-coding either.</li>
+<li><strong>TXT</strong> — arbitrary text hung on a name. Because anyone who controls a zone can publish text under it, TXT records became the universal proof-of-ownership mechanism (domain verification) and the carrier for mail policy (SPF, DKIM, DMARC).</li>
+<li><strong>NS</strong> — which servers are authoritative for a zone. These are the records that implement delegation (<a href="#cp-b10-6">B10.6</a>) — a referral is literally a set of NS records plus their glue.</li>
+</ul>
+<p>Two more you will see and should recognise without needing to use: <strong>SOA</strong> (start of authority) sits at the top of every zone and carries the zone's serial number and timing parameters, including the negative-caching TTL that <a href="#cp-b10-11">B10.11</a> depends on; and <strong>MX</strong> routes mail for a domain to named hosts by preference.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask for the two address types explicitly and see that a name can have both — or only one.
+<pre class="cmd">dig +noall +answer example.com A
+dig +noall +answer example.com AAAA</pre>
+<pre class="out">example.com.  1795  IN  <b>A</b>     23.220.75.232
+example.com.  1795  IN  <b>AAAA</b>  2600:1408:ec00:36::1736:7f24</pre></li>
+<li>Follow an alias. When an answer contains a CNAME, read it as a redirection: the resolver restarted the lookup at the target and returned both steps. (The specific target will differ when you run it — the <em>shape</em> is the lesson.)
+<pre class="cmd">dig +noall +answer www.wikipedia.org</pre>
+<pre class="out">www.wikipedia.org.  86400  IN  <b>CNAME</b>  dyna.wikimedia.org.   ← "ask about this instead"
+dyna.wikimedia.org.   600  IN  A      185.15.59.224           ← the answer to that</pre></li>
+<li>Go the other way with a reverse lookup. <code>dig -x</code> writes the <code>in-addr.arpa</code> name for you; run it without <code>-x</code> once to see what it is really asking.
+<pre class="cmd">dig +noall +answer -x 8.8.8.8
+dig +noall +answer 8.8.8.8.in-addr.arpa PTR      # the same query, spelled out</pre>
+<pre class="out">8.8.8.8.in-addr.arpa.  8555  IN  <b>PTR</b>  dns.google.
+    ← note the address written backwards, under a special zone</pre></li>
+<li>Ask for a service and get a host <em>and a port</em> — the property no other common record has.
+<pre class="cmd">dig +noall +answer _xmpp-server._tcp.gmail.com SRV | head -3</pre>
+<pre class="out">_xmpp-server._tcp.gmail.com. 900 IN <b>SRV</b> 5 0 <b>5269</b> xmpp-server.l.google.com.
+    #                                    prio weight <b>port</b>  target</pre></li>
+<li>Read text and delegation records, then prove the type-mismatch trap: ask a name that exists for a type it does not have, and get a perfectly successful, perfectly empty answer.
+<pre class="cmd">dig +noall +answer example.com TXT
+dig +noall +answer example.com NS
+dig example.com MX | grep -E 'status:|ANSWER:'</pre>
+<pre class="out">example.com.  86400  IN  <b>TXT</b>  "v=spf1 -all"
+example.com.  86400  IN  <b>NS</b>   a.iana-servers.net.
+;; flags: qr rd ra; QUERY: 1, <b>ANSWER: 0</b> ... <b>status: NOERROR</b>
+    ← NOERROR with zero answers: the name exists, that type does not. Not an error!</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Match each type to its job without notes: which one carries a port (SRV), which one is an alias that restarts the lookup (CNAME), which one goes from address to name (PTR), which one implements delegation (NS), which one carries proof-of-ownership text (TXT). Then explain what <code>NOERROR</code> with <code>ANSWER: 0</code> means (the name exists, but has no record of the type you asked for) and why that is different from <code>NXDOMAIN</code> (the name does not exist at all) — a distinction <a href="#cp-b10-9">B10.9</a> makes central.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The empty-but-successful answer is the trap that catches everyone once. <code>NOERROR</code> plus zero records does not mean failure and does not mean the name is wrong — it means you asked for a type this name doesn't carry. A tool that only prints the answer section (or <code>dig +short</code>, which prints nothing at all here) makes it look identical to "doesn't exist." Always glance at the <code>status:</code> line before concluding anything.</p>
+<p>The CNAME apex restriction bites in real deployments: you cannot point <code>example.com</code> itself at a load balancer's hostname with a CNAME, because the apex must hold NS and SOA records and a CNAME may not coexist with anything. Providers work around it with non-standard record types, which is why "just CNAME the root domain" is advice that fails.</p>
+<p>Finally, forward and reverse are independent. <code>PTR</code> records live in a zone controlled by whoever owns the <em>address block</em>, not the domain — usually your hosting provider. So a machine can have a perfectly good A record and a PTR that says something unrelated, and software that insists the two match (some mail systems, some old authentication schemes) will reject it for reasons that have nothing to do with your zone.</p>
+<div class="k8s-link">
+<p>Three of these are Kubernetes features wearing their DNS names. A normal Service is an <strong>A</strong> record for its ClusterIP. A <em>headless</em> Service (one with no ClusterIP) is a set of A records, one per backing pod, so the client sees the individual pods instead of a virtual address. An <code>ExternalName</code> Service is nothing but a <strong>CNAME</strong> answer — no proxying, no rules, just an alias. And <strong>SRV</strong> records are how a StatefulSet's members find each other with both address and port, which is what lets a database cluster form itself with no load balancer in the middle. When you meet those features, you will recognise them as record types you already queried by hand.</p>
+<p>Headless Services and per-pod records are <a href="w4.html#cp-4-13">W4.13</a>; the full set of record shapes a cluster serves, verified with <code>dig</code>, is <a href="w4.html#cp-4-17">W4.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">RFC 1035 §3.2.2 lists the original types and their wire formats; RFC 2782 defines SRV including the priority/weight algorithm. <code>man 1 dig</code> for asking a specific type, <code>-x</code> for reverse lookups and the <code>+noall +answer</code> combination used above to strip everything but records. <code>man 5 named.conf</code> and any zone-file example show how these look when written rather than queried.</p>
+</article>
+
+<article class="lesson" id="cp-b10-9" data-id="b10-9">
+<div class="lesson-head"><span class="cp-id">B10.9</span><h4>Read a dig answer completely: sections, status, flags, query time</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Most people read <code>dig</code> output by scanning for an IP address and ignoring everything else. Everything else is where the diagnosis lives. The status field alone tells you whether to go look at the name or at the server — two completely different investigations that present identically to a user as "it doesn't resolve." Reading the whole answer takes ten extra seconds and routinely saves an hour.</p>
+<h5>The concept</h5>
+<p>A DNS response has four sections, and <code>dig</code> prints them in order:</p>
+<ul>
+<li><strong>QUESTION</strong> — what was actually asked, fully qualified. Read it first, always: it is where you discover that the search list turned your short name into something you did not intend (<a href="#cp-b10-4">B10.4</a>).</li>
+<li><strong>ANSWER</strong> — the records that answer the question, including any CNAME hops taken along the way.</li>
+<li><strong>AUTHORITY</strong> — which servers are authoritative. On a failure this usually holds the zone's <strong>SOA</strong> record, and that SOA is what governs how long the failure is cached (<a href="#cp-b10-11">B10.11</a>).</li>
+<li><strong>ADDITIONAL</strong> — extra records the server volunteered, typically the addresses of servers named above (glue, <a href="#cp-b10-6">B10.6</a>), plus an <code>OPT</code> pseudo-record carrying EDNS options.</li>
+</ul>
+<p>Above the sections sits the header, and it holds the three things worth memorising:</p>
+<ul>
+<li><strong><code>status:</code></strong> — the verdict. <code>NOERROR</code> (the query succeeded; check <code>ANSWER:</code> for whether it succeeded with any records — see <a href="#cp-b10-8">B10.8</a>), <code>NXDOMAIN</code> (this name does not exist — the server is healthy and confident), <code>SERVFAIL</code> (the server tried and failed — a broken upstream, a DNSSEC validation failure, an unreachable zone), <code>REFUSED</code> (the server declines to answer you — usually an access-control or wrong-server problem).</li>
+<li><strong><code>flags:</code></strong> — <code>qr</code> (this is a response), <code>rd</code> (recursion was desired — you asked for legwork), <code>ra</code> (recursion available — the server does legwork), <code>aa</code> (authoritative answer — from the zone's owner, <a href="#cp-b10-5">B10.5</a>), <code>tc</code> (truncated — the answer didn't fit in a UDP packet and should be retried over TCP).</li>
+<li><strong><code>Query time</code></strong> — at the bottom, in milliseconds. A sub-millisecond time means a cache served you; tens of milliseconds means a real round trip; thousands means something timed out along the way. This one number is the fastest cache-hit detector you have.</li>
+</ul>
+<p>The status field is a routing decision for your investigation, and it is worth stating flatly: <strong><code>NXDOMAIN</code> is a name problem; <code>SERVFAIL</code> is a server problem.</strong> On NXDOMAIN, go check the name and the search path — the server did its job and told you the truth. On SERVFAIL, stop looking at the name entirely and go check the server and its upstreams. Users report both as "it doesn't resolve," and half of all wasted DNS debugging time is spent investigating the wrong one of these two.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read one successful answer completely, top to bottom, naming each part as you go.
+<pre class="cmd">dig example.com A</pre>
+<pre class="out">;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, <b>status: NOERROR</b>, id: 45231
+;; <b>flags: qr rd ra</b>; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+;; QUESTION SECTION:
+;example.com.            IN  A          ← what was actually asked
+;; ANSWER SECTION:
+example.com.  1421  IN  A  23.220.75.232
+;; <b>Query time: 0 msec</b>                 ← zero: served from the local cache
+;; SERVER: 127.0.0.53#53(127.0.0.53)     ← who answered: the stub (B10.7)</pre></li>
+<li>Now produce a genuine <code>NXDOMAIN</code> and read what changes. Note that the ANSWER section vanishes and an AUTHORITY section appears carrying the zone's SOA.
+<pre class="cmd">dig definitely-not-a-real-name.example.com A</pre>
+<pre class="out">;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, <b>status: NXDOMAIN</b>, id: 51002
+;; flags: qr rd ra; QUERY: 1, <b>ANSWER: 0</b>, <b>AUTHORITY: 1</b>
+;; AUTHORITY SECTION:
+example.com.  3600  IN  <b>SOA</b>  ns.icann.org. noc.dns.icann.org. 2025010101 7200 3600 1209600 <b>3600</b>
+    #                                                                            ↑ negative TTL: how long this "no" is cached</pre></li>
+<li>Compare a cache hit with a cache miss using nothing but the query time. Flush, ask cold, then ask again warm.
+<pre class="cmd">sudo resolvectl flush-caches
+dig example.org | grep 'Query time'      # cold
+dig example.org | grep 'Query time'      # warm</pre>
+<pre class="out">;; Query time: 24 msec        ← a real round trip happened
+;; Query time: 0 msec         ← served from cache; nothing left the machine</pre></li>
+<li>See a server that declines rather than fails. Asking an authoritative-only server to do recursion gets you a different status from either of the above — evidence that the four statuses really are distinct diagnoses.
+<pre class="cmd">dig @a.iana-servers.net wikipedia.org | grep -E 'status:|flags:'</pre>
+<pre class="out">;; flags: qr; QUERY: 1, ANSWER: 0 ...
+    ← no ra flag: this server does not do recursion for you (B10.5)</pre></li>
+<li>Watch a truncated answer fall back to TCP — the <code>tc</code> flag in action. Ask for a large response over UDP with a deliberately small buffer.
+<pre class="cmd">dig +ignore +bufsize=512 . NS | grep -E 'flags:|WARNING'</pre>
+<pre class="out">;; Truncated, retrying in TCP mode.        ← without +ignore, dig retries automatically
+;; flags: qr rd ra <b>tc</b>; ...                 ← tc = the answer did not fit in one UDP packet</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Given only a <code>dig</code> header, you should be able to say what to do next. <code>status: NXDOMAIN</code> → the server is fine and the name does not exist; go check the spelling and the search path. <code>status: SERVFAIL</code> → the name may be fine; go check the server and its upstreams. <code>status: NOERROR, ANSWER: 0</code> → the name exists but has no record of that type. <code>Query time: 0 msec</code> → you were served by a cache, so this tells you nothing about whether the authoritative data changed. Say each of those out loud before moving on.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>dig +short</code> is convenient and actively dangerous when debugging: it prints the answer records and nothing else, so <code>NXDOMAIN</code>, <code>SERVFAIL</code>, <code>NOERROR</code>-with-no-records and "the answer came from a stale cache" all look identical — an empty line. Use <code>+short</code> in scripts where you already know the shape of the answer; use full output whenever you are actually investigating.</p>
+<p>Second, always read the QUESTION section rather than trusting what you typed. Between the search list and shell quoting, the name that went out is not always the name you meant, and the QUESTION section is the only place the truth is recorded. This is how you catch a search-domain rewrite in one glance instead of ten minutes.</p>
+<p>Third, the <code>SERVER:</code> line at the bottom tells you who actually answered. On this machine it will normally say <code>127.0.0.53</code> — the stub — which means the answer may be cached and may be several tiers away from the truth. When an answer looks wrong, re-ask the authoritative server directly (<a href="#cp-b10-5">B10.5</a>) and compare; if they differ, you have found a caching problem rather than a data problem.</p>
+<div class="k8s-link">
+<p>Inside a cluster this reading skill is the debugging ladder. A pod that gets <code>NXDOMAIN</code> for <code>payments</code> has a name or namespace or search-path problem — the Service may not exist, or may be in a different namespace than assumed. A pod that gets <code>SERVFAIL</code> has a CoreDNS problem — its pods may be down, its upstream unreachable, or its configuration broken. And a <code>Query time</code> in the thousands points at the resolver being unreachable rather than wrong. Same four statuses, same four conclusions, one layer up.</p>
+<p>The cluster DNS debugging ladder built on exactly these signals is <a href="w4.html#cp-4-18">W4.18</a>; the record shapes you'll be reading are <a href="w4.html#cp-4-17">W4.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 dig</code> — particularly the query options (<code>+short</code>, <code>+noall</code>, <code>+answer</code>, <code>+trace</code>, <code>+tcp</code>, <code>+bufsize</code>, <code>+ignore</code>) and the description of the output format. RFC 1035 §4.1.1 defines the header fields, including the response codes that <code>dig</code> prints as <code>status:</code>. RFC 6891 covers EDNS and the <code>OPT</code> pseudo-record you see in the ADDITIONAL section.</p>
+</article>
+
+<article class="lesson" id="cp-b10-10" data-id="b10-10">
+<div class="lesson-head"><span class="cp-id">B10.10</span><h4>TTL: the contract every cache obeys, watched counting down</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"I changed the DNS record but it's still going to the old server" is one of the most common and most misunderstood operational complaints, and the explanation is entirely contained in one number attached to every record. Understanding TTL turns DNS changes from a source of anxiety into something you can plan precisely — and, unusually for an operational skill, it lets you predict the exact duration of the confusion.</p>
+<h5>The concept</h5>
+<p>Every record carries a <strong>TTL</strong> — time to live — in seconds. It is a statement by the zone's owner: <em>anyone who receives this record may keep using it for this many seconds without asking again.</em> It is not advice and it is not a maximum-age suggestion; it is the contract on which the entire caching layer of DNS is built, and well-behaved resolvers obey it exactly.</p>
+<p>The mechanics are simple and produce an observable signature. When a resolver fetches a record fresh from an authoritative server, it stores the record with the full TTL, say 3600. Every subsequent answer it serves from that cache carries the <em>remaining</em> time: 3598, 3550, 41. When it hits zero the entry is discarded and the next query goes back to the source. So a <strong>decreasing TTL across two consecutive queries is direct proof you were served from a cache</strong> — and a TTL that resets to its full value means you reached the authoritative server, or that some cache in between refetched.</p>
+<p>The operational consequence is the important part. When you change a record, every resolver that already holds the old value keeps serving it until <em>its</em> copy expires — up to the full TTL, and the clock started whenever that resolver last fetched, which you cannot know. If the TTL is 86400 (a day), some users will see the old address for a day, and there is nothing you can do about it from your end: you cannot reach into other people's caches.</p>
+<p>Which yields the one piece of TTL discipline that matters: <strong>lower the TTL before a planned change, not during it.</strong> If a record has a 24-hour TTL and you want to move it tomorrow, drop the TTL to 60 seconds today; wait a full old-TTL period for the world's caches to pick up the short value; then make the change, which now propagates in about a minute; then raise the TTL again once you're happy. Doing it the other way around — lowering the TTL at the moment you make the change — accomplishes nothing, because everyone is still holding the long-TTL copy.</p>
+<div class="flow"><span>fetch: TTL 3600</span><em>→</em><span>+10s: 3590</span><em>→</em><span class="hot">+3600s: expired</span><em>→</em><span>refetch: 3600</span></div>
+<p>A TTL you watch count down is a cached copy ageing; when it reaches zero the next query goes back to the source.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Watch a TTL count down. Flush first so the first query is genuinely cold, then query twice with a pause — the drop between the two numbers is the age of the cached entry.
+<pre class="cmd">sudo resolvectl flush-caches
+dig +noall +answer example.com A
+sleep 10
+dig +noall +answer example.com A</pre>
+<pre class="out">example.com.  <b>3600</b>  IN  A  23.220.75.232     ← fetched fresh: full TTL
+example.com.  <b>3590</b>  IN  A  23.220.75.232     ← ten seconds later, ten seconds gone</pre></li>
+<li>Prove where the countdown lives by asking the authoritative server directly. It always reports the full TTL, because it is not caching anything — it owns the record.
+<pre class="cmd">dig +noall +answer @a.iana-servers.net example.com A
+sleep 10
+dig +noall +answer @a.iana-servers.net example.com A</pre>
+<pre class="out">example.com.  86400  IN  A  23.220.75.232      ← full value
+example.com.  86400  IN  A  23.220.75.232      ← still full: no cache in this path</pre></li>
+<li>Watch an entry expire and be refetched. Pick a name with a short TTL, then poll it until the number jumps back up — the jump is the moment the cache went back to the source.
+<pre class="cmd">for i in $(seq 12); do
+  dig +noall +answer google.com A | head -1 | awk '{print strftime("%T"), "ttl="$2}'
+  sleep 20
+done</pre>
+<pre class="out">14:22:01 ttl=300
+14:22:21 ttl=280
+14:22:41 ttl=260
+...
+14:27:01 ttl=<b>300</b>          ← jumped back up: the entry expired and was refetched</pre></li>
+<li>See the cache from the daemon's side, which counts hits and misses rather than making you infer them.
+<pre class="cmd">resolvectl statistics | head -12</pre>
+<pre class="out">DNSSEC Verdicts ...
+Cache
+  Current Cache Size: 14
+  <b>Cache Hits: 231</b>            ← answers served without touching the network
+  <b>Cache Misses: 47</b>           ← answers that required a real query</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You should have watched one number decrease and then jump back up. Explain what each event meant (decreasing = a cached copy ageing; jumping back to full = the entry expired and was refetched from the source). Then state the planning rule in your own words: to make a DNS change propagate quickly, lower the TTL <em>at least one old-TTL period before</em> the change, not at the same time — and say why doing it simultaneously has no effect (every existing cache is still holding the long-TTL copy and will not re-ask until it expires).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>You cannot flush other people's caches. <code>resolvectl flush-caches</code> clears the resolver on <em>this</em> machine and nothing else — not the corporate resolver, not the user's ISP, not the CDN, and not the application's own in-process cache. When a change "hasn't propagated," the honest answer is a duration (the remaining TTL) rather than an action, and the only real lever is the one you had to pull in advance.</p>
+<p>Application-level caching is the layer that breaks the model, and it is worth knowing about because it produces failures that look impossible. Some runtimes and libraries resolve a name once at start-up and hold the address forever, TTL be damned — so the record changes, every resolver in the chain obeys it, and one process keeps talking to the old address until it is restarted. If DNS is provably correct from the same machine and one process still disagrees, suspect the process, not DNS.</p>
+<p>Finally, resist the urge to set every TTL to 30 seconds "just in case." Short TTLs multiply query volume against your authoritative servers and remove the buffer that keeps things resolving during a brief outage — with a long TTL, caches keep serving through a blip; with a 30-second TTL, an authoritative outage becomes a global outage in half a minute. TTL is a trade between agility and resilience, chosen deliberately.</p>
+<div class="k8s-link">
+<p>Cluster DNS answers carry TTLs too — CoreDNS serves records for Services with a short TTL (30 seconds by default) and caches upstream answers according to their own TTLs. That short value is deliberate: a Service's endpoints change whenever pods come and go, so answers must go stale quickly. It is also why the "an application keeps talking to a deleted pod" problem is almost always application-side caching rather than a cluster fault — the cluster's own TTL already expired. When you tune CoreDNS's cache plugin later, you are setting exactly the trade described above.</p>
+<p>The CoreDNS <code>cache</code> plugin and its TTL settings are read in <a href="w4.html#cp-4-15">W4.15</a>; how endpoint changes propagate into answers is <a href="w4.html#cp-4-11">W4.11</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">RFC 1035 §3.2.1 defines the TTL field and §4.1.3 its meaning in responses; RFC 2181 §5.2 is the (short, worthwhile) clarification on TTLs within a record set. <code>man 1 dig</code> for <code>+ttlunits</code>, which prints TTLs as <code>1h30m</code> rather than raw seconds. <code>man 1 resolvectl</code> for <code>statistics</code> and <code>flush-caches</code>. <code>man 5 resolved.conf</code> for <code>Cache=</code> and <code>CacheFromLocalhost=</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b10-11" data-id="b10-11">
+<div class="lesson-head"><span class="cp-id">B10.11</span><h4>Negative caching: failure is remembered too</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This lesson explains a sentence you have certainly heard and possibly said: "it started working on its own after a few minutes." Nothing works on its own. What happened is that a cached <em>failure</em> expired. Once you know that "no such name" is a cacheable answer with its own timer, a whole class of maddening, apparently-nondeterministic startup problems becomes predictable — and you know exactly which command shortens the wait.</p>
+<h5>The concept</h5>
+<p><strong>Negative caching</strong> is the rule that a resolver may remember "this name does not exist" just as it remembers an address. If it did not, every typo and every probe for a non-existent name would hammer the authoritative servers forever, so the design is necessary. But the consequence is sharp: <em>a name that does not exist yet can keep appearing not to exist after you create it.</em></p>
+<p>The timer is not the record's TTL — there is no record — so it comes from somewhere else: the <strong>SOA record</strong> returned in the AUTHORITY section of the NXDOMAIN response (<a href="#cp-b10-9">B10.9</a>). The SOA's last field is the <em>minimum</em> field, and modern DNS repurposes it as the negative-caching TTL: how many seconds a resolver may remember this "no." You saw it in B10.9's NXDOMAIN output; typical values are 300 to 3600 seconds. So the length of the confusion is written, in advance, in the zone you are querying — you can look it up rather than guess.</p>
+<p>The classic failure sequence is worth memorising because it recurs at every scale:</p>
+<ol>
+<li>Something starts up and resolves a name that does not exist yet — a service that hasn't been created, a peer that hasn't registered.</li>
+<li>It gets <code>NXDOMAIN</code>. The local resolver caches that negative answer for the SOA's minimum, say 600 seconds.</li>
+<li>The name is created, correctly, thirty seconds later. Everything is now right.</li>
+<li>The client keeps failing for the remaining nine and a half minutes, because it is being served a cached "no" — and every diagnostic you run from a <em>different</em> machine says the name resolves fine.</li>
+</ol>
+<p>Two remedies, one technical and one architectural. Technically, <code>resolvectl flush-caches</code> discards the negative entry immediately on this machine. Architecturally — and this is the durable lesson — startup code should <strong>re-resolve on retry</strong>, not resolve once and give up. A client that retries the connection but reuses a resolution it made at second zero will keep failing through the entire negative-cache window, and will look like a DNS problem when it is a retry-logic problem.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Produce a negative answer and read the timer that governs it from the SOA's last field.
+<pre class="cmd">sudo resolvectl flush-caches
+dig no-such-name-here.example.com | grep -A2 'AUTHORITY SECTION'</pre>
+<pre class="out">;; AUTHORITY SECTION:
+example.com.  3600  IN  SOA  ns.icann.org. noc.dns.icann.org. 2025010101 7200 3600 1209600 <b>3600</b>
+    #  serial  refresh retry expire ↑ minimum = the negative-cache TTL, in seconds</pre></li>
+<li>Prove the "no" was cached, using query time as the evidence (<a href="#cp-b10-9">B10.9</a>). The second failure is instant because nothing left the machine.
+<pre class="cmd">dig no-such-name-here.example.com | grep -E 'status:|Query time'
+dig no-such-name-here.example.com | grep -E 'status:|Query time'</pre>
+<pre class="out">;; status: NXDOMAIN ... ;; Query time: 31 msec     ← first: a real round trip
+;; status: NXDOMAIN ... ;; Query time: <b>0 msec</b>      ← second: the failure was remembered</pre></li>
+<li>Watch the negative entry age in the daemon's own cache view — a failure occupies a cache slot exactly as a success does.
+<pre class="cmd">resolvectl statistics | grep -E 'Cache Size|Hits|Misses'</pre>
+<pre class="out">Current Cache Size: 3
+Cache Hits: 12          ← the repeated NXDOMAIN counted as a hit, not a query
+Cache Misses: 5</pre></li>
+<li>Simulate the classic sequence end to end. Ask for a name before it exists, create it locally, and watch the answer <em>not</em> change until you flush. (Using <code>/etc/hosts</code> here is a shortcut — the point is the cached "no," which resolved holds regardless of where the eventual answer comes from.)
+<pre class="cmd">sudo resolvectl flush-caches
+resolvectl query late.example.com 2&gt;&amp;1 | tail -1       # fails: cached as NXDOMAIN
+echo '198.51.100.7  late.example.com' | sudo tee -a /etc/hosts
+resolvectl query late.example.com 2&gt;&amp;1 | tail -1       # may STILL fail: negative cache
+sudo resolvectl flush-caches
+resolvectl query late.example.com 2&gt;&amp;1 | tail -1       # now it resolves</pre>
+<pre class="out">late.example.com: Name 'late.example.com' not found      ← before it existed
+late.example.com: Name 'late.example.com' not found      ← after it existed: cached "no"
+late.example.com: 198.51.100.7                            ← after the flush</pre></li>
+<li>Clean up the test entry so it doesn't become the invisible override from <a href="#cp-b10-2">B10.2</a>.
+<pre class="cmd">sudo sed -i '/late.example.com/d' /etc/hosts
+grep -c late.example.com /etc/hosts || echo "removed"</pre>
+<pre class="out">0
+removed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, without notes, where the negative-cache duration comes from (the <code>minimum</code> field of the SOA record returned in the NXDOMAIN response's AUTHORITY section — <em>not</em> from any record's TTL, since there is no record) and why "it started working on its own" is never actually true (a cached failure expired). Then state the architectural fix in one sentence: retry logic must re-resolve, not reuse a resolution made before the name existed.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The signature that identifies this fault is a disagreement between machines: the name resolves perfectly from your laptop and keeps failing on the one box that asked too early. That asymmetry is the tell, and it points at a cache rather than at DNS data. Chasing it in the zone will find nothing wrong, because nothing <em>is</em> wrong — the data is correct and one resolver is holding an expired opinion.</p>
+<p>Flushing is more limited than it looks. <code>resolvectl flush-caches</code> clears this machine's resolver only; an upstream resolver may have its own negative entry, and the application may have cached the failure in its own memory. If a flush doesn't fix it, walk outward — query the upstream directly, then check whether the process has been restarted since.</p>
+<p>And do not "fix" negative caching by disabling it. It exists to keep failures from generating unbounded traffic, and turning it off (or setting the SOA minimum to a few seconds across a zone) trades a bounded, predictable delay for a permanent load problem. The right fix lives in the client's retry behaviour, not in the resolver's memory.</p>
+<div class="k8s-link">
+<p>This is one of the most common "flaky startup" causes in a cluster. A pod that starts before the Service it depends on exists resolves the Service name, gets NXDOMAIN, and — if its client library resolved once — keeps failing after the Service is created, while <code>kubectl</code> and every other pod insist the name works fine. The Kubernetes-native answers are the same two: make the container's retry loop re-resolve each attempt, or express the dependency properly (an init container that waits, or a readiness probe that lets the platform retry for you). Recognising the signature — one pod failing, everything else fine, no configuration wrong — saves you from rebuilding a perfectly healthy DNS setup.</p>
+<p>The debug ladder that distinguishes a stale answer from a broken one is <a href="w4.html#cp-4-18">W4.18</a>; how Service records come into existence in the first place is <a href="w4.html#cp-4-17">W4.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">RFC 2308 is the definitive document on negative caching and is the one that redefines the SOA <code>minimum</code> field as the negative TTL — short and directly relevant. RFC 1035 §3.3.13 defines the SOA record's fields in order, which is what you need to read the numbers above. <code>man 1 resolvectl</code> for <code>flush-caches</code> and <code>query</code>; <code>man 5 resolved.conf</code> for cache-related settings.</p>
+</article>
+
+</div><!-- /g-records -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
