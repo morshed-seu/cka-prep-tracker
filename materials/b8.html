@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beginner module B8: the real network, taught as a fixed diagnostic ladder — the four layers (link, network, transport, application) as a decision ladder you bisect rather than exam trivia; MAC addresses and ARP and the neighbour table; CIDR math in your head for /8 /16 /24 /26 /30; reading ip link and ip addr (UP vs LOWER_UP); the routing table, longest-prefix match, the default route, and ip route get as the 'which way would this packet go' oracle; ICMP, ping and traceroute for what they actually prove; a TCP connection end to end (SYN/SYN-ACK/ACK, teardown), the states in ss (LISTEN, ESTABLISHED, CLOSE-WAIT, TIME-WAIT), UDP, the 4-tuple, and listening vs established with 127.0.0.1 vs 0.0.0.0 binds; reading tcpdump and curl -v as layered probes and typing an HTTP request by hand through nc; the five-rung ladder (link, address, route, filter, listener); a 'trace a packet' project documenting one curl end to end; and a debugging drill for an unreachable host, a wrong netmask, and an MTU black hole.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐧</text></svg>">
+<title>B8 · Networking I: the real network — Beginner Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Beginner · Foundations</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a class="on" href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <span>Intermediate<em>Containers &amp; runtimes · soon</em></span>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>B8 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../beginner.html">← Beginner tracker</a></li>
+    <li><a href="foundations.html">Foundations · express refresher</a></li>
+    <li><a href="b0.html">B0 · Your Linux sandbox</a></li>
+    <li><a href="b1.html">B1 · Shell &amp; files</a></li>
+    <li><a href="b2.html">B2 · Processes &amp; signals</a></li>
+    <li><a href="b3.html">B3 · Kernel &amp; syscalls</a></li>
+    <li><a href="b4.html">B4 · Users &amp; permissions</a></li>
+    <li><a href="b5.html">B5 · Files, mounts &amp; overlayfs</a></li>
+    <li><a href="b6.html">B6 · Namespaces &amp; isolation</a></li>
+    <li><a href="b7.html">B7 · cgroups v2 &amp; limits</a></li>
+    <li><a href="b8.html">B8 · Networking I</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../beginner.html#b8">← Back to the beginner tracker</a></p>
+<header class="hero">
+  <h1>B8 — Networking I: the real network</h1>
+  <p>Almost everything people find hard about "Kubernetes networking" is really ordinary networking they never got to learn slowly. A packet leaving a pod obeys the exact same rules as a packet leaving your laptop: it needs a link to travel on, an address to aim at, a route to choose the door, a firewall that might stop it, and a program at the far end actually listening. This module teaches those five things as a <strong>fixed diagnostic ladder</strong> — link → address → route → filter → listener — that you climb the same way every single time, on any machine, for the rest of your career. Once the ladder is a reflex, "the network is broken" stops being a feeling and becomes a five-step checklist that ends at the exact rung that's lying to you.</p>
+  <p>We build it bottom-up. First <strong>layers and addresses</strong>: the four-layer model as a bisection tool, MAC addresses and ARP (how a machine finds its neighbour on the wire), CIDR math you can do in your head, and reading your own interfaces. Then <strong>routing</strong>: how the kernel picks an exit, longest-prefix match, and <code>ip route get</code> — the oracle that tells you the decision instead of making you guess. Then <strong>transport</strong>: one TCP connection from handshake to teardown, the connection states you'll actually see, UDP, the 4-tuple that lets one port serve thousands, and the difference between a port that's <em>listening</em> and one that's <em>connected</em>. Then <strong>observing</strong>: reading <code>tcpdump</code> and <code>curl -v</code> without fear, typing an HTTP request by hand, and committing the five-rung ladder to muscle memory. You finish by tracing one real <code>curl</code> end to end and diagnosing three faults by climbing the ladder rather than guessing.</p>
+  <div class="weights">
+    <span>Checkpoints<b>18</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>B1, B3</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Use the four layers (link, network, transport, application) as a <em>bisection ladder</em> — prove one layer, exonerate everything below it.</li>
+<li>Explain MAC addresses and ARP, read the neighbour table with <code>ip neigh</code>, and recognise a link-layer answer to an apparent IP problem.</li>
+<li>Do CIDR math in your head for <code>/8</code>, <code>/16</code>, <code>/24</code>, <code>/26</code>, <code>/30</code>: host count, network, broadcast, usable range.</li>
+<li>Read <code>ip link</code> and <code>ip addr</code>, distinguish <code>UP</code> from <code>LOWER_UP</code>, and treat addresses as attachable properties, not identities.</li>
+<li>Read a routing table as ordered rules, apply longest-prefix match, and use <code>ip route get</code> to ask the kernel which route wins.</li>
+<li>State exactly what <code>ping</code> and <code>traceroute</code> prove — and don't prove — and why "ping works but nothing else does" is a filter, not a paradox.</li>
+<li>Trace one TCP connection through SYN/SYN-ACK/ACK, data, and FIN teardown, and distinguish <em>refused</em> (instant RST) from <em>filtered</em> (hang).</li>
+<li>Read the TCP states in <code>ss -tan</code> and know what each accuses — especially <code>CLOSE-WAIT</code> (your bug) vs <code>TIME-WAIT</code> (normal).</li>
+<li>Contrast UDP with TCP and explain why DNS, VXLAN and metrics agents choose it.</li>
+<li>Name the 4-tuple that identifies a connection and why one server port serves thousands of clients.</li>
+<li>Separate <em>listening</em> from <em>established</em> with <code>ss -ltnp</code>/<code>ss -tnp</code>, and read a <code>127.0.0.1</code> vs <code>0.0.0.0</code> bind.</li>
+<li>Read a <code>tcpdump</code> line and a <code>curl -v</code> trace as layered probes that name the failing layer.</li>
+<li>Type an HTTP request by hand through <code>nc</code> and explain why <code>Host:</code> and the blank line matter.</li>
+<li>Run the five-rung ladder (<code>ip link</code> → <code>ip addr</code> → <code>ip route get</code> → <code>nft list ruleset</code> → <code>ss -ltnp</code>) in order, every time, without improvising.</li>
+<li>Trace one real <code>curl</code> end to end and diagnose an unreachable host, a wrong netmask, and an MTU black hole by climbing the ladder.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>B1</strong> because you will live inside <code>ip</code>, <code>ss</code> and <code>grep</code> output, slicing and reading it constantly; <strong>B3</strong> because a socket is a file descriptor (a listening server is a process holding an fd, which is why <code>ss -ltnp</code> can name the process), and one lab runs <code>strace</code> on <code>curl</code> to watch the syscalls a connection is made of. Everything runs on the throwaway <code>sandbox</code> VM (<a href="b0.html#cp-b0-1">B0.1</a>), never on the cluster — nothing here is dangerous, but you'll add and remove addresses and flush the ARP cache, so a snapshot (<a href="b0.html#cp-b0-9">B0.9</a>) keeps a clean baseline. The base image already has <code>iproute2</code> (<code>ip</code>, <code>ss</code>) and <code>curl</code>; install the observation tools once up front — <code>sudo apt-get install -y tcpdump traceroute bind9-dnsutils ipcalc netcat-openbsd</code> — since <code>net-tools</code> (the old <code>netstat</code>/<code>ifconfig</code>) is deliberately absent on 24.04 and you should learn the modern tools anyway. Your primary interface is called <code>ens3</code> on a typical Multipass VM; if <code>ip -br link</code> shows a different name, substitute it wherever a lab says <code>ens3</code>.</p>
+</div>
+
+<!-- ---------------- Layers and addresses ---------------- -->
+<div class="grp" id="g-layers"><h3>Layers and addresses</h3>
+
+<article class="lesson" id="cp-b8-1" data-id="b8-1">
+<div class="lesson-head"><span class="cp-id">B8.1</span><h4>The four layers as a decision ladder, not exam trivia</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The four-layer model gets taught as something to memorise for a test and then forget, which is exactly backwards. Its real value is as a <em>debugging tool</em>: every network question you will ever ask — "why can't this reach that?" — is really "which of four layers is lying to me?", and the layers give you a way to answer it by elimination instead of by guessing. Learn them as a ladder you climb, and network problems stop being mysterious.</p>
+<h5>The concept</h5>
+<p>Data crossing a network passes through four stacked concerns, each building on the one below. From the bottom:</p>
+<ul>
+<li><strong>Link</strong> — moving bits across <em>one</em> physical segment (a cable, a Wi-Fi cell, a virtual wire). Identities here are <abbr title="Media Access Control address — a 48-bit hardware address for a network interface on one segment">MAC addresses</abbr>. Scope: this wire only.</li>
+<li><strong>Network</strong> — getting a packet <em>between</em> segments, across routers, to anywhere. Identities are IP addresses; the job is routing. Scope: the whole internetwork.</li>
+<li><strong>Transport</strong> — turning "packets to a host" into "a conversation with a program": ports pick which program, and TCP adds reliability (ordering, retransmission) while UDP doesn't. Scope: process-to-process.</li>
+<li><strong>Application</strong> — what the two programs actually say: HTTP, DNS, SSH. Scope: the meaning of the bytes.</li>
+</ul>
+<p>Layering exists so each level can be swapped without disturbing the others — the same TCP runs unchanged over fibre, Wi-Fi, or the virtual veth pair you'll build in B9. But the payoff for <em>you</em> is <strong>bisection</strong>: because each layer sits on the one below, if you prove a lower layer works, every layer beneath it is exonerated and you never have to think about it again. Can you <code>ping</code> the host (network layer works)? Then the cable and MAC resolution (link) are fine — stop checking them. This is why the troubleshooting ladder in B8.16 is climbed strictly bottom-up, and why "it's DNS" (the application layer) is only a legitimate conclusion <em>after</em> the three layers under DNS have been cleared. Guessing at the top first is the classic time-waster; the model's gift is a fixed order.</p>
+<div class="flow"><span>link</span><em>→</em><span>network</span><em>→</em><span>transport</span><em>→</em><span class="hot">application</span><em>· prove low ⇒ exonerate lower</em></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>See all four layers in one place, each with its own tool, for a single act of loading a web page. Run these and label which layer each answers.
+<pre class="cmd">multipass shell sandbox
+ip link show ens3            # LINK  — does the wire exist and is it up?
+ip addr show ens3            # NETWORK — what IP address do we have?
+curl -s -o /dev/null -w '%{http_code}\n' http://example.com   # TRANSPORT+APPLICATION
+ss -tnp 2&gt;/dev/null | grep -m1 :80   # TRANSPORT — the actual connection, if quick enough</pre>
+<pre class="out">2: ens3: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ...      ← link: up, carrier present
+    inet 10.191.62.10/24 ...                          ← network: our address
+200                                                    ← application: HTTP said OK
+ESTAB 0 0 10.191.62.10:44xxx 93.184.x.x:80            ← transport: a TCP conversation</pre></li>
+<li>Now feel the bisection. Deliberately ask the wrong layer's question about a working host and a broken one, and watch which layer's tool changes its answer. A host that pings but won't serve HTTP has a working network layer and a failing transport/application layer.
+<pre class="cmd">ping -c1 example.com          # network layer: does the host answer at all?
+curl -s -o /dev/null -w '%{http_code}\n' http://example.com:9999   # transport: port 9999?</pre>
+<pre class="out">64 bytes from ... time=8.1 ms       ← network layer: fine
+curl: (7) Failed to connect ... port 9999   ← transport layer: nothing listening there</pre></li>
+<li>Confirm the "same transport over different links" idea by noting your loopback carries the identical TCP machinery as the real card — one connection, a different link.
+<pre class="cmd">curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1  2&gt;/dev/null || echo 'nothing on lo:80 (expected)'
+ip link show lo             # the loopback link — same layer-1 slot, a virtual wire</pre>
+<pre class="out">nothing on lo:80 (expected)
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; ...    ← a link like any other, just internal</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name the four layers bottom to top and the one identity or job each owns. (Link — MAC address, one segment; Network — IP address, routing between segments; Transport — ports + reliability, process to process; Application — the protocol's meaning, e.g. HTTP.) Then: you can <code>ping</code> a host but its web page won't load — which layers have you just proven work, and which is suspect? (Link and network work — ICMP echo made the round trip — so the fault is at transport or application: a closed/filtered port or a dead server, not the wire or the route.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The famous seven-layer OSI model exists too, but for debugging real Linux/Kubernetes networks the four-layer split above (the TCP/IP model) is what maps to your tools — <code>ip</code> for link/network, <code>ss</code>/<code>tcpdump</code> for transport, <code>curl</code>/<code>dig</code> for application. Don't get tangled trying to place things in OSI's presentation/session layers; nobody debugging a pod does. Learn the four that have tools.</p>
+<p>Bisection only works if you actually climb <em>in order</em> and trust a passed rung. The universal mistake is to leap to the most interesting hypothesis ("must be a DNS problem") before clearing the boring layers under it, then spend an hour on DNS when the interface was down the whole time. A wrong guess doesn't just fail — it costs a full investigation. The discipline the layers give you is worth more than any single fact in them: <em>lowest unproven layer first, always</em>.</p>
+<div class="k8s-link">
+<p>This ladder is the entire mental model behind Kubernetes network debugging. When a pod "can't reach a Service," the fix is to walk the same layers: is the pod's veth up (link)? does it have an IP and the right routes (network)? can it open a TCP connection to the Service IP (transport)? is the target actually serving and are there ready endpoints (application)? Every Kubernetes networking chapter — pod networking, Services, DNS, NetworkPolicy — is one of these four layers wearing a Kubernetes costume, and the bisection habit you build here is exactly what the W6 troubleshooting flow formalises one level up.</p>
+<p>The two-rule network model and building a pod network by hand are <a href="w4.html#cp-4-1">W4.1</a>–<a href="w4.html#cp-4-2">W4.2</a>; the troubleshooting ladder reappears in <a href="w6.html">W6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">There's no single man page for "the layers," but <code>man 7 ip</code> (the Linux IPv4 stack), <code>man 8 ip</code> (the command), and <code>man 8 ss</code> are the tools you'll map onto them. For the model itself, any TCP/IP reference; the RFCs are <code>RFC 1122</code> (host requirements) if you want the source. In the exam docs, the Kubernetes "Cluster Networking" concept page is where this model is assumed.</p>
+</article>
+
+<article class="lesson" id="cp-b8-2" data-id="b8-2">
+<div class="lesson-head"><span class="cp-id">B8.2</span><h4>The link layer: MAC addresses, ARP, and the neighbour table</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Before a machine can send a packet to anyone on its local wire, it has to answer a physical question that has nothing to do with IP: "which actual card do I hand these bits to?" The answer is a MAC address, and the way a machine finds it is ARP. This is the bottom rung of the ladder, and skipping it is why people stare at correct-looking IP settings for an hour when the real problem is that two machines can't even find each other on the segment.</p>
+<h5>The concept</h5>
+<p>Every network interface has a <strong>MAC address</strong> — a 48-bit hardware address (like <code>52:54:00:a1:b2:c3</code>) that identifies that one card on its local segment. IP addresses are for getting <em>across</em> the network; MAC addresses are for the final hop across <em>one</em> wire. So when your machine wants to send a packet to another IP on the same subnet, it must first translate that IP into the MAC address of the card that owns it. That translation is <strong>ARP</strong> (Address Resolution Protocol): the machine broadcasts "who has 192.168.1.1? tell me your MAC" to the entire local segment, and the owner replies with its MAC. The result is cached in the <strong>neighbour table</strong> (still often called the ARP cache) so it doesn't have to ask again for every packet.</p>
+<p>The one fact that makes this a debugging superpower: <strong>ARP is a broadcast to the local segment only — it never routes.</strong> Nothing carries an ARP request across a router. This is the physical meaning of "on the same subnet": two machines can ARP for each other only if each believes the other is local. And that's exactly why a <em>wrong netmask</em> makes two correctly-addressed machines invisible to each other — if A's mask says B is on a different subnet, A won't ARP for B at all; it hands the packet to its gateway instead, and the gateway may have no idea what to do with it. So a <code>FAILED</code> or missing neighbour entry is a <em>link-layer</em> answer to what looked like an IP problem. When you learn to read <code>ip neigh</code>, you can see this happen.</p>
+<div class="flow"><span>need to send to 192.168.1.1</span><em>→ ARP broadcast "who has it?" →</em><span class="hot">reply: my MAC is 52:54:…</span><em>→ cached in</em><span>ip neigh</span></div>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the neighbour table — the MACs your machine has already learned. Each line pairs a local IP with the MAC that answered for it, and a state.
+<pre class="cmd">multipass shell sandbox
+ip neigh show</pre>
+<pre class="out">10.191.62.1 dev ens3 lladdr 52:54:00:aa:bb:cc <b>REACHABLE</b>
+# an IP on our segment (the gateway), its MAC, and a healthy state</pre></li>
+<li>Watch ARP happen live. Flush the entry for the gateway, confirm it's gone, then send one ping and watch the table repopulate — that repopulation <em>is</em> an ARP request and reply.
+<pre class="cmd">GW=$(ip route | awk '/default/{print $3}')       # the gateway IP
+sudo ip neigh flush dev ens3                       # forget all learned MACs
+ip neigh show | grep "$GW" || echo 'gateway MAC: forgotten'
+ping -c1 "$GW" &gt;/dev/null                           # sending forces an ARP
+ip neigh show | grep "$GW"                          # learned again</pre>
+<pre class="out">gateway MAC: forgotten
+10.191.62.1 dev ens3 lladdr 52:54:00:aa:bb:cc <b>REACHABLE</b>   ← re-learned by ARP</pre></li>
+<li>See the states that accuse. A neighbour that can't be resolved shows <code>FAILED</code> — a link-layer verdict. Ask for a MAC that nobody owns on the segment and watch it fail.
+<pre class="cmd">ping -c1 -W1 10.191.62.199 &gt;/dev/null 2&gt;&amp;1     # an unused IP on our subnet
+ip neigh show 10.191.62.199</pre>
+<pre class="out">10.191.62.199 dev ens3  <b>FAILED</b>              ← nobody answered ARP: link-layer dead end</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What does ARP translate, and why can't an ARP request cross a router? (It translates a local IP address into the MAC address of the card that owns it; ARP is a broadcast scoped to one segment, and routers don't forward broadcasts — so ARP only resolves neighbours on the same subnet.) Then: two machines have correct IPs but one has a wrong netmask and they can't talk — explain in link-layer terms. (The machine with the wrong mask thinks the other is on a different subnet, so it never ARPs for it — it sends to the gateway instead — and the neighbour is never resolved: a link-layer failure caused by an addressing mistake.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Neighbour states look like errors but mostly aren't: <code>STALE</code> just means "we haven't used this entry recently, we'll re-verify on next use" — it's normal and not a problem. The states that actually accuse are <code>FAILED</code> (ARP got no answer — the neighbour isn't there or can't be reached on this segment) and a persistently <code>INCOMPLETE</code> entry (a request went out and nothing has replied yet). Don't chase <code>STALE</code>; do investigate <code>FAILED</code>.</p>
+<p>ARP is IPv4's mechanism; IPv6 does the same job with a different protocol (Neighbour Discovery, using ICMPv6), but <code>ip neigh</code> shows both in the same table, so the tool and the mental model carry over. Also note MAC addresses are only meaningful on the local segment — once a packet crosses a router, the source and destination MACs are rewritten for the next hop while the IP addresses stay the same. That "IP is end-to-end, MAC is hop-by-hop" split is worth holding onto; it's why you can't identify a remote machine by MAC.</p>
+<div class="k8s-link">
+<p>Inside a node, pods reach each other and the outside world through exactly this machinery, just on virtual wires. Each pod's veth (B9) has a MAC, the node's bridge learns those MACs, and a pod ARPs for its gateway (the bridge or the node) before sending — you can watch the same <code>ip neigh</code> table fill on a node. The "wrong netmask ⇒ can't ARP ⇒ silent unreachability" failure has a direct Kubernetes analogue in a misconfigured pod CIDR or node subnet, where pods that look correctly addressed can't resolve each other's MACs across the fabric. Link-layer thinking is the floor under every CNI story in W4.</p>
+<p>Pod veths, MACs, and the node bridge are built by hand in <a href="w4.html#cp-4-2">W4.2</a> and located on a live node in <a href="w4.html#cp-4-3">W4.3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-neighbour</code> for the neighbour table, states, and <code>flush</code>; <code>man 8 ip-link</code> for reading a MAC (<code>link/ether</code>). <code>man 7 arp</code> for the protocol and the kernel's ARP cache behaviour. For the "same subnet = same ARP domain" idea, see the CIDR lesson next (B8.3). In the exam docs, this is assumed under cluster networking — no kubernetes.io page covers ARP directly.</p>
+</article>
+
+<article class="lesson" id="cp-b8-3" data-id="b8-3">
+<div class="lesson-head"><span class="cp-id">B8.3</span><h4>CIDR math in your head: /8, /16, /24, /26, /30</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You will do subnet arithmetic constantly in Kubernetes without anyone asking you to "do subnetting" — the pod network is a <code>/16</code> carved into a <code>/24</code> per node, the Service range is a separate CIDR, and half of "pods can't reach X" is two ranges overlapping. Being able to look at <code>10.244.3.0/24</code> and instantly know its size and boundaries, in your head, is the difference between reasoning about a cluster's addressing and being mystified by it. It's a small skill with an enormous payoff.</p>
+<h5>The concept</h5>
+<p>An IP address is 32 bits. A <abbr title="Classless Inter-Domain Routing notation — an address plus a prefix length">CIDR</abbr> like <code>10.244.3.0/24</code> splits those bits with a slash: the number after the slash is how many <em>leading</em> bits are the <strong>network</strong> part (the neighbourhood), and the rest are the <strong>host</strong> part (the house number on that street). So <code>/24</code> means 24 network bits and 8 host bits. From the host-bit count, everything else follows:</p>
+<ul>
+<li><strong>Addresses in the block</strong> = 2<sup>(host bits)</sup>. For <code>/24</code>: 2<sup>8</sup> = 256 addresses.</li>
+<li><strong>Usable hosts</strong> = that minus 2 — the first address (all host bits 0) is the <em>network address</em> and the last (all host bits 1) is the <em>broadcast address</em>, neither assignable to a machine. For <code>/24</code>: 254 usable.</li>
+<li><strong>Network address</strong> = the block's first address; <strong>broadcast</strong> = its last; <strong>gateway</strong> = conventionally the first usable (<code>.1</code>), though that's convention, not law.</li>
+</ul>
+<p>The five masks you'll actually meet, worth knowing cold:</p>
+<table>
+<thead><tr><th>CIDR</th><th>Host bits</th><th>Addresses</th><th>Usable</th><th>Example block → range</th></tr></thead>
+<tbody>
+<tr><td><code>/8</code></td><td>24</td><td>16,777,216</td><td>16,777,214</td><td><code>10.0.0.0/8</code> → 10.0.0.1–10.255.255.254</td></tr>
+<tr><td><code>/16</code></td><td>16</td><td>65,536</td><td>65,534</td><td><code>10.244.0.0/16</code> → 10.244.0.1–10.244.255.254</td></tr>
+<tr><td><code>/24</code></td><td>8</td><td>256</td><td>254</td><td><code>10.244.3.0/24</code> → 10.244.3.1–10.244.3.254</td></tr>
+<tr><td><code>/26</code></td><td>6</td><td>64</td><td>62</td><td><code>192.168.1.64/26</code> → 192.168.1.65–192.168.1.126</td></tr>
+<tr><td><code>/30</code></td><td>2</td><td>4</td><td>2</td><td><code>10.0.0.4/30</code> → 10.0.0.5–10.0.0.6 (point-to-point links)</td></tr>
+</tbody>
+</table>
+<p>The one that trips people is the sub-<code>/24</code> mask like <code>/26</code>, because the boundaries fall <em>inside</em> the last octet. The trick: a <code>/26</code> has 64 addresses, so blocks start at multiples of 64 — <code>.0</code>, <code>.64</code>, <code>.128</code>, <code>.192</code>. An address like <code>192.168.1.64/26</code> is therefore a network address (start of the <code>.64</code>–<code>.127</code> block), its broadcast is <code>.127</code>, and its usable range is <code>.65</code>–<code>.126</code>. "Block size = 256 minus the mask's last octet" (256 − 192 = 64) is the fastest mental shortcut.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Check your head against <code>ipcalc</code> on the two blocks from the tracker. Work each out mentally first, then verify.
+<pre class="cmd">multipass shell sandbox
+ipcalc 10.244.3.0/24
+ipcalc 192.168.1.64/26</pre>
+<pre class="out">Address:   10.244.3.0
+Network:   10.244.3.0/24
+HostMin:   10.244.3.1
+HostMax:   10.244.3.254
+Broadcast: 10.244.3.255
+Hosts/Net: 254
+--- and for the /26: ---
+Network:   192.168.1.64/26
+HostMin:   192.168.1.65
+HostMax:   <b>192.168.1.126</b>       ← the boundary lands inside the last octet
+Broadcast: 192.168.1.127
+Hosts/Net: 62</pre></li>
+<li>Prove the "block size = 256 − last mask octet" trick by asking which network an address belongs to. <code>ipcalc</code> tells you the network address; check it matches your mental multiple-of-64 math.
+<pre class="cmd">ipcalc 192.168.1.100/26 | grep Network      # which /26 block is .100 in?</pre>
+<pre class="out">Network:   192.168.1.64/26         ← .100 falls in the .64–.127 block, as predicted</pre></li>
+<li>Connect it to Kubernetes addressing directly: the Flannel pod network is a <code>/16</code> the cluster hands out as a <code>/24</code> per node. Confirm the sizes with <code>ipcalc</code>.
+<pre class="cmd">ipcalc 10.244.0.0/16 | grep -E 'Hosts|Network'
+ipcalc 10.244.1.0/24 | grep -E 'Hosts|Network'   # one node's slice</pre>
+<pre class="out">Network:   10.244.0.0/16
+Hosts/Net: 65534                    ← the whole pod network
+Network:   10.244.1.0/24
+Hosts/Net: 254                      ← up to 254 pods on one node</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without a tool: how many usable hosts in a <code>/26</code>, and what are the network and broadcast addresses of <code>192.168.1.64/26</code>? (62 usable; network <code>192.168.1.64</code>, broadcast <code>192.168.1.127</code>, usable <code>.65</code>–<code>.126</code>.) Then: why is the usable count always the address count minus 2? (The first address — all host bits zero — is the network identifier and the last — all host bits one — is the broadcast address; neither can be assigned to a host.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The "minus 2" rule is an IPv4-subnet convention, not a universal law, and two modern cases break it. A <code>/31</code> (RFC 3021) is used for point-to-point links with <em>both</em> addresses usable (no room for a broadcast on a two-host link), and a <code>/32</code> is a single host route (one address, itself). Kubernetes leans on <code>/32</code>s heavily — a pod IP or a Service ClusterIP often appears as a <code>/32</code> route. So don't blindly subtract 2 for those; the rule is for ordinary <code>/8</code>–<code>/30</code> subnets.</p>
+<p>Overlapping CIDRs are the silent killer, and the math is how you catch them. If a cluster's pod CIDR (<code>10.244.0.0/16</code>) overlaps a range that already exists on the physical network, or the pod and Service CIDRs overlap each other, packets get routed to the wrong place with no error message — just mysterious unreachability. When you design or debug cluster networking, the first mental check is always "do any of these ranges overlap?", and you can only answer it if the CIDR arithmetic is instant. Overlap bugs don't announce themselves; you have to see them in the numbers.</p>
+<div class="k8s-link">
+<p>A cluster has three distinct CIDRs and you must keep them straight: the <strong>pod CIDR</strong> (e.g. <code>10.244.0.0/16</code>, carved per node into <code>/24</code>s), the <strong>Service CIDR</strong> (e.g. <code>10.96.0.0/12</code>, a purely virtual range that exists only as rewrite rules — no machine ever owns a Service IP), and the <strong>node network</strong> (the real subnet the VMs sit on). Half of cluster-networking debugging is knowing which range an address belongs to and whether any two overlap. The per-node <code>/24</code> split you verified above is literally how Flannel assigns pod addresses, and reading a route to a pod as a <code>/24</code> "out this interface" is the routed-CNI datapath in miniature.</p>
+<p>The three CIDRs and exactly where each is configured are <a href="w4.html#cp-4-4">W4.4</a>; the virtual Service CIDR shows up as rewrite rules in <a href="w4.html#cp-4-9">W4.9</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ipcalc</code> for the calculator; there's no man page for CIDR itself, but <code>RFC 4632</code> (CIDR) and <code>RFC 3021</code> (<code>/31</code> links) are the sources if you want them. <code>man 8 ip-route</code> shows how prefixes appear in the routing table (next lesson group). In the exam docs, the <code>kubeadm init</code> flags <code>--pod-network-cidr</code> and <code>--service-cidr</code> are where these ranges are set.</p>
+</article>
+
+<article class="lesson" id="cp-b8-4" data-id="b8-4">
+<div class="lesson-head"><span class="cp-id">B8.4</span><h4>Reading your interfaces: ip link, ip addr, UP vs LOWER_UP</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The first rung of the ladder is "does the wire even exist and is it working?", and answering it means reading two commands correctly. The subtlety that catches everyone is that there are <em>two</em> different kinds of "up" — one you set and one the hardware reports — and confusing them turns a dead cable into an afternoon of chasing routing ghosts. Getting <code>ip link</code> and <code>ip addr</code> fluent is the foundation everything else in the module stands on.</p>
+<h5>The concept</h5>
+<p>Two commands answer two questions. <code>ip link</code> is about the <em>interface itself</em> — does it exist, is it administratively enabled, does it see a carrier, what's its MAC. <code>ip addr</code> adds the <em>addresses</em> configured on it. The critical distinction lives in the flags <code>ip link</code> prints:</p>
+<ul>
+<li><strong><code>UP</code></strong> is the <em>administrative</em> state — you turned the interface on (<code>ip link set ens3 up</code>). It means "the OS is willing to use this interface."</li>
+<li><strong><code>LOWER_UP</code></strong> is the <em>carrier</em> state — the driver sees an actual signal on the wire (a cable is plugged in and live, or the virtual link's peer exists). It means "there is really something to talk to down there."</li>
+</ul>
+<p>You need <em>both</em>. An interface can be <code>UP</code> without <code>LOWER_UP</code> — administratively enabled but with no carrier — and that reads exactly like a routing or address problem until you look at the flags and see the carrier is missing. Reading <code>&lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt;</code> and confirming both are present is how you clear the link rung in one glance.</p>
+<p>The second idea is that <strong>an address is a property you attach to an interface, not an identity the card is born with</strong>. A single interface can hold several IP addresses at once; you add and remove them freely. This is why <code>ifconfig</code> is not just old but actively misleading here — it predates this model and can't show multiple addresses, network namespaces, or many modern attributes, so on exactly the machines this track builds it lies by omission. Use <code>ip</code>; it tells the truth. Below you attach a second address, use it, and detach it — proving addresses are movable properties.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the link and its flags. Confirm both <code>UP</code> (admin) and <code>LOWER_UP</code> (carrier) are present — that's the link rung cleared.
+<pre class="cmd">multipass shell sandbox
+ip -br link show            # brief: name, state, MAC
+ip link show ens3 | head -1</pre>
+<pre class="out">lo               UNKNOWN  00:00:00:00:00:00 ...
+ens3             UP       52:54:00:12:34:56 ...
+2: ens3: &lt;BROADCAST,MULTICAST,<b>UP,LOWER_UP</b>&gt; mtu 1500 ...   ← both ups present</pre></li>
+<li>Read the addresses, then attach a <em>second</em> one, ping it locally, and remove it — demonstrating that addresses are attachable properties.
+<pre class="cmd">ip -br addr show ens3                        # current address(es)
+sudo ip addr add 10.191.62.222/24 dev ens3   # attach a second address
+ip -br addr show ens3                          # now shows two
+ping -c1 10.191.62.222 &gt;/dev/null &amp;&amp; echo 'the new address answers'
+sudo ip addr del 10.191.62.222/24 dev ens3   # detach it
+ip -br addr show ens3                          # back to one</pre>
+<pre class="out">ens3   UP   10.191.62.10/24
+ens3   UP   10.191.62.10/24 10.191.62.222/24     ← two addresses on one card
+the new address answers
+ens3   UP   10.191.62.10/24                        ← detached cleanly</pre></li>
+<li>See the "UP but no carrier" trap safely. Bring an interface administratively down and watch <code>LOWER_UP</code> vanish while the interface still exists — the state that masquerades as a higher-layer fault. (Use loopback so you can't lock yourself out; restore it immediately.)
+<pre class="cmd">ip link show lo | head -1          # before: UP,LOWER_UP
+sudo ip link set lo down
+ip link show lo | head -1          # after: neither — the "link" is gone
+sudo ip link set lo up             # restore at once
+ip link show lo | head -1</pre>
+<pre class="out">1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; ...
+1: lo: &lt;LOOPBACK&gt; ...              ← down: no UP, no LOWER_UP — link rung fails here
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; ...  ← restored</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>What's the difference between <code>UP</code> and <code>LOWER_UP</code> in <code>ip link</code> output, and why do you need both? (<code>UP</code> is the administrative state you set — the OS will use the interface; <code>LOWER_UP</code> is the carrier — the driver sees a live signal. An interface that's <code>UP</code> without <code>LOWER_UP</code> is enabled but has nothing to talk to, which looks like a higher-layer fault until you check the flags.) Then: what does adding two addresses to one interface prove about the relationship between addresses and cards? (An address is a property attached to an interface, not a fixed identity — one card can hold many, and you add/remove them at will.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Loopback shows state <code>UNKNOWN</code> rather than <code>UP</code> in <code>ip -br link</code>, which looks alarming but is normal — loopback has no carrier concept, so its operational state is reported as unknown even while it works perfectly. Don't read <code>UNKNOWN</code> on <code>lo</code> as a problem. Real interfaces show <code>UP</code>/<code>DOWN</code>; only virtual ones without a carrier notion show <code>UNKNOWN</code>.</p>
+<p>Addresses you add with <code>ip addr add</code> are <em>not persistent</em> — they vanish on reboot, because persistence is a separate concern owned by the network configuration system (netplan/systemd-networkd on 24.04). That's fine and even useful for the throwaway labs here (a reboot resets your experiments), but don't be surprised when a hand-added address disappears; to make one stick you'd edit netplan, which is out of scope for this module. The runtime state (<code>ip</code>) and the persistent config (netplan) are deliberately different layers.</p>
+<div class="k8s-link">
+<p>On a Kubernetes node, <code>ip link</code> and <code>ip addr</code> show a small zoo of interfaces you'll now recognise: the node's real NIC, a CNI bridge (<code>cni0</code> or similar), a <code>flannel.1</code> VXLAN device, and one veth per local pod — each a link with its own state and MAC. Reading their flags is the first rung when a node's pods go unreachable. The "multiple addresses on one interface" fact underlies how a node can hold its own IP plus service-related addresses, and the "operational state UNKNOWN is fine for virtual devices" gotcha saves you from false alarms when you inspect veths and bridges, which routinely show <code>UNKNOWN</code>.</p>
+<p>You'll meet <code>cni0</code>, <code>flannel.1</code>, and per-pod veths on a real node in <a href="w4.html#cp-4-3">W4.3</a> and <a href="w4.html#cp-4-6">W4.6</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 ip-link</code> (interface state, flags, <code>set up</code>/<code>down</code>) and <code>man 8 ip-address</code> (<code>add</code>/<code>del</code>/<code>show</code>, scope) are the two core pages; <code>man 8 ip</code> for the <code>-br</code> brief output. For persistence, <code>man 5 netplan</code> is the 24.04 way (out of scope but worth knowing exists). No exam-docs entry — node interfaces are assumed by kubernetes.io.</p>
+</article>
+</div><!-- /g-layers -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B8 recall quiz</h3>
+<p>Answer out loud before revealing. If you can climb the five-rung ladder from memory and say what each rung's tool proves, this module has done its job.</p>
+<ol>
+<li>Name the four layers bottom to top and the identity or job each owns.
+<details class="reveal"><summary>Answer</summary><p>Link (MAC address, one segment) → Network (IP address, routing between segments) → Transport (ports + reliability, process to process; TCP vs UDP) → Application (the protocol's meaning, e.g. HTTP/DNS). Each sits on the one below, so proving a lower layer exonerates everything beneath it — which is why you debug bottom-up.</p></details></li>
+</ol>
+</div>
+
+<nav class="pager"><a href="b7.html">← B7 · Isolation II: cgroups v2</a><a href="../beginner.html#b9">B9 · Networking II — virtual networking &amp; packet filtering →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-25. iproute2 6.1 (<code>ip</code>, <code>ss</code>), tcpdump 4.99, traceroute 2.1, bind9-dnsutils 9.18 (<code>dig</code>), ipcalc 0.51, netcat-openbsd 1.226. Firewall backend is nftables on the 24.04 kernel (6.8); <code>net-tools</code> (<code>netstat</code>/<code>ifconfig</code>) is not installed — every lab uses <code>ip</code>/<code>ss</code>.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
