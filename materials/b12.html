@@ -157,7 +157,7 @@ grep -c . ~/threat-model.md</pre>
 <h5>The concept</h5>
 <p><strong>Least privilege</strong> means a program holds only the authority it needs, for only as long as it needs it. The trap is that "needs" is usually assumed rather than measured. A web server needs to bind port 80; historically that required root, so web servers ran as root, so a bug in the request parser gave an attacker the whole machine. The privilege that mattered was one narrow thing — bind a port below 1024 — and root was simply the only way anyone knew to ask for it. Linux has had a better answer for years: <abbr title="a single, individually-grantable piece of root's authority">capabilities</abbr> (<a href="b4.html#cp-b4-10">B4.10</a>) split root into a keyring of individually-issued permits, and <code>CAP_NET_BIND_SERVICE</code> is exactly the one permit here.</p>
 <p><strong>Defense in depth</strong> means assuming any single control will fail and asking what stands behind it. Not because you expect to be attacked in layers, but because controls fail in ordinary ways: a mode gets changed by a deployment script, a validation is skipped on one code path, a dependency is compromised. The question is never "is this control good enough", it is "what happens the day it isn't".</p>
-<p>Both become concrete on a service. Take a program that must serve on port 80 and read one config file, and walk it down the privilege ladder — running as root, then as an unprivileged user with the one capability it needs, then with the rest of the machine taken away from it. On systemd every rung is a line in a unit file (<a href="b11.html#cp-b11-4">B11.4</a>): <code>User=</code> drops the identity, <code>AmbientCapabilities=</code> grants the single permit, <code>NoNewPrivileges=</code> forbids regaining anything through a setuid binary (<a href="b4.html#cp-b4-9">B4.9</a>), <code>ProtectSystem=strict</code> makes the filesystem read-only for it, <code>PrivateTmp=</code> gives it a mount namespace of its own (<a href="b6.html#cp-b6-3">B6.3</a>). None of those is new machinery — they are B4's and B6's primitives with unit-file names.</p>
+<p>Both become concrete on a service. Take a program that must serve on port 80 and read one config file, and walk it down the privilege ladder — running as root, then as an unprivileged user with the one capability it needs, then with the rest of the machine taken away from it. On systemd every rung is a line in a unit file (<a href="b11.html#cp-b11-4">B11.4</a>): <code>User=</code> drops the identity, <code>AmbientCapabilities=</code> grants the single permit, <code>NoNewPrivileges=</code> forbids regaining anything through a setuid binary (<a href="b4.html#cp-b4-9">B4.9</a>), <code>ProtectSystem=strict</code> makes the filesystem read-only for it, <code>PrivateTmp=</code> gives it a mount namespace of its own (<a href="b6.html#cp-b6-6">B6.6</a>). None of those is new machinery — they are B4's and B6's primitives with unit-file names.</p>
 <div class="flow"><span>root, everything</span><em>→</em><span>own user + one capability</span><em>→</em><span>no new privileges</span><em>→</em><span class="hot">read-only fs, private /tmp</span></div>
 <p>Least privilege picks the rung; defense in depth is the reason you keep descending after it already works.</p>
 <h5>Lab</h5>
@@ -542,6 +542,338 @@ cleaned</pre></li>
 </div>
 <h5>Docs</h5>
 <p class="docs-links"><code>man 1 ssh-keygen</code> for key generation, passphrase changes (<code>-p</code>) and printing the public half from a private key (<code>-y</code>). <code>man 1 ssh-agent</code> and <code>man 1 ssh-add</code> for the cache and its socket; <code>man 8 sshd</code>, section <em>AUTHORIZED_KEYS FILE FORMAT</em>, for what a line in that file may contain — including the <code>command=</code> and <code>from=</code> restrictions worth knowing. <code>man 5 ssh_config</code> for <code>IdentitiesOnly</code> and <code>ProxyJump</code>.</p>
+</article>
+
+</div>
+
+<!-- ---------------- PKI hands-on ---------------- -->
+<div class="grp" id="g-pki"><h3>PKI hands-on</h3>
+
+<article class="lesson" id="cp-b12-8" data-id="b12-8">
+<div class="lesson-head"><span class="cp-id">B12.8</span><h4>Become a certificate authority</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><a href="#cp-b12-6">B12.6</a> ended on a gap: a signature proves someone holds a private key, not who they are. A certificate authority is the whole industry's answer to that gap, and it is far less mysterious than its reputation — it is a keypair plus other people's willingness to trust its signature. Building one takes a single command, and afterwards every certificate error you ever read will be about machinery you have personally assembled.</p>
+<h5>The concept</h5>
+<p>Use the canonical picture: <strong>a certificate is a notarized ID card, and the CA is the notary everyone already trusts.</strong> A <strong>certificate</strong> is a small document saying "this public key belongs to this name", plus validity dates and some usage rules, plus a signature over all of it. Verifying one means checking that signature against the CA's public key — which you must already hold and already trust. The trust does not come from the certificate; it comes from how the CA's own certificate got onto your machine.</p>
+<p>A <strong>root CA</strong> certificate is <strong>self-signed</strong>: its subject and issuer are the same name, and it is signed with its own private key. That is not a security property — anyone can self-sign anything, which is why a self-signed certificate presented by a server means nothing. What makes a root CA trustworthy is entirely out-of-band: your operating system ships with a bundle of them in <code>/etc/ssl/certs/</code>, your company puts its internal root there by policy, and in a moment you will pass yours explicitly with <code>-CAfile</code>. Trust is installed, never asserted.</p>
+<p>Two fields make a CA certificate a CA rather than an ordinary one, and clients enforce both. <code>basicConstraints: CA:TRUE</code> says this certificate may sign others; <code>keyUsage: keyCertSign</code> says the key is permitted to do so. A certificate without them is a leaf, and using it to sign is rejected regardless of the maths working.</p>
+<p>Then the part that matters operationally: <strong>the CA private key is the most valuable file in the system.</strong> Whoever holds it can mint an identity for any name, and everyone trusting that CA will believe it. There is no revocation of that fact in practice — you would have to distribute a new root to every client. This is why <code>ca.key</code> is mode 600, never copied, and on real infrastructure kept offline entirely.</p>
+<div class="flow"><span>CA keypair</span><em>→</em><span class="hot">self-signed CA cert</span><em>→</em><span>signs others</span><em>→</em><span>clients trust via -CAfile / /etc/ssl/certs</span></div>
+<p>The arrow that carries trust is the last one, and it is installed by an administrator, not by the network.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create the CA in one command: a new private key and a self-signed certificate over it, valid for ten years. <code>-nodes</code> means the key file is not passphrase-encrypted, which is right for a lab and wrong for anything real.
+<pre class="cmd">cd ~/ca
+openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+  -keyout ca.key -out ca.crt -subj '/CN=B12 Demo CA/O=sandbox'
+chmod 600 ca.key; ls -l ca.key ca.crt</pre>
+<pre class="out">-rw------- 1 ubuntu ubuntu 3272 Jul 25 10:02 <b>ca.key</b>     ← mint-anything power lives in this file
+-rw-rw-r-- 1 ubuntu ubuntu 1858 Jul 25 10:02 ca.crt       ← safe to hand to every client</pre></li>
+<li>Confirm it is self-signed by reading the two name fields. Identical subject and issuer is the definition — the chain stops here.
+<pre class="cmd">openssl x509 -in ca.crt -noout -subject -issuer</pre>
+<pre class="out">subject=CN=B12 Demo CA, O=sandbox
+issuer=<b>CN=B12 Demo CA, O=sandbox</b>          ← signed itself: this is a root</pre></li>
+<li>Check the two fields that make it usable as a CA at all. Clients read these before they will accept any signature it made.
+<pre class="cmd">openssl x509 -in ca.crt -noout -ext basicConstraints,keyUsage</pre>
+<pre class="out">X509v3 Basic Constraints: critical
+    <b>CA:TRUE</b>
+X509v3 Key Usage: critical
+    Digital Signature, <b>Certificate Sign</b>, CRL Sign</pre></li>
+<li>Verify it against itself. This is the one case where a certificate validates with only its own file — and it is exactly what "self-signed" means, not a mark of quality.
+<pre class="cmd">openssl verify -CAfile ca.crt ca.crt</pre>
+<pre class="out">ca.crt: <b>OK</b>          ← "OK" here means the maths checks out, not that anyone should trust it</pre></li>
+<li>See where the system's own trusted roots live, so you know what <code>-CAfile</code> is standing in for. Your CA is not in there, and adding it would be a deliberate administrative act.
+<pre class="cmd">ls /etc/ssl/certs/*.pem | wc -l
+grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt</pre>
+<pre class="out">146
+<b>146</b>          ← the roots your machine believes by default; every HTTPS check starts from this bundle</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain, without hedging, what you now hold in <code>ca.key</code> — the ability to issue a certificate for any name that any client trusting <code>ca.crt</code> will accept. Then answer why a self-signed server certificate warns in a browser while a self-signed <em>root</em> is the foundation of all trust: the difference is not the certificate, it is whether that root was installed on the client in advance. Finally, name the two extensions a CA certificate must carry, and say what a client does with a certificate that lacks them.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Self-signed certificate" is used to mean two completely different things and the ambiguity causes real confusion. A self-signed <em>leaf</em> served by a web server is a red flag: nothing vouches for it, and accepting it means accepting whoever is on the other end of the connection today. A self-signed <em>root CA</em> is normal and unavoidable — every trust chain terminates in one — and its safety comes entirely from how it reached your trust store. Same term, opposite implications.</p>
+<p>The second is the illusion of revocation. Certificate revocation lists and OCSP exist, are patchily supported, and are frequently ignored by clients. In practice the defence against a compromised certificate is a short validity period, not revocation — which is why modern public certificates last 90 days and why cluster certificates rotate automatically. If your CA key leaks, revocation will not save you; replacing the root everywhere will.</p>
+<div class="k8s-link">
+<p><code>kubeadm init</code> runs this exact command on your behalf. It creates <code>/etc/kubernetes/pki/ca.key</code> and <code>ca.crt</code> — a self-signed root for the cluster — and then issues every component certificate from it. Possession of that <code>ca.key</code> is functionally permanent cluster-admin: you can mint a client certificate with <code>CN=whoever</code> and <code>O=system:masters</code> and the API server will believe it, with no RBAC rule able to stop you. That is why the file never leaves the control-plane node, why backing up <code>/etc/kubernetes/pki</code> is backing up the crown jewels, and why a kubeadm cluster actually has more than one CA — the etcd CA and the front-proxy CA are separate roots, so that a compromise in one trust domain does not automatically mint identities in another.</p>
+<p>The three trust domains under <code>/etc/kubernetes/pki</code>, and which certificate belongs to which, is <a href="w2.html#cp-2-5">W2.5</a>; what a control-plane rebuild does to them is <a href="w2.html#cp-2-2">W2.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-req</code> for the <code>-x509</code> self-signing mode, <code>-subj</code> and <code>-nodes</code>. <code>man 1 openssl-x509</code> for reading certificates and the <code>-ext</code> selector used above. <code>man 5 x509v3_config</code> is the page that defines <code>basicConstraints</code>, <code>keyUsage</code> and (next lesson) <code>subjectAltName</code>. <code>man 8 update-ca-certificates</code> for how a root actually gets installed into a machine's trust store.</p>
+</article>
+
+<article class="lesson" id="cp-b12-9" data-id="b12-9">
+<div class="lesson-head"><span class="cp-id">B12.9</span><h4>Key, CSR, signature: issuing a certificate in two proper steps</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Issuing a certificate always splits across two parties, and the split is the security property. The subject makes a key and asks; the CA signs. Once you have done it by hand, the Kubernetes CSR API stops looking like a strange bureaucratic detour and starts looking like the only sane way to do it — and you stop being tempted by tutorials that generate a private key on the wrong machine.</p>
+<h5>The concept</h5>
+<p>A <strong>certificate signing request</strong> is a small document containing three things: the <strong>public key</strong> of the requester, the <strong>identity they are requesting</strong> (subject name, and the SAN list from <a href="#cp-b12-10">B12.10</a>), and a <strong>self-signature</strong> proving the requester holds the matching private key. It does not contain the private key, cannot contain it, and never needs to. The private key is generated on the machine that will use it and stays there for its entire life.</p>
+<p>That is the whole point of the two-step dance. A CSR can be emailed, pasted into a ticket, or posted to an API without exposing anything: the worst an interceptor can do with it is ask for a certificate they cannot use, because they lack the private key it commits to. Any process that sends you a private key — a colleague, a vendor, a script — has already failed, and the certificate should be reissued.</p>
+<p>The CA then does something narrow. It decides whether to believe the requested identity (that decision is policy, not cryptography, and it is where a real CA does all its actual work), and if so signs a certificate binding that public key to that name. The signature is <a href="#cp-b12-6">B12.6</a>'s operation over the certificate's contents. Note what the CA never learns: the requester's private key. It vouches for a name-to-key binding without ever holding the key it is vouching for.</p>
+<div class="flow"><span>subject: keypair</span><em>→</em><span class="hot">CSR (public key + name + self-sig)</span><em>→</em><span>CA signs</span><em>→</em><span>certificate back</span></div>
+<p>Only public material crosses the arrow; the private key never leaves the machine that made it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Generate the server's own key. Think of this as happening on the server, not on the CA — that separation is the lesson.
+<pre class="cmd">cd ~/ca
+openssl genrsa -out server.key 2048
+chmod 600 server.key</pre>
+<pre class="out">(no output — a 2048-bit key file, mode 600, on the machine that will use it)</pre></li>
+<li>Create the CSR from that key. Deliberately request only a common name for now; <a href="#cp-b12-10">B12.10</a> will show you why that is not enough.
+<pre class="cmd">openssl req -new -key server.key -out server.csr -subj '/CN=localhost'
+openssl req -in server.csr -noout -subject -verify</pre>
+<pre class="out">Certificate request self-signature <b>verify OK</b>       ← proves the requester holds the private key
+subject=CN=localhost</pre></li>
+<li>Prove the CSR carries the public half only, by extracting it and comparing with the public key derived from <code>server.key</code>. Identical output means the CSR commits to this exact keypair and carries nothing secret.
+<pre class="cmd">openssl req -in server.csr -noout -pubkey | sha256sum
+openssl rsa -in server.key -pubout 2&gt;/dev/null | sha256sum</pre>
+<pre class="out">3f9a1c...c2  -
+<b>3f9a1c...c2</b>  -          ← same public key; the CSR is safe to send anywhere</pre></li>
+<li>Now act as the CA and sign it. This is the step that requires <code>ca.key</code> — and it is the only step that does.
+<pre class="cmd">openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -sha256 -out server.crt
+openssl x509 -in server.crt -noout -subject -issuer -serial</pre>
+<pre class="out">Certificate request self-signature ok
+subject=CN=localhost
+issuer=<b>CN=B12 Demo CA, O=sandbox</b>          ← issued by your CA, not by itself
+serial=<b>4A2F1B...</b>                          ← unique per issuance; CAcreateserial started the counter</pre></li>
+<li>Verify the chain: does this certificate carry a valid signature from a CA you trust? This is what every TLS client does on every connection.
+<pre class="cmd">openssl verify -CAfile ca.crt server.crt</pre>
+<pre class="out">server.crt: <b>OK</b>          ← chain valid. Note this says nothing about the NAME being right (B12.10).</pre></li>
+<li>Show the negative case that makes the CA's role concrete: the same certificate against a CA that did not sign it.
+<pre class="cmd">openssl req -x509 -newkey rsa:2048 -sha256 -days 30 -nodes \
+  -keyout other-ca.key -out other-ca.crt -subj '/CN=Other CA' 2&gt;/dev/null
+openssl verify -CAfile other-ca.crt server.crt</pre>
+<pre class="out">C = , CN = localhost
+error 20 at 0 depth lookup: <b>unable to get local issuer certificate</b>
+                            ← "unknown CA": memorise this string, B12.16 makes you meet it again</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Say what a CSR contains and what it deliberately omits, then explain why that omission is the security property rather than an inconvenience. Check your understanding against the files: <code>ls -l ~/ca</code> should show exactly two files with mode <code>600</code> so far (<code>ca.key</code>, <code>server.key</code>), and you should be able to say which machine each of them would live on in a real deployment. Finally, note error 20's wording now — <em>unable to get local issuer certificate</em> — because it is the error people most often misread as "the certificate is broken" when it means "I do not trust who signed it".</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>-CAcreateserial</code> creates a <code>ca.srl</code> file that tracks the next serial number. Lose or ignore it and you can issue two certificates with the same serial from the same CA, which some clients and most auditors treat as a serious problem. In a lab it is invisible; the habit worth carrying is that serial uniqueness is the CA's responsibility, not the requester's.</p>
+<p>The second is the one-command shortcut. <code>openssl req -x509</code> generates a key and a self-signed certificate together, which is right for a root CA and wrong for everything else — it produces a certificate signed by nobody. If a tutorial hands you a single command that emits both <code>tls.key</code> and <code>tls.crt</code> for a server, look closely: you almost certainly want the two-step version, or your clients will need <code>--insecure</code> forever.</p>
+<div class="k8s-link">
+<p>Kubernetes exposes this exact two-step flow as an API. To onboard a human user, you generate a private key and a CSR on <em>their</em> machine, submit the CSR to the cluster as a <code>CertificateSigningRequest</code> object with <code>signerName: kubernetes.io/kube-apiserver-client</code>, and an administrator approves it with <code>kubectl certificate approve</code>. The cluster CA signs it, and the user pulls the certificate back out of the object's <code>status</code>. The private key never touches the cluster, which is precisely why the API is shaped this way — approval is a policy decision about a name, exactly as described above.</p>
+<p>The full CSR onboarding flow, from <code>openssl req</code> to a working kubeconfig, is <a href="w7.html#cp-7-3">W7.3</a>; the certificates kubeadm issues for the components themselves are <a href="w2.html#cp-2-3">W2.3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-req</code> for creating and inspecting CSRs (<code>-new</code>, <code>-verify</code>, <code>-pubkey</code>). <code>man 1 openssl-x509</code> for the <code>-req</code> signing mode, <code>-CA</code>/<code>-CAkey</code> and <code>-CAcreateserial</code>. <code>man 1 openssl-verify</code> lists every numbered verification error, including error 20 — worth skimming once so the strings are familiar before you meet them under pressure.</p>
+</article>
+
+<article class="lesson" id="cp-b12-10" data-id="b12-10">
+<div class="lesson-head"><span class="cp-id">B12.10</span><h4>SANs: where most certificate errors actually come from</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The certificate you signed in the last lesson passes <code>openssl verify</code> and will still be rejected by every modern client. The reason is one missing extension, and it is behind a large fraction of all real-world TLS failures — including the classic one that appears the day someone puts a load balancer in front of a working API server.</p>
+<h5>The concept</h5>
+<p>Verification has two independent halves, and conflating them is why the error is confusing:</p>
+<ul>
+<li><strong>Chain validation</strong> — is this certificate signed by a CA I trust, and is it within its validity dates? This is what <code>openssl verify -CAfile</code> answers.</li>
+<li><strong>Name matching</strong> — does this certificate actually cover the name I typed? A perfectly valid certificate for <code>example.com</code> must be refused when you asked for <code>bank.com</code>, or the entire system is pointless.</li>
+</ul>
+<p>Name matching reads the <strong>subject alternative name</strong> extension — the SAN list — and nothing else. Historically it read the subject's common name (<code>CN=localhost</code>), which is why so many people still think of the CN as "the hostname". That has been deprecated for years and is now simply ignored for name matching by browsers, Go's TLS library, curl and openssl alike. A certificate with a perfect CN and no SAN fails everywhere, with an error that mentions neither field clearly.</p>
+<p>A SAN entry is typed. <code>DNS:localhost</code> matches a hostname; <code>IP:127.0.0.1</code> matches a literal IP address, and — this is the part that catches people — a <code>DNS:</code> entry does <em>not</em> match a connection made to that IP. If a service is reached both by name and by address, both must be listed, separately. Wildcards (<code>DNS:*.svc.cluster.local</code>) match exactly one label, so they cover <code>foo.svc.cluster.local</code> and not <code>foo.bar.svc.cluster.local</code>.</p>
+<p>The practical rule follows directly: <strong>enumerate every name and address a client might use to reach this service, and put all of them in the SAN list at issuance time.</strong> Not the canonical one — all of them. A certificate cannot be amended later; adding a name means issuing a new certificate.</p>
+<div class="flow"><span>chain OK</span><em>+</em><span class="hot">name in SAN list</span><em>=</em><span>connection proceeds</span></div>
+<p>Two separate checks, two separate failure messages — and only one of them is about trust.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the problem exists. Your <code>server.crt</code> from <a href="#cp-b12-9">B12.9</a> has no SAN extension at all — look for it and find nothing.
+<pre class="cmd">cd ~/ca
+openssl x509 -in server.crt -noout -ext subjectAltName</pre>
+<pre class="out">No extensions in certificate            ← the CN says localhost; nothing here says it</pre></li>
+<li>Watch the two checks disagree. The chain is fine; the name check fails on the same file, with a completely different error.
+<pre class="cmd">openssl verify -CAfile ca.crt server.crt
+openssl verify -CAfile ca.crt -verify_hostname localhost server.crt</pre>
+<pre class="out">server.crt: OK                                         ← chain validation passes
+C = , CN = localhost
+error 62 at 0 depth lookup: <b>Hostname mismatch</b>          ← name matching fails: CN is not consulted</pre></li>
+<li>Write the extension file the CA will apply when signing. This is where the SAN list, and the leaf-certificate constraints, are declared.
+<pre class="cmd">cat &gt; san.ext &lt;&lt;'EOF'
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost, DNS:sandbox, IP:127.0.0.1
+EOF
+cat san.ext | tail -1</pre>
+<pre class="out">subjectAltName = DNS:localhost, DNS:sandbox, IP:127.0.0.1
+                 ↑ every name and address a client might use, enumerated at issuance</pre></li>
+<li>Reissue from the same CSR and the same key — only the CA's signing step changes. Nothing about the server's private key needs regenerating to fix a SAN.
+<pre class="cmd">openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -sha256 -extfile san.ext -out server.crt
+openssl x509 -in server.crt -noout -ext subjectAltName</pre>
+<pre class="out">X509v3 Subject Alternative Name:
+    <b>DNS:localhost, DNS:sandbox, IP Address:127.0.0.1</b></pre></li>
+<li>Re-run both checks. Chain and name now agree, which is the state every working TLS connection is in.
+<pre class="cmd">openssl verify -CAfile ca.crt -verify_hostname localhost server.crt
+openssl verify -CAfile ca.crt -verify_ip 127.0.0.1 server.crt</pre>
+<pre class="out">server.crt: <b>OK</b>
+server.crt: <b>OK</b>          ← the IP entry is what makes the second one pass; DNS: alone would not</pre></li>
+<li>Prove the "add a new name later" failure, because it is the one you will meet in production. A name nobody listed is refused even though nothing about the certificate is broken.
+<pre class="cmd">openssl verify -CAfile ca.crt -verify_hostname api.internal server.crt</pre>
+<pre class="out">error 62 at 0 depth lookup: <b>Hostname mismatch</b>
+                            ← the load-balancer scenario, in one command</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain the difference between the two verification halves and give the distinct error each produces — <em>unable to get local issuer certificate</em> for an untrusted signer, <em>Hostname mismatch</em> for a name not in the SAN list. Then answer the two questions that decide most real SAN bugs: does a <code>DNS:</code> entry cover a connection made to the corresponding IP address (no — you need an <code>IP:</code> entry), and can you add a name to an existing certificate (no — you reissue, though the key and CSR can be reused as in step 4).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The most expensive habit here is putting a hostname in the CN and assuming it works because it did once. It will pass a casual eyeball review and fail every client, and the error message — <em>Hostname mismatch</em>, or in Go <em>x509: certificate is valid for X, not Y</em> — points at the name rather than at the missing extension, so people re-check the DNS instead of the certificate. When a name-related TLS error appears, print the SAN list first, before anything else.</p>
+<p>The second is <code>-copy_extensions</code>. If you put SANs into the CSR with <code>-addext</code>, <code>openssl x509 -req</code> will silently drop them unless you pass <code>-copy_extensions=copyall</code> — and that flag is genuinely dangerous in a real CA, because it lets a requester ask for any extension including <code>CA:TRUE</code>. The safe pattern is the one used above: the CA decides the extensions with <code>-extfile</code>, the requester only asks.</p>
+<div class="k8s-link">
+<p>The API server's certificate is the longest SAN list most people ever read, and now it is obvious why: it must cover every name and address any client might use to reach it — the node's IP, the cluster IP of the <code>kubernetes</code> service (usually <code>10.96.0.1</code>), the names <code>kubernetes</code>, <code>kubernetes.default</code>, <code>kubernetes.default.svc</code> and <code>kubernetes.default.svc.cluster.local</code>, plus the node's hostname. Every in-cluster client resolves one of those (<a href="b10.html#cp-b10-4">B10.4</a>'s search list is why the short forms are needed) and each must match.</p>
+<p>This is also the single most common cause of a broken control plane after an infrastructure change: put a load balancer or a new DNS name in front of the API server without adding it to <code>apiServer.certSANs</code> and reissuing, and every client fails with a name mismatch while the server itself looks perfectly healthy. Reading and reissuing those certificates is <a href="w2.html#cp-2-6">W2.6</a>, and the kubeadm configuration that sets extra SANs is <a href="w2.html#cp-2-7">W2.7</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 x509v3_config</code> is the reference for the extension file written above — search it for <code>subjectAltName</code>, <code>extendedKeyUsage</code> and the <code>DNS:</code>/<code>IP:</code>/<code>URI:</code> prefixes. <code>man 1 openssl-verify</code> documents <code>-verify_hostname</code>, <code>-verify_ip</code> and error 62. <code>man 1 openssl-x509</code> for <code>-extfile</code> and the <code>-copy_extensions</code> warning.</p>
+</article>
+
+<article class="lesson" id="cp-b12-11" data-id="b12-11">
+<div class="lesson-head"><span class="cp-id">B12.11</span><h4>Read a certificate, verify a chain, find the expiry in five seconds</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Certificate expiry is the outage with no deploy behind it: nothing changed, nobody pushed, and at 03:14 the cluster stopped accepting its own kubelets. The only defence is fluency — being able to point <code>openssl</code> at a file or a live port and read the answer without looking anything up. That fluency is five commands, and this lesson drills them.</p>
+<h5>The concept</h5>
+<p>A certificate is a structured document, and <code>openssl x509 -text</code> prints all of it. The fields worth finding instantly:</p>
+<ul>
+<li><strong>Subject</strong> — who this certificate is about. In client certificates the <code>CN</code> is the username and each <code>O</code> is a group, which is <a href="#cp-b12-12">B12.12</a>'s subject.</li>
+<li><strong>Issuer</strong> — who signed it. Equal to the subject means self-signed (<a href="#cp-b12-8">B12.8</a>).</li>
+<li><strong>Validity</strong> — <em>Not Before</em> and <em>Not After</em>. Both are checked; a clock skewed into the past fails a brand-new certificate just as surely as expiry fails an old one.</li>
+<li><strong>Subject Alternative Name</strong> — the names it actually covers (<a href="#cp-b12-10">B12.10</a>).</li>
+<li><strong>Key Usage / Extended Key Usage</strong> — what it may be used for. <code>serverAuth</code> and <code>clientAuth</code> are distinct, and a certificate issued for one is rejected when presented for the other.</li>
+</ul>
+<p>Rather than reading the whole dump every time, use the targeted flags: <code>-subject</code>, <code>-issuer</code>, <code>-dates</code>, <code>-ext subjectAltName</code>, <code>-serial</code>. And learn <code>-checkend</code>, which answers "will this still be valid in N seconds?" with an exit status — the form you can put in a monitoring check, which is where this belongs rather than in someone's calendar.</p>
+<p>Two more skills complete the set. <code>openssl verify -CAfile</code> checks a chain against a trusted root, and <code>openssl s_client -connect host:port</code> pulls a certificate from a <em>live</em> server so you can inspect what is actually being served rather than what is on disk. The two answer different questions, and when they disagree you have found your bug: the file on disk was updated and the process was never restarted.</p>
+<div class="flow"><span>on disk: <code>x509 -in file</code></span><em>vs</em><span class="hot">on the wire: <code>s_client -connect</code></span><em>→</em><span>a disagreement is a missed restart</span></div>
+<p>Always check the wire when the file looks fine.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the whole thing once, so the shape is familiar. Then never do this again in a hurry.
+<pre class="cmd">cd ~/ca
+openssl x509 -in server.crt -noout -text | head -14</pre>
+<pre class="out">Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number: 4a:2f:1b:...
+        Signature Algorithm: sha256WithRSAEncryption
+        <b>Issuer: CN=B12 Demo CA, O=sandbox</b>
+        Validity
+            <b>Not Before: Jul 25 10:11:03 2026 GMT</b>
+            <b>Not After : Jul 25 10:11:03 2027 GMT</b>
+        Subject: CN=localhost</pre></li>
+<li>Now the fast version — the four flags worth muscle memory. This is what you actually run during an incident.
+<pre class="cmd">openssl x509 -in server.crt -noout -subject -issuer -dates -ext subjectAltName</pre>
+<pre class="out">subject=CN=localhost
+issuer=CN=B12 Demo CA, O=sandbox
+notBefore=Jul 25 10:11:03 2026 GMT
+<b>notAfter=Jul 25 10:11:03 2027 GMT</b>
+X509v3 Subject Alternative Name:
+    DNS:localhost, DNS:sandbox, IP Address:127.0.0.1</pre></li>
+<li>Turn expiry into a check rather than a reading exercise. <code>-checkend</code> exits 0 if the certificate outlives the window and 1 if it does not — usable in a script or a monitor.
+<pre class="cmd">openssl x509 -in server.crt -noout -checkend 2592000; echo "exit=$?"
+openssl x509 -in server.crt -noout -checkend 99999999; echo "exit=$?"</pre>
+<pre class="out">Certificate will not expire
+exit=0                       ← safe for the next 30 days
+Certificate will expire
+<b>exit=1</b>                       ← would be expired within ~3.2 years: this is your alert condition</pre></li>
+<li>Verify the chain, then break the trust deliberately and read the difference. Both messages are ones you will meet again in <a href="#cp-b12-16">B12.16</a>.
+<pre class="cmd">openssl verify -CAfile ca.crt server.crt
+openssl verify -CAfile other-ca.crt server.crt 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">server.crt: OK
+error 20 at 0 depth lookup: <b>unable to get local issuer certificate</b></pre></li>
+<li>Inspect a certificate that is actually being served, using a real public endpoint. This is the command for "what is this server presenting <em>right now</em>".
+<pre class="cmd">echo | openssl s_client -connect ubuntu.com:443 2&gt;/dev/null \
+  | openssl x509 -noout -subject -dates -ext subjectAltName | head -5</pre>
+<pre class="out">subject=CN=ubuntu.com
+notBefore=... GMT
+<b>notAfter=... GMT</b>
+X509v3 Subject Alternative Name:
+    DNS:ubuntu.com, DNS:www.ubuntu.com          ← a real SAN list, read off the wire</pre></li>
+<li>Practise the five-second version until it is reflex: one line, one answer, no flags to recall.
+<pre class="cmd">openssl x509 -in server.crt -noout -enddate</pre>
+<pre class="out">notAfter=Jul 25 10:11:03 2027 GMT          ← this is the whole skill</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Without notes, produce three commands: the expiry date of a certificate file, the SAN list of a certificate being served on a live port, and a check that exits non-zero if a certificate expires within 30 days. Then explain what it means when the file on disk shows a fresh <em>Not After</em> and <code>s_client</code> shows an expired one — the file was renewed and the process still holds the old certificate in memory, so the fix is a restart or a reload, not another renewal.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Clock skew produces certificate errors that read like corruption. A machine whose clock is days behind will reject a certificate issued today with <em>certificate is not yet valid</em>, and one whose clock has jumped forward will report expiry on something perfectly current. When a certificate error appears on exactly one machine, check <code>timedatectl</code> before you check anything else — this is a routine cause of a single node failing to join a cluster.</p>
+<p>The second is trusting the file over the connection. Renewal writes a new file; the running process usually mapped the old one at startup and will keep serving it until it is restarted or explicitly reloaded. That is why <code>s_client</code> is the authoritative answer during an incident and the file on disk is only a claim about intent.</p>
+<div class="k8s-link">
+<p>A kubeadm cluster issues component certificates with a <strong>one-year</strong> lifetime, and this is the reason clusters that are left alone for thirteen months stop working with no change having been made. <code>kubeadm certs check-expiration</code> is exactly this lesson's <code>-enddate</code> loop, run over every file in <code>/etc/kubernetes/pki</code> and every embedded certificate in the control-plane kubeconfigs, and <code>kubeadm certs renew all</code> reissues them — after which the static-pod control plane must actually restart to pick them up, which is the disk-versus-wire distinction biting in the most consequential place it can.</p>
+<p>Inspecting cluster certificates by hand is <a href="w2.html#cp-2-6">W2.6</a>; the check-expiration and renewal workflow is <a href="w2.html#cp-2-7">W2.7</a>; the kubelet's own client certificate and its automatic rotation — the one certificate that does <em>not</em> need this treatment — is <a href="w2.html#cp-2-8">W2.8</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-x509</code> for every display flag used here (<code>-subject</code>, <code>-issuer</code>, <code>-dates</code>, <code>-enddate</code>, <code>-serial</code>, <code>-ext</code>, <code>-checkend</code>). <code>man 1 openssl-s_client</code> for pulling a certificate off a live port, including <code>-servername</code> when the server uses SNI to pick between several. <code>man 1 openssl-verify</code> for the numbered errors, and <code>man 1 timedatectl</code> for the clock check the gotcha above depends on.</p>
+</article>
+
+<article class="lesson" id="cp-b12-12" data-id="b12-12">
+<div class="lesson-head"><span class="cp-id">B12.12</span><h4>Real TLS, then mutual TLS: s_server, s_client and -Verify</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everything so far has been files. This is where the files become a connection: a server proving its identity to a client, then — the step that matters for Kubernetes — a client proving its identity right back. Once you have watched a handshake succeed and then fail for a specific reason, the cluster's entire authentication model is something you have already built.</p>
+<h5>The concept</h5>
+<p>An ordinary TLS connection is <strong>one-way authentication</strong>. The server presents a certificate; the client checks the chain (<a href="#cp-b12-9">B12.9</a>) and the name (<a href="#cp-b12-10">B12.10</a>) and, satisfied, proceeds. The server learns nothing about the client — which is right for the public web, where the server has no idea who is visiting and does not need one.</p>
+<p><strong>Mutual TLS</strong> (mTLS) adds the mirror image: the server demands a certificate from the client and verifies it against a CA it trusts. Now both ends have proven possession of a private key whose public half is bound, by a trusted signature, to a name. Two consequences follow. First, authentication is finished before a single byte of application data is sent — there is no login request, no token, no password. Second, the identity is <em>in</em> the certificate, so the server can read it straight out of the subject rather than looking anything up.</p>
+<p>That last point is the one to carry forward. In a mutually-authenticated connection, the server extracts the client's identity from the certificate's subject: the <strong>CN becomes the username</strong> and each <strong>O (organization) becomes a group</strong>. That convention is not something Kubernetes invented — it is how X.509 client authentication is conventionally mapped — but Kubernetes uses it literally, and knowing it explains kubeconfigs at a glance.</p>
+<p><code>openssl</code> ships both ends. <code>s_server</code> is a minimal TLS server, <code>s_client</code> a minimal client, and their verification flags are worth reading carefully: on the server, <code>-Verify</code> (capital V) <em>requires</em> a client certificate and fails the connection without one, while <code>-verify</code> (lowercase) merely asks and continues if none arrives. That distinction is the difference between mTLS and a suggestion.</p>
+<div class="flow"><span>server cert → client checks</span><em>+</em><span class="hot">client cert → server checks</span><em>=</em><span>both identities proven, before any data</span></div>
+<p>Mutual TLS is the same check run twice, in opposite directions.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a TLS server with the certificate you issued. <code>-www</code> makes it answer HTTP requests, so a browser-shaped client can talk to it.
+<pre class="cmd">cd ~/ca
+openssl s_server -accept 4433 -cert server.crt -key server.key -www &gt;/dev/null 2&gt;&amp;1 &amp;
+sleep 1; ss -ltnp 2&gt;/dev/null | grep 4433</pre>
+<pre class="out">LISTEN 0  4096  *:<b>4433</b>  *:*  users:(("openssl",pid=5120,fd=4))     ← a real TLS listener</pre></li>
+<li>Connect and read the verification result. The last line of the handshake summary is the one that matters.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 -CAfile ca.crt 2&gt;/dev/null \
+  | grep -E 'Verify return code|Cipher|Protocol' </pre>
+<pre class="out">Protocol  : TLSv1.3
+Cipher    : <b>TLS_AES_256_GCM_SHA384</b>          ← symmetric cipher for the conversation (B12.5)
+<b>Verify return code: 0 (ok)</b>                  ← chain checked against your CA</pre></li>
+<li>See what happens without the CA. The connection still forms — encryption never needed trust — but verification fails, which is what a browser turns into a full-page warning.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 2&gt;/dev/null | grep 'Verify return code'</pre>
+<pre class="out">Verify return code: <b>21 (unable to verify the first certificate)</b>
+                    ← encrypted but unauthenticated: exactly what --insecure buys you</pre></li>
+<li>Issue a client certificate. Same two steps as before, with the identity fields that matter for authentication — a username in <code>CN</code> and groups in <code>O</code>.
+<pre class="cmd">openssl genrsa -out client.key 2048 2&gt;/dev/null; chmod 600 client.key
+openssl req -new -key client.key -out client.csr -subj '/CN=alice/O=developers/O=oncall'
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' &gt; client.ext
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -sha256 -extfile client.ext -out client.crt 2&gt;/dev/null
+openssl x509 -in client.crt -noout -subject -ext extendedKeyUsage</pre>
+<pre class="out">subject=<b>CN=alice, O=developers, O=oncall</b>     ← username, then two groups
+X509v3 Extended Key Usage:
+    <b>TLS Web Client Authentication</b>            ← clientAuth, not serverAuth</pre></li>
+<li>Restart the server demanding a client certificate. Capital <code>-Verify</code> is the flag that makes it mandatory.
+<pre class="cmd">kill %1 2&gt;/dev/null; sleep 1
+openssl s_server -accept 4433 -cert server.crt -key server.key \
+  -CAfile ca.crt -Verify 1 -www &gt;/dev/null 2&gt;&amp;1 &amp;
+sleep 1; echo | openssl s_client -connect localhost:4433 -CAfile ca.crt 2&gt;&amp;1 | tail -2</pre>
+<pre class="out">40E7...:error:0A000412:SSL routines::sslv3 alert bad certificate
+<b>peer did not return a certificate</b>          ← the server refused: no client identity offered</pre></li>
+<li>Connect again, this time presenting the client certificate and key. Both ends now verify, and the server prints the identity it read.
+<pre class="cmd">echo | openssl s_client -connect localhost:4433 -CAfile ca.crt \
+  -cert client.crt -key client.key 2&gt;/dev/null | grep -E 'Verify return code|subject='  | head -3</pre>
+<pre class="out">subject=CN=localhost
+<b>Verify return code: 0 (ok)</b>          ← client verified the server; the server verified alice
+</pre></li>
+<li>Stop the server. The certificates stay — <a href="#cp-b12-15">B12.15</a> builds the project on exactly these files.
+<pre class="cmd">kill %1 2&gt;/dev/null; sleep 1; ss -ltn 2&gt;/dev/null | grep -c 4433</pre>
+<pre class="out">0          ← listener gone</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State what each side proves in a mutual TLS handshake, and where the client's identity comes from once it succeeds. Then check three things you should now be able to produce on demand: the flag that makes a client certificate mandatory rather than optional (<code>-Verify</code>, capital), the verify return code of a successful connection (<code>0 (ok)</code>), and the error a server gives a client that brings no certificate (<em>peer did not return a certificate</em>). If you can also explain why code 21 means the connection was encrypted but worthless, you are ready for the project.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Encryption and authentication are separate, and step 3 is the proof. A connection with no verification at all is still encrypted — nobody passively watching the wire can read it — and still completely insecure, because you may be talking to anyone. This is what <code>curl --insecure</code> and <code>kubectl --insecure-skip-tls-verify</code> actually do: they keep the encryption and discard the identity check. Using them to "fix" a certificate error converts a loud problem into a silent one.</p>
+<p>The second is <code>extendedKeyUsage</code>. A certificate marked <code>serverAuth</code> presented as a client certificate is rejected, and the error rarely says so plainly. When a client certificate is refused by a server that trusts the CA and everything looks right, print the EKU — this is a common failure when someone reuses a server certificate for a client identity because both were signed by the same CA.</p>
+<div class="k8s-link">
+<p>You have just built the cluster's authentication model. Every core Kubernetes component authenticates to the API server with a client certificate, and the API server's <code>--client-ca-file</code> is the <code>-CAfile</code> you passed to <code>s_server</code>. The identity mapping is literal: the certificate's <strong>CN becomes the username</strong> and every <strong>O becomes a group</strong>. That is why the admin kubeconfig kubeadm writes contains a certificate with <code>O=kubeadm:cluster-admins</code> — a group that a ClusterRoleBinding grants <code>cluster-admin</code> to — and why the kubelet's certificate is <code>CN=system:node:node01, O=system:nodes</code>, which is exactly what the Node authorizer keys off. There is no User object anywhere in Kubernetes; the username <em>is</em> the string in the certificate, which is also why users cannot be deleted, only their certificates left to expire or their bindings removed.</p>
+<p>The three credential types and the "there is no User object" rule are <a href="w7.html#cp-7-1">W7.1</a>; which identity is inside each kubeconfig kubeadm writes is <a href="w2.html#cp-2-3">W2.3</a>, and the Node authorizer that reads <code>O=system:nodes</code> is <a href="w7.html#cp-7-5">W7.5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-s_server</code> — read the difference between <code>-verify</code> and <code>-Verify</code> in its own words, plus <code>-CAfile</code> and <code>-www</code>. <code>man 1 openssl-s_client</code> for <code>-cert</code>/<code>-key</code>, <code>-CAfile</code>, <code>-showcerts</code> and the verify return codes. <code>man 1 openssl-verify</code> for what codes 20 and 21 mean, and <code>man 5 x509v3_config</code> for <code>extendedKeyUsage</code>.</p>
 </article>
 
 </div>
