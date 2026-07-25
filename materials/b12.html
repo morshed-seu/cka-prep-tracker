@@ -292,6 +292,259 @@ uid=0(root) gid=0(root) groups=0(root)              ← authenticated, then auth
 </article>
 
 </div>
+
+<!-- ---------------- Crypto in plain terms ---------------- -->
+<div class="grp" id="g-crypto"><h3>Crypto in plain terms</h3>
+
+<article class="lesson" id="cp-b12-4" data-id="b12-4">
+<div class="lesson-head"><span class="cp-id">B12.4</span><h4>Hashing, encoding, encryption — three things that are not each other</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>These three get muddled constantly, and one particular muddle causes real damage: people see base64 and think "encrypted". It is not. It is not even slightly. Getting this straight takes ten minutes with three commands, and it inoculates you against the single most common beginner misreading in the entire Kubernetes ecosystem — that a Secret's base64 value is protected.</p>
+<h5>The concept</h5>
+<p>Three operations, distinguished by one question: <em>who can reverse it, and with what?</em></p>
+<ul>
+<li><strong>Hashing</strong> — one way, no key, and nobody can reverse it. A hash function turns any input into a fixed-size fingerprint (<code>sha256sum</code> gives 64 hex characters whether the input is one byte or a gigabyte). Change one bit of the input and roughly half the output bits change, which is what makes it a useful fingerprint. Use it to answer "is this the same as that?" without holding the original: password checking, file integrity, and — as you will see later — the thing that actually gets signed in a signature.</li>
+<li><strong>Encoding</strong> — reversible by <em>anyone</em>, no key involved. Base64 rewrites arbitrary bytes using 64 safe characters so they survive a place that only accepts text: a JSON field, an email body, a YAML file. It is a transport convenience with the security value of writing something backwards. <code>base64 -d</code> undoes it, and there is nothing to know or possess in order to run that command.</li>
+<li><strong>Encryption</strong> — reversible only <em>with a key</em>. Without the key, the output is meaningless; with it, the original comes back exactly. This is the only one of the three that protects a secret's contents, and it always raises the question the other two never do: who has the key, and where is it kept?</li>
+</ul>
+<p>The tell for encoding is that the transformation is fully specified in a public document and needs no secret input. If you can undo it on any machine in the world with a command that takes no key, it was encoding. There is a related third-party habit worth naming: hashes are often stored alongside a random <strong>salt</strong>, so that two users with the same password do not get the same fingerprint and a precomputed table of common passwords stops being useful. That is why <code>/etc/shadow</code> entries contain a <code>$6$</code> prefix, a salt and then the hash.</p>
+<div class="flow"><span>hash: one way, no key</span><em>·</em><span>encode: reversible by anyone</span><em>·</em><span class="hot">encrypt: reversible with a key</span></div>
+<p>Only the right-hand one protects anything; the middle one is the one people mistake for it.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run all three on the same string and put the outputs next to each other. Start with hashing — note the fixed length regardless of input.
+<pre class="cmd">echo -n 'hunter2' | sha256sum
+echo -n 'hunter3' | sha256sum</pre>
+<pre class="out">f52fbd32b2b3b86ff88ef6c490628285f482af15ddcb29541f94bcf526a3f6c7  -
+<b>bd50f2c...totally different...9a1c</b>  -        ← one character changed, the whole fingerprint did</pre></li>
+<li>Now encode the same string, and immediately undo it. No key was involved in either direction — this is the whole point.
+<pre class="cmd">echo -n 'hunter2' | base64
+echo -n 'aHVudGVyMg==' | base64 -d; echo</pre>
+<pre class="out">aHVudGVyMg==
+<b>hunter2</b>          ← recovered by anyone, anywhere, with no secret at all</pre></li>
+<li>Encrypt it properly and see what a keyed transformation looks like. The output is bytes, so it is base64-armoured for display — both operations in one line, which is exactly why people confuse them.
+<pre class="cmd">echo -n 'hunter2' | openssl enc -aes-256-cbc -pbkdf2 -pass pass:mykey -a
+echo 'U2FsdGVkX1+...' | openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:mykey -a</pre>
+<pre class="out">U2FsdGVkX1+3Qm0Zt7YbVw==8k2Lp9xNc1dRfGh4      ← ciphertext (armoured with base64 for display)
+hunter2                                        ← only comes back with -pass pass:mykey</pre></li>
+<li>Prove the key is load-bearing: same ciphertext, wrong key, no plaintext. This is the difference between encoding and encryption in one command.
+<pre class="cmd">echo -n 'hunter2' | openssl enc -aes-256-cbc -pbkdf2 -pass pass:mykey -a &gt; /tmp/ct
+openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:WRONG -a -in /tmp/ct</pre>
+<pre class="out">bad decrypt
+40E7...:error:1C800064:Provider routines::<b>bad decrypt</b>        ← no key, no plaintext</pre></li>
+<li>Try to reverse a hash the same way and confirm there is no command for it. What people call "cracking" is guessing inputs and comparing fingerprints — which is why a slow, salted password hash matters.
+<pre class="cmd">sudo grep '^ubuntu:' /etc/shadow | cut -d: -f2 | cut -c1-30</pre>
+<pre class="out">$6$Xk2p9QmZ$hT4vN...       ← $6$ = SHA-512-crypt, then the salt, then the hash. No key, no reverse.</pre></li>
+<li>Do the Kubernetes experiment early, because it is the reason this lesson exists. A Secret's value is stored exactly like this — one command from plaintext.
+<pre class="cmd">printf 'apiVersion: v1\nkind: Secret\ndata:\n  password: %s\n' "$(echo -n 'hunter2' | base64)" | tee /tmp/secret.yaml
+grep password: /tmp/secret.yaml | awk '{print $2}' | base64 -d; echo</pre>
+<pre class="out">  password: aHVudGVyMg==
+<b>hunter2</b>          ← that is the entire "protection" a Secret's encoding provides</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Answer three questions cold. Which of the three can you undo with no secret whatsoever, and why does that operation exist at all? (Encoding — so arbitrary bytes survive a text-only field.) Why can a password file store hashes safely but never store encrypted passwords comfortably? (A hash needs no key to verify against, so there is no key to protect or leak; an encrypted password requires the key to be present on the machine doing the check, which just moves the secret.) And what does a <code>$6$</code> prefix in <code>/etc/shadow</code> tell you? (The hash algorithm, followed by a per-user salt, so identical passwords do not produce identical hashes.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The base64-is-security misreading is so common that it deserves stating in its strongest form: if a value is base64 in a config file, a Git repository or a YAML manifest, treat it as if it were written in plain text, because it is. The encoding stops nobody, and it has the unfortunate side effect of <em>looking</em> like protection to a casual reader, which is worse than no protection at all — plaintext at least looks alarming.</p>
+<p>The second trap is reaching for a fast hash where a slow one is required. <code>sha256sum</code> is designed to be fast, which is a virtue for file integrity and a liability for passwords, where speed is exactly what an attacker guessing billions of candidates wants. Password storage uses deliberately slow, salted functions (<code>bcrypt</code>, <code>scrypt</code>, <code>argon2</code>, or SHA-512-crypt with many rounds as in <code>/etc/shadow</code>). Same word, "hash"; entirely different design goal.</p>
+<div class="k8s-link">
+<p>This is the whole answer to "why are Kubernetes Secrets only base64?" They are not encrypted. A Secret object is a ConfigMap whose values happen to be base64-encoded, with slightly more careful default handling — kubectl does not print the values by accident, and they can be mounted as files with tighter permissions. But anyone who can read the Secret object through the API, or read etcd directly, has the value with one <code>base64 -d</code>. Two things change that picture, and both are cluster-level configuration rather than a property of the object: <strong>encryption at rest</strong>, where the API server encrypts Secret values before writing them to etcd using an <code>EncryptionConfiguration</code>, and RBAC that treats <code>get secrets</code> as the privileged verb it actually is.</p>
+<p>Secrets, base64 and what encryption at rest really does is <a href="w3.html#cp-3-23">W3.23</a>; the four ways a pod consumes them is <a href="w3.html#cp-3-21">W3.21</a>, and why etcd is its own trust domain is <a href="w2.html#cp-2-5">W2.5</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 sha256sum</code> and <code>man 1 base64</code> for the two simple tools. <code>man 1 openssl-enc</code> for symmetric encryption on the command line, including why <code>-pbkdf2</code> is not optional when deriving a key from a passphrase. <code>man 5 shadow</code> and <code>man 3 crypt</code> for the password-hash format and its algorithm prefixes.</p>
+</article>
+
+<article class="lesson" id="cp-b12-5" data-id="b12-5">
+<div class="lesson-head"><span class="cp-id">B12.5</span><h4>Symmetric and asymmetric keys, and why TLS uses both</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every secure connection you have ever made used two kinds of key in the same session, for reasons that are practical rather than theoretical. Understanding why is what turns the TLS handshake from a mysterious ritual into an obvious sequence — and it is also what explains why a certificate contains a public key and never a private one.</p>
+<h5>The concept</h5>
+<p><strong>Symmetric</strong> encryption uses one key for both directions: the same secret encrypts and decrypts. It is fast — modern CPUs have AES instructions built in — and it has one crippling problem, the <em>key distribution problem</em>: before you can talk to someone securely, you both need the same secret, and getting it to them is the very thing you cannot do yet.</p>
+<p><strong>Asymmetric</strong> encryption uses a mathematically linked pair: a <strong>public key</strong> you may hand to anyone, and a <strong>private key</strong> you never disclose to anybody, ever. What one encrypts, only the other can decrypt. That solves distribution outright — publish the public half, and anyone can send you something only you can read, with no prior arrangement. The price is speed: the maths is orders of magnitude slower than symmetric encryption, and RSA can only encrypt a payload smaller than its key size, so encrypting a video stream with it is not merely slow, it is impossible without chopping the stream up.</p>
+<p>So real protocols use both, in the only sensible arrangement: <strong>an expensive asymmetric introduction to agree on a cheap symmetric key</strong>, then all the actual traffic under that symmetric key. That is the entire architecture of TLS. The certificate exchange and key agreement at the start of the connection exist to establish one temporary session key; from then on the connection is symmetric AES. When you later read a cipher suite like <code>ECDHE-RSA-AES256-GCM-SHA384</code> in <a href="#cp-b12-12">B12.12</a>, you are reading exactly this split: <code>ECDHE</code> agrees the session key, <code>RSA</code> authenticates who you agreed it with, <code>AES256-GCM</code> is the symmetric cipher doing the work, <code>SHA384</code> is the hash.</p>
+<p>One more thing to fix in your head now, because it decides whether the rest of the module makes sense: <strong>a keypair has two uses, and they run in opposite directions.</strong> Encrypt with the public key so only the private key can read it — that is confidentiality. Or transform with the private key so anyone with the public key can check it — that is a signature, and it is <a href="#cp-b12-6">B12.6</a>. Certificates are entirely about the second use.</p>
+<div class="flow"><span>asymmetric handshake</span><em>→</em><span class="hot">agree one session key</span><em>→</em><span>symmetric AES for all traffic</span></div>
+<p>Expensive introduction, cheap conversation — the shape of every HTTPS connection.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make a working directory for the rest of the module, then generate an RSA keypair. Note that the "private key" file contains both halves — the public one is derived from it.
+<pre class="cmd">mkdir -p ~/ca &amp;&amp; cd ~/ca
+openssl genrsa -out demo.key 2048
+chmod 600 demo.key
+openssl rsa -in demo.key -pubout -out demo.pub
+ls -l demo.key demo.pub</pre>
+<pre class="out">-rw------- 1 ubuntu ubuntu 1704 Jul 25 09:02 <b>demo.key</b>     ← mode 600: this half is the secret
+-rw-rw-r-- 1 ubuntu ubuntu  451 Jul 25 09:02 demo.pub      ← this half is meant to be given away</pre></li>
+<li>Look inside both. The public file is small and contains only the modulus and exponent; the private file contains those plus the factors that make decryption possible.
+<pre class="cmd">head -2 demo.pub
+openssl rsa -in demo.key -noout -text | head -4</pre>
+<pre class="out">-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5Kj...
+Private-Key: (<b>2048 bit</b>, 2 primes)
+modulus: 00:e4:a8:...                          ← the modulus is in BOTH files; the primes only here</pre></li>
+<li>Use the pair for confidentiality: encrypt with the public key, decrypt with the private one. Anyone holding <code>demo.pub</code> can send you this; only you can open it.
+<pre class="cmd">echo 'meet at noon' &gt; msg.txt
+openssl pkeyutl -encrypt -pubin -inkey demo.pub -in msg.txt -out msg.enc
+openssl pkeyutl -decrypt -inkey demo.key -in msg.enc</pre>
+<pre class="out">meet at noon        ← round-tripped through the pair, with no shared secret arranged in advance</pre></li>
+<li>Now hit the size limit that forces the hybrid design. RSA cannot encrypt more than roughly its key size, so a real payload is out of the question.
+<pre class="cmd">head -c 5000 /dev/urandom &gt; big.bin
+openssl pkeyutl -encrypt -pubin -inkey demo.pub -in big.bin -out big.enc</pre>
+<pre class="out">Public Key operation error
+40B7...:error:0200006E:rsa routines::<b>data too large for key size</b>     ← this is why TLS is hybrid</pre></li>
+<li>Encrypt the same file symmetrically and time both. The gap is the practical argument, not an aesthetic one.
+<pre class="cmd">head -c 20M /dev/urandom &gt; huge.bin
+time openssl enc -aes-256-cbc -pbkdf2 -pass pass:k -in huge.bin -out huge.enc</pre>
+<pre class="out">real    0m0.14s        ← 20 MB of AES in a seventh of a second; RSA cannot do this at any size</pre></li>
+<li>Confirm the CPU is helping, which is why symmetric encryption is essentially free on modern hardware.
+<pre class="cmd">grep -o -m1 ' aes ' /proc/cpuinfo &amp;&amp; echo 'AES-NI present'
+rm -f big.bin big.enc huge.bin huge.enc msg.enc</pre>
+<pre class="out"> aes
+AES-NI present         ← hardware AES instructions: the "cheap conversation" half is cheap</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Explain in two sentences why TLS uses both key types, naming the specific problem each one solves — distribution for asymmetric, speed and payload size for symmetric. Then answer the question that catches people out: if you hand someone your public key, what can they do with it? (Encrypt something only you can read, and verify signatures you made. They cannot decrypt your traffic, sign as you, or derive the private half.) Check yourself against the file listing: the only file in <code>~/ca</code> that ever needs mode <code>600</code> is the one ending <code>.key</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The naming trips everybody at least once. A file called <code>something.key</code> is the private key and must never be copied anywhere casually; a <code>.pub</code>, <code>.crt</code> or <code>.pem</code> certificate contains only the public half and is safe to email, commit and serve over the internet. When you feel unsure which you are holding, <code>openssl rsa -in FILE -noout -text | head -1</code> says <code>Private-Key</code> or errors — five seconds, and it has saved more than one person from pasting a private key into a ticket.</p>
+<p>The second is assuming key size is the only thing that matters. A 2048-bit RSA key and a 256-bit elliptic-curve key offer comparable strength, because the numbers measure different mathematics — EC keys are dramatically smaller and faster for equivalent security, which is why <code>ed25519</code> is now the default for SSH and why Kubernetes components increasingly use ECDSA. Do not compare bit counts across algorithms.</p>
+<div class="k8s-link">
+<p>Every component of a cluster holds a keypair, and the split you just built is exactly how they are stored: <code>/etc/kubernetes/pki/</code> holds <code>.key</code> files (private, mode 600, never leave the node) beside <code>.crt</code> files (public, handed to anyone who connects). The API server presents its public half to every client on every connection; the private half never crosses the network even once. There is one more place the asymmetric pair shows up in a form that surprises people: <code>sa.key</code> and <code>sa.pub</code>, the keypair the controller manager uses to <em>sign</em> ServiceAccount tokens and the API server uses to verify them — no certificate involved, just a raw keypair doing the second use of a pair.</p>
+<p>The layout of <code>/etc/kubernetes/pki</code>, including that odd <code>sa.key</code>/<code>sa.pub</code> couple, is <a href="w2.html#cp-2-5">W2.5</a>; how those tokens are issued and rotated is <a href="w7.html#cp-7-4">W7.4</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-genrsa</code> and <code>man 1 openssl-genpkey</code> (the modern, algorithm-agnostic generator) for making keys; <code>man 1 openssl-rsa</code> for inspecting and converting them; <code>man 1 openssl-pkeyutl</code> for the raw encrypt/decrypt operations used above. <code>man 1 openssl-ciphers</code> decodes cipher-suite names like <code>ECDHE-RSA-AES256-GCM-SHA384</code> piece by piece.</p>
+</article>
+
+<article class="lesson" id="cp-b12-6" data-id="b12-6">
+<div class="lesson-head"><span class="cp-id">B12.6</span><h4>Signatures: the keypair used backwards</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A signature is the mechanism behind certificates, SSH logins, signed tokens and package verification — four things that look unrelated until you notice they are one operation. It is also the precise thing a certificate authority does for a living, so the next group of lessons is much easier once this is concrete rather than abstract.</p>
+<h5>The concept</h5>
+<p>Run the keypair in the other direction. Transform something with your <strong>private</strong> key, and anyone holding your <strong>public</strong> key can check that the transformation could only have come from the private half. That check yields two facts at once:</p>
+<ul>
+<li><strong>Origin</strong> — it was produced by whoever holds that private key.</li>
+<li><strong>Integrity</strong> — the data has not changed by a single bit since, because the signature is over the data's hash and any change gives a different hash.</li>
+</ul>
+<p>Mechanically, you do not sign the data itself — you hash it first (<a href="#cp-b12-4">B12.4</a>) and sign the hash. That is why signing a 10 GB file is as fast as signing a sentence, and it is why signature commands always name a hash algorithm: <code>openssl dgst -sha256 -sign</code>. The verifier repeats the hash over the data it received, undoes the signature with the public key, and compares. Equal means both facts hold; different means one of them does not, and the tool cannot tell you which.</p>
+<p>Now the essential limitation, which the whole of PKI exists to patch. A valid signature proves the data came from the holder of a specific private key. It says <strong>nothing about who that holder is</strong>. If an attacker generates their own keypair and signs a message, the signature verifies perfectly against their public key — the maths is not lying, it simply answers a narrower question than you wanted. Verification therefore only means something if you already had good reason to trust the public key you checked against. That "already trusted public key" problem is solved by <a href="#cp-b12-8">a certificate authority</a>: someone you trust signs a statement binding a public key to a name, and the trust flows from there.</p>
+<div class="flow"><span>data</span><em>→</em><span>hash</span><em>→</em><span class="hot">sign with private key</span><em>·</em><span>verify with public key</span><em>→</em><span>origin + integrity</span></div>
+<p>Both facts come from one check; neither of them is "and this person is who they say they are".</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Sign a file with the private key you already made. The output is opaque bytes, so keep it in its own file.
+<pre class="cmd">cd ~/ca
+echo 'transfer 100 to alice' &gt; order.txt
+openssl dgst -sha256 -sign demo.key -out order.sig order.txt
+ls -l order.sig</pre>
+<pre class="out">-rw-rw-r-- 1 ubuntu ubuntu <b>256</b> Jul 25 09:14 order.sig      ← 256 bytes = 2048 bits, one RSA block</pre></li>
+<li>Verify it with only the public half. This is the operation a recipient performs, and they never need your private key to do it.
+<pre class="cmd">openssl dgst -sha256 -verify demo.pub -signature order.sig order.txt</pre>
+<pre class="out"><b>Verified OK</b>       ← origin (that private key) and integrity (unchanged) in one word</pre></li>
+<li>Change exactly one byte of the data and verify again. Nothing about the signature file changed — the mismatch is entirely in the hash.
+<pre class="cmd">sed -i 's/alice/bobbb/' order.txt
+openssl dgst -sha256 -verify demo.pub -signature order.sig order.txt</pre>
+<pre class="out">Verification failure
+40C7...:error:02000068:rsa routines::<b>bad signature</b>          ← integrity broken, caught immediately</pre></li>
+<li>Restore the file and confirm verification comes back. The check is exact, not fuzzy: correct data means correct result, every time.
+<pre class="cmd">sed -i 's/bobbb/alice/' order.txt
+openssl dgst -sha256 -verify demo.pub -signature order.sig order.txt</pre>
+<pre class="out">Verified OK</pre></li>
+<li>Now demonstrate the limitation that motivates certificates. An impostor generates their own keypair, signs a forged order, and it verifies perfectly — against <em>their</em> public key.
+<pre class="cmd">openssl genrsa -out impostor.key 2048 2&gt;/dev/null
+openssl rsa -in impostor.key -pubout -out impostor.pub 2&gt;/dev/null
+echo 'transfer 9000 to mallory' &gt; forged.txt
+openssl dgst -sha256 -sign impostor.key -out forged.sig forged.txt
+openssl dgst -sha256 -verify impostor.pub -signature forged.sig forged.txt</pre>
+<pre class="out"><b>Verified OK</b>       ← the maths is fine. The question "whose key is impostor.pub?" is unanswered.</pre></li>
+<li>Confirm the forged signature fails against the key you actually trust — which is the only reason step 5 is not a disaster.
+<pre class="cmd">openssl dgst -sha256 -verify demo.pub -signature forged.sig forged.txt
+rm -f impostor.key impostor.pub forged.txt forged.sig</pre>
+<pre class="out">Verification failure          ← trust was never in the signature; it was in which public key you held</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>State the two facts a valid signature establishes, and the one fact it does not. Then explain why signing hashes the data first — and what that buys beyond speed (a fixed-size input for a fixed-size operation, and the fact that any change anywhere in the data changes the thing that was signed). Finally, describe step 5 in one sentence to someone else: a signature that verifies against an untrusted public key proves only that somebody, somewhere, holds the matching private key.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>"Signed" on its own is a meaningless assurance, and marketing uses it that way constantly. The useful question is always <em>signed by a key you had a prior reason to trust?</em> A signed container image, a signed release tarball and a signed token are each worth exactly as much as the answer to that follow-up. This is not pedantry: it is the entire attack that certificate authorities and pinned public keys exist to prevent.</p>
+<p>The second gotcha is the pair of near-identical commands. <code>openssl dgst -sign</code> takes the <em>private</em> key, <code>-verify</code> takes the <em>public</em> one, and passing the wrong file gives a confusing parse error rather than a clear "that is the wrong half". If <code>-verify</code> complains about reading the key, you have almost certainly handed it a private key file.</p>
+<div class="k8s-link">
+<p>Two signature-verification flows run continuously inside a cluster. The first is TLS: when kubectl connects, the API server proves it holds the private key matching the certificate it presented, and kubectl checks that certificate's signature against the cluster CA embedded in your kubeconfig — a signature check over a name binding, which is <a href="#cp-b12-8">B12.8</a>'s subject. The second is ServiceAccount tokens, which are JWTs: a base64 header and payload (encoding, not encryption — you can read any token's claims with <code>base64 -d</code>) followed by a signature made with <code>sa.key</code>. The API server verifies it with <code>sa.pub</code>, and that verification <em>is</em> the pod's authentication. Both are this lesson's one operation, applied to different data.</p>
+<p>How a pod's token is issued, projected and rotated is <a href="w7.html#cp-7-4">W7.4</a>; the CSR API — where you ask the cluster CA to sign a public key you generated — is <a href="w7.html#cp-7-3">W7.3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 openssl-dgst</code> is the page for both halves of this lesson — search it for <code>-sign</code>, <code>-verify</code> and <code>-signature</code>. <code>man 1 openssl-pkeyutl</code> shows the lower-level <code>-sign</code>/<code>-verify</code> operations if you want to see the hash step separated out. <code>man 1 sha256sum</code> remains the plain-text way to see the hash that is actually being signed.</p>
+</article>
+
+<article class="lesson" id="cp-b12-7" data-id="b12-7">
+<div class="lesson-head"><span class="cp-id">B12.7</span><h4>SSH keys and the agent — the example already in your hands</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have been using public-key cryptography every time you log into a machine, and probably without connecting it to anything in the previous three lessons. Making that connection is worth doing deliberately, because SSH is the clearest small example of the whole pattern: a keypair, a signature challenge, a trusted list of public keys, and a cache that trades safety for convenience.</p>
+<h5>The concept</h5>
+<p>An SSH login with keys works like this. The server has your <strong>public</strong> key on a line in <code>~/.ssh/authorized_keys</code>. When you connect, the server sends a challenge, and your client proves it holds the matching private key by <strong>signing</strong> that challenge (<a href="#cp-b12-6">B12.6</a>). The server verifies the signature against the public key on file. Your private key never crosses the network — not encrypted, not at all — which is the property that makes key login strictly better than passwords, where the secret itself is transmitted (inside the encrypted channel, but transmitted).</p>
+<p>Because the private key is a file, it is protected by exactly one thing on disk: its mode. <code>ssh</code> enforces this itself and will flatly refuse to use a key that other users can read — one of the few programs that fails closed on a permission problem rather than warning. A key can additionally be encrypted with a <strong>passphrase</strong>, which is symmetric encryption (<a href="#cp-b12-4">B12.4</a>) wrapped around the private key file: stealing the file then gets you nothing without the passphrase.</p>
+<p>That protection is also an annoyance — a passphrase typed on every connection is a passphrase people remove. <strong><code>ssh-agent</code></strong> is the compromise: a small background process that holds your <em>decrypted</em> private key in memory, so you type the passphrase once per session and every subsequent connection asks the agent to produce signatures on your behalf. The trade-off is worth naming because it recurs everywhere — every credential cache, every token in a pod, every kubeconfig on a laptop makes the same bargain. A decrypted secret is sitting in a running process's memory, reachable by anything that can reach that process: you, root, and any code running as you.</p>
+<div class="flow"><span>server: challenge</span><em>→</em><span class="hot">client signs with private key</span><em>→</em><span>server verifies vs authorized_keys</span><em>→</em><span>session</span></div>
+<p>Nothing secret travels; only a signature does.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Generate a key with a passphrase, so the agent has something to hold. Ed25519 keys are small, fast, and now the sensible default.
+<pre class="cmd">cd ~/ca
+ssh-keygen -t ed25519 -f ~/.ssh/demo_key -C 'b12 demo' -N 'sandbox-pass'
+head -1 ~/.ssh/demo_key</pre>
+<pre class="out">-----BEGIN OPENSSH PRIVATE KEY-----      ← the file is itself encrypted; the passphrase decrypts it</pre></li>
+<li>Authorize it for your own account, so you can log into <code>localhost</code> and watch the exchange. The public half is what goes on the server.
+<pre class="cmd">cat ~/.ssh/demo_key.pub &gt;&gt; ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+ssh -i ~/.ssh/demo_key -o IdentitiesOnly=yes localhost hostname</pre>
+<pre class="out">Enter passphrase for key '/home/ubuntu/.ssh/demo_key':
+<b>sandbox</b>          ← logged in; the passphrase decrypted the local file, nothing more</pre></li>
+<li>Now start an agent and load the key once. From here the passphrase is not asked again — the agent signs each challenge for you.
+<pre class="cmd">eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/demo_key        # passphrase: sandbox-pass
+ssh-add -l</pre>
+<pre class="out">Agent pid 4412
+Identity added: /home/ubuntu/.ssh/demo_key (b12 demo)
+256 SHA256:9k2Lp... b12 demo (ED25519)        ← the agent is holding it, decrypted, in memory</pre></li>
+<li>Connect twice more and note what you are no longer typing. This is the convenience the trade-off buys.
+<pre class="cmd">ssh -o IdentitiesOnly=yes -i ~/.ssh/demo_key localhost 'echo login-1'
+ssh -o IdentitiesOnly=yes -i ~/.ssh/demo_key localhost 'echo login-2'</pre>
+<pre class="out">login-1
+login-2          ← no prompt: the agent produced both signatures</pre></li>
+<li>Look at the boundary the agent creates. It is a Unix socket (<a href="b9.html#cp-b9-17">B9.17</a>) owned by you, and anything that can reach that socket can sign as you without ever knowing the passphrase.
+<pre class="cmd">echo "$SSH_AUTH_SOCK"; ls -l "$SSH_AUTH_SOCK"</pre>
+<pre class="out">/tmp/ssh-XXXX2kPq/agent.4411
+srw------- 1 ubuntu ubuntu 0 Jul 25 09:31 /tmp/ssh-XXXX2kPq/agent.4411
+                             ↑ mode 600 on a socket is the whole control (B12.1's boundary 2)</pre></li>
+<li>Prove that <code>ssh</code> fails closed on permissions — one of the clearest examples of a tool refusing to proceed with a weakened control.
+<pre class="cmd">chmod 644 ~/.ssh/demo_key
+ssh -o IdentitiesOnly=yes -i ~/.ssh/demo_key localhost hostname 2&gt;&amp;1 | head -3</pre>
+<pre class="out">@@@@@ WARNING: UNPROTECTED PRIVATE KEY FILE! @@@@@
+Permissions 0644 for '/home/ubuntu/.ssh/demo_key' are too open.
+<b>This private key will be ignored.</b>          ← refuses to use it at all</pre></li>
+<li>Restore the mode and clean up the agent. The key files stay — <a href="#cp-b12-16">B12.16</a> does not need them, but leaving a demo key authorized is untidy.
+<pre class="cmd">chmod 600 ~/.ssh/demo_key
+ssh-add -D &amp;&amp; ssh-agent -k &gt;/dev/null
+grep -v 'b12 demo' ~/.ssh/authorized_keys &gt; /tmp/ak &amp;&amp; mv /tmp/ak ~/.ssh/authorized_keys; echo cleaned</pre>
+<pre class="out">All identities removed.
+cleaned</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Describe an SSH key login as a signature challenge, in one sentence, naming which half of the pair lives where. Then answer two questions about the agent: what does it hold, and what does someone gain by reaching its socket? (A decrypted private key; the ability to sign as you — to log in anywhere that key is authorized — without ever learning the passphrase, for as long as the agent runs.) If you can also say why <code>ssh</code> refuses a mode-644 key rather than warning, you have the lesson.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Agent forwarding (<code>ssh -A</code>) deserves a specific warning, because it is the same trade-off pushed one hop further. It exports your agent socket to the machine you log into, so that machine can sign with your key while you are connected — convenient for hopping through a bastion, and it means root on that intermediate machine can use your identity to reach everything you can reach, silently, for the length of the session. Prefer <code>ProxyJump</code> (<code>ssh -J</code>), which tunnels through the bastion without ever exposing the agent to it.</p>
+<p>The second is the passphrase's real scope. It protects the key <em>file at rest</em> and nothing else. Once the agent holds the key, the passphrase is irrelevant to anyone attacking the running system; and a key with no passphrase is simply a plaintext credential on disk, protected by mode <code>600</code> alone — which is precisely the situation of most automation credentials, including a kubeconfig.</p>
+<div class="k8s-link">
+<p>A kubeconfig is the same bargain in a different file format, and seeing that is the point of this lesson. <code>~/.kube/config</code> typically contains <code>client-certificate-data</code> and <code>client-key-data</code> — a certificate and, crucially, a <em>private key</em>, base64-encoded and therefore in plain text (<a href="#cp-b12-4">B12.4</a>). It is your identity to the cluster, it has no passphrase, and it is protected by its file mode and nothing else. Copying it to a shared machine, pasting it into a chat, or baking it into an image is the exact equivalent of publishing a passphrase-less SSH private key. Treat it like one: mode <code>600</code>, never in Git, and rotate it if it ever leaves your machine.</p>
+<p>What is actually inside a kubeconfig, field by field, is <a href="w7.html#cp-7-2">W7.2</a>; the certificates kubeadm generates for each identity, and where their keys live, is <a href="w2.html#cp-2-3">W2.3</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 ssh-keygen</code> for key generation, passphrase changes (<code>-p</code>) and printing the public half from a private key (<code>-y</code>). <code>man 1 ssh-agent</code> and <code>man 1 ssh-add</code> for the cache and its socket; <code>man 8 sshd</code>, section <em>AUTHORIZED_KEYS FILE FORMAT</em>, for what a line in that file may contain — including the <code>command=</code> and <code>from=</code> restrictions worth knowing. <code>man 5 ssh_config</code> for <code>IdentitiesOnly</code> and <code>ProxyJump</code>.</p>
+</article>
+
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
