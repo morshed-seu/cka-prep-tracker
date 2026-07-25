@@ -833,6 +833,266 @@ sudo systemctl daemon-reload; systemctl --failed --no-pager | tail -1</pre>
 
 </div><!-- /g-operating -->
 
+<!-- ---------------- Logs and boot ---------------- -->
+<div class="grp" id="g-logs"><h3>Logs and boot</h3>
+
+<article class="lesson" id="cp-b11-10" data-id="b11-10">
+<div class="lesson-head"><span class="cp-id">B11.10</span><h4>journalctl with intent: one unit, follow, since, priority, boot</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Half of debugging is finding the relevant lines quickly, and on a modern Linux machine those lines are not in a text file you can <code>grep</code>. They are in the journal, and the difference between someone who knows five <code>journalctl</code> flags and someone who does not is the difference between answering a question in ten seconds and scrolling through thousands of unrelated lines. This is also the exact command you will run on every unhealthy Kubernetes node, so the fluency transfers directly.</p>
+<h5>The concept</h5>
+<p><strong>journald</strong> is systemd's logging service, and it collects far more than a log file ever did. Every unit's <strong>stdout and stderr are captured automatically</strong> — a program that simply prints to the screen is already logging correctly, with no configuration and no log file of its own. It also collects the kernel's messages, everything sent to the classic syslog socket, and audit records, into one merged, time-ordered store.</p>
+<p>The store is <strong>structured and binary</strong>, not text. Every entry carries fields — which unit produced it, the PID, the uid, the priority, the boot it belongs to — alongside the message. That is why <code>grep /var/log/…</code> finds nothing on a modern box, and it is a feature: you can select by field rather than hoping a regex matches. The cost is that you must go through <code>journalctl</code> to read it.</p>
+<p>The flags worth committing to memory:</p>
+<ul>
+<li><strong><code>-u &lt;unit&gt;</code></strong> — only this unit. The single most useful flag; repeatable to merge several units in time order, which is how you correlate a service with its dependency.</li>
+<li><strong><code>-f</code></strong> — follow, like <code>tail -f</code>. Combine with <code>-u</code> and restart the service in another window to watch a start-up live.</li>
+<li><strong><code>-n N</code></strong> — the last N lines (default 10).</li>
+<li><strong><code>--since</code> / <code>--until</code></strong> — time windows in plain language: <code>--since "10 min ago"</code>, <code>--since today</code>, <code>--since "2026-07-25 09:00"</code>.</li>
+<li><strong><code>-p &lt;priority&gt;</code></strong> — severity, using syslog's eight levels: <code>emerg</code> 0, <code>alert</code> 1, <code>crit</code> 2, <code>err</code> 3, <code>warning</code> 4, <code>notice</code> 5, <code>info</code> 6, <code>debug</code> 7. <code>-p err</code> means "err and worse," which is the fastest way to skim a noisy machine.</li>
+<li><strong><code>-b</code></strong> — this boot only. <strong><code>-b -1</code></strong> — the previous boot, which is where the evidence lives after a crash and reboot (and requires persistence, <a href="#cp-b11-11">B11.11</a>).</li>
+<li><strong><code>-k</code></strong> — kernel messages only, the equivalent of <code>dmesg</code> (<a href="b3.html#cp-b3-11">B3.11</a>) but with the journal's time filters available.</li>
+<li><strong><code>-o &lt;format&gt;</code></strong> — output shape. <code>short-precise</code> adds milliseconds (essential for ordering races, as <a href="#cp-b11-5">B11.5</a> used); <code>cat</code> prints the bare message with no metadata; <code>json-pretty</code> shows every field an entry actually carries.</li>
+<li><strong><code>-x</code></strong> — add explanatory text from the message catalogue where one exists.</li>
+</ul>
+<p>You can also select by any field directly, which is where the structured store pays off: <code>journalctl _PID=1234</code>, <code>journalctl _UID=1000</code>, <code>journalctl _COMM=sshd</code>. And priorities are worth understanding rather than memorising by number — a program writing to stderr gets <code>err</code> by default under systemd, which is why perfectly ordinary diagnostic chatter sometimes shows up red.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read one unit's log, which is the command you will type most often for the rest of your career.
+<pre class="cmd">multipass shell sandbox
+journalctl -u hello -n 5 --no-pager</pre>
+<pre class="out">Jul 25 10:20:01 sandbox systemd[1]: Started hello.service - A hello service, overridden.
+Jul 25 10:20:01 sandbox hello.sh[5402]: <b>good evening from pid 5402 (every 3s)</b>
+Jul 25 10:20:04 sandbox hello.sh[5402]: good evening from pid 5402 (every 3s)
+    ← systemd's own messages and the program's stdout, merged in one stream</pre></li>
+<li>Watch a start-up happen live. Follow in one window, restart in another, and read the sequence as it is written.
+<pre class="cmd"># window 1:
+journalctl -u hello -f
+# window 2:
+sudo systemctl restart hello</pre>
+<pre class="out">Jul 25 10:22:14 sandbox systemd[1]: Stopping hello.service...
+Jul 25 10:22:14 sandbox systemd[1]: hello.service: Deactivated successfully.
+Jul 25 10:22:14 sandbox systemd[1]: Started hello.service.
+Jul 25 10:22:14 sandbox hello.sh[5490]: good evening from pid 5490 (every 3s)
+    ← Ctrl-C to stop following</pre></li>
+<li>Narrow by time and by severity — the two filters that turn a noisy machine into a readable one.
+<pre class="cmd">journalctl --since "5 min ago" -p warning --no-pager | tail -5
+journalctl -b -p err --no-pager | tail -3</pre>
+<pre class="out">Jul 25 10:18:02 sandbox systemd[1]: hog.service: A process of this unit has been killed by the OOM killer.
+    ← -p warning shows warning and worse; -p err narrows further
+    ← -b limits to this boot, so you are not reading last week's problems</pre></li>
+<li>Correlate two units in one time-ordered stream. This is how you find out whether a service failed because its dependency was late.
+<pre class="cmd">sudo systemctl restart hello
+journalctl -u hello -u ssh --since "1 min ago" -o short-precise --no-pager | tail -4</pre>
+<pre class="out">10:24:31.402 sandbox systemd[1]: Stopping hello.service...
+10:24:31.418 sandbox systemd[1]: Started hello.service.
+10:24:31.420 sandbox hello.sh[5530]: good evening from pid 5530 (every 3s)
+    ← millisecond precision: the ordering is unambiguous</pre></li>
+<li>See what an entry really contains. The message is one field among many, and those fields are what makes selection precise.
+<pre class="cmd">journalctl -u hello -n 1 -o json-pretty --no-pager | grep -E '_PID|_UID|_SYSTEMD_UNIT|PRIORITY|MESSAGE'</pre>
+<pre class="out">"PRIORITY" : "6",                          ← info
+"_PID" : "5530",
+"_UID" : "1000",
+"<b>_SYSTEMD_UNIT</b>" : "hello.service",         ← the field -u actually filters on
+"MESSAGE" : "good evening from pid 5530 (every 3s)"</pre></li>
+<li>Select by a field directly, bypassing units entirely — useful when you know the process but not the unit.
+<pre class="cmd">journalctl _COMM=systemd -n 3 --no-pager -o cat
+journalctl -k -n 2 --no-pager | tail -2</pre>
+<pre class="out">Started hello.service - A hello service, overridden.
+Stopping hello.service...
+kernel: ... ← -k gives kernel messages only, with journal time filters available</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Produce four answers with four commands, without looking them up: everything this unit logged in the last ten minutes (<code>journalctl -u hello --since "10 min ago"</code>); only errors from this boot (<code>journalctl -b -p err</code>); a live view of a restart (<code>journalctl -u hello -f</code>); and two units interleaved with millisecond timestamps (<code>journalctl -u a -u b -o short-precise</code>). Then explain why a program that only prints to stdout is already logging correctly under systemd (journald captures a unit's stdout and stderr automatically) and why <code>grep</code> on <code>/var/log</code> often finds nothing (the journal is a structured binary store, not a text file).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The commonest waste of time is reading the journal without <code>-u</code>. The default view is <em>everything on the machine</em>, so the lines you want are interleaved with cron, DHCP, the kernel and every other service, and people conclude the log is useless when they simply never narrowed it. Reach for <code>-u</code> first, then add time and priority filters.</p>
+<p>Priorities are set by the producer and are not reliable evidence of severity. Anything a unit writes to stderr is recorded as <code>err</code> by default, so ordinary progress messages from a program that logs to stderr will appear at error level, and filtering with <code>-p err</code> will show you a screen of things that are perfectly fine. Conversely a genuinely serious event logged to stdout appears as <code>info</code> and is hidden by that same filter. Use priority to narrow, never to conclude.</p>
+<p>Finally, <code>-b -1</code> only works if the journal is persistent. On a machine with a volatile journal, the previous boot's logs were in memory and are gone — which is exactly the crash you most needed to read about. That is the entire subject of <a href="#cp-b11-11">B11.11</a>, and it is worth checking <em>before</em> you need it.</p>
+<div class="k8s-link">
+<p><code>journalctl -u kubelet</code> is the single most valuable command on a broken node, because the kubelet is the component that knows why pods are not running and it reports that reasoning here. When <code>kubectl</code> itself cannot help you — the API server is down, or the node is NotReady and nothing is reporting — this is the fallback, and the flags are exactly the ones you just practised: <code>-u kubelet -f</code> while you reproduce, <code>-u kubelet --since "10 min ago"</code> after an incident, <code>-b -1</code> after a node reboot. The same is true of <code>journalctl -u containerd</code> one layer down. Note also the parallel: a container's stdout is collected by the kubelet exactly as a unit's stdout is collected by journald, which is why "log to stdout" is the correct advice in both worlds.</p>
+<p>Where logs physically live and the fallback ladder for when <code>kubectl</code> cannot help is <a href="w6.html#cp-6-2">W6.2</a>; the five planted kubelet faults and their five journal signatures are <a href="w6.html#cp-6-11">W6.11</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 journalctl</code> — read the "Options" section once in full; it is long but each flag is one line, and you will use a dozen of them forever. <code>man 7 systemd.journal-fields</code> lists every field an entry can carry, which is what you filter on with <code>_PID=</code>, <code>_COMM=</code> and friends. <code>man 8 systemd-journald.service</code> for what gets collected and from where. <code>man 5 journald.conf</code> for the settings behind it, which the next lesson uses.</p>
+</article>
+
+<article class="lesson" id="cp-b11-11" data-id="b11-11">
+<div class="lesson-head"><span class="cp-id">B11.11</span><h4>Will your logs survive the crash? Journal persistence</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There is exactly one moment when you need the logs from before a reboot, and it is after an unplanned reboot, when the machine came back and nobody knows why it went away. If the journal was volatile, those logs were in memory and are gone — permanently, with no recovery — and the incident becomes unexplainable. This is a five-minute check you do <em>before</em> you need it, and it is worth being slightly pedantic about because "we don't know why it rebooted" is a genuinely bad sentence to have to say.</p>
+<h5>The concept</h5>
+<p>journald stores the journal in one of two places, and which one is decided by the <code>Storage=</code> setting in <code>/etc/systemd/journald.conf</code>:</p>
+<ul>
+<li><code>/run/log/journal/</code> — <strong>volatile</strong>. <code>/run</code> is a tmpfs (<a href="b5.html#cp-b5-9">B5.9</a>), which means memory: fast, self-cleaning, and erased completely at every boot.</li>
+<li><code>/var/log/journal/</code> — <strong>persistent</strong>. On disk, survives reboots, and is what makes <code>journalctl -b -1</code> possible.</li>
+</ul>
+<p>The default is <code>Storage=auto</code>, and this is the part worth reading carefully because it is unusual: <strong><code>auto</code> means "persistent if <code>/var/log/journal/</code> exists, volatile otherwise" — and it will not create the directory</strong>. So the existence of a directory, not a configuration value, is what decides whether your logs survive. Distributions differ on whether they ship it, which is why the honest instruction is "check on your machine" rather than "it is on by default."</p>
+<p>That gives you two ways to enable persistence, and they are equivalent in effect:</p>
+<ul>
+<li>Create the directory and restart journald — <code>sudo mkdir -p /var/log/journal &amp;&amp; sudo systemctl restart systemd-journald</code>. This works because <code>auto</code> then finds it. (<code>systemd-tmpfiles --create --prefix /var/log/journal</code> creates it with the right ownership and permissions, which is the tidier form.)</li>
+<li>Set it explicitly with a drop-in — <code>Storage=persistent</code> in <code>/etc/systemd/journald.conf.d/</code> — which also creates the directory, and states the intent in a file rather than leaving it implicit in a directory's existence. Preferable on anything you care about.</li>
+</ul>
+<p>Persistence brings a disk-space question with it, which journald answers with limits you can set: <code>SystemMaxUse=</code> (total cap, default 10% of the filesystem), <code>SystemKeepFree=</code> (leave this much free), <code>MaxRetentionSec=</code> (discard entries older than this) and <code>MaxFileSec=</code> (rotate at this age). journald enforces these itself — there is no <code>logrotate</code> involved — and you can clean up on demand with <code>journalctl --vacuum-size=200M</code> or <code>--vacuum-time=7d</code>. Checking <code>journalctl --disk-usage</code> occasionally is a reasonable habit; an unbounded journal on a small root filesystem is a real way to fill a disk.</p>
+<div class="flow"><span>Storage=auto</span><em>→</em><span>does /var/log/journal exist?</span><em>yes →</em><span class="hot">persistent</span><em>·</em><span>no →</span><em></em><span>volatile (gone at reboot)</span></div>
+<p>A directory's existence, not a setting, decides whether you can read the logs from before a crash.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find out what your machine actually does. Do not assume — check all three signals: the configured value, whether the directory exists, and where journald is currently writing.
+<pre class="cmd">grep -E '^#?Storage' /etc/systemd/journald.conf
+ls -d /var/log/journal 2&gt;/dev/null || echo "/var/log/journal does NOT exist"
+journalctl --disk-usage</pre>
+<pre class="out">#Storage=auto                                   ← commented out: the default, auto
+/var/log/journal                                ← exists here, so this journal is persistent
+Archived and active journals take up 48.0M in the file system.
+    # if the directory is absent you would see /run/log/journal in the path instead</pre></li>
+<li>Confirm it by asking journald where its files are, which is unambiguous in a way that reading configuration is not.
+<pre class="cmd">journalctl -n 0 --header 2&gt;/dev/null | grep -m2 'File Path' || \
+  sudo find /run/log/journal /var/log/journal -name '*.journal' 2&gt;/dev/null | head -2</pre>
+<pre class="out">/var/log/journal/9f2c.../system.journal        ← under /var: on disk, survives reboot
+    # a path under /run/log/journal would mean memory-only</pre></li>
+<li>Make the intent explicit with a drop-in rather than relying on a directory existing. This is the form you want on any machine whose logs matter.
+<pre class="cmd">sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' | \
+  sudo tee /etc/systemd/journald.conf.d/10-persist.conf
+sudo systemctl restart systemd-journald
+journalctl --disk-usage</pre>
+<pre class="out">[Journal]
+Storage=persistent
+SystemMaxUse=200M
+Archived and active journals take up 48.0M in the file system.      ← now capped at 200M</pre></li>
+<li>Prove persistence the only way that really counts: reboot, and ask for the previous boot's logs.
+<pre class="cmd">journalctl --list-boots --no-pager | tail -2
+sudo reboot          # from the host: multipass shell sandbox   (to get back in)
+# after logging back in:
+journalctl --list-boots --no-pager | tail -2
+journalctl -b -1 -n 3 --no-pager</pre>
+<pre class="out"> 0 8f3c... Sat 2026-07-25 09:02:11 UTC—Sat 2026-07-25 10:41:03 UTC
+<b>-1</b> 8f3c... Sat 2026-07-25 09:02:11 UTC—Sat 2026-07-25 10:41:03 UTC   ← the boot before this one
+Jul 25 10:41:01 sandbox systemd[1]: Stopping hello.service...
+Jul 25 10:41:02 sandbox systemd[1]: Shutting down.
+    ← you can read the machine's last words before it went away</pre></li>
+<li>Check that your enabled service came back by itself after that reboot — the payoff for <code>enable</code> in <a href="#cp-b11-6">B11.6</a>.
+<pre class="cmd">systemctl is-enabled hello; systemctl is-active hello
+systemctl show hello -p ActiveEnterTimestamp --value</pre>
+<pre class="out">enabled
+active                                    ← it started itself at boot
+Sat 2026-07-25 10:41:44 UTC               ← seconds after the machine came up</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>journalctl --list-boots</code> should list at least two boots and <code>journalctl -b -1</code> should return real lines from before your reboot. State what <code>Storage=auto</code> does (persistent if <code>/var/log/journal/</code> exists, volatile otherwise, and it will not create the directory), name the two ways to turn persistence on, and say which single command tells you how much disk the journal is using (<code>journalctl --disk-usage</code>). Your <code>hello</code> service should also have come back on its own — confirm with <code>systemctl is-active hello</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The trap is discovering this after the incident. A volatile journal looks completely normal in every way — logs are there, <code>journalctl</code> works, filters work — right up to the moment the machine reboots and the one thing you needed is gone with no error message and no recovery. There is no way to reconstruct it. Check persistence on any machine you might have to explain, and check it while everything is fine.</p>
+<p>Persistence is not free, and the failure mode at the other end is filling the disk. The defaults cap the journal at 10% of the filesystem, which is sane on a large disk and less so on a small root volume shared with something that logs heavily. Set <code>SystemMaxUse=</code> deliberately on small machines, and remember there is no <code>logrotate</code> to blame — journald manages its own size, so the settings that matter are in <code>journald.conf</code>.</p>
+<p>Note also that a persistent journal keeps records that were previously ephemeral, including anything services logged that they perhaps should not have. That is a fine trade, but it makes the journal worth thinking about as data: it is readable by root and, depending on group membership, by users in <code>systemd-journal</code>, and it now lives on disk and in backups.</p>
+<div class="k8s-link">
+<p>This is the setting that decides whether a node reboot is explicable. When a node drops out of the cluster and comes back, <code>journalctl -u kubelet -b -1</code> is how you find out what it was complaining about before it went — a full disk, an OOM event, a certificate that expired, a runtime that died. With a volatile journal there is no <code>-b -1</code> and the node's death is simply unexplained, which in a real cluster means it will happen again. Making the journal persistent is a standard part of preparing nodes for production, and now you know exactly which directory and which setting are involved.</p>
+<p>Reading a node's death timeline end to end is <a href="w6.html#cp-6-13">W6.13</a>; the kubelet journal signatures you would be looking for are <a href="w6.html#cp-6-11">W6.11</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 journald.conf</code> is the page — <code>Storage=</code>, <code>SystemMaxUse=</code>, <code>SystemKeepFree=</code>, <code>MaxRetentionSec=</code>, and the explicit note that <code>auto</code> does not create <code>/var/log/journal</code>. <code>man 1 journalctl</code> for <code>--list-boots</code>, <code>-b -1</code>, <code>--disk-usage</code>, <code>--vacuum-size=</code> and <code>--vacuum-time=</code>. <code>man 8 systemd-tmpfiles</code> if you prefer creating the directory with correct ownership rather than a bare <code>mkdir</code>.</p>
+</article>
+
+<article class="lesson" id="cp-b11-12" data-id="b11-12">
+<div class="lesson-head"><span class="cp-id">B11.12</span><h4>The boot picture: targets, what took so long, and the cgroup tree</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two questions come up on every real machine: "what is this box supposed to be running?" and "why does it take four minutes to boot?" Both are answered by tools you already have and probably have not used. And the third command in this lesson, <code>systemd-cgls</code>, prints something worth more than either: the whole machine's process tree organised by who is accounting for what — which on a Kubernetes node is the entire layout of the node in one screen.</p>
+<h5>The concept</h5>
+<p><strong>Targets</strong> replaced the old numbered runlevels with something you can read. A target is a named group of units (<a href="#cp-b11-2">B11.2</a>), and the <em>default target</em> is the goal systemd works toward at boot: reach it, and the machine is considered up. On a server that is <code>multi-user.target</code> — networking, logins, services, no graphical session. On a desktop it is <code>graphical.target</code>, which itself pulls in <code>multi-user.target</code>. Others you will meet: <code>rescue.target</code> (single-user, minimal), <code>emergency.target</code> (barely anything, a shell on the console), and the synchronisation points <code>network.target</code>, <code>network-online.target</code> (<a href="#cp-b11-5">B11.5</a>) and <code>timers.target</code>.</p>
+<p><strong>Boot analysis</strong> is two commands. <code>systemd-analyze</code> prints how long the phases took (firmware, loader, kernel, userspace). <code>systemd-analyze blame</code> ranks units by how long each took to start — useful, but read it with the caveat below. <code>systemd-analyze critical-chain</code> is the more honest one: it follows the <em>ordering</em> chain that actually delayed reaching the target, which is what you want, because a slow unit that nothing waits for delays nothing.</p>
+<p><strong>The cgroup tree</strong> is the part that connects this module back to <a href="b7.html#cp-b7-12">B7.12</a>. systemd does not merely start processes; it places every one of them in a cgroup, and it organises those cgroups into a deliberate hierarchy:</p>
+<ul>
+<li><code>system.slice</code> — the machine's services. Every unit you have written in this module lives here.</li>
+<li><code>user.slice</code> — logged-in users, one <code>user-&lt;uid&gt;.slice</code> each, containing a <code>.scope</code> per session. A <em>scope</em> is a cgroup for processes systemd did <em>not</em> start but has adopted for accounting — your SSH session is one.</li>
+<li><code>init.scope</code> — PID 1 itself.</li>
+</ul>
+<p>Because every unit is a cgroup, every unit can carry resource limits without any of B7's file editing: <code>MemoryMax=</code>, <code>CPUQuota=</code>, <code>TasksMax=</code> and friends in the unit file (or via <code>systemctl set-property</code>) are written straight into <code>cpu.max</code>, <code>memory.max</code> and <code>pids.max</code> for you. You used one already — <code>MemoryMax=32M</code> in <a href="#cp-b11-9">B11.9</a> — and it produced a genuine cgroup OOM kill.</p>
+<p>That is why <code>systemd-cgls</code> on a Kubernetes node is such a good picture: you see <code>system.slice</code> holding <code>kubelet.service</code> and <code>containerd.service</code>, and right next to it <code>kubepods.slice</code> holding one cgroup per pod, with the pods' containers nested inside. The node's whole resource story — what is the platform, what is the workload, and who is accounted where — in one tree.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find out what this machine is aiming at, and confirm it has arrived.
+<pre class="cmd">systemctl get-default
+systemctl is-active multi-user.target
+systemctl list-dependencies multi-user.target --no-pager | head -6</pre>
+<pre class="out"><b>multi-user.target</b>            ← a server: no graphical session
+active
+multi-user.target
+● ├─cron.service
+● ├─<b>hello.service</b>              ← your unit is here because you enabled it (B11.3)
+● ├─ssh.service</pre></li>
+<li>Ask how long the boot took, and where the time went.
+<pre class="cmd">systemd-analyze
+systemd-analyze blame --no-pager | head -5</pre>
+<pre class="out">Startup finished in 3.921s (kernel) + 12.404s (userspace) = 16.326s
+graphical.target reached after 12.301s in userspace.
+<b>6.010s</b> cloud-init.service                 ← the biggest single contributor
+2.114s snapd.service
+1.402s systemd-networkd-wait-online.service</pre></li>
+<li>Now ask the better question: what actually held up the boot, by following the ordering chain rather than raw durations.
+<pre class="cmd">systemd-analyze critical-chain --no-pager | head -8</pre>
+<pre class="out">The time when unit became active or started is printed after the "@" character.
+The time the unit took to start is printed after the "+" character.
+multi-user.target @12.301s
+└─ssh.service @12.290s
+  └─network-online.target @11.980s
+    └─systemd-networkd-wait-online.service @10.578s <b>+1.402s</b>
+      ← this chain is what delayed the target; blame's top entry may not appear here at all</pre></li>
+<li>Look at the cgroup tree — the same hierarchy from B7.12, now with the names explained.
+<pre class="cmd">systemd-cgls --no-pager | head -18</pre>
+<pre class="out">Control group /:
+-.slice
+├─<b>user.slice</b>
+│ └─user-1000.slice
+│   └─session-3.scope           ← your SSH session: a scope, not a service
+│     ├─1301 sshd: ubuntu [priv]
+│     └─1310 -bash
+├─<b>init.scope</b>
+│ └─1 /sbin/init                 ← PID 1 itself
+└─<b>system.slice</b>
+  ├─hello.service
+  │ ├─5530 /bin/bash /home/ubuntu/hello.sh
+  │ └─5544 sleep 3
+  ├─ssh.service
+  └─systemd-journald.service</pre></li>
+<li>Set a resource limit as a unit property and watch it land in the cgroup file from B7 — proving these are the same mechanism with friendlier names.
+<pre class="cmd">sudo systemctl set-property hello CPUQuota=20% MemoryMax=64M
+cat /sys/fs/cgroup/system.slice/hello.service/cpu.max
+cat /sys/fs/cgroup/system.slice/hello.service/memory.max
+systemctl show hello -p CPUQuotaPerSecUSec -p MemoryMax</pre>
+<pre class="out"><b>20000 100000</b>          ← exactly B7.6's cpu.max: 20ms of every 100ms
+<b>67108864</b>              ← B7.8's memory.max, 64 MiB
+CPUQuotaPerSecUSec=200ms
+MemoryMax=67108864</pre></li>
+<li>See live resource use per unit, which is <code>top</code> organised by the tree you just looked at.
+<pre class="cmd">systemd-cgtop -n 2 -b --no-pager 2&gt;/dev/null | head -6</pre>
+<pre class="out">Control Group          Tasks  %CPU   Memory  Input/s Output/s
+/                        142   2.1     612.4M
+/system.slice             98   1.4     398.1M
+/system.slice/hello.se…    2   0.0       2.1M
+/user.slice               12   0.3      88.2M</pre></li>
+<li>Remove the properties you just set, so the unit is back to what its files say.
+<pre class="cmd">sudo systemctl set-property hello CPUQuota= MemoryMax=
+systemctl show hello -p MemoryMax --value</pre>
+<pre class="out">infinity          ← back to unlimited</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Name your machine's default target and say what reaching it means (the set of units constituting a working system has started). Explain why <code>critical-chain</code> is a better answer than <code>blame</code> to "why was the boot slow" (blame ranks durations regardless of whether anything waited for that unit; critical-chain follows the ordering dependencies that actually delayed the target). Then, from your <code>systemd-cgls</code> output, say which slice holds services, which holds your login session, and what the difference between a <em>slice</em>, a <em>service</em> and a <em>scope</em> is (a slice groups for resource management, a service is a unit systemd started, a scope is a cgroup for processes it adopted rather than started).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>systemd-analyze blame</code> is the most misused command in this lesson. It ranks units by start duration with no regard for whether anything was waiting, so the unit at the top of the list frequently delayed nothing at all — it just started slowly, in parallel, while the boot proceeded without it. People "optimise" boots by disabling the top entry and are then puzzled that nothing improved. Use <code>critical-chain</code> to find what was actually on the path, and treat <code>blame</code> as a curiosity.</p>
+<p>Do not hand-edit the cgroup files systemd owns. Writing to <code>/sys/fs/cgroup/system.slice/foo.service/memory.max</code> works for a moment and is then reasserted by systemd at the next reload or restart, silently reverting your change (the same lesson as <a href="b7.html#cp-b7-12">B7.12</a>). Set the property on the unit — in the file, in a drop-in, or with <code>systemctl set-property</code> — and let systemd write the file.</p>
+<p>Finally, <code>systemctl set-property</code> is persistent by default: it writes a drop-in under <code>/etc/systemd/system/&lt;unit&gt;.d/</code> and the setting survives reboots. If you want a temporary change, pass <code>--runtime</code>. Discovering months later that a limit you set "just to test" is still in force, in a file you did not write by hand, is an avoidable kind of confusion — and <code>systemctl cat</code> is how you find it.</p>
+<div class="k8s-link">
+<p>Run <code>systemd-cgls</code> on a Kubernetes node and the whole node is on one screen: <code>system.slice</code> holding <code>kubelet.service</code> and <code>containerd.service</code> — the platform — and <code>kubepods.slice</code> beside it holding one cgroup per pod, subdivided by QoS class, with each container's processes nested inside. That layout is not decoration: it is how a node reserves resources for itself so that a runaway pod cannot starve the kubelet, and it is where a pod's <code>requests</code> and <code>limits</code> physically land as <code>cpu.weight</code> and <code>memory.max</code>. Everything you set here with <code>MemoryMax=</code> on a unit, Kubernetes sets on a container's cgroup for the same reason and with the same result at OOM time.</p>
+<p>Requests and limits as scheduler bookkeeping versus cgroup enforcement are <a href="w3.html#cp-3-16">W3.16</a>; QoS classes and what they buy you when memory runs out are <a href="w3.html#cp-3-17">W3.17</a>; the kubelet's own place in that tree is <a href="w1.html#cp-1-2">W1.2</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 systemd-analyze</code> for <code>blame</code>, <code>critical-chain</code>, <code>plot</code> (an SVG timeline) and <code>verify</code> (checks a unit file for errors before you deploy it — genuinely useful). <code>man 7 systemd.special</code> for every standard target and when each is reached. <code>man 1 systemd-cgls</code> and <code>man 1 systemd-cgtop</code> for the tree and the live view. <code>man 5 systemd.resource-control</code> is the mapping between unit properties and <a href="b7.html#cp-b7-1">B7</a>'s cgroup files — <code>CPUQuota=</code>→<code>cpu.max</code>, <code>MemoryMax=</code>→<code>memory.max</code>, <code>TasksMax=</code>→<code>pids.max</code>.</p>
+</article>
+
+</div><!-- /g-logs -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
