@@ -1093,6 +1093,275 @@ systemctl show hello -p MemoryMax --value</pre>
 
 </div><!-- /g-logs -->
 
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b11-13" data-id="b11-13">
+<div class="lesson-head"><span class="cp-id">B11.13</span><h4>Mini project — promote your supervisor into a real service, and schedule a job</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>In <a href="b2.html#cp-b2-17">B2.17</a> you wrote a supervisor: fork a child, wait for it, decide from the exit status whether to restart, back off, forward SIGTERM. It was about fifty lines and it worked. Now you retire most of it — because everything it does by hand, systemd does by declaration — and keep the part that is genuinely yours. That trade is the whole point of this module, and doing it deliberately is what makes the abstraction stick: you are not learning a tool, you are recognising which of your own code a tool replaces. Then you add a scheduled job, because the second half of "keeping a machine running" is doing things on time.</p>
+<h5>The concept</h5>
+<p>Two deliverables, each a few lines of configuration:</p>
+<ol>
+<li><strong><code>supervisor.service</code></strong> — your B2.17 script, run as a proper unit: <code>Restart=on-failure</code> with a real <code>RestartSec</code> backoff (<a href="#cp-b11-4">B11.4</a>), its command supplied by an <code>EnvironmentFile</code> so an operator can change what it supervises without touching the unit (<a href="#cp-b11-8">B11.8</a>), running as an unprivileged user, logging to the journal by doing nothing at all (<a href="#cp-b11-10">B11.10</a>), and enabled so it survives a reboot (<a href="#cp-b11-6">B11.6</a>).</li>
+<li><strong><code>sysreport.timer</code> + <code>sysreport.service</code></strong> — <a href="b1.html#cp-b1-15">B1.15</a>'s <code>sysreport.sh</code> run hourly. The service is <code>Type=oneshot</code> (it does a job and exits, <a href="#cp-b11-4">B11.4</a>); the timer says when. <code>OnCalendar=hourly</code> sets the schedule and <code>Persistent=true</code> means "if the machine was off when a run was due, run it once at the next boot" — the thing cron never did.</li>
+</ol>
+<p>Notice what your script no longer needs to do. The restart loop, the backoff, the signal forwarding on shutdown, the "did it exit or was it killed" decision — all of it is now three lines of unit configuration, applied uniformly to every service on the machine, with logging and resource accounting attached for free. What remains yours is the part that was always the interesting bit: the policy about <em>this particular</em> child. That is exactly the trade Kubernetes offers one layer up, and recognising it here is why the cluster's version will feel familiar rather than magical.</p>
+<div class="flow"><span>B2.17: 50 lines of loop</span><em>→</em><span class="hot">Restart= · RestartSec= · EnvironmentFile= · enable</span><em>→</em><span>same behaviour, supervised by PID 1</span></div>
+<p>The project is a subtraction: most of your supervisor becomes configuration, and what is left is the part that was genuinely about your workload.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the two scripts from earlier modules are present. If either is missing, go back and rebuild it — this project is explicitly a promotion of existing work, not a rewrite.
+<pre class="cmd">multipass shell sandbox
+ls -l /home/ubuntu/supervisor.py /home/ubuntu/sysreport.sh</pre>
+<pre class="out">-rwxr-xr-x 1 ubuntu ubuntu  1204 ... /home/ubuntu/supervisor.py     ← from B2.17
+-rwxr-xr-x 1 ubuntu ubuntu   860 ... /home/ubuntu/sysreport.sh      ← from B1.15</pre></li>
+<li>Write the operator-facing configuration first. Everything a person might want to change lives here, and nowhere else.
+<pre class="cmd">sudo tee /etc/default/supervisor &gt;/dev/null &lt;&lt;'EOF'
+# what supervisor.py should keep running; edit and restart the service
+SUP_CMD=sleep 20
+EOF
+cat /etc/default/supervisor</pre>
+<pre class="out"># what supervisor.py should keep running; edit and restart the service
+SUP_CMD=sleep 20</pre></li>
+<li>Write the unit. Read each line and name which lesson it came from — that recognition is the deliverable as much as the file is.
+<pre class="cmd">sudo tee /etc/systemd/system/supervisor.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=B2.17 mini-supervisor, promoted to a real service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/etc/default/supervisor
+ExecStart=/usr/bin/python3 /home/ubuntu/supervisor.py $SUP_CMD
+Restart=on-failure
+RestartSec=3s
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now supervisor
+systemctl is-enabled supervisor; systemctl is-active supervisor</pre>
+<pre class="out">Created symlink /etc/systemd/system/multi-user.target.wants/supervisor.service → ...
+enabled
+active</pre></li>
+<li>Prove it is genuinely supervised on two axes. First the child: your script restarts it (that logic is still yours). Then the supervisor itself: systemd restarts <em>that</em> if it dies badly.
+<pre class="cmd">journalctl -u supervisor -n 3 --no-pager -o cat
+sup=$(systemctl show supervisor -p MainPID --value); echo "supervisor pid: $sup"
+sudo kill -KILL "$sup"; sleep 5
+echo "after: $(systemctl show supervisor -p MainPID --value), restarts: $(systemctl show supervisor -p NRestarts --value)"</pre>
+<pre class="out">starting: sleep 20
+child 6021 exited 0, restarting in 1s        ← your script's own loop, still doing its job
+supervisor pid: 6018
+after: <b>6104</b>, restarts: <b>1</b>                    ← systemd supervised the supervisor
+    # note $SUP_CMD split into two arguments (sleep, 20) — the B11.8 splitting rule at work</pre></li>
+<li>Change what it supervises without touching the unit — the payoff for putting configuration in its own file.
+<pre class="cmd">sudo sed -i 's/^SUP_CMD=.*/SUP_CMD=sleep 5/' /etc/default/supervisor
+sudo systemctl restart supervisor; sleep 8
+journalctl -u supervisor --since '30 sec ago' --no-pager -o cat | tail -2</pre>
+<pre class="out">starting: sleep 5
+child 6180 exited 0, restarting in 1s        ← a faster cycle: the file changed the behaviour</pre></li>
+<li>Now the scheduled half. The service does the job once and exits; the timer decides when.
+<pre class="cmd">sudo tee /etc/systemd/system/sysreport.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Hourly system report (B1.15)
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/sysreport.sh
+EOF
+sudo tee /etc/systemd/system/sysreport.timer &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Run the system report hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now sysreport.timer</pre>
+<pre class="out">Created symlink /etc/systemd/system/timers.target.wants/sysreport.timer → ...</pre></li>
+<li>Check the schedule, then force a run now rather than waiting an hour — and read the output where it landed, in the journal, with no redirection anywhere.
+<pre class="cmd">systemctl list-timers sysreport.timer --no-pager
+sudo systemctl start sysreport.service
+journalctl -u sysreport -n 6 --no-pager -o cat</pre>
+<pre class="out">NEXT                        LEFT    LAST  PASSED  UNIT             ACTIVATES
+Sat 2026-07-25 12:00:00 UTC 34min   -     -       <b>sysreport.timer  sysreport.service</b>
+=== sysreport for sandbox at 2026-07-25T11:26:03 ===
+uptime: 11:26:03 up 45 min,  1 user,  load average: 0.02, 0.05, 0.01
+disk:   /dev/sda1  20G  6.2G  13G  33% /
+    ← B1.15's script, unchanged, now logging to the journal for free</pre></li>
+<li>Confirm the whole arrangement survives what it is supposed to survive.
+<pre class="cmd">sudo reboot          # then: multipass shell sandbox
+systemctl is-active supervisor; systemctl is-active sysreport.timer
+systemctl list-timers --no-pager | grep sysreport</pre>
+<pre class="out">active
+active
+Sat 2026-07-25 12:00:00 UTC 12min  -  -  sysreport.timer  sysreport.service
+    ← both came back on their own: the point of "enable"</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Four things should be true. <code>systemctl is-enabled supervisor</code> and <code>systemctl is-active supervisor</code> both report affirmatively after a reboot. Killing the supervisor's main PID gets it restarted by systemd, with <code>NRestarts</code> incrementing. Editing <code>/etc/default/supervisor</code> and restarting changes what it supervises, with no edit to the unit. And <code>systemctl list-timers</code> shows <code>sysreport.timer</code> with a real next-run time, while <code>journalctl -u sysreport</code> holds the output of a run. Then answer the conceptual question: which parts of your B2.17 script did systemd make unnecessary, and which part is still genuinely yours? (The restart loop, backoff, signal forwarding and exit-status decision became configuration; the policy about what to run and how to react to <em>that specific</em> child stayed yours.)</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The commonest failure here is <code>status=203/EXEC</code> (<a href="#cp-b11-9">B11.9</a>) on first start, and it is almost always one of three things: a relative path in <code>ExecStart</code>, a script without the execute bit, or a missing shebang. systemd is not running a shell, so it cannot find things on <code>PATH</code> and cannot guess an interpreter. Note that this unit sidesteps the shebang question entirely by invoking <code>/usr/bin/python3</code> explicitly, which is the more robust form for a unit.</p>
+<p>The second is <code>User=ubuntu</code> combined with root-owned paths. The service runs as an unprivileged user, so anything it reads or writes must be reachable by that user — including the working directory and any output file. If it works when you run it by hand as yourself and fails as a unit, compare the two environments: user, working directory and <code>PATH</code> are the usual three differences, and the journal names the failure precisely if you read it.</p>
+<p>For the timer, remember that <code>OnCalendar=hourly</code> means "on the hour," not "an hour from now" — so the first run may be up to an hour away, which is why the lab forces one with <code>systemctl start sysreport.service</code>. Note also that you enable the <strong>timer</strong>, never the service: enabling the service would run it at every boot, which is not what a schedule means. And <code>Persistent=true</code> is what makes a missed run catch up after downtime; without it, a machine that was off at noon simply skips noon.</p>
+<div class="k8s-link">
+<p>You have just built, at node scale, the two things Kubernetes offers at cluster scale — and the correspondence is exact. <code>supervisor.service</code> with <code>Restart=on-failure</code> is a Deployment's pod with <code>restartPolicy: OnFailure</code>: a declared intent to keep something running, with backoff, restart counting and logs collected. <code>sysreport.timer</code> is a CronJob: <code>OnCalendar</code> is the schedule, <code>Type=oneshot</code> is the Job that runs to completion, and <code>Persistent=true</code> is the missed-run behaviour that <code>startingDeadlineSeconds</code> governs in the cluster version. The difference is scope, not concept — systemd supervises one machine's processes, Kubernetes supervises a cluster's containers — and every question you can ask here (did it run, why did it fail, what did it print, when is it next due) has a direct counterpart there.</p>
+<p>The workload zoo including Job and CronJob is <a href="w3.html#cp-3-10">W3.10</a>; how the kubelet, itself a unit exactly like the one you wrote, supervises everything else on a node is <a href="w1.html#cp-1-19">W1.19</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.timer</code> for <code>OnCalendar=</code>, <code>OnBootSec=</code>, <code>Persistent=</code>, <code>RandomizedDelaySec=</code> and <code>AccuracySec=</code>. <code>man 7 systemd.time</code> is the calendar-expression syntax (<code>hourly</code>, <code>daily</code>, <code>Mon *-*-* 04:00:00</code>) — and <code>systemd-analyze calendar "Mon *-*-* 04:00:00"</code> will tell you exactly when an expression next fires, which beats guessing. <code>man 5 systemd.service</code> for <code>Type=oneshot</code> and <code>RemainAfterExit=</code>. <code>man 1 systemctl</code> for <code>list-timers</code>.</p>
+</article>
+
+<article class="lesson drill" id="cp-b11-14" data-id="b11-14">
+<div class="lesson-head"><span class="cp-id">B11.14</span><h4>Debugging drill — a unit that won't start, and a restart loop hiding a config error</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two faults, diagnosed from <code>systemctl status</code> and <code>journalctl</code> and nothing else — which is exactly the constraint you will be under on a node where <code>kubectl</code> is not answering. The first teaches the fork in the road that decides where you look; the second teaches the harder skill of noticing that a service reporting itself as busy starting is actually failing, over and over, and that the current attempt's logs are the least useful ones available.</p>
+<h5 class="verify">Symptom 1 — the service will not start, and the reason is in one word</h5>
+<ol class="lab">
+<li>A unit fails immediately. Do not guess: read the parenthesised ending on the <code>Process:</code> line and let it route you (<a href="#cp-b11-9">B11.9</a>). Two variants are planted here — run both and note that they demand opposite next moves.
+<pre class="cmd">multipass shell sandbox
+# variant A:
+sudo tee /etc/systemd/system/broken.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Fault 1
+[Service]
+User=ubuntu
+ExecStart=/home/ubuntu/reporter.sh
+EOF
+sudo systemctl daemon-reload; sudo systemctl start broken 2&gt;/dev/null
+systemctl status broken --no-pager | grep -E 'Active:|Process:'
+# variant B:
+printf '#!/bin/sh\necho "cannot read /etc/secret-config" &gt;&amp;2\nexit 78\n' | sudo tee /home/ubuntu/reporter.sh
+sudo chmod +x /home/ubuntu/reporter.sh; sudo systemctl start broken 2&gt;/dev/null
+systemctl status broken --no-pager | grep -E 'Active:|Process:|cannot read'</pre>
+<pre class="out">Active: failed (Result: exit-code)
+Process: 6501 ExecStart=/home/ubuntu/reporter.sh (code=exited, <b>status=203/EXEC</b>)
+    ← variant A: systemd could not execute it at all
+Active: failed (Result: exit-code)
+Process: 6540 ExecStart=/home/ubuntu/reporter.sh (code=exited, <b>status=78</b>)
+sandbox reporter.sh[6540]: <b>cannot read /etc/secret-config</b>
+    ← variant B: the program ran and explained itself</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>Two different failures that look alike until you read the code.</strong> Variant A is <code>203/EXEC</code>: systemd could not execute the command, so the program never ran and has no logs — the cause is the path, the execute bit or a missing interpreter (here, the file did not exist yet). Its siblings <code>200/CHDIR</code> (bad <code>WorkingDirectory=</code>) and <code>217/USER</code> (unknown <code>User=</code>) belong to the same class: systemd failed during set-up, before your code existed, so reading application logs is guaranteed to be wasted effort. Fix by making the command executable and correct: <code>ls -l</code> the path, check the shebang, use an absolute path. Variant B is <code>status=78</code>: the program ran, decided it could not continue, and said why on stderr — which journald captured, so the answer is in <code>journalctl -u broken</code>. Fix the thing it complained about. Had you instead seen <code>(code=killed, signal=KILL)</code> you would be in the third case entirely: nothing the program logged will help, because it was ended from outside — look for the OOM killer (<code>Result: oom-kill</code>, <a href="b7.html#cp-b7-9">B7.9</a>), a timeout, or an operator. The reflex: <em>read the parenthesised ending before you read a single log line — it tells you whether the logs are worth reading at all.</em></p></details>
+
+<h5 class="verify">Symptom 2 — the service looks busy, and is actually failing forty times a minute</h5>
+<ol class="lab">
+<li>A service with <code>Restart=always</code> and a broken configuration. Watch how it presents: not as <code>failed</code>, but as <code>activating (auto-restart)</code> — which reads like "starting up" and is in fact "dying repeatedly." The tell is not in <code>status</code>'s state line but in its counters and its journal.
+<pre class="cmd">sudo tee /etc/systemd/system/looper.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=Fault 2
+StartLimitIntervalSec=0
+[Service]
+ExecStart=/bin/sh -c 'echo "FATAL: no such database host: db.invalid" &gt;&amp;2; exit 1'
+Restart=always
+RestartSec=1s
+EOF
+sudo systemctl daemon-reload; sudo systemctl start looper; sleep 8
+systemctl status looper --no-pager | grep -E 'Active:|Main PID:'
+systemctl show looper -p NRestarts --value
+journalctl -u looper --since '20 sec ago' --no-pager -o cat | sort | uniq -c</pre>
+<pre class="out">Active: <b>activating (auto-restart)</b> (Result: exit-code) since ...     ← not "failed"
+NRestarts=<b>7</b>                                    ← seven attempts in eight seconds
+      7 FATAL: no such database host: db.invalid   ← the same error, over and over</pre></li>
+</ol>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong><code>Restart=always</code> is converting a permanent configuration error into an endless loop, and the loop is disguising itself as start-up activity.</strong> The service can never work — the host it needs does not exist — but because it is restarted every second, it spends most of its life in <code>activating (auto-restart)</code>, which does not read as a failure and does not necessarily alert. Three tells identify it, and any one is enough: the state is <code>activating (auto-restart)</code> rather than <code>active</code> or <code>failed</code>; <code>systemctl show -p NRestarts</code> is a number that keeps climbing; and the journal contains the <em>same</em> message repeating, which <code>sort | uniq -c</code> makes obvious in one command. Note what defeats the naive approach: <code>systemctl status</code> shows only the last ten journal lines, so during a loop you see three copies of one error and may conclude it happened three times — always go to <code>journalctl -u &lt;unit&gt;</code> for the count. (This unit sets <code>StartLimitIntervalSec=0</code> to disable the rate limiter and keep the loop running; a real unit with default settings would instead hit the limiter after five attempts and stop with <em>"start request repeated too quickly"</em> — <a href="#cp-b11-4">B11.4</a> — which is systemd doing you the favour of turning an infinite loop into a visible failure.) Fix the configuration, then <code>systemctl reset-failed looper</code> to clear the state and counter, and consider whether <code>Restart=on-failure</code> with a longer <code>RestartSec</code> would have made the fault visible an hour earlier. The reflex: <em>a service that is always "starting" is a service that is always dying — check NRestarts and count the repeats in the journal before you believe the state line.</em></p></details>
+
+<h5 class="gotcha">Gotchas</h5>
+<p>The two faults fail in opposite directions, which is why they are paired. The first is loud and immediate — the unit is <code>failed</code>, nothing is running, someone notices in seconds — and its entire difficulty is choosing the right place to look, which one word of status decides for you. The second is quiet and durable: it can run for weeks, because "restarting" does not look like "broken", the process really does exist for a fraction of every second, and a health check that only asks "is the unit loaded" will say yes. Ranked by how much time they waste, the quiet one wins easily.</p>
+<p>Both have a one-command discriminator worth keeping together. <em>Failed to start</em> → read the parenthesised ending: <code>203/EXEC</code> means the program never ran, <code>status=N</code> means it chose to stop and its logs will say why, <code>signal=KILL</code> means look outside it. <em>Suspiciously busy</em> → <code>systemctl show &lt;unit&gt; -p NRestarts</code>, then <code>journalctl -u &lt;unit&gt; | sort | uniq -c</code> to see whether one error is repeating. Two commands, and between them they cover most of what goes wrong with services on a Linux machine.</p>
+<p>Clean up the whole module's work when you are finished, so the sandbox is not left carrying half a dozen invented services.</p>
+<pre class="cmd">for u in broken looper hello supervisor sysreport.timer sysreport; do
+  sudo systemctl disable --now $u 2&gt;/dev/null; sudo systemctl reset-failed $u 2&gt;/dev/null
+done
+sudo rm -rf /etc/systemd/system/{broken,looper,hello,supervisor,sysreport}.service \
+            /etc/systemd/system/sysreport.timer /etc/systemd/system/hello.service.d \
+            /etc/default/hello /etc/default/supervisor
+sudo systemctl daemon-reload; systemctl --failed --no-pager | tail -1</pre>
+<pre class="out">0 loaded units listed.        ← a clean machine again</pre>
+<div class="k8s-link">
+<p>Both faults have exact counterparts one layer up, and you will meet them constantly. The first is a pod whose container exits immediately: <code>203/EXEC</code> corresponds to a bad command or entrypoint (the container never ran, so <code>kubectl logs</code> is empty and the answer is in the pod's events); a non-zero exit code corresponds to an application that started and gave up, where the logs <em>do</em> hold the answer; and a signal death corresponds to <code>OOMKilled</code> with exit 137, where the logs are silent for the same reason as here. The second fault is <code>CrashLoopBackOff</code> in every particular: a container restarting endlessly because of a permanent error, where the restart count is the tell, the current attempt's logs are the least useful ones, and <code>kubectl logs --previous</code> exists precisely because of the problem you just solved with <code>journalctl</code> and <code>uniq -c</code>.</p>
+<p>CrashLoopBackOff, <code>--previous</code> and the exit-code alphabet are <a href="w6.html#cp-6-16">W6.16</a>; the five planted kubelet faults and their journal signatures are <a href="w6.html#cp-6-11">W6.11</a>; the universal first moves on any broken workload are <a href="w6.html#cp-6-1">W6.1</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.exec</code> for the exit-code table (<code>203/EXEC</code>, <code>200/CHDIR</code>, <code>217/USER</code> and the rest) — the one genuinely standard set of codes. <code>man 5 systemd.unit</code> for <code>StartLimitIntervalSec=</code> and <code>StartLimitBurst=</code>, and <code>man 5 systemd.service</code> for <code>Restart=</code> and <code>RestartSec=</code>. <code>man 1 systemctl</code> for <code>show -p NRestarts</code> and <code>reset-failed</code>. Re-read <a href="#cp-b11-9">B11.9</a> for the status-reading skill both faults rest on.</p>
+</article>
+
+</div><!-- /g-project -->
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>B11 recall quiz</h3>
+<p>Answer out loud before revealing. If you can read a failed unit's status and say in one sentence where you would look next — and explain why the kubelet is the only Kubernetes component systemd knows about — this module has done its job.</p>
+<ol>
+<li>What are PID 1's three duties, and what does the kernel do differently for it?
+<details class="reveal"><summary>Answer</summary><p>Bring the machine to a working state, supervise what is running, and adopt-and-reap every orphan the kernel reparents to it. The kernel treats it specially by <em>not</em> delivering signals with a default action unless PID 1 has installed a handler — which protects the machine (a dead PID 1 panics the kernel) and explains why a container process with no <code>SIGTERM</code> handler ignores the polite stop and dies only to the later <code>SIGKILL</code>.</p></details></li>
+<li>Name the five unit types you will actually meet and what each manages.
+<details class="reveal"><summary>Answer</summary><p><code>.service</code> (a process to run and supervise), <code>.socket</code> (a listening socket that starts the service on first connection), <code>.timer</code> (a schedule that starts another unit — cron's replacement), <code>.target</code> (a named group of units and a synchronisation point, with no process of its own), <code>.mount</code> (a filesystem; every <code>fstab</code> line becomes one). Bonus: <code>.slice</code> and <code>.scope</code> are the cgroup types from B11.12.</p></details></li>
+<li>Where do unit files live, in what precedence order, and why does that matter?
+<details class="reveal"><summary>Answer</summary><p><code>/etc/systemd/system/</code> (yours, highest) → <code>/run/systemd/system/</code> (runtime) → <code>/usr/lib/systemd/system/</code> (the vendor's, lowest). It matters because editing the vendor copy works right up until the next package upgrade silently replaces the file and reverts your change. Write your own units in <code>/etc/</code>, and override vendor units with drop-ins.</p></details></li>
+<li>You wrote a unit file and nothing you change has any effect. What did you forget?
+<details class="reveal"><summary>Answer</summary><p><code>systemctl daemon-reload</code>. systemd caches unit files and does not notice edits by itself, so restarts keep applying the version it read last — with no error, which is what makes it so confusing. The rhythm is: edit → <code>daemon-reload</code> → <code>restart</code> → <code>status</code>.</p></details></li>
+<li>What does <code>Type=</code> decide, and what goes wrong if you declare <code>simple</code> for a daemon that forks?
+<details class="reveal"><summary>Answer</summary><p>It decides when systemd may consider start-up finished — and therefore which process it supervises. Declare <code>simple</code> for a forking daemon and systemd watches the original process, which exits immediately after forking; it sees the service die instantly, restarts it per policy, and the real daemons pile up in the background unmanaged. The symptom is "systemd keeps restarting it but it is clearly running"; the fix is <code>Type=forking</code> (usually with <code>PIDFile=</code>).</p></details></li>
+<li>A unit has <code>Requires=db.service</code> and no <code>After=</code>. What can go wrong, and when?
+<details class="reveal"><summary>Answer</summary><p>It can start before the thing it requires, because requirement and ordering are independent and systemd starts units in parallel. It fails only on a cold boot, when both start at once and the dependency loses the race — never when you restart by hand, because then the dependency has been up for hours. That is the classic "works on reboot, fails at boot" bug. The fix is one line: add <code>After=db.service</code>; the default pairing to reach for is <code>Wants=</code> plus <code>After=</code>.</p></details></li>
+<li>What is the difference between <code>start</code> and <code>enable</code>, and what single command does both?
+<details class="reveal"><summary>Answer</summary><p><code>start</code> acts on the running system now and is forgotten at reboot; <code>enable</code> creates a symlink so the unit is wanted at the next boot and does nothing to the running system. "Gone after the reboot" is <code>start</code> without <code>enable</code>; "enabled but nothing happened" is the reverse. <code>systemctl enable --now &lt;unit&gt;</code> does both.</p></details></li>
+<li>You want to change one setting on a package-installed unit. What do you do, and what is the trap when the setting is <code>ExecStart</code>?
+<details class="reveal"><summary>Answer</summary><p>Write a drop-in: <code>/etc/systemd/system/&lt;unit&gt;.d/10-something.conf</code> with only the keys you want, then <code>daemon-reload</code> (or use <code>systemctl edit</code>, which does both). The trap is that <code>ExecStart=</code> is list-valued and <em>accumulates</em>, so your line is appended to the vendor's and systemd refuses the unit with "more than one ExecStart= setting." Clear the list first with a bare <code>ExecStart=</code>, then set yours. Confirm the result with <code>systemctl cat</code>.</p></details></li>
+<li>You edited a service's <code>EnvironmentFile</code> and nothing changed. Why, and what is the Kubernetes parallel?
+<details class="reveal"><summary>Answer</summary><p>The environment is read and copied into the process when it starts; nothing can change a running process's environment from outside, so the file takes effect only on restart. The exact parallel is a pod's environment variables sourced from a ConfigMap: they are set at container start and never update when the ConfigMap changes, while a mounted ConfigMap volume does update. Same mechanism, same reason.</p></details></li>
+<li><code>Process: 1234 ExecStart=… (code=exited, status=1)</code> versus <code>(code=killed, signal=KILL)</code>. Where do you look in each case?
+<details class="reveal"><summary>Answer</summary><p><code>code=exited</code> means the program ran and <em>chose</em> to stop, so it knows why — read its logs. <code>code=killed</code> means something ended it from outside, so its logs contain nothing about it — look outside the program: the OOM killer (<code>Result: oom-kill</code>), an operator, or a timeout. A third case, <code>status=203/EXEC</code>, means systemd could not execute the command at all, so no program logs exist: check the path, the execute bit and the interpreter.</p></details></li>
+<li>What does <code>Storage=auto</code> actually do, and why should you care before an incident rather than after one?
+<details class="reveal"><summary>Answer</summary><p>It stores the journal persistently in <code>/var/log/journal/</code> <em>if that directory exists</em>, and volatilely in <code>/run/log/journal/</code> otherwise — and it will not create the directory. So a directory's existence, not a setting, decides whether logs survive a reboot. You care in advance because a volatile journal looks completely normal until the machine reboots unexpectedly, at which point <code>journalctl -b -1</code> has nothing and the incident is permanently unexplainable.</p></details></li>
+<li>Why is <code>systemd-analyze critical-chain</code> a better answer than <code>blame</code> to "why was the boot slow"?
+<details class="reveal"><summary>Answer</summary><p><code>blame</code> ranks units by how long each took to start, regardless of whether anything was waiting for them — a slow unit that nothing depends on delays nothing, so the top entry is frequently irrelevant. <code>critical-chain</code> follows the ordering dependencies that actually delayed reaching the target, which is the question you meant to ask.</p></details></li>
+<li>What does <code>systemd-cgls</code> show on a Kubernetes node, and why is that one screen worth so much?
+<details class="reveal"><summary>Answer</summary><p><code>system.slice</code> holding <code>kubelet.service</code> and <code>containerd.service</code> — the platform — beside <code>kubepods.slice</code> holding one cgroup per pod, subdivided by QoS class, with each container's processes nested inside. It is the node's entire resource story in one tree: what is platform, what is workload, and who is accounted where. It is also where a pod's requests and limits physically land, as <code>cpu.weight</code> and <code>memory.max</code>.</p></details></li>
+<li>Why is the kubelet the only Kubernetes component systemd manages?
+<details class="reveal"><summary>Answer</summary><p>Because of a chicken-and-egg problem: the API server cannot be scheduled by machinery that only exists once the API server is running. The escape hatch is the static pod — the kubelet reads pod YAML from a directory on disk and runs it with no API server involved. So the boot order is systemd → kubelet → everything else, and "restart the API server" means moving a manifest file, not running <code>systemctl restart</code>.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Explain what an init system is for, why PID 1 is special to the kernel, and why a container's PID 1 that ignores SIGTERM takes the whole grace period to stop.</li>
+<li>Recognise <code>.service</code>, <code>.socket</code>, <code>.timer</code>, <code>.target</code> and <code>.mount</code> units, and know that an idle service behind a timer is correct rather than broken.</li>
+<li>Write a working unit from scratch, put it in the directory that wins, and follow the edit → <code>daemon-reload</code> → restart → status rhythm without being told.</li>
+<li>Choose <code>Restart=</code>, <code>RestartSec=</code> and <code>Type=</code> deliberately, and recognise the forking-daemon-declared-<code>simple</code> failure and the start rate limiter's "repeated too quickly" message.</li>
+<li>Separate ordering from requirement, reach for <code>Wants=</code> plus <code>After=</code> by default, and diagnose a "works on restart, fails at boot" race as a missing <code>After=</code>.</li>
+<li>Use the ten <code>systemctl</code> verbs that matter, never confusing <code>start</code> with <code>enable</code> or <code>restart</code> with <code>reload</code>, and reach for <code>systemctl cat</code> when someone asks what a service is really configured to do.</li>
+<li>Override any vendor unit with a drop-in, including clearing an accumulating key like <code>ExecStart=</code> with an empty assignment first.</li>
+<li>Keep operator-editable configuration in an <code>EnvironmentFile</code>, use <code>$VAR</code> and <code>${VAR}</code> knowing which one splits, and explain why an edit needs a restart to take effect.</li>
+<li>Read a failure from <code>systemctl status</code> alone and route the investigation: exit code → the program's logs; signal → outside the program; <code>203/EXEC</code> → the program never ran.</li>
+<li>Drive <code>journalctl</code> with intent — one unit, follow, time window, priority, this boot or the last one — and correlate two units with millisecond timestamps.</li>
+<li>Check and configure journal persistence before you need it, and explain why <code>Storage=auto</code> makes a directory's existence the deciding factor.</li>
+<li>Read the boot picture: the default target, the ordering chain that actually delayed it, and the slice/scope tree that places every process on the machine.</li>
+<li>Set resource limits as unit properties and know they are B7's cgroup files with friendlier names — and that hand-editing those files loses to systemd.</li>
+<li>Promote a hand-written supervisor into a real service with restart policy, environment file, journald logging and boot enablement, and schedule a job with a <code>.timer</code>.</li>
+<li>Diagnose a unit that will not start and a <code>Restart=always</code> loop hiding a permanent error, using <code>NRestarts</code> and a repeated-message count as the discriminators.</li>
+<li>Read <code>systemctl status kubelet</code> and <code>journalctl -u kubelet</code> as ordinary prose — the two commands you will run on every broken node.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b10.html">← B10 · Names: DNS and resolution</a><a href="../beginner.html#b12">B12 · Security fundamentals →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-25. systemd 255 (<code>systemctl</code>, <code>journalctl</code>, <code>systemd-analyze</code>, <code>systemd-cgls</code>, <code>systemd-cgtop</code>, <code>systemd-tmpfiles</code>), unified cgroup v2 hierarchy, <code>/lib</code> merged into <code>/usr</code> so vendor units live in <code>/usr/lib/systemd/system/</code>. journald defaults to <code>Storage=auto</code>, which is persistent only when <code>/var/log/journal/</code> exists — check yours rather than assuming. Kubernetes facts checked against v1.35 (LF CKA target): the kubelet is the only control-plane-adjacent component run as a systemd unit, kubeadm configures it through the drop-in <code>/etc/systemd/system/kubelet.service.d/10-kubeadm.conf</code>, and the kubelet's own configuration drop-in directory (<code>--config-dir</code>) reached general availability in v1.35.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
