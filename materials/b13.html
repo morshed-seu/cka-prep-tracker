@@ -1078,6 +1078,306 @@ beta: renewed                    ← no handover protocol, no cleanup, no stuck 
 </article>
 
 </div>
+
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-b13-14" data-id="b13-14">
+<div class="lesson-head"><span class="cp-id">B13.14</span><h4>Mini project — a reconciler and a quorum simulation</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two artefacts, each about forty lines, that between them contain the two ideas the Kubernetes control plane is built from. When you finish, you will have written a controller — the real pattern, not a simplification — and you will have watched a cluster refuse to accept writes at the exact moment the arithmetic says it must. Everything in the advanced track's control-plane material is a larger version of these two files.</p>
+<h5>The concept</h5>
+<p>Artefact one is a <strong>reconciler</strong>: a loop that keeps N worker processes alive by comparing desired to observed and acting on the difference (<a href="#cp-b13-12">B13.12</a>). It runs as a systemd unit (<a href="b11.html#cp-b11-3">B11.3</a>) with its desired count in an <code>EnvironmentFile</code>, which makes it a real service rather than a script — and gives you the same edit-then-reload rhythm every controller has.</p>
+<p>Artefact two is a <strong>quorum simulation</strong>: three members, a write path that requires a majority to acknowledge, and a way to take members down. It exists to make one moment visible — the transition from "one member down, everything fine" to "two members down, writes refused" (<a href="#cp-b13-8">B13.8</a>).</p>
+<p>Success criteria, all of which you should be able to demonstrate:</p>
+<ul>
+<li>The reconciler runs as an enabled systemd unit and converges to the desired worker count on start.</li>
+<li>Killing a worker by hand is corrected within one interval, with no recovery code written for that case.</li>
+<li>Editing the desired count and restarting scales in both directions using the same code path.</li>
+<li>Its actions are idempotent: a pass with nothing to do does nothing and logs that it did nothing.</li>
+<li>The quorum simulation accepts writes with 3/3 and 2/3 members up, and refuses at 1/3 — and the data is still intact on the survivor.</li>
+</ul>
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the reconciler. Read desired, observe actual, act on the difference, sleep, repeat — the four steps, with logging so the journal tells the story.
+<pre class="cmd">cd ~/dist; cat &gt; reconciler.py &lt;&lt;'EOF'
+#!/usr/bin/env python3
+"""Keep DESIRED worker processes alive. The controller pattern, in one loop."""
+import os, signal, subprocess, sys, time
+
+TAG      = 'b13-worker'                       # how we recognise our own workers
+INTERVAL = int(os.environ.get('INTERVAL', '5'))
+
+def desired():
+    return int(os.environ.get('DESIRED', '3'))
+
+def observed():
+    """Actual state, read from the world — never from our own memory."""
+    out = subprocess.run(['pgrep', '-f', TAG], capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+def start_worker():
+    subprocess.Popen(['bash', '-c', f'exec -a {TAG} sleep 86400'],
+                     start_new_session=True)
+
+def reconcile():
+    want, have = desired(), observed()
+    if len(have) == want:
+        print(f'desired={want} actual={len(have)} — no action', flush=True)
+        return
+    print(f'desired={want} actual={len(have)} — acting', flush=True)
+    for _ in range(want - len(have)):
+        start_worker(); print('  + started a worker', flush=True)
+    for pid in have[want:]:
+        os.kill(pid, signal.SIGTERM); print(f'  - stopped worker {pid}', flush=True)
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+while True:
+    reconcile()
+    time.sleep(INTERVAL)
+EOF
+chmod +x reconciler.py; python3 -c "import ast;ast.parse(open('reconciler.py').read())" &amp;&amp; echo "syntax ok"</pre>
+<pre class="out">syntax ok</pre></li>
+<li>Give it a configuration file and a unit, so the desired count is operator-editable and the loop is supervised (<a href="b11.html#cp-b11-8">B11.8</a>).
+<pre class="cmd">printf 'DESIRED=3\nINTERVAL=5\n' | sudo tee /etc/default/reconciler &gt;/dev/null
+sudo tee /etc/systemd/system/reconciler.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=B13 reconciler — keeps N workers alive
+[Service]
+EnvironmentFile=/etc/default/reconciler
+ExecStart=/home/ubuntu/dist/reconciler.py
+Restart=on-failure
+RestartSec=2
+User=ubuntu
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now reconciler
+sleep 6; systemctl is-active reconciler; pgrep -fc b13-worker</pre>
+<pre class="out">active
+<b>3</b>          ← converged to the desired count on its own</pre></li>
+<li>Read the journal and see the loop doing nothing, correctly. A reconciler that logs "no action" every pass is a reconciler that is working.
+<pre class="cmd">journalctl -u reconciler -n 3 --no-pager -o cat</pre>
+<pre class="out">desired=3 actual=3 — no action
+desired=3 actual=3 — no action          ← idempotent: nothing to do, so nothing done
+desired=3 actual=3 — no action</pre></li>
+<li>Break the actual state from outside and watch it converge without any recovery code existing.
+<pre class="cmd">pkill -o -f b13-worker; echo "killed one worker at $(date +%T)"
+sleep 7; pgrep -fc b13-worker; journalctl -u reconciler -n 2 --no-pager -o cat</pre>
+<pre class="out">killed one worker at 11:04:12
+3
+desired=3 actual=2 — acting
+<b>  + started a worker</b>          ← the difference was observed and closed, one pass later</pre></li>
+<li>Scale in both directions through configuration alone. The same subtraction handles up and down (<a href="b11.html#cp-b11-8">B11.8</a> — an <code>EnvironmentFile</code> edit needs a restart).
+<pre class="cmd">sudo sed -i 's/DESIRED=3/DESIRED=5/' /etc/default/reconciler
+sudo systemctl restart reconciler; sleep 6; echo "scaled up: $(pgrep -fc b13-worker)"
+sudo sed -i 's/DESIRED=5/DESIRED=2/' /etc/default/reconciler
+sudo systemctl restart reconciler; sleep 6; echo "scaled down: $(pgrep -fc b13-worker)"</pre>
+<pre class="out">scaled up: <b>5</b>
+scaled down: <b>2</b>          ← one code path, both directions, no special case for either</pre></li>
+<li>Now artefact two — the quorum simulation. Three members, and a write that must be acknowledged by a majority.
+<pre class="cmd">cat &gt; quorum.py &lt;&lt;'EOF'
+#!/usr/bin/env python3
+"""Three members; a write commits only when a majority has stored it."""
+import os, sys
+
+MEMBERS = ['m1', 'm2', 'm3']
+QUORUM  = len(MEMBERS) // 2 + 1
+
+def up(m):    return os.path.exists(f'{m}.up')
+def alive():  return [m for m in MEMBERS if up(m)]
+
+def write(value):
+    live = alive()
+    if len(live) &lt; QUORUM:
+        print(f'{len(live)}/{len(MEMBERS)} up, need {QUORUM}: WRITE REFUSED (no quorum)')
+        return False
+    for m in live:
+        open(f'{m}.data', 'w').write(value)
+    print(f'{len(live)}/{len(MEMBERS)} up, need {QUORUM}: committed "{value}" to {live}')
+    return True
+
+def read():
+    for m in alive():
+        print(f'  {m} holds: {open(f"{m}.data").read()}')
+
+if __name__ == '__main__':
+    if sys.argv[1] == 'write': write(sys.argv[2])
+    else: read()
+EOF
+chmod +x quorum.py; touch m1.up m2.up m3.up; ./quorum.py write "cluster-state-v1"</pre>
+<pre class="out">3/3 up, need 2: <b>committed</b> "cluster-state-v1" to ['m1', 'm2', 'm3']</pre></li>
+<li>Take one member down. Quorum holds, writes continue — this is the failure the cluster was sized to tolerate.
+<pre class="cmd">rm m3.up; ./quorum.py write "cluster-state-v2"</pre>
+<pre class="out">2/3 up, need 2: <b>committed</b> "cluster-state-v2" to ['m1', 'm2']</pre></li>
+<li>Take a second member down and find the cliff. Note what still works, and what does not.
+<pre class="cmd">rm m2.up; ./quorum.py write "cluster-state-v3"; ./quorum.py read</pre>
+<pre class="out">1/3 up, need 2: <b>WRITE REFUSED (no quorum)</b>          ← the exact moment, predicted by the arithmetic
+  m1 holds: cluster-state-v2                       ← reads still work; no data was lost</pre></li>
+<li>Restore a member and confirm recovery is a matter of coming back, not of restoring a backup.
+<pre class="cmd">touch m2.up; ./quorum.py write "cluster-state-v3"</pre>
+<pre class="out">2/3 up, need 2: <b>committed</b> "cluster-state-v3" to ['m1', 'm2']          ← recovered by itself</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Walk the success-criteria list and demonstrate each. Then answer the question that shows the reconciler is understood rather than merely running: where in <code>reconciler.py</code> is the recovery logic for "someone killed a worker"? (There is none — <code>observed()</code> reads the world every pass, so a killed worker is simply a smaller number, and the same subtraction that scales up handles it. That absence is the pattern.) For the quorum half, state what a 1/3 cluster can and cannot do, and why "restore from backup" would be the wrong reflex there.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The one line to look at twice is <code>observed()</code>. It identifies workers by matching a tag in the process table, which means the tag must match what <code>start_worker()</code> actually creates — that is why the workers are launched with <code>exec -a b13-worker</code>, so the process name carries the tag. If observation and action disagree about what a worker looks like, the loop never converges, which is exactly the fault you will diagnose in <a href="#cp-b13-15">B13.15</a>.</p>
+<p>The second is the restart in step 5. Editing <code>/etc/default/reconciler</code> changes nothing until the service restarts, because the environment is read at start (<a href="b11.html#cp-b11-8">B11.8</a>) — the same reason a pod's <code>env:</code> from a ConfigMap never updates while a mounted volume does. A more sophisticated reconciler would read its desired state from a file on every pass instead, which is exactly what makes the Kubernetes version respond to <code>kubectl scale</code> without a restart.</p>
+<div class="k8s-link">
+<p>The Deployment controller is <code>reconciler.py</code> with three additions. Its desired state comes from an object in etcd rather than an environment variable, so changing it does not require a restart. Its observation comes from an <em>informer</em> — a watch plus a periodic re-list, backed by a local cache (<a href="#cp-b13-12">B13.12</a>) — rather than from <code>pgrep</code>. And its actions go through a rate-limited work queue so a persistently failing object backs off (<a href="#cp-b13-11">B13.11</a>). The loop in the middle is the same loop you just wrote, including the part where killing a pod triggers no undo path at all. Meanwhile <code>quorum.py</code> is etcd's admission rule: a write commits when a majority has stored it, and stops when it cannot.</p>
+<p>The controller pattern in full is <a href="w1.html#cp-1-16">W1.16</a>; Raft and the commit rule behind the quorum half is <a href="w1.html#cp-1-9">W1.9</a>; and watching the whole thing stop when you kill the controller-manager is the weekend drill at <a href="w1.html#cp-1-24">W1.24</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 pgrep</code> for the observation step and its <code>-f</code> matching; <code>help exec</code> in bash for <code>exec -a</code>, which is how a process gets a name you can find it by. <code>man 5 systemd.service</code> for <code>EnvironmentFile=</code> and <code>Restart=</code>, and <code>man 1 journalctl</code> for reading a loop's own account of itself. <code>man 2 kill</code> and <code>man 7 signal</code> for the termination path the reconciler uses to scale down.</p>
+</article>
+
+<article class="lesson drill" id="cp-b13-15" data-id="b13-15">
+<div class="lesson-head"><span class="cp-id">B13.15</span><h4>Debugging drill — a reconciler that fights itself, and a detector that invents failures</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Both faults here are self-inflicted in the same way real ones are: the code is doing exactly what it was told, and what it was told is subtly wrong. They are also the two failure modes you are most likely to meet in a Kubernetes cluster wearing different clothes — a controller creating objects endlessly, and a node flapping between <code>Ready</code> and <code>NotReady</code> under load.</p>
+<h5>The concept</h5>
+<p>Fault one: <strong>a reconciler whose observation does not match its action.</strong> If the loop cannot see the things it creates, every pass observes zero, acts, and observes zero again — so it creates forever. The tell is unmistakable once you know it: the actual count climbs without bound while the log insists it is still short. The root cause is never in the action; it is always in the observation.</p>
+<p>Fault two: <strong>a failure detector tuned tighter than the system's normal variance.</strong> A timeout shorter than the peer's worst-case renewal interval produces alternating dead/alive verdicts — flapping (<a href="#cp-b13-13">B13.13</a>). Each transition triggers expensive work, the work adds load, the load delays more heartbeats. The tell is that the transitions are periodic and correlated with load, rather than a single clean transition to dead.</p>
+<p>The diagnostic habit both share: <strong>compare what the system believes with what is true.</strong> For the reconciler, that is its logged <code>actual</code> against a count you take yourself. For the detector, it is its verdict against whether the peer is genuinely renewing.</p>
+<div class="flow"><span>count climbs, log says "still short"</span><em>→</em><span class="hot">observation is broken</span><em>·</em><span>dead/alive/dead/alive</span><em>→</em><span class="hot">timeout &lt; variance</span></div>
+<p>Two symptoms, two immediate suspects.</p>
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault 1 — plant it.</strong> Change the tag that <code>observed()</code> looks for so it no longer matches the workers that get started, then restart the service.
+<pre class="cmd">cd ~/dist; cp reconciler.py reconciler.py.bak
+sed -i "s/^TAG      = 'b13-worker'/TAG      = 'b13-worker'\nOBSERVE_TAG = 'b13-wrkr'/" reconciler.py
+sed -i "s/\['pgrep', '-f', TAG\]/['pgrep', '-f', OBSERVE_TAG]/" reconciler.py
+sudo systemctl restart reconciler; sleep 12</pre>
+<pre class="out">(no output — the fault is planted and the loop is running)</pre></li>
+<li>Observe the symptom without looking at the code. Count the workers twice, ten seconds apart.
+<pre class="cmd">echo "workers now: $(pgrep -fc b13-worker)"; sleep 10; echo "workers now: $(pgrep -fc b13-worker)"</pre>
+<pre class="out">workers now: 6
+workers now: <b>10</b>          ← climbing, forever, with nobody asking for more</pre></li>
+<li>Read what the reconciler believes. Its own account is the whole diagnosis: it insists actual is 0 while the machine is full of workers.
+<pre class="cmd">journalctl -u reconciler -n 4 --no-pager -o cat; echo "--- but truly running: $(pgrep -fc b13-worker)"</pre>
+<pre class="out">desired=2 actual=<b>0</b> — acting
+  + started a worker
+  + started a worker
+--- but truly running: <b>12</b>          ← belief and reality disagree: the observation is wrong</pre></li>
+<li>Confirm the root cause directly, by running the observation the reconciler runs.
+<pre class="cmd">pgrep -f b13-wrkr | wc -l; pgrep -f b13-worker | wc -l</pre>
+<pre class="out">0          ← what the reconciler asks for: matches nothing
+<b>12</b>         ← what it actually creates</pre></li>
+<li>Repair it and confirm convergence — including cleaning up the pile it made, which the correct loop does by itself.
+<pre class="cmd">sudo systemctl stop reconciler; pkill -f b13-worker
+mv reconciler.py.bak reconciler.py; sudo systemctl start reconciler; sleep 8
+echo "workers: $(pgrep -fc b13-worker)"; journalctl -u reconciler -n 1 --no-pager -o cat</pre>
+<pre class="out">workers: <b>2</b>
+desired=2 actual=2 — no action          ← converged and idle, as it should have been all along</pre></li>
+<li><strong>Fault 2 — plant it.</strong> A peer whose renewal interval varies under load, judged by a timeout tighter than that variance.
+<pre class="cmd">( while true; do touch hb; sleep $(( RANDOM % 4 + 1 )); done ) &amp;      # renews every 1–4 s
+verdict() { age=$(( $(date +%s) - $(stat -c %Y hb) ))
+  [ "$age" -le "$1" ] &amp;&amp; echo "ALIVE" || echo "DEAD"; }
+for i in $(seq 12); do echo -n "$(verdict 2) "; sleep 1; done; echo</pre>
+<pre class="out">ALIVE ALIVE <b>DEAD</b> ALIVE ALIVE <b>DEAD DEAD</b> ALIVE ALIVE <b>DEAD</b> ALIVE ALIVE
+      ↑ flapping: the peer never stopped renewing, and was declared dead four times</pre></li>
+<li>Count the transitions, because "it flaps" needs to be a number before you can say a fix worked.
+<pre class="cmd">flaps() { prev=""; n=0; for i in $(seq 20); do v=$(verdict $1)
+    [ -n "$prev" ] &amp;&amp; [ "$v" != "$prev" ] &amp;&amp; n=$((n+1)); prev=$v; sleep 0.5; done
+  echo "timeout ${1}s -&gt; $n transitions in 10s"; }
+flaps 2; flaps 10</pre>
+<pre class="out">timeout 2s -&gt; <b>7</b> transitions in 10s          ← every one of these would move workloads
+timeout 10s -&gt; <b>0</b> transitions in 10s          ← stable, at the cost of slower real detection</pre></li>
+<li>Fix it the other way too, because widening the timeout is only one of two levers: renew more often.
+<pre class="cmd">kill %1 2&gt;/dev/null; ( while true; do touch hb; sleep 1; done ) &amp;      # renew 4x faster
+flaps 4; kill %1 2&gt;/dev/null</pre>
+<pre class="out">timeout 4s -&gt; <b>0</b> transitions in 10s          ← same detection speed, no false positives</pre></li>
+<li>Tear down everything this module created, or roll back the snapshot from <a href="b0.html#cp-b0-9">B0.9</a>.
+<pre class="cmd">sudo systemctl disable --now reconciler; pkill -f b13-worker
+sudo rm -f /etc/systemd/system/reconciler.service /etc/default/reconciler
+sudo systemctl daemon-reload; sudo iptables -F INPUT
+rm -rf ~/dist /srv/app; echo torn-down</pre>
+<pre class="out">torn-down</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>For each fault, state the symptom, the one command that confirms the diagnosis, and the fix. Fault 1: an unbounded climb in actual count while the log claims it is short — confirmed by running the loop's own observation by hand and getting zero — fixed by making observation and action agree about what a worker looks like. Fault 2: periodic dead/alive alternation correlated with load — confirmed by counting transitions at two different timeouts — fixed either by widening the timeout or by renewing more often, and you should be able to say when each lever is the right one.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>In fault 1 the instinct is to add a safety cap — "never start more than ten" — which converts an obvious runaway into a silent, permanently wrong system that also never converges. Resist it. A reconciler that cannot observe its own work is broken in a way no limit fixes, and the unbounded growth is the useful symptom that led you to the real bug in four commands.</p>
+<p>In fault 2 the instinct is the mirror image: widen the timeout until the flapping stops and move on. That works, and it silently doubles or triples how long a genuine failure goes undetected. The better question is why the renewals are so variable — a peer whose heartbeat interval swings between 1 and 4 seconds is telling you something about its own health, and step 8's fix (renew more often, keep detection fast) is usually the more honest one.</p>
+<div class="k8s-link">
+<p>Both faults have exact cluster-scale counterparts. A controller whose label selector does not match the labels it applies creates objects forever — the classic version is a Deployment whose selector and pod template disagree, which the API server now rejects at creation time precisely because the runaway was so common. And node flapping is fault 2 at cluster scale: a node under heavy load delays its Lease renewals past the 40-second grace period, is marked <code>NotReady</code>, has its pods evicted and rescheduled — which adds load, delays more renewals, and repeats. That is why the node monitor's timeouts are conservative by default and why "the node is flapping" is a load investigation, not a timeout-tuning exercise.</p>
+<p>The <code>NotReady</code> ladder, end to end, is <a href="w6.html#cp-6-10">W6.10</a>; narrating a node's full death timeline second by second is <a href="w6.html#cp-6-13">W6.13</a>; and the ownership references that keep a controller's work identifiable are <a href="w1.html#cp-1-17">W1.17</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 pgrep</code> for the observation that broke, and <code>man 1 pkill</code> for the cleanup. <code>man 1 stat</code> (<code>-c %Y</code>) for the heartbeat age. <code>man 1 journalctl</code> for reading a loop's own account of what it believed at the time — the single most valuable artefact in both faults. <code>man 5 systemd.service</code> for <code>StartLimitIntervalSec=</code>, the systemd-level guard against a restart loop, which is worth comparing with the "don't add a cap" gotcha above.</p>
+</article>
+
+</div>
+
+<div class="quiz" id="quiz"><h3>B13 recall quiz</h3>
+<p>Answer out loud before revealing. If you can explain partial failure and quorum arithmetic to a colleague, and describe a reconciler without using the word "event", this module has done its job.</p>
+<ol>
+<li>What are the three reasons to distribute a system, and what does the availability arithmetic depend on?
+<details class="reveal"><summary>Answer</summary><p>Scale (the work does not fit on one machine), availability (survive losing a machine) and blast radius (one failure should not take everything). Two 99% machines give 99.99% only if their failures are <em>independent</em> — and two replicas on one node, one rack or one power feed are not. Every surprised availability post-mortem has a correlated failure in it.</p></details></li>
+<li>You send a request and get no reply. What could have happened, and which can you distinguish?
+<details class="reveal"><summary>Answer</summary><p>It never arrived; it arrived and the peer died; it arrived, executed fully, and the reply was lost; or it is still running. None are distinguishable from the caller — the only way to ask is another message with the same problem. Hence: retry (so operations must be idempotent), time out (so you will sometimes be wrong about who is dead), and require a majority to agree.</p></details></li>
+<li>Why can't you order events across machines by timestamp, and what is used instead?
+<details class="reveal"><summary>Answer</summary><p>Clocks have offset, drift apart, and can be <em>stepped backwards</em> by a correction — so a later event can carry an earlier timestamp. Use the wall clock for display, <code>CLOCK_MONOTONIC</code> for durations and timeouts, and a logical counter for ordering across machines. etcd's revision and every object's <code>resourceVersion</code> are that counter: comparable within one cluster, meaningless outside it, and not convertible to a time.</p></details></li>
+<li>Why is "count the round trips" better advice than "reduce the bytes"?
+<details class="reveal"><summary>Answer</summary><p>Because the ladder is roughly a thousand-fold per rung: ~100 ns for a memory reference, ~100 µs for an SSD read, ~0.5 ms for a same-datacentre round trip, tens of milliseconds across a continent. Ten sequential requests cost ten round trips that cannot overlap, regardless of how small each payload is. Also watch tails, not means — a request touching ten services meets ten chances to hit a slow one.</p></details></li>
+<li>Your script increments a counter file 1000 times across two concurrent writers and ends at 612. What happened?
+<details class="reveal"><summary>Answer</summary><p>Lost updates: both writers read the same value, both computed the same successor, both wrote it, and one increment vanished — repeatedly. No command failed and nothing was logged, which is what makes shared-state concurrency bugs so late-diagnosed. Fix by serialising (a lock) or by making the operation atomic. This is the whole reason "stateless" is the easy case.</p></details></li>
+<li>What does a follower read give you, and what does an asynchronous leader failure cost?
+<details class="reveal"><summary>Answer</summary><p>A read of the recent past — usually milliseconds behind, which surfaces as the "I saved it and it didn't save" bug when a user reads immediately after writing. If the leader dies, every write it accepted but had not yet shipped is lost. Synchronous replication closes that window by not acknowledging until a follower has the write, at the cost of a round trip per write; etcd sits at that strict end.</p></details></li>
+<li>State CAP in a form that is actually usable.
+<details class="reveal"><summary>Answer</summary><p>When a network partition happens, you must choose between refusing to answer (staying consistent) and answering with possibly-stale data (staying available). There is no trade-off when there is no partition, which is why "pick two of three" misleads. Kubernetes picks both, in different places: etcd refuses writes without quorum, while controllers act on a cached view and correct themselves next pass.</p></details></li>
+<li>Quorum for N = 3, 4, 5 and 7 — and why is 4 a bad number?
+<details class="reveal"><summary>Answer</summary><p><code>floor(N/2)+1</code> = 2, 3, 3, 4; tolerating 1, 1, 2 and 3 failures. Four members tolerate exactly what three do while adding a machine that can fail and an extra acknowledgement to every write. Majorities are required because two disjoint groups cannot both hold one — which is what stops both sides of a partition from acting.</p></details></li>
+<li>A three-member etcd cluster loses two members. What exactly happens?
+<details class="reveal"><summary>Answer</summary><p>Writes are refused — the survivor cannot prove it is not the minority side of a split — while reads generally keep working. No data is lost and nothing is corrupted. The cluster is read-only: <code>kubectl get</code> works, every create/update/delete fails, and nothing self-heals because controllers cannot write either. Recovery is bringing a member back, not restoring a snapshot.</p></details></li>
+<li>Narrate a Raft leader failure, and name what prevents split brain.
+<details class="reveal"><summary>Answer</summary><p>Followers stop hearing heartbeats; one times out first (timeouts are randomised, so simultaneous candidacies are rare), increments the term, and requests votes; a majority grants them and it leads for the new term. No committed entry is lost because every committed entry was already stored by a majority, and any two majorities overlap. Split brain is prevented by quorum (only one side of a partition can elect) and by terms (a stale leader's messages carry an old term, are rejected, and it stands down — fencing).</p></details></li>
+<li>Why is <code>kubectl apply</code> idempotent, and why does that matter more than it sounds?
+<details class="reveal"><summary>Answer</summary><p>It submits a desired end state rather than a change, so applying it ten times equals applying it once — which makes the retry after a timeout safe by construction, and timeouts are unavoidable. Compare <code>create</code> repeated (an error) or "scale up by one" repeated (an outage). The same requirement runs down through every controller, because a controller re-runs its reconcile function constantly and can restart at any moment.</p></details></li>
+<li>What does backoff prevent, what does jitter prevent, and what is <code>CrashLoopBackOff</code>?
+<details class="reveal"><summary>Answer</summary><p>Backoff stops one client from amplifying a struggling service's load; jitter stops many clients from synchronising into a spike (the thundering herd). <code>CrashLoopBackOff</code> is this pattern as a status name: the kubelet restarts a failed container with an exponentially growing delay up to a five-minute cap by default. It is the node protecting itself, not a diagnosis — the diagnosis is in <code>kubectl logs --previous</code> and the exit code.</p></details></li>
+<li>Describe the reconciliation loop without using the word "event", and say why it needs no memory.
+<details class="reveal"><summary>Answer</summary><p>Read desired state, observe actual state, act on the difference, repeat. It needs no memory because the truth is in the observation — so its own restart, a failed action, and someone deleting a pod behind its back are all the same situation on the next pass. That is why deleting a Deployment's pod runs no undo logic: the next pass sees one fewer than desired and creates one.</p></details></li>
+<li>Watch or poll?
+<details class="reveal"><summary>Answer</summary><p>Both. Watching is immediate and cheap when idle but a missed event means permanent drift; polling is simple and self-healing but costs latency and constant work. Real controllers watch for responsiveness and re-list periodically for correctness — which is exactly what an informer is.</p></details></li>
+<li>State the failure-detection trade-off, and what a lease adds to a lock.
+<details class="reveal"><summary>Answer</summary><p>A shorter timeout detects real failures faster and invents more failures that never happened; push it below the peer's normal variance and you get flapping, which is self-reinforcing because each transition adds load. A lease is a lock with an expiry, so a holder that dies does not hold it forever — and the rule is to renew several times per expiry period so one lost renewal is survivable. Kubernetes: the kubelet renews a node Lease about every 10 s against a 40-second grace period, and controller-manager/scheduler elect their active instance by holding a lease.</p></details></li>
+<li>A reconciler's worker count climbs without bound while its log says it is still short. Where is the bug?
+<details class="reveal"><summary>Answer</summary><p>In the observation, never in the action. The loop cannot see the things it creates — a tag, selector or label mismatch — so every pass observes zero and acts again. Confirm by running the loop's own observation by hand. The cluster-scale version is a Deployment whose selector does not match its pod template, which the API server now rejects at creation precisely because the runaway was so common. Do not "fix" it with a cap.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Name the three reasons to distribute, and state the independence precondition the availability arithmetic rests on.</li>
+<li>Explain partial failure and demonstrate it — a lost reply and a lost request producing the identical client symptom.</li>
+<li>Derive retry, idempotency, timeouts and quorum from that one fact, in order, without notes.</li>
+<li>Use the wall clock, the monotonic clock and a logical counter for the three different jobs they are each correct for.</li>
+<li>Recite the eight fallacies with a failure you caused attached to each, and price a design by counting round trips.</li>
+<li>Tell stateless from stateful by the replaceability test, and explain how two writers silently lose updates.</li>
+<li>Describe leader/follower replication, measure lag, and state what an asynchronous failover costs.</li>
+<li>State CAP as the partition-time choice, and place etcd and the controllers on opposite sides of it deliberately.</li>
+<li>Compute quorum and failure tolerance in your head, and explain why nobody runs four members.</li>
+<li>Narrate a Raft leader failure, define split brain, and name quorum and fencing as its two defences.</li>
+<li>Recognise a non-idempotent operation on sight and rewrite it into the absolute form.</li>
+<li>Implement exponential backoff with jitter, with a cap and an attempt limit, and say what each part prevents.</li>
+<li>Implement a reconciliation loop, and choose watch, poll or both knowing precisely what each buys and fails at.</li>
+<li>Explain leases and heartbeats, and defend a chosen timeout from measurements rather than instinct.</li>
+<li>Run a reconciler as a systemd unit that converges from any starting state, and a quorum simulation that refuses writes at exactly the predicted moment.</li>
+<li>Diagnose a reconciler whose observation does not match its action, and a detector tuned below the system's variance.</li>
+<li>Read the Kubernetes control plane as an instance of patterns you have now built yourself.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="foundations.html">Foundations · the ten-minute express version of the cross-cutting ideas →</a></div>
+
+<nav class="pager"><a href="b12.html">← B12 · Security fundamentals</a><a href="../beginner.html#b14">B14 · Capstone &amp; assessment →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-25. Python 3.12, systemd 255, iptables on the nftables backend, <code>systemd-timesyncd</code> as the time daemon (so the clock lab stops and starts that unit rather than <code>chronyd</code>). Every distributed behaviour here is simulated with processes, files and firewall rules on a single VM — deliberately, since the mechanisms are what matter and a second machine adds setup without adding insight. Kubernetes facts checked against v1.35 (LF CKA target): the kubelet renews its node <code>Lease</code> in <code>kube-node-lease</code> roughly every 10 s (a quarter of the 40 s <code>nodeLeaseDurationSeconds</code>) and the node controller marks a node <code>NotReady</code> after the 40 s default <code>--node-monitor-grace-period</code>; <code>CrashLoopBackOff</code> still backs off to a <strong>5-minute</strong> maximum by default, with the upstream work to make that maximum shorter and configurable (KEP-4603, split into KEP-5593) still opt-in rather than the default; etcd remains a Raft cluster where a write commits once a majority has persisted it, which is why control planes are sized 3 or 5 and never 4.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
