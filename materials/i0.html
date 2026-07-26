@@ -261,6 +261,391 @@ sudo ~/minibox.sh --clean</pre></li>
 </article>
 </div>
 
+<!-- ---------------- The toolchain ---------------- -->
+<div class="grp" id="g-toolchain"><h3>The toolchain</h3>
+
+<article class="lesson" id="cp-i0-4" data-id="i0-4">
+<div class="lesson-head"><span class="cp-id">I0.4</span><h4>Install the runtime layer from the projects' own releases</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>sudo apt install containerd</code> works and would be wrong here. Ubuntu 24.04 packages the <strong>1.7</strong> line, which predates almost everything this track teaches about configuring containerd: the config file's version number, the names of its plugins, and where the CRI implementation lives inside it all changed in 2.0 and again since. Learning 1.7's layout and then meeting 2.x on a real node is the worst of both worlds.</p>
+<h5>The concept</h5>
+<p>Three binaries, three separate projects, three separate release cadences — and one of the recurring confusions in this ecosystem is that people say "containerd" when they mean all three.</p>
+<ul>
+<li><strong><code>containerd</code></strong> is a long-running daemon. It holds a content store of image layers, a metadata database, and the bookkeeping for every container on the machine, and it exposes all of that over a unix socket. In the track's analogy it is the <em>building-services company</em>: it does not lay bricks itself, it dispatches people who do.</li>
+<li><strong><code>runc</code></strong> is not a daemon. It is a program you run once, which reads a directory containing a root filesystem and a <code>config.json</code>, creates the namespaces and cgroups that file describes, execs your process, and — in the normal case — <em>leaves</em>. The <em>contractor</em>: it shows up with the work order, does exactly what is written on it, and goes home.</li>
+<li>The <strong>CNI plugins</strong> are a directory of small standalone binaries (<code>bridge</code>, <code>host-local</code>, <code>portmap</code>, <code>loopback</code>…), each of which does one networking job when executed with JSON on standard input. There is no daemon and no library; the interface is the process boundary itself.</li>
+</ul>
+<p>Everything gets an explicit version, and this is the habit rather than the detail. Every one of those three projects now ships minor releases on a several-month cadence, so "latest" means something different depending on the month you read this; pinning is what makes an output you paste into a bug report reproducible by the person reading it. Versions this page was authored against, verified 2026-07-27:</p>
+<table>
+<tr><th>Component</th><th>Version here</th><th>Where it goes</th><th>Why not <code>apt</code></th></tr>
+<tr><td>containerd</td><td><code>2.3.3</code></td><td><code>/usr/local/bin</code></td><td>noble ships 1.7.28 — pre-2.0 config and plugin layout</td></tr>
+<tr><td>runc</td><td><code>v1.5.1</code></td><td><code>/usr/local/sbin</code></td><td>tracks containerd's release matrix, not the distro's</td></tr>
+<tr><td>CNI plugins</td><td><code>v1.9.1</code></td><td><code>/opt/cni/bin</code></td><td>no current distro package exists</td></tr>
+</table>
+<p>The install paths are not arbitrary either. <code>/opt/cni/bin</code> is the directory every CRI implementation looks in by default, and <code>/usr/local</code> is the conventional home for software you installed outside the package manager — keeping it out of <code>/usr/bin</code> means a later <code>apt</code> operation can never quietly replace it.</p>
+<h5>Lab</h5>
+<ol>
+<li>Set the versions once, as variables, so the rest of the lab reads like the release-notes page it came from. Check each against the project's own releases page if you want the current one; if you change them, write the new numbers down.
+<pre class="cmd">CONTAINERD_VER=2.3.3
+RUNC_VER=v1.5.1
+CNI_VER=v1.9.1</pre></li>
+<li>containerd first: the static tarball unpacks into <code>/usr/local</code>, and its systemd unit comes from the same repository.
+<pre class="cmd">cd /tmp
+curl -fsSLO https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VER}/containerd-${CONTAINERD_VER}-linux-amd64.tar.gz
+sudo tar Cxzvf /usr/local containerd-${CONTAINERD_VER}-linux-amd64.tar.gz</pre>
+<pre class="out">bin/
+<b>bin/containerd</b>
+<b>bin/containerd-shim-runc-v2</b>
+<b>bin/ctr</b>
+bin/containerd-stress</pre>
+<p>Three of those four names are the whole of I7 in advance: the daemon, the per-container shim that outlives it, and the debug client.</p></li>
+<li><code>runc</code> is a single static binary. There is no tarball because there is nothing else to ship.
+<pre class="cmd">curl -fsSLO https://github.com/opencontainers/runc/releases/download/${RUNC_VER}/runc.amd64
+sudo install -m 755 runc.amd64 /usr/local/sbin/runc</pre></li>
+<li>The CNI plugins go into the directory the runtime will look in, which must exist first.
+<pre class="cmd">curl -fsSLO https://github.com/containernetworking/plugins/releases/download/${CNI_VER}/cni-plugins-linux-amd64-${CNI_VER}.tgz
+sudo mkdir -p /opt/cni/bin
+sudo tar Cxzf /opt/cni/bin cni-plugins-linux-amd64-${CNI_VER}.tgz
+ls /opt/cni/bin</pre>
+<pre class="out">LICENSE  README.md  bandwidth  <b>bridge</b>  dhcp  dummy  firewall  host-device
+<b>host-local</b>  ipvlan  <b>loopback</b>  macvlan  <b>portmap</b>  ptp  sbr  static  tap  tuning
+vlan  vrf</pre>
+<p>Four of those are what an ordinary Kubernetes node actually uses. I9 makes you write a fifth.</p></li>
+<li>Install the service unit and start the daemon.
+<pre class="cmd">sudo curl -fsSL -o /usr/local/lib/systemd/system/containerd.service --create-dirs \
+  https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now containerd
+systemctl is-active containerd</pre>
+<pre class="out">Created symlink /etc/systemd/system/multi-user.target.wants/containerd.service → /usr/local/lib/systemd/system/containerd.service.
+<b>active</b></pre></li>
+<li>Look at the configuration containerd would write for itself. Do not save it yet — the point right now is the first two lines.
+<pre class="cmd">sudo containerd config default | head -8
+sudo containerd config default | grep "plugins\.'io.containerd.cri" </pre>
+<pre class="out"><b>version = 4</b>
+root = '/var/lib/containerd'
+state = '/run/containerd'
+temp = ''
+disabled_plugins = []
+required_plugins = []
+oom_score = 0
+imports = ['/etc/containerd/conf.d/*.toml']
+  [plugins.<b>'io.containerd.cri.v1.images'</b>]
+  [plugins.<b>'io.containerd.cri.v1.runtime'</b>]</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>systemctl is-active containerd</code> prints <code>active</code>, and each binary reports the version you pinned:</p>
+<pre class="cmd">containerd --version; runc --version | head -1; ls /opt/cni/bin/bridge</pre>
+<pre class="out">containerd github.com/containerd/containerd/v2 <b>v2.3.3</b> aad11006b...
+runc version <b>1.5.1</b>
+/opt/cni/bin/bridge</pre>
+<p>If <code>containerd --version</code> says <code>1.7.x</code>, the distro package is installed and shadowing yours — <code>sudo apt remove containerd containerd.io</code> and check <code>command -v containerd</code> resolves to <code>/usr/local/bin</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The config version number is a moving target and the single most common source of stale advice about containerd. <strong>2.0 moved from <code>version = 2</code> to <code>version = 3</code></strong> and renamed the CRI plugin; <strong>2.3 moved again to <code>version = 4</code></strong>. Old configs are migrated in memory at every startup and keep working, which is exactly why people do not notice they are following a guide for a layout that no longer exists. Two rules keep you out of trouble: generate a fresh config with <code>containerd config default</code> rather than copying one from a blog, and use <code>containerd config migrate</code> to convert an old file rather than editing it by hand.</p>
+<p>Note there is <em>also</em> a <code>plugins.'io.containerd.grpc.v1.cri'</code> section in the default output. That is the compatibility shell for the old single CRI plugin, which 2.x split into the separate <code>…cri.v1.images</code> and <code>…cri.v1.runtime</code> plugins you saw above. Configuring the old path and wondering why nothing changed is a rite of passage; I7 and I8 come back to it.</p>
+<p><code>runc</code> lands in <code>/usr/local/sbin</code>, which is on root's <code>PATH</code> but not always on an ordinary user's. That is deliberate — <code>runc</code> does essentially nothing useful unprivileged — but it means <code>runc --version</code> may report <em>command not found</em> until you use <code>sudo</code> or add the directory to your <code>PATH</code>.</p>
+<div class="k8s-link">
+<p>This is precisely what <a href="w0.html#cp-0-6">W0.6 — install containerd + kubeadm/kubelet/kubectl by hand</a> does on every node, in the same order and from the same tarballs. It is worth noticing how little of that lesson is Kubernetes: three quarters of a node's container machinery is installed before <code>kubeadm</code> is mentioned.</p>
+<p>The <code>/opt/cni/bin</code> directory is the one <a href="w0.html#cp-0-7">W0.7 — kubeadm init, install a CNI, join both workers</a> fills when you apply a Flannel or Calico manifest: those manifests are mostly a DaemonSet whose job is to drop a binary into that directory and a JSON file into <code>/etc/cni/net.d</code>. I9 is where that stops being magic.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The <a href="https://github.com/containerd/containerd/blob/main/docs/getting-started.md">containerd getting-started guide</a> is the source these steps follow; <code>docs/cri/config.md</code> in the same repository is the configuration reference. <code>containerd config default</code> and <code>containerd config migrate</code> are the two commands to remember. For runc, the repository's <code>README</code> and <code>man 8 runc</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i0-5" data-id="i0-5">
+<div class="lesson-head"><span class="cp-id">I0.5</span><h4>Install the client layer, and draw the map of who owns which layer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You are about to have four different command-line tools on this machine that can all show you "containers", and they will disagree. That is not a bug and it is the classic beginner error in this ecosystem: <code>ctr</code>, <code>crictl</code> and <code>nerdctl</code> cut into the same chain at different heights, so each shows a different, correct, partial view. Ten minutes drawing the map now saves you the "but my container isn't there" hour later.</p>
+<h5>The concept</h5>
+<p>The chain, in one line: <strong>kubelet → (CRI) → containerd → (shim) → runc → your process</strong>, with images arriving from a registry over HTTP and the network attached by a CNI plugin executed as a subprocess. Every arrow in that sentence is a module of this track.</p>
+<svg viewBox="0 0 660 320" width="100%" style="max-width:660px" role="img" aria-label="The container stack from kubelet down to the workload process, with the three client tools shown cutting in at different heights.">
+  <rect x="8" y="8" width="644" height="304" rx="10" fill="none" stroke="var(--line)"/>
+  <text x="20" y="28" fill="var(--muted)" font-size="11">one node</text>
+
+  <rect x="200" y="40" width="240" height="34" rx="6" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="320" y="62" fill="var(--ink)" font-size="12" text-anchor="middle">kubelet</text>
+  <text x="452" y="61" fill="var(--muted)" font-size="10.5">advanced track · W1</text>
+
+  <path d="M320 74 L320 96" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="330" y="90" fill="var(--accent)" font-size="10.5">CRI (gRPC over a unix socket) — I8</text>
+
+  <rect x="200" y="96" width="240" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="320" y="118" fill="var(--ink)" font-size="12" text-anchor="middle">containerd — I7</text>
+
+  <path d="M320 130 L320 152" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="330" y="146" fill="var(--accent)" font-size="10.5">containerd-shim-runc-v2 — one per container</text>
+
+  <rect x="200" y="152" width="240" height="34" rx="6" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text x="320" y="174" fill="var(--ink)" font-size="12" text-anchor="middle">runc — I3</text>
+
+  <path d="M320 186 L320 208" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="330" y="202" fill="var(--accent)" font-size="10.5">reads config.json (OCI runtime-spec) — I2</text>
+
+  <rect x="200" y="208" width="240" height="34" rx="6" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="320" y="230" fill="var(--ink)" font-size="12" text-anchor="middle">your process, in namespaces + a cgroup</text>
+
+  <rect x="24" y="252" width="180" height="44" rx="6" fill="none" stroke="var(--line)"/>
+  <text x="114" y="270" fill="var(--muted)" font-size="10.5" text-anchor="middle">registry — I4, I5</text>
+  <text x="114" y="286" fill="var(--ink)" font-size="11" text-anchor="middle">image layers in, over HTTPS</text>
+  <path d="M204 274 L280 274 L280 130" stroke="var(--line)" stroke-width="1.2" fill="none" stroke-dasharray="3 3"/>
+
+  <rect x="456" y="252" width="180" height="44" rx="6" fill="none" stroke="var(--line)"/>
+  <text x="546" y="270" fill="var(--muted)" font-size="10.5" text-anchor="middle">CNI plugin — I9</text>
+  <text x="546" y="286" fill="var(--ink)" font-size="11" text-anchor="middle">exec'd, JSON in / JSON out</text>
+  <path d="M456 274 L380 274 L380 130" stroke="var(--line)" stroke-width="1.2" fill="none" stroke-dasharray="3 3"/>
+
+  <rect x="24" y="96" width="150" height="90" rx="6" fill="none" stroke="var(--line)"/>
+  <text x="99" y="114" fill="var(--muted)" font-size="10.5" text-anchor="middle">clients cut in here</text>
+  <text x="99" y="134" fill="var(--ink)" font-size="11" text-anchor="middle">crictl → CRI level</text>
+  <text x="99" y="152" fill="var(--ink)" font-size="11" text-anchor="middle">ctr, nerdctl → containerd</text>
+  <text x="99" y="170" fill="var(--ink)" font-size="11" text-anchor="middle">runc → below both</text>
+</svg>
+<p>Read it top to bottom: each layer knows less than the one above. The kubelet knows about pods; containerd knows about containers and images but not pods; <code>runc</code> knows about neither — it knows about a directory and a JSON file.</p>
+<p>The four clients, and what each one can and cannot see:</p>
+<table>
+<tr><th>Tool</th><th>Speaks</th><th>Sees</th><th>Blind to</th></tr>
+<tr><td><code>ctr</code></td><td>containerd's own native API</td><td>everything containerd holds, in every <em>namespace</em></td><td>pods; it has no concept of one</td></tr>
+<tr><td><code>crictl</code></td><td><strong>CRI</strong> — the same interface the kubelet uses</td><td>pod sandboxes and the containers inside them</td><td>anything created outside CRI (e.g. by <code>ctr</code>)</td></tr>
+<tr><td><code>nerdctl</code></td><td>containerd, with a Docker-shaped CLI</td><td>what you created with <code>nerdctl</code>; builds, compose</td><td>CRI's pods, unless you ask for that namespace</td></tr>
+<tr><td><code>runc</code></td><td>nothing — no client/server at all</td><td>bundles on disk that it started itself</td><td>images, registries, networks, containerd</td></tr>
+</table>
+<p>The word <strong>namespace</strong> is overloaded here and it catches everyone once. containerd has its own notion of a namespace — a top-level partition of its metadata store, so that two tools can use the same daemon without seeing each other's objects. It has nothing to do with Linux kernel namespaces, and nothing to do with Kubernetes Namespaces. The kubelet's containers live in containerd's <code>k8s.io</code> namespace; <code>ctr</code> defaults to <code>default</code>. That one fact explains most of "my container isn't there".</p>
+<p><code>skopeo</code> joins the list for a different reason: it talks to <em>registries</em> and never to a runtime at all. It can inspect and copy images between a registry, a local directory and a tarball without any daemon running, which makes it the right tool for I4 and I5 precisely because it removes containerd from the picture.</p>
+<h5>Lab</h5>
+<ol>
+<li>Install the client layer. <code>crictl</code> comes from cri-tools, whose version tracks the Kubernetes CRI API version; <code>nerdctl</code>'s <em>full</em> bundle also carries BuildKit, which I6 needs.
+<pre class="cmd">CRICTL_VER=v1.36.0
+NERDCTL_VER=2.3.5
+cd /tmp
+curl -fsSLO https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VER}/crictl-${CRICTL_VER}-linux-amd64.tar.gz
+sudo tar Cxzf /usr/local/bin crictl-${CRICTL_VER}-linux-amd64.tar.gz
+curl -fsSLO https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VER}/nerdctl-${NERDCTL_VER}-linux-amd64.tar.gz
+mkdir -p /tmp/nc &amp;&amp; tar Cxzf /tmp/nc nerdctl-${NERDCTL_VER}-linux-amd64.tar.gz
+sudo install -m 755 /tmp/nc/nerdctl /usr/local/bin/nerdctl</pre></li>
+<li><code>skopeo</code> and the small tools come from apt, where the distro version is perfectly fine — none of them are on a fast-moving interface.
+<pre class="cmd">sudo apt install -y skopeo jq tree curl</pre></li>
+<li>Tell <code>crictl</code> where the runtime is. Without this it probes a list of well-known socket paths and warns on every invocation, which makes its output annoying to paste into a lesson.
+<pre class="cmd">sudo tee /etc/crictl.yaml &gt;/dev/null &lt;&lt;'EOF'
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+EOF</pre></li>
+<li>Draw the map. On paper, not in a file — the point is to produce it from memory, and you will be asked to redraw it at the end of I7 and compare the two. Six boxes is enough: kubelet, containerd, shim, runc, your process, and the two things hanging off the side (registry, CNI plugin). Label each arrow with what crosses it.</li>
+<li>Then make the ambiguity concrete: list containerd's namespaces, which are empty today but will not stay that way.
+<pre class="cmd">sudo ctr namespace ls</pre>
+<pre class="out">NAME LABELS</pre>
+<p>An empty list is correct on a fresh daemon — namespaces are created on first use. After I7 pulls an image with <code>ctr</code> you will see <code>default</code>; after I8 creates a sandbox with <code>crictl</code> you will see <code>k8s.io</code> too, holding a completely separate set of objects.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>All four clients report a version, and <code>crictl</code> reaches the daemon without a warning about the endpoint:</p>
+<pre class="cmd">crictl --version; nerdctl --version; skopeo --version; sudo crictl version | head -3</pre>
+<pre class="out">crictl version <b>v1.36.0</b>
+nerdctl version <b>2.3.5</b>
+skopeo version 1.13.3
+Version:  0.1.0
+RuntimeName:  <b>containerd</b>
+RuntimeVersion:  <b>v2.3.3</b></pre>
+<p>Then, without looking: name the tool you would reach for to answer "is the kubelet's container running?" (<code>crictl</code>, because it sees what the kubelet sees), and the one for "does this image tag exist in the registry, and what is its digest?" (<code>skopeo</code>, because no runtime need be involved).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>crictl</code>'s own <code>Version: 0.1.0</code> line in <code>crictl version</code> is the <em>CRI API</em> version, not the tool's — the tool's is what <code>crictl --version</code> prints. Two different numbers with almost the same command; read the labels.</p>
+<p>Almost everything here needs root, because it all ends at a unix socket owned by root (<code>/run/containerd/containerd.sock</code>) or at a syscall that requires privilege. If a command mysteriously reports "connection refused" or "permission denied", try it under <code>sudo</code> before debugging anything else. Rootless operation is real and is I1 and I11's subject; it is not the default.</p>
+<p>A version mismatch between <code>crictl</code> and your Kubernetes version is tolerated but not silent — cri-tools follows the Kubernetes minor version, and using a much older <code>crictl</code> against a newer runtime can hide fields that were added in between. Pin it to the Kubernetes version you care about; for this track that is v1.35 or newer.</p>
+<div class="k8s-link">
+<p><code>crictl</code> is the tool the advanced track reaches for when <code>kubectl</code> has stopped being useful. <a href="w6.html#cp-6-2">W6.2 — where logs physically live</a> is that ladder written down: when the API server is down, or the kubelet cannot start a pod at all, you go to the node and ask the runtime directly.</p>
+<p>The same distinction explains a whole class of exam-relevant failures. <a href="w6.html#cp-6-17">W6.17 — image failures: ErrImagePull, ImagePullBackOff</a> is a kubelet-level symptom whose cause is always one layer down, in exactly the registry conversation you will hold by hand in I5.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/kubernetes-sigs/cri-tools/blob/master/docs/crictl.md">cri-tools' <code>crictl</code> guide</a> — the closest thing to a manual it has; <code>crictl --help</code> and <code>ctr --help</code> (note <code>ctr</code>'s help is organised by object: <code>ctr images</code>, <code>ctr containers</code>, <code>ctr tasks</code>). <code>man 1 skopeo</code> and <code>man 1 skopeo-inspect</code>. For the containerd-namespace concept, <code>ctr namespace --help</code> and the <code>docs/namespaces.md</code> file in the containerd repository.</p>
+</article>
+
+<article class="lesson" id="cp-i0-6" data-id="i0-6">
+<div class="lesson-head"><span class="cp-id">I0.6</span><h4>First contact with each tool — and no more than that</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Four commands, chosen because each one leaks a fact about the architecture that the rest of the track spends modules unpacking. The instruction that matters most in this lesson is the one telling you to stop: run them, notice the one thing each reveals, and resist trying to understand the output. Nothing here is a prerequisite for the next lesson; all of it is a prerequisite for recognising the same output later and thinking "I have seen this".</p>
+<h5>The concept</h5>
+<p>What to notice, in advance, so you actually see it:</p>
+<ul>
+<li><strong><code>ctr version</code> prints a client version <em>and</em> a server version, separately.</strong> That is your first sight of the daemon architecture — <code>ctr</code> is a thin client over a unix socket and the thing that holds your containers is a long-lived process elsewhere. It has a surprising consequence that I7 makes you prove: killing the daemon does <em>not</em> kill the containers, because the daemon is not their parent. A per-container <em>shim</em> is.</li>
+<li><strong><code>crictl info</code> reports readiness as a set of conditions</strong>, and one of them will be false. The runtime is ready; the network is not, because no CNI configuration exists on this box yet. That single false condition is the most common reason a real node sits in <code>NotReady</code>, and you are seeing it in its purest form: nothing is broken, something is merely absent.</li>
+<li><strong><code>nerdctl info</code> answers in Docker's vocabulary</strong> — storage driver, logging driver, cgroup driver — over a daemon that is not Docker. Those names are a compatibility surface, and knowing they are a translation rather than the underlying truth stops you looking for a "storage driver" setting in containerd's config.</li>
+<li><strong><code>runc spec</code> writes a <code>config.json</code> and needs no daemon, no image and no network.</strong> Open it and you will recognise most of it from <code>minibox.sh</code>: a root filesystem path, a process to exec, a list of namespaces, a set of capabilities, a few mounts. That recognition <em>is</em> the thesis of this track, so let it land before I2 formalises it.</li>
+</ul>
+<h5>Lab</h5>
+<ol>
+<li>The daemon split.
+<pre class="cmd">sudo ctr version</pre>
+<pre class="out"><b>Client:</b>
+  Version:  v2.3.3
+  Revision: aad11006b869517fcd3009450b6f82da282e1a9b
+  Go version: go1.26.5
+
+<b>Server:</b>
+  Version:  v2.3.3
+  Revision: aad11006b869517fcd3009450b6f82da282e1a9b
+  UUID: d3ed62da-716f-4c62-aecc-c495fef138e0</pre></li>
+<li>Readiness, as the kubelet would ask for it. <code>crictl info</code> prints a large JSON document; <code>.status</code> is the part that answers "could a pod start right now?".
+<pre class="cmd">sudo crictl info | jq .status</pre>
+<pre class="out">{
+  "conditions": [
+    { "type": "<b>RuntimeReady</b>", "status": <b>true</b>, "reason": "", "message": "" },
+    { "type": "<b>NetworkReady</b>", "status": <b>false</b>,
+      "reason": "NetworkPluginNotReady",
+      "message": "Network plugin returns error: <b>cni plugin not initialized</b>" },
+    { "type": "ContainerdHasNoDeprecationWarnings", "status": true }
+  ]
+}</pre>
+<p>Two things to file away. <code>NetworkReady: false</code> is expected today and stays false until I9 writes a file into <code>/etc/cni/net.d</code>. And that third condition is containerd telling you it has not had to migrate anything deprecated — a genuinely useful thing to check after any upgrade.</p></li>
+<li>The Docker-shaped view of the same daemon.
+<pre class="cmd">sudo nerdctl info</pre>
+<pre class="out">Server:
+ Server Version: <b>v2.3.3</b>
+ <b>Storage Driver: overlayfs</b>
+ Logging Driver: json-file
+ <b>Cgroup Driver: systemd</b>
+ Cgroup Version: 2
+ ...
+ Kernel Version:   6.8.0-xx-generic
+ Operating System: Ubuntu 24.04.x LTS
+<b>WARNING: IPv4 forwarding is disabled</b></pre>
+<p>"Storage Driver: overlayfs" is the overlay filesystem you mounted by hand in <a href="b5.html#cp-b5-13">B5.13 — overlayfs by hand</a> and again in <code>minibox.sh</code>, now under a name Docker invented. The forwarding warning is honest and will matter in I9.</p></li>
+<li>Now the thing with no daemon at all. Generate a default bundle configuration in an empty directory.
+<pre class="cmd">mkdir -p ~/spectest &amp;&amp; cd ~/spectest
+runc spec
+wc -c config.json
+jq 'keys' config.json</pre>
+<pre class="out">2500 config.json
+[
+  "hostname",
+  "linux",
+  "mounts",
+  <b>"ociVersion"</b>,
+  "process",
+  "root"
+]</pre></li>
+<li>Read two fields, and stop. This is the whole lesson: notice how much of it you already recognise.
+<pre class="cmd">jq -r '.ociVersion' config.json
+jq '.linux.namespaces' config.json</pre>
+<pre class="out"><b>1.3.0</b>
+[
+  { "type": "pid" },
+  { "type": "network" },
+  { "type": "ipc" },
+  { "type": "uts" },
+  { "type": "mount" },
+  { "type": "cgroup" }
+]</pre>
+<p>Six namespaces, listed by name in a JSON file. <code>minibox.sh</code> passes five of them as flags to <code>unshare</code>. The mechanism is identical; what changed is that here it is <em>written down in a format another program could have generated</em>. Close the file. I2 is the lesson.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>sudo ctr version</code> shows matching client and server versions; <code>sudo crictl info | jq -r '.status.conditions[0].status'</code> prints <code>true</code>; <code>~/spectest/config.json</code> exists and <code>jq -r '.ociVersion' ~/spectest/config.json</code> prints <code>1.3.0</code>. If <code>ctr version</code> prints only a client block and an error, the daemon is not running — <code>systemctl status containerd</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>runc spec</code> writes <code>config.json</code> into the <em>current directory</em> and overwrites an existing one without asking. Always run it in a directory you made for the purpose. It also does not create the <code>rootfs/</code> directory the config refers to — the bundle it generates is deliberately incomplete, which is why running <code>runc run</code> on it immediately fails. That is I3's first lab, not a mistake here.</p>
+<p>Do not read the whole <code>config.json</code> yet, and especially do not start editing it. It is 2.5 KB and about a dozen concepts, several of which (masked paths, rlimits, the seccomp default, the device allow-list) are only sensible after I1. Reading it cold is the reliable way to conclude that the OCI spec is impenetrable, when it is actually one of the shortest specifications you will ever be asked to know.</p>
+<div class="specref">
+<p>The <code>ociVersion</code> field you just read is the first thing the runtime specification requires of any bundle:</p>
+<blockquote><code>ociVersion</code> (string, REQUIRED) MUST be in SemVer v2.0.0 format and specifies the version of the Open Container Initiative Runtime Specification with which the bundle complies.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#specification-version">config.md § Specification version</a></cite>
+<p>So <code>runc</code> writing <code>1.3.0</code> is not runc's own version (which is 1.5.1) — it is runc declaring which edition of the standard this file conforms to. Two different numbers that both look like a version of "the container thing", and telling them apart is worth doing once, now.</p>
+</div>
+<div class="k8s-link">
+<p>The <code>NetworkReady: false</code> condition you just saw is the runtime half of a node's <code>Ready</code> condition. On a real node, this exact message is what the kubelet reports upward as <code>container runtime network not ready: cni plugin not initialized</code> — and it is the number-one cause of a freshly-<code>kubeadm init</code>ed control plane sitting in <code>NotReady</code> until a CNI is applied.</p>
+<p>See <a href="w0.html#cp-0-7">W0.7 — kubeadm init, install a CNI, join both workers</a>, where installing the CNI is what flips it, and <a href="w6.html#cp-6-11">W6.11 — the NotReady ladder, end to end</a> for the diagnosis path. You have now seen the bottom rung of that ladder before ever meeting the top of it.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 8 runc</code> and <code>man 8 runc-spec</code>; <code>ctr --help</code>; <code>crictl info --help</code>. The <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">runtime-spec's <code>config.md</code></a> is the field-by-field reference for the file you just generated — bookmark it, do not read it yet.</p>
+</article>
+</div>
+
+<!-- ---------------- How to read a spec ---------------- -->
+<div class="grp" id="g-spec"><h3>How to read a spec</h3>
+
+<article class="lesson" id="cp-i0-7" data-id="i0-7">
+<div class="lesson-head"><span class="cp-id">I0.7</span><h4>RFC 2119, the shape of the OCI documents, and finding the sentence that settles it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the reading skill the whole track depends on, and it is genuinely a skill rather than a fact. Most arguments about container behaviour — does a runtime have to do X, is it safe to rely on Y, whose bug is this — are settled by a single sentence in a Markdown file that takes under a minute to find. The people who seem to know this ecosystem cold are, very often, just people who have read the specs and know their table of contents.</p>
+<h5>The concept</h5>
+<p>Specifications are written in a small controlled vocabulary defined by <strong>RFC 2119</strong>, and every OCI document opens by saying so. The words are not English intensifiers; they are conformance requirements with precise consequences:</p>
+<table>
+<tr><th>Keyword</th><th>Means</th><th>What it implies for you</th></tr>
+<tr><td><strong>MUST</strong> / <strong>REQUIRED</strong> / <strong>SHALL</strong></td><td>absolute requirement</td><td>an implementation that does not is non-conforming; you may rely on it, and file a bug when it fails</td></tr>
+<tr><td><strong>MUST NOT</strong> / <strong>SHALL NOT</strong></td><td>absolute prohibition</td><td>if you see it happen, that is a bug, not a feature to depend on</td></tr>
+<tr><td><strong>SHOULD</strong> / <strong>RECOMMENDED</strong></td><td>do it unless you have a stated reason not to</td><td>most implementations do it; a few deliberately do not, and they are still conforming</td></tr>
+<tr><td><strong>MAY</strong> / <strong>OPTIONAL</strong></td><td>genuinely optional</td><td><strong>this is where portability bugs live</strong> — code that assumes it happens is broken on the runtime that doesn't</td></tr>
+</table>
+<p>Two habits follow, and they pay off immediately.</p>
+<p><strong>First: MAY is a warning label.</strong> When a specification says a runtime MAY do something, two conforming implementations can differ, and any code you write that assumes one of them is quietly non-portable. Most cross-runtime bugs — works on containerd, fails on CRI-O; works with runc, fails with crun — live under a MAY.</p>
+<p><strong>Second: "the specification is silent on this" is a real and frequent answer</strong>, and often the most useful one. The runtime specification says nothing whatsoever about images, registries, networking, logging, or how containers are named. Every one of those silences is a later module of this track, because each was filled in later by a <em>different</em> standard or by no standard at all. Recognising that a behaviour is unspecified is more useful than guessing which implementation's behaviour is the standard one.</p>
+<p>The OCI documents are short and their layout is regular. The runtime specification is a handful of Markdown files in one repository, split by concern, and knowing which file answers which kind of question is most of the skill:</p>
+<table>
+<tr><th>File</th><th>Answers</th></tr>
+<tr><td><code>spec.md</code></td><td>the introduction, and the RFC 2119 statement itself</td></tr>
+<tr><td><code>bundle.md</code></td><td>what a "bundle" is: a directory containing <code>config.json</code> and a root filesystem</td></tr>
+<tr><td><code>config.md</code></td><td><strong>every field of <code>config.json</code></strong>, platform-independent — the file you will open most</td></tr>
+<tr><td><code>config-linux.md</code></td><td>the Linux-only parts: namespaces, cgroups, devices, seccomp, sysctls</td></tr>
+<tr><td><code>runtime.md</code></td><td>the <em>lifecycle</em>: what <code>create</code>, <code>start</code>, <code>kill</code>, <code>delete</code> and <code>state</code> must do</td></tr>
+<tr><td><code>features.md</code></td><td>how a runtime advertises what it supports (this is how you avoid relying on a MAY)</td></tr>
+<tr><td><code>glossary.md</code></td><td>the definitions the other files use precisely</td></tr>
+</table>
+<p>The image and distribution specifications have the same shape in their own repositories, and CNI's is a single <code>SPEC.md</code>. You will meet all of them.</p>
+<h5>Lab</h5>
+<ol>
+<li>Clone the specification you will use most. It is small — a few hundred kilobytes — and having it locally means you can grep it, which is the whole trick.
+<pre class="cmd">cd ~ &amp;&amp; git clone --depth 1 --branch v1.3.0 \
+  https://github.com/opencontainers/runtime-spec.git
+ls ~/runtime-spec/*.md</pre>
+<pre class="out">bundle.md  config-linux.md  <b>config.md</b>  features.md  glossary.md
+principles.md  <b>runtime.md</b>  spec.md  ...</pre></li>
+<li>Read the conformance sentence itself, so you know it is really there rather than taking this lesson's word for it.
+<pre class="cmd">grep -A2 'key words' ~/runtime-spec/spec.md</pre>
+<pre class="out">The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" are to be interpreted as described in [RFC 2119][rfc2119].</pre></li>
+<li>Now the timed exercise. <strong>In under a minute</strong>, find the sentence that says whether <code>process</code> is required in a <code>config.json</code>. Try it before reading on.
+<pre class="cmd">grep -n '^\*\* `process` \|`process` (object' ~/runtime-spec/config.md</pre>
+<pre class="out">**`process`** (object, <b>OPTIONAL</b>) specifies the container process.</pre>
+<p>Stopping there gets you the wrong answer, which is why this is the exercise. Read the <em>next</em> sentence:</p>
+<pre class="cmd">grep -A1 '`process` (object' ~/runtime-spec/config.md</pre>
+<pre class="out">**`process`** (object, OPTIONAL) specifies the container process.
+This property is <b>REQUIRED when [`start`](runtime.md#start) is called</b>.</pre></li>
+<li>Sit with what that means, because it is the shape of most specification answers. <code>process</code> is optional in the document but required in practice for any bundle you intend to <em>run</em> — which is how a runtime can legitimately accept a <code>config.json</code> with no <code>process</code>, let you <code>create</code> the container, and only then fail at <code>start</code>. "Optional" and "you can leave it out" are not the same claim.</li>
+<li>Practise the same move on a question with a different answer: is <code>root</code> required?
+<pre class="cmd">grep -B1 -A3 'On all other platforms, this field is REQUIRED' ~/runtime-spec/config.md</pre>
+<pre class="out">On Windows, for Windows Server Containers, this field is REQUIRED.
+For [Hyper-V Containers](config-windows.md#hyperv), this field MUST NOT be set.
+<b>On all other platforms, this field is REQUIRED.</b></pre>
+<p>Three different answers depending on platform, in three consecutive sentences. This is why "I read that a container must have a root filesystem" is a claim that needs a platform attached to it.</p></li>
+<li>Finally, prove a silence. Search the entire runtime specification for the words that are <em>not</em> in it.
+<pre class="cmd">grep -ril 'registry\|image manifest\|CNI' ~/runtime-spec/*.md | wc -l</pre>
+<pre class="out"><b>0</b></pre>
+<p>Zero files. The document that defines what a container is has nothing to say about where its filesystem came from or how it reaches the network. Those are separate standards — I4, I5 and I9 — and the separation is deliberate design, not an oversight.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Answer these three without looking, then check: (1) If a spec says a runtime MAY do something, can you rely on it? <em>No — that is precisely where implementations differ.</em> (2) Is <code>process</code> required in <code>config.json</code>? <em>Optional in the document, required before <code>start</code>.</em> (3) Which OCI document tells you what <code>runc delete</code> must do? <em><code>runtime.md</code>, the lifecycle file — not <code>config.md</code>.</em></p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Read the version of the specification your tools implement, not <code>main</code>. GitHub shows you the default branch, which contains unreleased changes; the tag matters. <code>runc --version</code> printed <code>spec: 1.3.0</code> in I0.6, which is why the clone above pins <code>v1.3.0</code>. Answering a question from <code>main</code> and then finding your runtime disagrees is a very ordinary way to lose an hour.</p>
+<p>Do not confuse the three OCI specifications, which version independently and answer different questions: <strong>runtime-spec</strong> (v1.3.0) says what a container <em>is</em> and how to run one; <strong>image-spec</strong> (v1.1.1) says what an image <em>is</em> on disk; <strong>distribution-spec</strong> (v1.1.1) says how a registry serves them over HTTP. A question about digests belongs to the second, not the first.</p>
+<p>Beware, too, of reading a normative document as a tutorial. Specifications are written for implementers and say nothing about why you would want a feature or how to use it well. When a spec answers "what is allowed" and you needed "what should I do", the spec is not the wrong document — you asked the wrong question of it.</p>
+<div class="specref">
+<p>Every OCI document inherits its vocabulary from one sentence:</p>
+<blockquote>The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" are to be interpreted as described in RFC 2119.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/spec.md">spec.md</a>; the identical statement opens the image and distribution specifications, and the CNI specification.</cite>
+<p>And the exercise's answer, in full, showing why the parenthesis alone is not the answer:</p>
+<blockquote><code>process</code> (object, OPTIONAL) specifies the container process. This property is REQUIRED when <code>start</code> is called.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#process">config.md § Process</a></cite>
+</div>
+<div class="k8s-link">
+<p>Kubernetes has the same skill under a different name, and it is the highest-value habit in the CKA exam: <code>kubectl explain</code> reads the API schema out of your live cluster and tells you whether a field is required, what type it is, and what it defaults to — with no browser and no guessing about which version's fields you are looking at. <a href="w0.html#cp-0-11">W0.11 — kubectl explain</a> drills it.</p>
+<p>The instinct is identical to the one you just practised: the authoritative answer is already on the machine in front of you, in a document with a stable structure, and finding it is faster and more accurate than asking the internet. The difference is only that Kubernetes ships its schema inside the API server, while OCI ships its in a Git repository.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://www.rfc-editor.org/rfc/rfc2119">RFC 2119</a> itself is one page — read it once, today. Then the four specifications you will use: <a href="https://github.com/opencontainers/runtime-spec">runtime-spec</a>, <a href="https://github.com/opencontainers/image-spec">image-spec</a>, <a href="https://github.com/opencontainers/distribution-spec">distribution-spec</a>, and <a href="https://github.com/containernetworking/cni/blob/main/SPEC.md">CNI's <code>SPEC.md</code></a>. Clone each at the tag your tools implement, and grep rather than browse.</p>
+</article>
+</div>
+
 <div class="godeep"><a href="../beginner.html#b14">Beginner B14 · where <code>minibox.sh</code> is built one layer at a time →</a></div>
 
 <nav class="pager"><a href="../intermediate.html#i0">← Intermediate tracker</a><a href="../intermediate.html#i1">I1 · The primitives the beginner track left out →</a></nav>
