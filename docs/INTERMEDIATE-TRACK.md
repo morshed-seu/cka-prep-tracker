@@ -934,9 +934,26 @@ the `intermediate-track-plan` memory.
 | **I-S2** | ✅ **done.** Wiring, no content: `.specref` in `site.css`; `tools/check-links.sh` third track; switcher pill made live in all 35 pages; stub `intermediate.html` with `PUBLISHED=[]`; `labs/intermediate/seed/` populated from the beginner artifacts. Two notes for later sessions: the stub's counters fall back to a `PLANNED={cps:195,hrs:78}` constant while no `section.wk[id^="i"]` exists — **delete it once I-S3 lands real sections**, or the fallback silently masks a selector bug; and the seed scripts are `bash -n`-clean but have **never been run live** (no `buildbox` yet), so I0 must run both end to end and paste real output |
 | **I-S3** | ✅ **done.** `intermediate.html` sections **I0–I6** (96 checkpoints, 35 h), each following this document's checkpoint groups exactly, with a trailing `Project & drill` group (I0: project only). One note for I-S4: `PLANNED` was **kept rather than deleted** — with only half the sections present, counters that measure just the tickable part would report 96 cps / 35 h as the whole track, so `PLANNED` gained `mods:14` and the hours note now reads "N h published of ~78 h planned" while `mods.length < PLANNED.mods`. Delete it in I-S4, when that branch becomes dead code. Checkpoint prose deliberately says "containerd 2.x" / "runc 1.5.x": a re-search on 2026-07-26 already returned **2.3.3**, so exact pins belong in I0's install lab, in one place, next to a pasted version command |
 | **I-S4** | ✅ **done.** `intermediate.html` sections **I7–I13** (99 checkpoints, 43 h) — the tracker is now complete at **195 cp / 78 h across 14 modules**, verified by count against this document's per-module tables. `PLANNED` and the partial-publication branch in `refresh()` are deleted; the hours note now reads plain "N modules to go · 78 h total", matching `beginner.html` line for line. The "Being written now" banner was rewritten to the beginner track's post-completion wording. Facts re-verified 2026-07-27 while authoring: containerd **2.3.3** (2026-07-10 — the page footer's pin was bumped from 2.3.2), CNI spec **1.1.0**, CSI spec **1.11.0**, and in-place pod resize is **GA in k8s v1.35**, not merely extended — I8.10 says GA. One wording note carried into I9.3: the CNI spec's own sentence enumerates *five* operations (ADD, DEL, CHECK, GC, VERSION) and defines STATUS alongside them, so the checkpoint quotes it that way rather than saying "six verbs" |
-| **I-S5** | `materials/i0.html` — **the pattern-setter**: establishes `.specref`, the back-reference habit, the toolchain table. Review before continuing |
+| **I-S5** | ✅ **done.** `materials/i0.html` — the pattern-setter (8 lessons, every one carrying the full anatomy; `.specref` on I0.6 and I0.7). `intermediate.html`'s `PUBLISHED` is now `[0]`. Every command on the page was **run live** and its output pasted verbatim. Three findings for later sessions: (1) containerd **2.3.3's `containerd config default` emits `version = 4`, not 3** — 2.0 moved 2→3, 2.3 moved 3→4, and the default output still also carries a legacy `plugins.'io.containerd.grpc.v1.cri'` section beside the split `…cri.v1.runtime` / `…cri.v1.images` plugins; I7/I8 must not repeat the "version 3" claim. (2) `crictl info`'s `.status` on a fresh box reports `NetworkReady: false` / `cni plugin not initialized` plus a `ContainerdHasNoDeprecationWarnings` condition — used as I0.6's teaching moment and I9's payoff. (3) **`labs/intermediate/seed/minibox.sh` was broken and is fixed in this commit** — see the note below |
 | **I-S6 … I-S18** | `materials/i1.html` … `materials/i13.html`, one module per session |
 | **I-S19** | `labs/intermediate/i13-*.sh` + `mock/intermediate-final*.html` + cross-track QA + docs |
+
+**Seed-script correction, made in I-S5 (2026-07-27).** I-S2 shipped `labs/intermediate/seed/*.sh`
+`bash -n`-clean but never executed. Running `minibox.sh` for the first time in I0.3 showed it could
+never have worked: it dropped `CAP_SYS_ADMIN` with `capsh` *before* calling `unshare`, and both
+`unshare(2)` and `pivot_root(2)` require it — so it died with `unshare failed: Operation not
+permitted` having isolated nothing. B14's own listing (`materials/b14.html`, the lesson that builds
+`minibox` layer by layer) **has the same ordering bug and is still unfixed** — fixing it there means
+reworking several interlocking Python-patch lab steps, which is a beginner-track session's work, not
+a drive-by. The seed copy now: builds the rootfs with `capsh` plus its three shared objects copied in
+(`install_capsh()`), runs a plain `unshare` in stage 1, and drops the four capabilities in stage 2
+*after* `enter_rootfs`; it also calls `hash -r` after `pivot_root`, because bash had cached
+`/usr/bin/mount` and that path no longer exists inside the new root. The fix is pedagogically better
+than the bug: "isolate, then disarm" and "a bash runtime must ship `capsh` into the rootfs because
+`runc`, being one process, still has its own code in memory when it drops privilege" are now I0.3
+content and set up I3. Verified live: namespaces, cgroup limits, veth/bridge/NAT egress, and the
+four-capability drop all confirmed by pasted output. `net-up.sh` needed no change and works as
+shipped (its first pod-to-pod ping can time out on ARP — use `-c2`).
 
 **Sessions at risk of overrunning:** I-S12 (I7, 18 cp) certainly, and I-S7 (I2), I-S9 (I4), I-S13
 (I8), I-S14 (I9) plausibly — all 16 cp with heavy labs. Plan two sittings for I7. The beginner
