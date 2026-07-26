@@ -4,9 +4,10 @@
 #   - each lesson anchor has a matching tracker checkpoint
 #   - each lesson's data-id matches its own anchor id
 #
-# Two tracks, one rule: anchor id = "cp-" + data-id with a leading "w" stripped.
-#   advanced: index.html     data-id="w3-7"  <->  materials/w3.html  id="cp-3-7"
-#   beginner: beginner.html  data-id="b3-7"  <->  materials/b3.html  id="cp-b3-7"
+# Three tracks, one rule: anchor id = "cp-" + data-id with a leading "w" stripped.
+#   advanced:     index.html        data-id="w3-7"  <->  materials/w3.html  id="cp-3-7"
+#   beginner:     beginner.html     data-id="b3-7"  <->  materials/b3.html  id="cp-b3-7"
+#   intermediate: intermediate.html data-id="i3-7"  <->  materials/i3.html  id="cp-i3-7"
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -47,8 +48,8 @@ check_track(){                      # $1 = tracker file, $2 = page prefix (w|b),
 
     # lesson data-id <-> its own anchor id
     while IFS= read -r line; do
-      id=$(grep -o 'id="cp-b\?[0-9]*-[0-9]*"' <<<"$line" | sed 's/id="//; s/"//' || true)
-      did=$(grep -o 'data-id="[wb][0-9]*-[0-9]*"' <<<"$line" | sed 's/data-id="w\?/cp-/; s/"//' || true)
+      id=$(grep -o 'id="cp-[bi]\?[0-9]*-[0-9]*"' <<<"$line" | sed 's/id="//; s/"//' || true)
+      did=$(grep -o 'data-id="[wbi][0-9]*-[0-9]*"' <<<"$line" | sed 's/data-id="w\?/cp-/; s/"//' || true)
       if [ -n "$id" ] && [ -n "$did" ] && [ "$id" != "$did" ]; then
         echo "FAIL $page: lesson id=$id has data-id mapping to $did"
         fail=1
@@ -60,7 +61,8 @@ check_track(){                      # $1 = tracker file, $2 = page prefix (w|b),
   done
 }
 
-check_track index.html    w "advanced track"
-check_track beginner.html b "beginner track"
+check_track index.html        w "advanced track"
+check_track beginner.html     b "beginner track"
+check_track intermediate.html i "intermediate track"
 
 exit $fail
