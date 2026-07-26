@@ -646,6 +646,178 @@ For [Hyper-V Containers](config-windows.md#hyperv), this field MUST NOT be set.
 </article>
 </div>
 
+<!-- ---------------- Project ---------------- -->
+<div class="grp" id="g-project"><h3>Project</h3>
+
+<article class="lesson project" id="cp-i0-8" data-id="i0-8">
+<div class="lesson-head"><span class="cp-id">I0.8</span><h4><code>toolcheck.sh</code> — every version and every config path, in one table</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>For the next thirteen modules, the most common thing that will go wrong is not a mistake in your command — it is a difference between your box and the one these lessons were written on. A different containerd minor, a config file you edited three modules ago and forgot, a venv you did not activate. Every one of those is invisible until you look, and looking takes one command if you build it now.</p>
+<p>The second reason is more subtle and more valuable: writing this script forces you to answer, for each component, <em>where does it read its configuration from?</em> That question has a non-obvious answer for at least three of them, and knowing it is worth more than the script.</p>
+<h5>The concept</h5>
+<p>Four design decisions, each of which recurs every time you write a small operational tool.</p>
+<ul>
+<li><strong>Report everything, then fail once.</strong> The obvious implementation exits at the first missing tool, which tells you the least useful possible thing: one problem at a time. Instead the script counts failures, prints the whole table, and exits non-zero at the end. A tool that stops at the first error turns one broken install into five runs.</li>
+<li><strong>Distinguish "missing" from "not configured".</strong> A component can be installed and have no configuration file, which is normal — containerd runs happily on its compiled-in defaults with no <code>/etc/containerd/config.toml</code> at all. So the table marks a config path <code>+</code> if the file exists and <code>-</code> if it does not, and neither is a failure. Only a missing <em>binary</em> is.</li>
+<li><strong>Print the environment's facts, not just the tools'.</strong> Three lines at the bottom answer questions that are not about any one binary: which runtime-spec version your <code>runc</code> implements, whether this box is cgroup v2, and whether the daemon is actually running. Those are the three things most likely to explain a mismatch that the version table alone cannot.</li>
+<li><strong>Do not use <code>set -e</code> here.</strong> This is the rare script where you want it off: its entire job is to run commands that might fail and report on them. <code>set -uo pipefail</code> keeps the useful halves — unset variables are still errors, and a failure mid-pipeline is still noticed.</li>
+</ul>
+<p>The config paths themselves are the part worth memorising, because several are not where you would guess:</p>
+<table>
+<tr><th>Component</th><th>Reads its config from</th><th>Note</th></tr>
+<tr><td>containerd</td><td><code>/etc/containerd/config.toml</code></td><td>optional; absent means compiled-in defaults, which is the state you are in now</td></tr>
+<tr><td>runc</td><td>— nothing —</td><td>every input arrives as the bundle's <code>config.json</code>; there is no global config, by design</td></tr>
+<tr><td>crictl</td><td><code>/etc/crictl.yaml</code></td><td>absent means it probes well-known socket paths and warns</td></tr>
+<tr><td>nerdctl</td><td><code>~/.config/nerdctl/nerdctl.toml</code></td><td>per-user, unlike the rest</td></tr>
+<tr><td>CNI</td><td><code>/etc/cni/net.d/</code> (plus <code>/opt/cni/bin</code>)</td><td>a <em>directory</em>, read in lexical order; containerd created it empty at startup</td></tr>
+<tr><td>skopeo</td><td><code>/etc/containers/registries.conf</code></td><td>shared with podman/buildah — the "containers" family, not the containerd one</td></tr>
+</table>
+<p>That <code>runc</code> row is the interesting one. A component with no configuration file is a component whose entire behaviour is a function of its inputs, which is exactly what makes it replaceable — and replaceability is the point of a specification. Hold that thought for I3.</p>
+<h5>Lab</h5>
+<ol>
+<li>Write the script on <code>buildbox</code>, in your home directory.
+<pre class="cmd">cat &gt; ~/toolcheck.sh &lt;&lt;'EOF'
+#!/usr/bin/env bash
+# toolcheck — one table of what this box actually has, and where each component
+# reads its configuration from. Run it at the top of every module.
+set -uo pipefail
+
+missing=0
+
+row() {                                   # row &lt;name&gt; &lt;version-cmd&gt; &lt;config-path&gt;
+  local name=$1 vercmd=$2 conf=$3 ver mark=' '
+  if ! ver=$(eval "$vercmd" 2&gt;/dev/null) || [ -z "$ver" ]; then
+    ver=MISSING; missing=$((missing + 1))
+  fi
+  [ -n "$conf" ] &amp;&amp; { [ -e "$conf" ] &amp;&amp; mark='+' || mark='-'; }
+  printf '%-11s %-16s %s %s\n' "$name" "$ver" "$mark" "${conf:-—}"
+}
+
+printf '%-11s %-16s %s %s\n' COMPONENT VERSION ' ' CONFIG
+printf '%-11s %-16s %s %s\n' ----------- ---------------- - ------
+
+row containerd "containerd --version | awk '{print \$3}'" /etc/containerd/config.toml
+row runc       "runc --version | awk 'NR==1{print \$3}'" ''
+row crictl     "crictl --version | awk '{print \$3}'" /etc/crictl.yaml
+row nerdctl    "nerdctl --version | awk '{print \$3}'" "$HOME/.config/nerdctl/nerdctl.toml"
+row skopeo     "skopeo --version | awk '{print \$3}'" /etc/containers/registries.conf
+row cni        "ls /opt/cni/bin/bridge &gt;/dev/null &amp;&amp; echo installed" /etc/cni/net.d
+row jq         "jq --version | sed 's/jq-//'" ''
+row python3    "python3 -V | awk '{print \$2}'" "$HOME/.venv-intermediate/bin/activate"
+
+echo
+echo "runtime-spec implemented: $(runc --version 2&gt;/dev/null | awk '/^spec:/{print $2}')"
+echo "cgroup hierarchy:         $(stat -fc %T /sys/fs/cgroup)"
+echo "containerd service:       $(systemctl is-active containerd 2&gt;/dev/null)"
+
+if [ "$missing" -gt 0 ]; then
+  echo
+  echo "FAIL: $missing component(s) missing" &gt;&amp;2
+  exit 1
+fi
+echo
+echo "OK: toolchain complete"
+EOF
+chmod +x ~/toolcheck.sh</pre></li>
+<li>Run it. Everything installed in this module should be present; two config paths will be missing, and that is correct.
+<pre class="cmd">~/toolcheck.sh; echo "exit=$?"</pre>
+<pre class="out">COMPONENT   VERSION            CONFIG
+----------- ---------------- - ------
+containerd  <b>v2.3.3</b>           - /etc/containerd/config.toml
+runc        <b>1.5.1</b>              —
+crictl      <b>v1.36.0</b>          + /etc/crictl.yaml
+nerdctl     <b>2.3.5</b>            - /home/ubuntu/.config/nerdctl/nerdctl.toml
+skopeo      1.13.3           + /etc/containers/registries.conf
+cni         installed        + /etc/cni/net.d
+jq          1.7                —
+python3     3.12.3           - /home/ubuntu/.venv-intermediate/bin/activate
+
+runtime-spec implemented: <b>1.3.0</b>
+cgroup hierarchy:         <b>cgroup2fs</b>
+containerd service:       <b>active</b>
+
+<b>OK: toolchain complete</b>
+exit=0</pre>
+<p>Read the three <code>-</code> marks: containerd has no config file (it is on defaults), nerdctl has no per-user config, and the venv line is <code>-</code> because <code>python3</code> here resolved to the venv's copy while <code>$HOME</code> expanded before activation — if yours shows <code>+</code>, your <code>.bashrc</code> activation from I0.2 is working and that is equally fine.</p></li>
+<li>Prove the failure path, because a check that has never failed has never been tested. Hide one binary, run again, put it back.
+<pre class="cmd">sudo mv /usr/local/bin/nerdctl /usr/local/bin/nerdctl.hidden
+~/toolcheck.sh; echo "exit=$?"
+sudo mv /usr/local/bin/nerdctl.hidden /usr/local/bin/nerdctl</pre>
+<pre class="out">nerdctl     <b>MISSING</b>          - /home/ubuntu/.config/nerdctl/nerdctl.toml
+...
+<b>FAIL: 1 component(s) missing</b>
+exit=<b>1</b></pre></li>
+<li>Save the output somewhere you will still have in thirteen modules' time, then take the snapshot you will actually live on.
+<pre class="cmd">~/toolcheck.sh &gt; ~/toolchain-baseline.txt
+exit</pre>
+<pre class="cmd">multipass stop buildbox
+multipass snapshot buildbox --name clean
+multipass start buildbox</pre>
+<pre class="out">Snapshot taken: buildbox.clean</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>~/toolcheck.sh</code> exits 0 and prints eight component rows with no <code>MISSING</code>; hiding any one binary makes it exit 1 while still printing the whole table. <code>multipass list --snapshots</code> shows both <code>blank</code> and <code>clean</code> on <code>buildbox</code>. From here on, "restore <code>clean</code>" means "the box exactly as it is at the end of I0".</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>eval</code> in <code>row()</code> deserves a word, because <code>eval</code> is usually a mistake. Here every string passed to it is a literal written in this file — no user input reaches it — which is the only condition under which it is defensible. It is used because each tool prints its version in a slightly different shape and the alternative is eight near-identical functions. If you extend the script, keep that invariant: the version command is always a literal.</p>
+<p>Re-run this after every snapshot restore, and especially after any module that changes containerd's configuration. The failure mode it catches is not "I forgot to install something" — it is "I restored a snapshot from before I installed something", which produces a much more confusing symptom because the tool was there ten minutes ago.</p>
+<p>If you later add a component (BuildKit in I6, <code>cosign</code> and a scanner in I11), add its row here at the same time. A check that is one module out of date is worse than no check, because you will trust it.</p>
+<div class="k8s-link">
+<p>Node-level version drift is a real Kubernetes failure class, and this script is its miniature. A cluster's nodes can run different container runtime versions, and <code>kubectl get nodes -o wide</code> prints each node's <code>CONTAINER-RUNTIME</code> column for exactly this reason — it is the first thing to compare when one node behaves differently from the others.</p>
+<p>The formal version of the same concern is <a href="w2.html#cp-2-12">W2.12 — memorize the version skew rules</a>, which governs how far apart the control plane and the kubelets may drift. Same instinct at a different altitude: write the versions down, and check them before you debug anything else.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 1 bash</code> — the <em>Parameter Expansion</em> section for <code>${conf:-—}</code>, <em>The Set Builtin</em> for <code>-uo pipefail</code>, and <em>SHELL BUILTIN COMMANDS</em> for <code>eval</code> and <code>local</code>. <code>man 1 printf</code> for the field-width syntax. <code>man 1 systemctl</code> for <code>is-active</code>, which is designed to be read by scripts rather than people.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>I0 recall quiz</h3>
+<p>Answer out loud before revealing. These are all setup questions, which makes them easy to skip and expensive to get wrong — every one of them is a mismatch you would otherwise debug in a later module.</p>
+<ol>
+<li>Why a third VM? Give the three separate reasons, not one.
+<details class="reveal"><summary>Answer</summary><p><strong>Size</strong>: the beginner <code>sandbox</code> is 2 vCPU / 4 GB / 20 GB, which image builds and a local registry will exhaust. <strong>Blast radius</strong>: these labs stop and reconfigure containerd, which would break the CKA lab's nodes, whose kubelets use that same daemon. <strong>Internet</strong>: unlike <code>sandbox</code>, <code>buildbox</code> must reach real registries, because that conversation is the subject matter of I4–I6.</p></details></li>
+<li>What is PEP 668, and why is <code>--break-system-packages</code> a bad habit even on a throwaway VM?
+<details class="reveal"><summary>Answer</summary><p>PEP 668 lets a distribution mark its Python as <em>externally managed</em> — the marker is <code>/usr/lib/python3.12/EXTERNALLY-MANAGED</code> — so <code>pip</code> refuses to write into packages that <code>apt</code> owns. Real Ubuntu system tools are written in Python, and a <code>pip</code> upgrade of a shared library can break boot or package operations. On a throwaway box the flag works, and then you restore a snapshot, forget you used it, and cannot reproduce your own result.</p></details></li>
+<li><code>minibox.sh</code> is a container runtime. Name three things it lacks that are not mechanisms.
+<details class="reveal"><summary>Answer</summary><p>A <strong>written description</strong> another program could read or generate (that is <code>config.json</code>); a <strong>name or ID</strong> by which a second tool could find the container; and a <strong>defined lifecycle</strong> — an agreed way to ask it to create, start, stop or delete. All three are agreements, not machinery. It also has no image format, no registry and no network calling convention.</p></details></li>
+<li>Why must a runtime isolate before it drops capabilities, and what does that cost a shell-script runtime?
+<details class="reveal"><summary>Answer</summary><p><code>unshare(2)</code> and <code>pivot_root(2)</code> both need <code>CAP_SYS_ADMIN</code>; drop it first and the runtime fails with <code>EPERM</code> having isolated nothing. Because <code>pivot_root</code> then makes the host's <code>/usr</code> unreachable, a bash runtime has to ship <code>capsh</code> and its libraries <em>inside</em> the rootfs to drop anything. <code>runc</code> is one process that unshares, pivots, drops and execs, so its own code is still in memory when it gives up privilege.</p></details></li>
+<li>Why install containerd from a tarball instead of <code>apt</code> on Ubuntu 24.04?
+<details class="reveal"><summary>Answer</summary><p>Noble ships the <strong>1.7</strong> line, which predates the configuration layout this track teaches: 2.0 moved the config to <code>version = 3</code> and split the CRI plugin into <code>io.containerd.cri.v1.runtime</code> and <code>io.containerd.cri.v1.images</code>; 2.3 moved the config again to <code>version = 4</code>. Learning 1.7's layout and then meeting 2.x on a real node is the worst of both.</p></details></li>
+<li><code>ctr</code>, <code>crictl</code> and <code>nerdctl</code> can all list containers on the same box and disagree. Why?
+<details class="reveal"><summary>Answer</summary><p>They cut into the same chain at different heights and, crucially, look in different <strong>containerd namespaces</strong> — containerd's own metadata partitions, unrelated to Linux or Kubernetes namespaces. <code>crictl</code> speaks CRI and sees pod sandboxes in the <code>k8s.io</code> namespace; <code>ctr</code> speaks containerd's native API and defaults to <code>default</code>; <code>nerdctl</code> is a Docker-shaped face on the same daemon. A container created by one is invisible to the others unless you name the namespace.</p></details></li>
+<li>Which of those tools would you use to ask "does this image tag exist and what is its digest", and why is it none of the above?
+<details class="reveal"><summary>Answer</summary><p><code>skopeo</code>. It talks to registries over HTTP and needs no runtime, no daemon and nothing pulled locally — which makes it the right tool precisely because it takes containerd out of the picture. I4 and I5 lean on it heavily.</p></details></li>
+<li>Your fresh containerd reports <code>NetworkReady: false</code>. Is something broken?
+<details class="reveal"><summary>Answer</summary><p>No — something is <em>absent</em>. There is no CNI configuration in <code>/etc/cni/net.d</code> yet, so the runtime correctly reports it cannot attach a pod to a network. This is the purest form of the most common cause of a node stuck in <code>NotReady</code> after <code>kubeadm init</code>: the cluster is fine, the CNI has simply not been installed.</p></details></li>
+<li><code>runc --version</code> prints <code>1.5.1</code> and <code>spec: 1.3.0</code>. What are those two numbers?
+<details class="reveal"><summary>Answer</summary><p>The first is runc's own release version. The second is the version of the <strong>OCI runtime specification</strong> it implements — the same number that appears as <code>ociVersion</code> in a generated <code>config.json</code>. They move independently: a bundle declares which edition of the standard it complies with, not which runtime wrote it.</p></details></li>
+<li>In RFC 2119 terms, where do portability bugs live, and why?
+<details class="reveal"><summary>Answer</summary><p>Under <strong>MAY</strong> / <strong>OPTIONAL</strong>. If a spec says a runtime may do something, two conforming implementations can differ — so code that assumes the behaviour happens is broken on the one that doesn't, and neither implementation has a bug. <code>features.md</code> exists so a runtime can advertise which optional things it actually supports.</p></details></li>
+<li>Is <code>process</code> required in a <code>config.json</code>?
+<details class="reveal"><summary>Answer</summary><p>Both answers are right, which is the lesson. The spec says "<code>process</code> (object, OPTIONAL)" and then, in the very next sentence, "This property is REQUIRED when <code>start</code> is called." So a runtime may accept and <code>create</code> a bundle without it, and must fail at <code>start</code>. Reading the parenthesis alone gets you the wrong answer.</p></details></li>
+<li>The OCI runtime specification says nothing about images, registries or networking. Is that a gap?
+<details class="reveal"><summary>Answer</summary><p>No — it is deliberate separation. Those are three <em>other</em> standards (image-spec, distribution-spec, CNI) that version independently, which is what lets you swap a registry without touching your runtime. "The spec is silent on this" is a real and frequent answer, and recognising it beats guessing which implementation's behaviour is the standard one.</p></details></li>
+<li>Why does <code>toolcheck.sh</code> not exit at the first missing tool, and why does it not use <code>set -e</code>?
+<details class="reveal"><summary>Answer</summary><p>Because a tool that stops at the first error turns one broken install into five runs — it counts failures, prints the whole table, and exits non-zero at the end. <code>set -e</code> is off for the same reason: the script's entire job is to run commands that may fail and report on them. <code>set -uo pipefail</code> keeps the useful halves.</p></details></li>
+<li>Which component in the table has no configuration file at all, and why is that significant?
+<details class="reveal"><summary>Answer</summary><p><code>runc</code>. Every input it takes arrives as the bundle's <code>config.json</code>, so its behaviour is a pure function of its inputs — which is exactly what makes it replaceable by any other conforming runtime. A component with no hidden state is the practical payoff of having a specification.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Stand up, snapshot and restore a build box, and justify why it is separate from both other tracks' machines.</li>
+<li>Explain PEP 668 from the marker file, and work inside a venv without being tempted by the escape hatch.</li>
+<li>Run a bash container runtime and a hand-built pod network, and name what each one lacks — agreements, not mechanisms.</li>
+<li>Install containerd, runc and the CNI plugins at pinned versions from the projects' own releases, and say what the distro package would have cost you.</li>
+<li>Draw the kubelet → CRI → containerd → shim → runc → process chain from memory, and place each client tool on it.</li>
+<li>Read an OCI specification: apply RFC 2119 keywords, navigate the document set, and find a normative sentence in under a minute.</li>
+<li>Print the whole toolchain's versions and config paths in one command, and know which absences are normal.</li>
+</ul>
+</div>
+
 <div class="godeep"><a href="../beginner.html#b14">Beginner B14 · where <code>minibox.sh</code> is built one layer at a time →</a></div>
 
 <nav class="pager"><a href="../intermediate.html#i0">← Intermediate tracker</a><a href="../intermediate.html#i1">I1 · The primitives the beginner track left out →</a></nav>
