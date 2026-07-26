@@ -931,7 +931,7 @@ the `intermediate-track-plan` memory.
 | Phase | Scope |
 |---|---|
 | **I-S1** | This document. Docs-only commit |
-| **I-S2** | Wiring, no content: `.specref` in `site.css`; `tools/check-links.sh` third track; switcher pill made live in all 35 pages; stub `intermediate.html` with `PUBLISHED=[]`; `labs/intermediate/seed/` populated from the beginner artifacts |
+| **I-S2** | ✅ **done.** Wiring, no content: `.specref` in `site.css`; `tools/check-links.sh` third track; switcher pill made live in all 35 pages; stub `intermediate.html` with `PUBLISHED=[]`; `labs/intermediate/seed/` populated from the beginner artifacts. Two notes for later sessions: the stub's counters fall back to a `PLANNED={cps:195,hrs:78}` constant while no `section.wk[id^="i"]` exists — **delete it once I-S3 lands real sections**, or the fallback silently masks a selector bug; and the seed scripts are `bash -n`-clean but have **never been run live** (no `buildbox` yet), so I0 must run both end to end and paste real output |
 | **I-S3** | `intermediate.html` sections **I0–I6** (96 checkpoints) |
 | **I-S4** | `intermediate.html` sections **I7–I13** (99 checkpoints) + hours panel |
 | **I-S5** | `materials/i0.html` — **the pattern-setter**: establishes `.specref`, the back-reference habit, the toolchain table. Review before continuing |
