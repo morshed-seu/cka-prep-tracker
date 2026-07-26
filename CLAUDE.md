@@ -5,7 +5,7 @@ Dependency-free static site (GitHub Pages) that takes a user from zero to passin
 | Track | Tracker | Lessons | Plan | Status |
 |---|---|---|---|---|
 | **Beginner** — the Linux/networking/distributed-systems machinery Kubernetes is built from | `beginner.html` | `materials/b0…b14.html` | [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) | ✅ complete (B-S1…B-S19; 225 checkpoints) |
-| **Intermediate** — composing that machinery into containers, runtimes, images, CNI | `intermediate.html` | `materials/i0…i13.html` | [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) | 🚧 spec + wiring done (I-S1/I-S2); tracker stub live, `PUBLISHED=[]`; 14 modules / 195 checkpoints planned |
+| **Intermediate** — composing that machinery into containers, runtimes, images, CNI | `intermediate.html` | `materials/i0…i13.html` | [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) | 🚧 I-S1…I-S3 done; **I0–I6 tickable (96 of 195 cp)**, I7–I13 next, `PUBLISHED=[]` (no lesson pages yet) |
 | **Advanced** — Kubernetes itself, through the CKA | `index.html` | `materials/w0…w8.html` | [`docs/PLAN.md`](docs/PLAN.md) | ✅ complete |
 
 Decisions already made (don't re-ask): fully self-contained lesson depth; all four extras (fault scripts, quizzes, cheat sheets, mock exam); implement one phase per session, in track/week order.
@@ -99,7 +99,7 @@ Full spec: [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) — 14 mod
 |---|---|---|
 | I-S1 | `docs/INTERMEDIATE-TRACK.md` — curriculum spec (docs-only commit) | ✅ done |
 | I-S2 | Wiring, no content: `.specref` in `site.css`; third track in `check-links.sh`; switcher pill made live in all 35 existing pages; stub `intermediate.html` (`PUBLISHED=[]`); `labs/intermediate/seed/` | ✅ done |
-| I-S3 | `intermediate.html` sections I0–I6 (96 checkpoints) | |
+| I-S3 | `intermediate.html` sections I0–I6 (96 checkpoints) | ✅ done |
 | I-S4 | `intermediate.html` sections I7–I13 (99 checkpoints) + hours panel | |
 | I-S5 | `materials/i0.html` — **pattern-setter** (`.specref`, back-reference habit, toolchain table); review before continuing | |
 | I-S6 … I-S18 | `materials/i1.html` … `materials/i13.html`, one module per session | |
