@@ -8,9 +8,11 @@
 # pointing back at B14, because the argument is about what the standards added
 # to *this file*, not about the file itself.
 #
-# Two differences from the lesson's version, both marked below:
+# Three differences from the lesson's version, all marked below:
 #   * an --init mode that builds the busybox rootfs B14.1 assembles by hand;
-#   * the launcher quotes its arguments instead of splitting them on spaces.
+#   * the launcher quotes its arguments instead of splitting them on spaces;
+#   * the capability drop happens INSIDE, after pivot_root, not before unshare —
+#     see the note above stage 2. I0.3 and I3 both come back to why.
 #
 # Usage (on a throwaway VM, as root):
 #   sudo ./minibox.sh --init            # build /srv/minibox from /bin/busybox
@@ -44,7 +46,26 @@ init_rootfs() {                      # B14.1, as a function instead of by hand
   echo "$NAME" > "$ROOT/lower-conf/etc/hostname"
   printf 'root:x:0:0:root:/root:/bin/sh\n' > "$ROOT/lower-conf/etc/passwd"
   printf 'nameserver %s\n' "${DNS:-8.8.8.8}" > "$ROOT/lower-conf/etc/resolv.conf"
+  install_capsh
   echo "rootfs ready: $(find "$ROOT/lower-base/bin" -type l | wc -l) applets in $ROOT/lower-base/bin"
+}
+
+# capsh has to live INSIDE the rootfs, because the capability drop is the last
+# thing that happens before the workload runs — and by then pivot_root has made
+# the host's /usr unreachable. runc needs no such trick: it is one process that
+# unshares, pivot_roots, drops caps and execs, so it still has its own code in
+# memory at the moment it drops privilege. This is the price of writing a
+# runtime as a shell script that keeps handing control to other binaries.
+install_capsh() {
+  local capsh; capsh=$(command -v capsh) || {
+    echo "install capsh first: apt install -y libcap2-bin" >&2; exit 1; }
+  install -d -m 755 "$ROOT/lower-base"/{lib64,lib/x86_64-linux-gnu}
+  install -m 755 "$capsh" "$ROOT/lower-base/bin/capsh"
+  # ldd names exactly the shared objects the loader will look for; copy those,
+  # nothing else, so the rootfs stays a rootfs and not a copy of the host.
+  ldd "$capsh" | awk '/=> \//{print $3} /ld-linux/{print $1}' | while read -r so; do
+    install -m 755 "$so" "$ROOT/lower-base$so"
+  done
 }
 
 mount_rootfs() {                     # B14.1 — the overlay: lower + upper + work
@@ -89,6 +110,7 @@ enter_rootfs() {                     # B14.2 — runs INSIDE the new namespaces
   pivot_root . .oldroot
   cd /
   umount -l /.oldroot && rmdir /.oldroot          # the host filesystem is now unreachable
+  hash -r                                         # bash cached /usr/bin/mount; that path is gone
   mount -t proc proc /proc                        # the step everyone forgets
   hostname "$NAME"
 }
@@ -102,9 +124,14 @@ clean() {
 }
 
 # ---- stage 2: we are already inside the namespaces ----
+# Order matters and is the correction B14's listing gets wrong: unshare(2) and
+# pivot_root(2) both require CAP_SYS_ADMIN, so a runtime that drops it first
+# fails with EPERM before it has isolated anything. Isolate, then disarm.
 if [ "${_MINIBOX_STAGE:-}" = "inside" ]; then
   enter_rootfs
-  exec "${@:-/bin/sh}"
+  exec /bin/capsh --drop=cap_sys_admin,cap_net_admin,cap_sys_module,cap_sys_time \
+    --no-new-privs --shell=/bin/sh -- \
+    -c "exec $(printf '%q ' "${@:-/bin/sh}")"
 fi
 
 # ---- stage 1: the launcher, on the host ----
@@ -116,16 +143,10 @@ esac
 mount_rootfs
 setup_cgroup
 
-# Quote each argument so a command with spaces survives the trip through
-# capsh's -c string. (B14's version used a bare $*, which splits them.)
-cmd=$(printf '%q ' "$0" "$@")
-
 # The child is backgrounded rather than exec'd, because setup_net has to run on
 # the HOST against the child's pid — which is exactly how every real runtime
 # does it: the runtime creates the netns, then the network plugin configures it.
-_MINIBOX_STAGE=inside capsh \
-  --drop=cap_sys_admin,cap_net_admin,cap_sys_module,cap_sys_time --no-new-privs -- \
-  -c "exec unshare --mount --pid --uts --ipc --net --fork $cmd" &
+_MINIBOX_STAGE=inside unshare --mount --pid --uts --ipc --net --fork "$0" "$@" &
 child=$!
 
 # Wait for unshare to actually enter its new netns before wiring it: until the
