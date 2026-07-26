@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Intermediate module I0: build and snapshot buildbox, install containerd, runc, the CNI plugins, crictl, nerdctl and skopeo at pinned versions, bootstrap the two beginner-track artefacts the track argues about, and learn to read an OCI specification.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I0 · Your build box — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I0 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Intermediate tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i0">← Back to the intermediate tracker</a></p>
+<header class="hero">
+  <h1>I0 — Your build box</h1>
+  <p>This track takes apart software that other people wrote: <code>containerd</code>, <code>runc</code>, the CNI plugins, a registry. Taking software apart means stopping it mid-flight, editing its configuration to something wrong on purpose, and occasionally leaving it in a state where nothing starts. So the first module builds a second machine for that — <code>buildbox</code> — and then installs every component of the container stack on it at a version you chose and wrote down.</p>
+  <p>The version part is not bookkeeping. For the rest of this track, "my output doesn't match the lesson's" is nearly always a version answer, and the fastest way to settle it is a table you can print in one command. That table is this module's mini project.</p>
+  <div class="weights">
+    <span>Checkpoints<b>8</b></span>
+    <span>Hours<b>~2</b></span>
+    <span>Prerequisites<b>the beginner track, or equivalent</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Stand up and snapshot a second throwaway VM, and say why it is neither the beginner sandbox nor a cluster node.</li>
+<li>Create the Python environment this track's programs run in, and explain the error you get without it.</li>
+<li>Bootstrap the two beginner-track artefacts — a bash container runtime and a hand-built pod network — and confirm both actually run.</li>
+<li>Install containerd, runc and the CNI plugins from the projects' own releases rather than from <code>apt</code>, and say why that matters on Ubuntu 24.04.</li>
+<li>Draw the map of which binary owns which layer, from the kubelet down to the workload process.</li>
+<li>Read an OCI specification: RFC 2119 keywords, how the documents are laid out, and how to find the sentence that settles an argument.</li>
+<li>Print the whole toolchain's versions and config paths in one command, and fail loudly when something is missing.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p>The <a href="../beginner.html">Beginner track</a>, or equivalent fluency with namespaces, cgroups v2, overlayfs and Linux networking — this track never re-teaches those, it only extends them. If you skipped it, you can still start here: the two artefacts the track argues about ship in <code>labs/intermediate/seed/</code> and I0.3 installs them for you.</p>
+<p>On your host you need room for a second VM: 4 vCPU, 8 GB RAM and 40 GB of disk while it is running. Unlike the beginner sandbox, this machine <strong>needs working internet</strong> — pulling real images from real registries is the subject matter of I4–I6, not a setup step.</p>
+</div>
+
+<!-- ---------------- The box ---------------- -->
+<div class="grp" id="g-box"><h3>The box</h3>
+
+<article class="lesson" id="cp-i0-1" data-id="i0-1">
+<div class="lesson-head"><span class="cp-id">I0.1</span><h4>Launch <code>buildbox</code>, and know why it is a third machine</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You almost certainly already have virtual machines from the other two tracks — a <code>sandbox</code> from <a href="b0.html#cp-b0-4">B0.4</a>, and possibly a three-node cluster from <a href="w0.html#cp-0-5">W0.5</a>. It is tempting to reuse one. Doing so is the single most likely way to lose an afternoon in this track, and the reasons are worth stating before you type anything, because each of them is really a fact about what containers do to a machine.</p>
+<h5>The concept</h5>
+<p>Three reasons, in order of how badly each one bites.</p>
+<ul>
+<li><strong>Not the beginner <code>sandbox</code>.</strong> That machine is 2 vCPU / 4 GB / 20 GB, which is fine for unshare-and-cgroup experiments and not fine for pulling and unpacking real images: a handful of ordinary base images plus a local registry plus a BuildKit cache will fill 20 GB, and image builds are the one thing in this track that genuinely wants cores. Its <code>clean</code> snapshot is also a beginner-track asset you may still want intact.</li>
+<li><strong>Not the CKA lab's <code>cp</code>/<code>node01</code>/<code>node02</code>.</strong> These labs stop containerd, rewrite its configuration, restart it, point <code>crictl</code> at it, and in I9 replace the CNI configuration on disk. Every one of those actions breaks a running Kubernetes node — that node's kubelet is talking to the same containerd through the same socket. The advanced track depends on that cluster staying up.</li>
+<li><strong>It needs internet, and the beginner sandbox deliberately did not.</strong> B0 built a machine that could work entirely offline, because a beginner-track lab that fails because DNS is down teaches nothing. Here, <em>the network is the subject</em>: an image is something you fetch from a registry over HTTPS, and I5 spends a whole module doing that by hand with <code>curl</code>.</li>
+</ul>
+<p>One more habit carried straight from B0: name the Ubuntu release by number. <code>multipass launch lts</code> is a moving alias — as of July 2026 it resolves to Ubuntu 26.04, not 24.04 — and the failure is silent, because the VM boots and every command exists and only the details disagree with the pasted output in these lessons.</p>
+<p>The <strong>snapshot</strong> reflex matters more here than it did in the beginner track, not less. There, you broke things you had built yourself and could rebuild. Here you will break <code>containerd</code>'s configuration, and the difference between a five-second restore and an hour of reading someone else's TOML is entirely down to whether you took the snapshot first.</p>
+<div class="flow"><span>launch</span><em>→</em><span>install toolchain</span><em>→</em><span class="hot">snapshot <code>clean</code></span><em>→</em><span>wreck freely</span><em>→</em><span class="hot">restore</span></div>
+<h5>Lab</h5>
+<ol>
+<li>Launch the machine, naming the release explicitly. The first run downloads a cloud image if you do not already have 24.04 cached; later launches are quick.
+<pre class="cmd">multipass launch 24.04 --name buildbox --cpus 4 --memory 8G --disk 40G</pre>
+<pre class="out">Launched: buildbox</pre></li>
+<li>Confirm it is up and that both your machines are visible side by side. Seeing them together is the point — you are meant to know which one you are typing into.
+<pre class="cmd">multipass list</pre>
+<pre class="out">Name       State     IPv4            Image
+<b>buildbox   Running   10.75.158.x     Ubuntu 24.04 LTS</b>
+sandbox    Running   10.75.158.158   Ubuntu 24.04 LTS</pre></li>
+<li>Get a shell and confirm the release and the cgroup hierarchy. The second check is the one that matters: it proves the unified cgroup v2 tree that every resource lesson in this track assumes, rather than trusting the label on the image.
+<pre class="cmd">multipass shell buildbox</pre>
+<pre class="cmd">lsb_release -cs
+stat -fc %T /sys/fs/cgroup
+nproc; free -h | head -2</pre>
+<pre class="out"><b>noble</b>
+<b>cgroup2fs</b>
+<b>4</b>
+               total   used   free  shared  buff/cache  available
+Mem:           <b>7.8Gi</b>   0.3Gi  7.1Gi   1.0Mi       0.5Gi       <b>7.4Gi</b></pre></li>
+<li>Prove the machine can reach a registry before you depend on it. This is one unauthenticated HTTP request to Docker Hub's registry API; a <code>200</code> means DNS, routing and TLS all work.
+<pre class="cmd">curl -sI https://registry-1.docker.io/v2/ | head -1
+curl -sI https://github.com | head -1</pre>
+<pre class="out">HTTP/1.1 <b>401</b> Unauthorized
+HTTP/2 <b>200</b></pre>
+<p>A <code>401</code> from the registry is the correct answer, not a failure: the API is telling you it works and wants a token. I5 is the module that goes and gets one.</p></li>
+<li>Leave the VM (<code>exit</code>), then take the baseline snapshot and practise putting it back. Do this once now while nothing is installed, so the reflex exists before it is expensive.
+<pre class="cmd">multipass stop buildbox
+multipass snapshot buildbox --name blank
+multipass start buildbox
+multipass exec buildbox -- sudo rm /etc/hostname
+multipass stop buildbox
+multipass restore --destructive buildbox.blank
+multipass start buildbox
+multipass exec buildbox -- cat /etc/hostname</pre>
+<pre class="out">Snapshot taken: buildbox.blank
+<b>buildbox</b></pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>multipass list --snapshots</code> shows <code>blank</code> on <code>buildbox</code>; inside the VM <code>lsb_release -cs</code> prints <code>noble</code>, <code>nproc</code> prints <code>4</code>, and <code>stat -fc %T /sys/fs/cgroup</code> prints <code>cgroup2fs</code>. If you kept the beginner track's <code>snapshot.sh</code>/<code>restore.sh</code> from <a href="b0.html#cp-b0-9">B0.9</a>, they already take an instance name — <code>snapshot.sh buildbox</code> works today with no edits.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>If <code>multipass launch</code> fails for lack of memory, remember that the beginner sandbox and the three CKA VMs are probably still running and holding their own allocations. <code>multipass stop sandbox cp node01 node02</code> frees them; nothing in this track needs them running at the same time as <code>buildbox</code>.</p>
+<p>A freshly launched VM keeps working for a minute or two after it prints <code>Launched</code> — <code>cloud-init</code> is still finishing first-boot setup and holds <code>apt</code>'s lock while it does. If the next lesson's <code>apt</code> complains it cannot get a lock, wait it out with <code>cloud-init status --wait</code> rather than killing the lock holder.</p>
+<p>You will take a second snapshot at the end of this module, once the toolchain is installed. Keep both: <code>blank</code> is the floor you fall back to if an install goes wrong, and <code>clean</code> (I0.8) is the one you will actually use between modules.</p>
+<div class="k8s-link">
+<p>Everything you install on this box over the next hour is what the advanced track's <a href="w0.html#cp-0-6">W0.6 — install containerd + kubeadm/kubelet/kubectl by hand</a> installs on every node of a cluster, minus the Kubernetes parts. A node is a machine with exactly this stack on it plus a kubelet; <code>kubeadm</code> adds no container machinery of its own.</p>
+<p>The snapshot habit is the same one <a href="w0.html#cp-0-8">W0.8</a> asks for on the cluster VMs, and for the same reason: the fastest fix for a control plane you broke while learning is not a repair, it is a restore.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>multipass help launch</code>, <code>multipass help snapshot</code>, <code>multipass help restore</code>. Inside the VM, <code>man 1 stat</code> (note that <code>-f</code> asks about the <em>filesystem</em>) and <code>man 7 cgroups</code>, which is the primary source you will be arguing with in I1.</p>
+</article>
+
+<article class="lesson" id="cp-i0-2" data-id="i0-2">
+<div class="lesson-head"><span class="cp-id">I0.2</span><h4>The Python environment, and the error you get without it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Several modules of this track ask you to write a program rather than run one: an image parser in I4, a registry client in I5, a toy CRI server in I8, a CNI plugin in I9. Those are written in Python 3, and on Ubuntu 24.04 installing a Python library the obvious way fails with an error message that looks like a bug and is not. Meeting it deliberately now, with an explanation, costs two minutes; meeting it in the middle of I5 costs your concentration.</p>
+<h5>The concept</h5>
+<p>A <strong>virtual environment</strong> (a "venv") is a directory containing its own <code>python3</code>, its own <code>pip</code>, and its own <code>site-packages</code> folder. Activating one puts that directory first on your <code>PATH</code>, so <code>python3</code> means the copy in the venv and every library you install lands inside it. Deleting the directory uninstalls everything you ever put in it. Nothing is global; nothing is shared.</p>
+<p>Ubuntu insists on this, and the mechanism has a name. <strong>PEP 668</strong> lets a distribution mark its Python installation as <em>externally managed</em> — meaning "<code>apt</code> owns the packages here, do not let <code>pip</code> write into them". The marker is a real file you can look at:</p>
+<pre class="cmd">cat /usr/lib/python3.12/EXTERNALLY-MANAGED</pre>
+<pre class="out">[externally-managed]
+Error=To install Python packages system-wide, try apt install
+ python3-xyz, where xyz is the package you are trying to
+ install. ...</pre>
+<p>The reason is not tidiness. On Ubuntu, real system tools are written in Python — <code>cloud-init</code>, parts of the installer, <code>apt</code>'s own helpers — and they import libraries that <code>apt</code> installed at specific versions. A <code>pip install</code> that upgrades one of those libraries system-wide can leave the machine unable to finish a boot or complete a package operation. The escape hatch <code>--break-system-packages</code> exists and is named honestly. Use the venv.</p>
+<p>One thing a venv does <em>not</em> do: it does not isolate you from the kernel, from files, or from anything else. It is a <code>PATH</code> trick and a directory, not a container. That distinction is worth holding onto for the whole track — you are about to spend fourteen modules on the machinery that does provide real isolation, and "virtual environment" is a name that invites the confusion.</p>
+<h5>Lab</h5>
+<ol>
+<li>Install the venv module and — so you can see the failure — <code>pip</code> itself, which the cloud image does not ship.
+<pre class="cmd">sudo apt update
+sudo apt install -y python3-venv python3-pip jq tree</pre></li>
+<li>Reproduce the error on purpose. Do not skip this: the point is to recognise it instantly the next time it appears, in someone else's terminal, in a bug report.
+<pre class="cmd">pip install requests</pre>
+<pre class="out"><b>error: externally-managed-environment</b>
+
+× This environment is externally managed
+╰─&gt; To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    ...</pre></li>
+<li>Create the track's environment. Every Python lab from here on assumes this exact path, so that a lesson can say "activate the venv" without repeating itself.
+<pre class="cmd">python3 -m venv ~/.venv-intermediate
+source ~/.venv-intermediate/bin/activate</pre></li>
+<li>Confirm the activation actually changed which interpreter you are running, then install something into it.
+<pre class="cmd">which python3
+pip install requests
+python3 -c 'import requests; print(requests.__version__)'</pre>
+<pre class="out"><b>/home/ubuntu/.venv-intermediate/bin/python3</b>
+Successfully installed ... requests-2.34.2 ...
+<b>2.34.2</b></pre></li>
+<li>Make it automatic, so you never debug an <code>ImportError</code> that was really an unactivated venv.
+<pre class="cmd">echo 'source ~/.venv-intermediate/bin/activate' &gt;&gt; ~/.bashrc</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Open a fresh shell (<code>exit</code>, then <code>multipass shell buildbox</code>). The prompt is prefixed with <code>(.venv-intermediate)</code>, <code>which python3</code> points inside your home directory, and <code>python3 -c 'import requests'</code> prints nothing and exits 0.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>sudo python3 …</code> does <strong>not</strong> use your venv. <code>sudo</code> resets the environment, so the root shell gets <code>/usr/bin/python3</code> and none of your installed libraries — which produces a baffling <code>ModuleNotFoundError</code> for a module you can see is installed. When a lab genuinely needs both root and the venv, spell out the interpreter: <code>sudo ~/.venv-intermediate/bin/python3 script.py</code>.</p>
+<p>Do not be tempted by <code>--break-system-packages</code> "just this once on a throwaway VM". It works, and then two modules later you restore a snapshot, forget you used it, and cannot reproduce your own result. The venv costs one line in <code>.bashrc</code>.</p>
+<div class="k8s-link">
+<p>No direct counterpart — this is toolchain hygiene, not a Kubernetes mechanism. It earns its place because the same instinct shows up one level up: a container image exists largely so that an application's dependencies are pinned somewhere that cannot collide with the host's.</p>
+<p>Keep the comparison in mind when you reach <a href="w3.html#cp-3-16">W3.16 — requests vs limits</a> and, later here, I4's layer model: a venv isolates <em>a search path</em>, an image isolates <em>a filesystem</em>, and a container isolates <em>kernel resources</em>. Three different strengths of the same word.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://peps.python.org/pep-0668/">PEP 668</a> for the marker file and why distributions wanted it; <code>man 1 python3</code>; <code>python3 -m venv --help</code>. The Python packaging guide's "Installing packages using pip and virtual environments" is the canonical how-to.</p>
+</article>
+
+<article class="lesson" id="cp-i0-3" data-id="i0-3">
+<div class="lesson-head"><span class="cp-id">I0.3</span><h4>Seed the two artefacts this whole track argues about</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This track's thesis is that the container ecosystem added remarkably little <em>mechanism</em> — it added <em>contracts</em>. That claim is only interesting if you are holding the mechanism in your hands while someone shows you the contract. The two scripts you install now are that mechanism: a container runtime in about eighty lines of bash, and a pod network in about forty. Every module from here compares a real component against one of them.</p>
+<h5>The concept</h5>
+<p>Look at what you are holding before anyone calls it primitive.</p>
+<p><code>minibox.sh</code> — the assembled form of what <a href="b14.html#cp-b14-1">B14.1–B14.4</a> build one layer at a time — mounts an <strong>overlay filesystem</strong> (a stack of read-only directories with one writable layer on top, exactly the shape a container image has), <code>unshare</code>s five <strong>namespaces</strong> so the process gets its own mounts, process list, hostname, IPC and network, writes CPU, memory and PID limits into a <strong>cgroup</strong>, <code>pivot_root</code>s so the host filesystem becomes unreachable, drops four <strong>capabilities</strong>, and execs your command. Then it wires a <strong>veth pair</strong> into a bridge on the host, gives the inside end an address and a default route, and adds a NAT rule so it can reach the internet.</p>
+<p>That is a container runtime. It is not a toy version of one; it is one. What it lacks is not machinery but agreement: there is no file another program could read to learn what this container is, no name by which a second tool could find it, no defined way to ask it to stop, and no way to hand the same description to a different implementation and get the same container. It has no bugs a specification would have caught, because it has no specification.</p>
+<p><code>net-up.sh</code> — the beginner track's <a href="b9.html#cp-b9-19">B9.19</a> mini project — is the same story for networking: it creates <em>N</em> network namespaces on one bridge, allocates each an address, routes between them, and masquerades their egress. That is a pod network: IP address management, the wiring, and the egress path. What it lacks is a calling convention, which is precisely and only what CNI adds.</p>
+<table>
+<tr><th>You already built</th><th>The standard that later formalised it</th><th>Module</th></tr>
+<tr><td><code>minibox.sh</code>'s namespace + cgroup + rootfs setup</td><td>OCI runtime-spec <code>config.json</code></td><td>I2</td></tr>
+<tr><td>the <code>unshare</code>/<code>pivot_root</code>/<code>exec</code> sequence</td><td><code>runc</code> and the runtime lifecycle</td><td>I3</td></tr>
+<tr><td>the overlay <code>lowerdir</code> stack</td><td>OCI image-spec layers and digests</td><td>I4</td></tr>
+<tr><td>copying a rootfs onto the box by hand</td><td>OCI distribution-spec (a registry)</td><td>I5</td></tr>
+<tr><td><code>net-up.sh</code>'s veth + bridge + IPAM + NAT</td><td>CNI: "exec a binary, JSON in, JSON out"</td><td>I9</td></tr>
+</table>
+<p>One correction ships with the seed copy, and it is worth reading because it is a genuine ordering bug that the specification-free version invites. <code>unshare(2)</code> and <code>pivot_root(2)</code> both require <code>CAP_SYS_ADMIN</code>. A runtime that drops that capability <em>before</em> it isolates the process fails with <code>EPERM</code> having isolated nothing. So the rule is <strong>isolate, then disarm</strong> — and because <code>pivot_root</code> has by then made the host's <code>/usr</code> unreachable, the seed script has to copy <code>capsh</code> and its shared libraries into the rootfs to be able to drop anything at all. <code>runc</code> needs no such trick: it is a single process that unshares, pivots, drops and execs, so its own code is still in memory at the moment it gives up privilege. Keep that in mind; I3 is that lesson.</p>
+<h5>Lab</h5>
+<ol>
+<li>Copy both scripts onto the box. They live in this site's repository under <code>labs/intermediate/seed/</code>; from your host, <code>multipass transfer</code> is the direct route (if your Multipass is a snap and cannot read your temp directory, pipe them instead, as the second line shows).
+<pre class="cmd">multipass transfer labs/intermediate/seed/minibox.sh buildbox:/home/ubuntu/minibox.sh
+multipass exec buildbox -- bash -c 'cat &gt; ~/net-up.sh' &lt; labs/intermediate/seed/net-up.sh
+multipass exec buildbox -- chmod +x /home/ubuntu/minibox.sh /home/ubuntu/net-up.sh</pre></li>
+<li>Inside the VM, install the two packages the scripts need. <code>busybox-static</code> is a single binary containing several hundred small Unix tools — it is what makes a 5 MB root filesystem possible without a package manager.
+<pre class="cmd">sudo apt install -y busybox-static libcap2-bin iptables</pre></li>
+<li>Build the root filesystem. This is <a href="b14.html#cp-b14-1">B14.1</a> as a function: it creates the overlay's lower directories, installs busybox's applets as symlinks, writes a three-line <code>/etc</code>, and copies <code>capsh</code> in.
+<pre class="cmd">sudo ~/minibox.sh --init</pre>
+<pre class="out"><b>rootfs ready: 271 applets in /srv/minibox/lower-base/bin</b></pre></li>
+<li>Run something inside it. Read the output line by line — every one of them is a namespace or a cgroup doing its job.
+<pre class="cmd">sudo ~/minibox.sh /bin/sh -c 'id; hostname; ls /; ip -br addr; ping -c1 -W3 10.88.0.1'</pre>
+<pre class="out">uid=0(root) gid=0 groups=0
+<b>minibox</b>                       ← UTS namespace: its own hostname
+bin dev etc lib lib64 proc root sys tmp
+lo    UNKNOWN  127.0.0.1/8
+<b>eth0@if6  UP  10.88.0.2/24</b>     ← network namespace: its own interface
+64 bytes from 10.88.0.1: seq=0 ttl=64 time=0.196 ms</pre></li>
+<li>Confirm the capability drop happened, and that egress through the NAT rule works. <code>capsh --print</code>'s bounding set is the authoritative list of what this process could ever regain.
+<pre class="cmd">sudo ~/minibox.sh /bin/sh -c '/bin/capsh --print | head -2; ping -c1 -W3 8.8.8.8 | tail -2'</pre>
+<pre class="out">Current: =ep <b>cap_net_admin,cap_sys_module,cap_sys_admin,cap_sys_time-ep</b>
+Bounding set =cap_chown,cap_dac_override,...   ← the four are absent
+1 packets transmitted, 1 packets received, 0% packet loss</pre></li>
+<li>Now the network script. <code>up 2</code> creates two namespaces on one bridge; give it a second before testing, because the first packet has to wait for ARP.
+<pre class="cmd">sudo ~/net-up.sh up 2</pre>
+<pre class="out"><b>bridge cni0 = 10.20.0.1/24, egress via ens3</b>
+  pod1 = 10.20.0.2
+  pod2 = 10.20.0.3</pre>
+<pre class="cmd">sudo ip netns exec pod1 ping -c2 -W2 10.20.0.3 | tail -2
+sudo ip netns exec pod1 ping -c1 -W3 8.8.8.8 | tail -2</pre>
+<pre class="out">2 packets transmitted, <b>2 received</b>, 0% packet loss
+1 packets transmitted, <b>1 received</b>, 0% packet loss</pre></li>
+<li>Tear both down. Leaving them up costs you a bridge and a NAT rule that will confuse a later module.
+<pre class="cmd">sudo ~/net-up.sh down
+sudo ~/minibox.sh --clean</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Both scripts ran without an error and both cleaned up: <code>ip netns list</code> is empty, <code>ip link show cni0</code> and <code>ip link show mb0</code> both report <em>does not exist</em>, and <code>ls /srv/minibox</code> reports no such directory. You should be able to say, out loud, which line of <code>minibox.sh</code> creates the isolation and which creates the filesystem.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Both scripts carry a <strong>wrong-box guard</strong>: they refuse to run if <code>/etc/kubernetes</code> exists. That is not paranoia — <code>minibox.sh</code> writes a MASQUERADE rule and <code>net-up.sh</code> flips <code>net.ipv4.ip_forward</code>, and doing either on a cluster node produces a networking failure that is genuinely hard to trace back to its cause. If the guard fires, you are on the wrong machine; do not edit it out.</p>
+<p>If <code>minibox.sh</code> reports <code>unshare failed: Operation not permitted</code> while you <em>are</em> root, you are running a copy with the pre-correction ordering (capabilities dropped before <code>unshare</code>). Re-copy from <code>labs/intermediate/seed/</code>. I1.4 explains the other cause of that message, which applies when you are <em>not</em> root: Ubuntu 24.04 gates unprivileged user namespaces behind AppArmor.</p>
+<p><code>--clean</code> deliberately leaves the NAT rule for <code>10.88.0.0/24</code> in place and says so. Removing a MASQUERADE rule you did not add is a good way to break something else on a shared machine; on <code>buildbox</code> you can flush it yourself with <code>sudo iptables -t nat -F POSTROUTING</code>.</p>
+<div class="k8s-link">
+<p><code>minibox.sh</code> is a pod with one container in it, and <code>net-up.sh</code> is that pod's network. Put them beside <a href="w1.html#cp-1-20">W1.20 — understand CRI: kubelet → containerd → shim → runc</a> and the chain becomes concrete: everything in that lesson exists to turn a YAML object into the sequence of syscalls your two scripts make by hand.</p>
+<p>The clearest single mapping is <a href="w1.html#cp-1-21">W1.21 — meet the pause container</a>. A pod's namespaces have to be created and held open by <em>something</em> before any application container joins them; in <code>minibox.sh</code> that something is the backgrounded <code>unshare</code> whose PID the script wires the veth into. Kubernetes calls the equivalent the sandbox, and I8 is where you create one directly.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">Read the two scripts themselves — they are commented line by line and are the shortest primary source in this track. Then <code>man 7 namespaces</code>, <code>man 2 pivot_root</code>, <code>man 8 ip-netns</code>, <code>man 1 capsh</code>, and <code>man 5 overlayfs</code> (or the kernel's <code>Documentation/filesystems/overlayfs.rst</code>) for the <code>lowerdir</code>/<code>upperdir</code>/<code>workdir</code> triple.</p>
+</article>
+</div>
+
+<div class="godeep"><a href="../beginner.html#b14">Beginner B14 · where <code>minibox.sh</code> is built one layer at a time →</a></div>
+
+<nav class="pager"><a href="../intermediate.html#i0">← Intermediate tracker</a><a href="../intermediate.html#i1">I1 · The primitives the beginner track left out →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble") on Multipass, verified 2026-07-27, with <b>containerd 2.3.3</b>, <b>runc 1.5.1</b> (runtime-spec 1.3.0), <b>CNI plugins v1.9.1</b>, <b>crictl v1.36.0</b>, <b>nerdctl 2.3.5</b> and <b>skopeo 1.13.3</b>. All output on this page was captured from a real run at those versions. containerd ships minor releases on a roughly four-month cadence and its config file has moved from <code>version = 3</code> (2.0) to <code>version = 4</code> (2.3) — generate a fresh config with <code>containerd config default</code> rather than copying one, and re-check the pinned versions against each project's releases page before you file a bug against this page.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
