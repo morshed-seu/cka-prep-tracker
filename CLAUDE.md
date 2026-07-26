@@ -5,7 +5,7 @@ Dependency-free static site (GitHub Pages) that takes a user from zero to passin
 | Track | Tracker | Lessons | Plan | Status |
 |---|---|---|---|---|
 | **Beginner** — the Linux/networking/distributed-systems machinery Kubernetes is built from | `beginner.html` | `materials/b0…b14.html` | [`docs/BEGINNER-TRACK.md`](docs/BEGINNER-TRACK.md) | ✅ complete (B-S1…B-S19; 225 checkpoints) |
-| **Intermediate** — composing that machinery into containers, runtimes, images, CNI | `intermediate.html` | `materials/i0…i13.html` | [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) | 🚧 I-S1…I-S3 done; **I0–I6 tickable (96 of 195 cp)**, I7–I13 next, `PUBLISHED=[]` (no lesson pages yet) |
+| **Intermediate** — composing that machinery into containers, runtimes, images, CNI | `intermediate.html` | `materials/i0…i13.html` | [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) | 🚧 I-S1…I-S4 done; **tracker complete — all 195 cp tickable (I0–I13, 78 h)**, `PUBLISHED=[]` (no lesson pages yet; I-S5 writes `materials/i0.html`) |
 | **Advanced** — Kubernetes itself, through the CKA | `index.html` | `materials/w0…w8.html` | [`docs/PLAN.md`](docs/PLAN.md) | ✅ complete |
 
 Decisions already made (don't re-ask): fully self-contained lesson depth; all four extras (fault scripts, quizzes, cheat sheets, mock exam); implement one phase per session, in track/week order.
@@ -100,7 +100,7 @@ Full spec: [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) — 14 mod
 | I-S1 | `docs/INTERMEDIATE-TRACK.md` — curriculum spec (docs-only commit) | ✅ done |
 | I-S2 | Wiring, no content: `.specref` in `site.css`; third track in `check-links.sh`; switcher pill made live in all 35 existing pages; stub `intermediate.html` (`PUBLISHED=[]`); `labs/intermediate/seed/` | ✅ done |
 | I-S3 | `intermediate.html` sections I0–I6 (96 checkpoints) | ✅ done |
-| I-S4 | `intermediate.html` sections I7–I13 (99 checkpoints) + hours panel | |
+| I-S4 | `intermediate.html` sections I7–I13 (99 checkpoints) + hours panel | ✅ done — **tracker complete: 195 cp / 78 h** |
 | I-S5 | `materials/i0.html` — **pattern-setter** (`.specref`, back-reference habit, toolchain table); review before continuing | |
 | I-S6 … I-S18 | `materials/i1.html` … `materials/i13.html`, one module per session | |
 | I-S19 | `labs/intermediate/i13-*.sh` + `mock/intermediate-final*.html` + cross-track QA | |
@@ -109,7 +109,7 @@ Full spec: [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) — 14 mod
 
 Intermediate specifics that differ from both other tracks: anchors are `data-id="iN-M"` ↔ `id="cp-iN-M"` (the existing one rule covers it); labs run on a **second** throwaway Multipass VM named `buildbox` (Ubuntu 24.04, 4 vCPU / 8 GB / 40 GB) that **needs internet** for registry pulls, never on `sandbox` or the CKA cluster; every conceptual lesson carries **both** a `.specref` ("What the spec actually says") and the inherited `.k8s-link`, plus an inline back-reference to the beginner lesson that built the primitive by hand; **Docs** links point at the OCI/CNI/CRI specs and the containerd/runc repos. Language policy: **CLI-first (`ctr`/`crictl`/`nerdctl`/`runc`/`skopeo`/`cnitool`/`curl`/`jq`), Python 3 where the subject genuinely is a program** — the ecosystem's Go is linked and explained, never required; Python labs assume the `~/.venv-intermediate` venv from I0 because 24.04 enforces PEP 668. The analogy registry gains an intermediate extension (runtime spec = the written work order, runc = the contractor, shim = the on-site foreman, containerd = the building-services company, image = a flat-pack kit, registry = the parts warehouse, sandbox = the room rented before any guest checks in) — it lives in `docs/INTERMEDIATE-TRACK.md` § "Analogy registry — intermediate extension" and extends, never competes with, the two tables below.
 
-**Verified 2026-07-25 and binding on I-S2+ (re-verify each session):** CKA still targets **k8s v1.35**; **containerd 2.3.2** current (noble ships 1.7.28 — the track installs 2.x from the official tarball); **runc v1.5.1**; **OCI image-spec v1.1.1 / runtime-spec v1.3.0 / distribution-spec v1.1.1**; **CNI spec v1.1.0** with six verbs (ADD, DEL, CHECK, **GC**, **STATUS**, VERSION). Also confirmed: the advanced track has **no** `securityContext` / Pod Security Standards anchor anywhere — don't invent one, say so and link what exists.
+**Verified 2026-07-27 and binding on I-S2+ (re-verify each session):** CKA still targets **k8s v1.35**; **containerd 2.3.3** (2026-07-10) current (noble ships 1.7.28 — the track installs 2.x from the official tarball); **runc v1.5.1**; **OCI image-spec v1.1.1 / runtime-spec v1.3.0 / distribution-spec v1.1.1**; **CNI spec v1.1.0** — its own text says *"CNI defines 5 operations: ADD, DEL, CHECK, GC, and VERSION"* and defines **STATUS** alongside them, so quote it that way rather than claiming "six verbs"; **CSI spec v1.11.0**; **in-place pod resize is GA in v1.35** (beta in 1.33), so `UpdateContainerResources` is its GA mechanism. Also confirmed: the advanced track has **no** `securityContext` / Pod Security Standards anchor anywhere — don't invent one, say so and link what exists (I11.5 does).
 
 ## Phase workflow
 
