@@ -147,7 +147,7 @@ sudo runc run hello</pre>
 </div>
 
 <h5>Docs</h5>
-<p class="docs-links">The whole of <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/bundle.md">runtime-spec <code>bundle.md</code></a> is 14 lines long — read it now, in full, because you will never have a cheaper opportunity. Then <code>man 8 runc-spec</code> and <code>man 8 runc-run</code>.</p>
+<p class="docs-links">The whole of <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/bundle.md">runtime-spec <code>bundle.md</code></a> is 22 lines long — read it now, in full, because you will never have a cheaper opportunity. Then <code>man 8 runc-spec</code> and <code>man 8 runc-run</code>.</p>
 </article>
 
 <article class="lesson" id="cp-i2-2" data-id="i2-2">
@@ -984,7 +984,7 @@ sudo runc state life</pre>
 </div>
 
 <h5>Docs</h5>
-<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime-spec <code>runtime.md</code></a> — 112 lines, the whole lifecycle, worth reading in one sitting. <code>man 7 pid_namespaces</code> for the signal rule; <code>man 8 runc-state</code>, <code>man 8 runc-list</code>.</p>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime-spec <code>runtime.md</code></a> — 150 lines, the whole lifecycle, worth reading in one sitting. <code>man 7 pid_namespaces</code> for the signal rule; <code>man 8 runc-state</code>, <code>man 8 runc-list</code>.</p>
 </article>
 
 <article class="lesson" id="cp-i2-10" data-id="i2-10">
@@ -1283,6 +1283,231 @@ The <code>startContainer</code> hooks MUST be called as part of the <code>start<
 
 <h5>Docs</h5>
 <p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#posix-platform-hooks">config.md § POSIX-platform Hooks</a> for the full table including timeouts and the deprecated <code>prestart</code>. <a href="https://github.com/NVIDIA/nvidia-container-toolkit">NVIDIA/nvidia-container-toolkit</a> if you want to read a hook that people actually run in production.</p>
+</article>
+</div>
+
+<!-- ---------------- Boundaries ---------------- -->
+<div class="grp" id="g-bound"><h3>Boundaries</h3>
+
+<article class="lesson" id="cp-i2-13" data-id="i2-13">
+<div class="lesson-head"><span class="cp-id">I2.13</span><h4>What the specification refuses to standardise</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You now know what a container is, formally — and the list of things that definition leaves out is startlingly long. Images. Registries. Networking. Logs. Names. Restart policy. Storage. Every one of those is something you would call essential, and none of them appears in the document. That is not an oversight; it is the design. And the list of omissions turns out to be this track's table of contents, derived rather than announced, which is a far better way to hold it.</p>
+
+<h5>The concept</h5>
+<p>The specification's abstract says exactly what it covers: <em>configuration, execution environment, and lifecycle</em>. Everything outside those three words was left to somebody else, on purpose, because a standard that covered them would have had to pick a winner in arguments that were still live in 2015 — and would have been ignored.</p>
+<p>The omissions, and who filled each gap:</p>
+<table class="langpair"><thead><tr><th>not in the runtime spec</th><th>the gap it leaves</th><th>filled by</th></tr></thead><tbody>
+<tr><td><strong>Images</strong></td><td>Where does <code>rootfs/</code> come from? What is a layer? How is one identified?</td><td>OCI image spec — <strong>I4</strong></td></tr>
+<tr><td><strong>Registries</strong></td><td>How do you fetch one over a network? Who authenticates?</td><td>OCI distribution spec — <strong>I5</strong></td></tr>
+<tr><td><strong>Building</strong></td><td>How does a source tree become an image?</td><td>Nobody, formally — Dockerfile/BuildKit are de facto only — <strong>I6</strong></td></tr>
+<tr><td><strong>Names and lifecycle policy</strong></td><td>Container ids are opaque strings the caller invents. Nothing restarts anything.</td><td>The runtime layer: containerd — <strong>I7</strong></td></tr>
+<tr><td><strong>Networking</strong></td><td>The spec joins or creates a network namespace and stops. No addresses, no routes, no DNS.</td><td>CNI — <strong>I9</strong></td></tr>
+<tr><td><strong>Storage</strong></td><td><code>mounts</code> assumes something already mounted it.</td><td>CSI (and snapshotters) — <strong>I10</strong></td></tr>
+<tr><td><strong>Logging</strong></td><td>stdout goes to a file descriptor the caller supplied. Rotation, collection, format: not specified.</td><td>The runtime layer and the CRI — <strong>I7</strong>, <strong>I8</strong></td></tr>
+<tr><td><strong>The orchestrator's interface</strong></td><td>Pods, sandboxes, image pulls-on-demand.</td><td>CRI — <strong>I8</strong></td></tr>
+</tbody></table>
+<p>The pattern is worth naming. The runtime specification standardises the <em>narrowest possible thing</em> — one container, on one machine, from one directory — and every other specification in this track sits above it, filling exactly one gap. That is why the stack is swappable: each layer talks to the one below through a document, not a library.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Fetch the whole specification. It is smaller than you expect.
+<pre class="cmd">mkdir -p /tmp/rs &amp;&amp; cd /tmp/rs
+for f in spec.md config.md config-linux.md runtime.md bundle.md glossary.md; do
+  curl -sSLO https://raw.githubusercontent.com/opencontainers/runtime-spec/v1.3.0/$f
+done
+wc -l *.md</pre>
+<pre class="out">    22 bundle.md
+  1159 config-linux.md
+  1184 config.md
+    52 glossary.md
+   150 runtime.md
+    54 spec.md
+  <b>2621 total</b></pre>
+<p>Two and a half thousand lines, blank lines included, defines the thing the entire container industry agrees on. The lifecycle — the part everyone argues about — is 150 of them.</p></li>
+
+<li>Now search it for the words that are not there. This is the exercise; do it before reading the answer.
+<pre class="cmd">for w in registry "image manifest" "pull " Dockerfile "log file" "restart polic" "volume plugin"; do
+  printf '%-16s %s\n' "$w" "$(grep -ril "$w" *.md | tr '\n' ' ')"
+done</pre>
+<pre class="out">registry
+image manifest
+pull
+Dockerfile
+log file
+restart polic
+volume plugin</pre>
+<p>Seven searches, zero hits, across the whole specification. Now contrast:</p>
+<pre class="cmd">for w in namespace cgroup seccomp capabilit hook mount; do
+  printf '%-12s %s hits\n' "$w" "$(grep -ic "$w" config*.md | awk -F: '{s+=$2} END{print s}')"
+done</pre>
+<pre class="out">namespace    109 hits
+cgroup       117 hits
+seccomp      32 hits
+capabilit    15 hits
+hook         60 hits
+mount        96 hits</pre>
+<p>Kernel mechanisms: hundreds of mentions. Everything the ecosystem is famous for: none.</p></li>
+
+<li>Read the one place where the specification touches networking, because it is unusually explicit about declining to.
+<pre class="cmd">grep -n -B4 -A4 'IP address assignment' config-linux.md</pre>
+<pre class="out">This schema focuses solely on <b>moving existing network devices</b> identified by name
+from the host network namespace into the container network namespace. <b>It does
+not cover</b> the complexities of network device creation or network configuration,
+such as <b>IP address assignment, routing, and DNS setup</b>.</pre>
+<p>That is <code>linux.netDevices</code>, added in the 1.2/1.3 era so a runtime can move an SR-IOV interface into a container without a plugin. And in the same breath it names three things it will not do — which are precisely the three things a CNI plugin does. Specifications do not usually mark their own boundaries this clearly; when one does, quote it.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Without looking at the table, name the specification or component that fills each gap: images, registries, networking, storage, the orchestrator's interface. If you can, you can also now say why <code>docker build</code> has never been standardised and why that is a real problem rather than a trivium — which is I6's opening argument.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Not standardised" does not mean "not implemented".</strong> runc has <code>exec</code>, <code>ps</code>, <code>events</code> and <code>checkpoint</code>. They work. They are simply not things another conformant runtime must provide, so anything built on them is built on runc rather than on the standard.</li>
+<li><strong>The de facto standard is often stronger than the de jure one.</strong> Nothing standardises the Dockerfile, and yet every builder implements it. Knowing which of the two kinds of standard you are relying on tells you what happens when you try to swap a component.</li>
+<li><strong>Beware "OCI-compliant" as a marketing claim.</strong> There are four OCI specifications and a product may conform to one. "OCI-compliant image" and "OCI-compliant runtime" are different assertions about different documents.</li>
+</ul>
+
+<div class="specref">
+<blockquote>The Open Container Initiative Runtime Specification aims to specify the configuration, execution environment, and lifecycle of a container.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/spec.md">spec.md § Abstract</a></cite>
+<p>Three nouns. Everything in the table above is outside all three, and the specification's authors knew it — the <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/principles.md">principles document</a> makes the minimalism explicit, requiring containers to be "as small as possible" in scope and to avoid dependence on any particular orchestrator or vendor.</p>
+</div>
+
+<div class="k8s-link">
+<p>This is why Kubernetes could drop Docker as a runtime in v1.24 without pods noticing. The pod spec never described a Docker container; it described something that gets compiled into a bundle, and the bundle's definition was owned by a standard rather than by a vendor. <a href="w1.html#cp-1-19">W1.19</a> tells that story from the cluster side — and the reason it was a non-event is everything in this lesson.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/spec.md">spec.md</a> and <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/principles.md">principles.md</a> — together about 100 lines, and the closest thing this ecosystem has to a statement of intent. Then skim the table of contents of the <a href="https://github.com/opencontainers/image-spec">image</a> and <a href="https://github.com/opencontainers/distribution-spec">distribution</a> specs to see the gaps being filled.</p>
+</article>
+
+<article class="lesson" id="cp-i2-14" data-id="i2-14">
+<div class="lesson-head"><span class="cp-id">I2.14</span><h4>Prove the contract is real: the same bundle, a different runtime</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everything so far has been a claim: <em>any compliant runtime produces the same container from the same bundle</em>. Claims about portability are cheap and frequently false. This lesson tests it — one byte-identical <code>config.json</code>, two independently written runtimes (runc is Go, crun is C), and a diff. The result is not quite "identical", and the two ways in which it is not are more instructive than a clean pass would have been.</p>
+
+<h5>The concept</h5>
+<p><code>crun</code> is a complete, independent implementation of the runtime specification, written in C by the Podman maintainers, sharing no code with runc. If the contract is real, dropping it in should change nothing that matters. If the contract is aspirational, it will change plenty.</p>
+<p>There is one thing to establish first: <strong>the contract is versioned, and runtimes declare which version they implement.</strong> That declaration is not decorative. A runtime that does not know an <code>ociVersion</code> is entitled to refuse the bundle rather than guess.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install the second runtime and read its own conformance claim.
+<pre class="cmd">sudo apt-get install -y crun
+crun --version</pre>
+<pre class="out">crun version <b>1.14.1</b>
+commit: de537a7965bfbe9992e2cfae0baeb56a08128171
+<b>spec: 1.0.0</b>
++SYSTEMD +SELINUX +APPARMOR +CAP +SECCOMP +EBPF +WASM:wasmedge +YAJL</pre>
+<p>runc said <code>spec: 1.3.0</code>; crun says <code>spec: 1.0.0</code>. Two conformant runtimes, three minor versions apart. Keep that in mind for the next step.</p></li>
+
+<li>Build a bundle that reports everything worth comparing, and run it under runc.
+<pre class="cmd">cd ~/i2
+sudo rm -rf same &amp;&amp; sudo mkdir -p same/rootfs
+sudo tar -C same/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+cd same &amp;&amp; sudo runc spec
+sudo jq '.process.terminal = false
+ | .process.args = ["/bin/sh","-c","echo ns:; for n in mnt pid net uts ipc cgroup; do echo \"  $n $(readlink /proc/self/ns/$n)\"; done; echo caps:; grep -E \"^Cap(Prm|Eff|Bnd)\" /proc/self/status; echo cgroup:; cat /proc/self/cgroup; echo hostname:; hostname; echo nnp:; grep NoNewPrivs /proc/self/status"]
+ | .linux.cgroupsPath = "/i2demo/same"
+ | .linux.resources.cpu = {quota:50000, period:100000}
+ | .linux.resources.memory = {limit:134217728}
+ | .linux.resources.pids = {limit:64}' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo sha256sum config.json
+sudo sh -c 'runc run same &gt; /tmp/out-runc.txt 2&gt;&amp;1'; echo "runc rc=$?"</pre>
+<pre class="out">0d096afe63f819b973edbd3ccd39d846f136b2efc513ae06acc334aabf72c33c  config.json
+runc rc=0</pre></li>
+
+<li>Now the same bundle, untouched, under crun.
+<pre class="cmd">sudo sh -c 'crun run same &gt; /tmp/out-crun.txt 2&gt;&amp;1'; echo "crun rc=$?"
+sudo cat /tmp/out-crun.txt</pre>
+<pre class="out">crun rc=1
+<b>unknown version specified</b></pre>
+<p>The first result is a refusal, and it is the right one. <code>runc spec</code> wrote <code>ociVersion: "1.3.0"</code>; crun 1.14.1 implements 1.0.0 and will not pretend to understand a document from a later edition. Find where its ceiling actually is:</p>
+<pre class="cmd">for v in 1.3.0 1.2.0 1.1.0 1.0.2 1.0.0; do
+  sudo jq ".ociVersion = \"$v\"" config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+  printf 'ociVersion=%-7s crun: ' $v
+  sudo crun run same &gt;/tmp/o 2&gt;&amp;1 &amp;&amp; echo OK || head -1 /tmp/o
+done</pre>
+<pre class="out">ociVersion=1.3.0   crun: unknown version specified
+ociVersion=1.2.0   crun: unknown version specified
+ociVersion=<b>1.1.0</b>   crun: <b>OK</b>
+ociVersion=1.0.2   crun: OK
+ociVersion=1.0.0   crun: OK</pre>
+<p>This is what a versioned contract looks like when it works. Not "it broke mysteriously" — a named refusal, at a known boundary, from a runtime that knows what it does and does not implement.</p></li>
+
+<li>Set a version both accept and run the real comparison.
+<pre class="cmd">sudo jq '.ociVersion = "1.1.0"' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo sha256sum config.json
+sudo sh -c 'runc run same &gt; /tmp/out-runc.txt 2&gt;&amp;1'
+sudo sh -c 'crun run same &gt; /tmp/out-crun.txt 2&gt;&amp;1'
+sudo sha256sum config.json
+sudo diff /tmp/out-runc.txt /tmp/out-crun.txt</pre>
+<pre class="out">260b8c07f7a89e59daaf6af5948e68070e898e9a624cab171a7e271e4c21d1b0  config.json
+260b8c07f7a89e59daaf6af5948e68070e898e9a624cab171a7e271e4c21d1b0  config.json
+
+4c4
+&lt;   net net:[<b>4026532281</b>]
+---
+&gt;   net net:[<b>4026532280</b>]
+7c7
+&lt;   cgroup cgroup:[<b>4026532280</b>]
+---
+&gt;   cgroup cgroup:[<b>4026532391</b>]</pre>
+<p>The file's digest is identical before and after both runs — neither runtime rewrote it. And the entire difference between two independently written runtimes is <strong>two namespace inode numbers</strong>. Here is the full runc output for reference:</p>
+<pre class="out">ns:
+  mnt mnt:[4026532275]
+  pid pid:[4026532279]
+  net net:[4026532281]
+  uts uts:[4026532277]
+  ipc ipc:[4026532278]
+  cgroup cgroup:[4026532280]
+caps:
+CapPrm:	0000000020000420
+CapEff:	0000000020000420
+CapBnd:	0000000020000420
+cgroup:
+0::/
+hostname:
+runc
+nnp:
+NoNewPrivs:	1</pre></li>
+
+<li>Account for every difference, which is the actual assignment.
+<ul>
+<li><strong>The two inode numbers</strong> are kernel bookkeeping. Namespace inodes are allocated from a global counter and recycled, so the numbers depend only on what the machine did just before. The four namespaces that <em>match</em> match for the same uninteresting reason — those inodes had just been freed by the previous run and were handed straight back.</li>
+<li><strong>Everything with semantic content is identical.</strong> Capability masks to the bit (<code>0x20000420</code> = <code>cap_kill</code>, <code>cap_net_bind_service</code>, <code>cap_audit_write</code>). <code>NoNewPrivs</code>. The hostname <code>runc</code> — which crun also produced, because it is a string in the config file and not the runtime's name. And <code>/proc/self/cgroup</code> reading <code>0::/</code> under both, because the cgroup namespace makes each container see its own cgroup as the root.</li>
+</ul>
+<p>That is the contract being real. Two codebases with nothing in common, one document, one observable result.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Check the cgroup values crun wrote, since it had to translate the same v1-flavoured field names: <code>sudo cat /sys/fs/cgroup/i2demo/same/cpu.max</code> reads <code>50000 100000</code> after either runtime. Then re-run with <code>ociVersion</code> back at <code>1.3.0</code> and confirm runc is still happy while crun still refuses — the asymmetry is the version contract, not a bug.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ociVersion</code> is a real compatibility gate, not metadata.</strong> Bundles are generated by the runtime layer, which usually knows what its runtime accepts — so this rarely bites in production, and bites hard the first time you hand-write a config or upgrade one half of the pair.</li>
+<li><strong>Conformance is a floor.</strong> Both runtimes honour everything in the file; that does not make them interchangeable in practice. crun is dramatically smaller and faster to start; runc supports checkpoint/restore; they differ on cgroup driver details and on how strictly they validate. Portability of the <em>bundle</em> is the guarantee, not identity of the runtime.</li>
+<li><strong>Do not compare namespace inode numbers across runs and conclude anything.</strong> They are only meaningful within a single observation — comparing two processes at the same moment, which is what I2.7 did.</li>
+<li><strong>Test with a stopped container between runs.</strong> Running both runtimes against the same container id concurrently produces a state-directory collision, and the error blames the id.</li>
+</ul>
+
+<div class="specref">
+<blockquote><code>ociVersion</code> (string, REQUIRED) MUST be in SemVer v2.0.0 format and specifies the version of the Open Container Initiative Runtime Specification with which the bundle complies. The Open Container Initiative Runtime Specification follows semantic versioning and retains forward and backward compatibility within major versions.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#specification-version">config.md § Specification Version</a></cite>
+<p>"Retains forward and backward compatibility within major versions" is a promise about the <em>document</em>: a 1.3.0 bundle uses no field a 1.0.0 runtime would misinterpret, only fields it may not know. crun's refusal is therefore conservative rather than required — and conservative is the right default when the alternative is silently ignoring a security-relevant field.</p>
+</div>
+
+<div class="k8s-link">
+<p>This is the mechanism behind <code>RuntimeClass</code>. A cluster can run gVisor's <code>runsc</code> or Kata's VM-based runtime for untrusted workloads and runc for everything else, from identical pod specs, because all of them consume the same bundle. <a href="w3.html#cp-3-9">W3.9</a> covers the scheduling side; the reason it works at all is what you just measured.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/containers/crun">containers/crun</a> — its README is candid about where it differs from runc. <a href="https://github.com/opencontainers/runtime-tools">opencontainers/runtime-tools</a> carries the official conformance test suite if you want to check a runtime rather than trust it. <code>man 8 crun</code>.</p>
 </article>
 </div>
 </main>
