@@ -494,7 +494,7 @@ sudo runc state dt2 | jq -c '{status, pid}'</pre>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong><code>--detach</code>'s exit code is about the launch, not the workload.</strong> Scripts that treat <code>runc run --detach && echo success</code> as meaning the container is healthy are testing that the container was <em>created</em>. It may have exited a millisecond later.</li>
+<li><strong><code>--detach</code>'s exit code is about the launch, not the workload.</strong> Scripts that treat <code>runc run --detach &amp;&amp; echo success</code> as meaning the container is healthy are testing that the container was <em>created</em>. It may have exited a millisecond later.</li>
 <li><strong>Foreground <code>runc</code> holds your terminal's file descriptors.</strong> Close the terminal and the container's stdio disappears with it; a container writing to a closed pipe gets <code>SIGPIPE</code>. This is why every real launcher detaches and hands stdio to something durable.</li>
 <li><strong>The re-parent target is not always PID 1.</strong> Anything that called <code>prctl(PR_SET_CHILD_SUBREAPER)</code> claims orphans below it first — and that is exactly the trick a shim uses. If you see a detached container parented to something other than PID&nbsp;1, you have found a subreaper.</li>
 <li><strong>Do not run <code>runc</code> from a shell you will close</strong> while testing, foreground or not. Use <code>setsid</code> as the labs do; otherwise your experiment ends when your SSH session does.</li>
@@ -1442,6 +1442,77 @@ ls: cannot access '…/d2': No such file or directory
 
 </div><!-- /g-project -->
 
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>Why can a runtime not simply call <code>unshare()</code> and carry on?
+<details class="reveal"><summary>Answer</summary><p>Because <code>unshare</code> changes the <em>caller's</em> namespaces — the runtime would end up inside the container it was building. So runc re-executes itself as <code>runc init</code> and buries that copy instead. It needs three processes rather than two because <code>unshare(CLONE_NEWPID)</code> does not move the caller into the new PID namespace, only its future children, forcing one more <code>clone()</code>.</p></details></li>
+<li>What does <code>execve("/proc/self/fd/6", ["runc","init"])</code> tell you that <code>execve("/usr/local/sbin/runc", …)</code> would not?
+<details class="reveal"><summary>Answer</summary><p>That runc re-executes a <strong>file descriptor</strong>, not a path — a sealed clone of its own binary, made by the <code>exeseal</code> machinery. Executing by path would let a malicious image arrange for that path to resolve elsewhere, which is CVE-2019-5736. The fd refers to an inode the container cannot name.</p></details></li>
+<li>Your <code>strace -f runc create</code> never returns. What is wrong?
+<details class="reveal"><summary>Answer</summary><p>Nothing. <code>create</code> deliberately leaves <code>runc init</code> alive, parked on the exec FIFO, and <code>strace -f</code> waits for every process it follows. Wrap it in <code>timeout</code>. The container was created successfully — <code>runc list</code> proves it.</p></details></li>
+<li>State the rule that fixes the order of container setup, in one sentence.
+<details class="reveal"><summary>Answer</summary><p>Every step removes a power, so each step must run <em>after</em> everything that still needs the power it removes. That places <code>pivot_root</code> before the capability drop (it needs <code>CAP_SYS_ADMIN</code>), the mounts before seccomp (the profile blocks <code>mount</code>), and <code>execve</code> unarguably last.</p></details></li>
+<li>A created-but-not-started container: what exists, and what is the process called?
+<details class="reveal"><summary>Answer</summary><p>Everything except your program — namespaces, cgroup, mounts, pivoted root, dropped capabilities. The process is <code>runc init</code>, blocked on <code>/run/runc/&lt;id&gt;/exec.fifo</code> with wchan <code>wait_for_partner</code>. <code>start</code> opens the fifo, the init unblocks, and <code>execve</code> replaces the program <em>in the same PID</em>.</p></details></li>
+<li>After <code>runc run --detach</code> returns successfully, what is supervising your container?
+<details class="reveal"><summary>Answer</summary><p>Nothing. runc has exited and the container is re-parented to PID 1, which will reap it and discard the exit status. Lost with the parent: the exit code, stdio ownership, a signal path, and any notification of death. That list is the job description of a shim.</p></details></li>
+<li>Why does the naive "run detached, then <code>runc state</code> for the PID" approach fail 20 times out of 20 on a fast container, yet always work in your testing?
+<details class="reveal"><summary>Answer</summary><p>Because <code>pid</code> is only required while the container is <code>created</code> or <code>running</code>; once stopped, runc reports <code>0</code>. A container that exits immediately is always stopped by the time you ask. It works in testing because people test with <code>sleep 1000</code>, where the container cannot lose the race. <code>--pid-file</code> is written before runc exits, by the process that knew.</p></details></li>
+<li>Who listens and who connects on a console socket, and what actually crosses it?
+<details class="reveal"><summary>Answer</summary><p><strong>You</strong> listen; the runtime connects. The pty <em>master</em> file descriptor crosses as <code>SCM_RIGHTS</code> ancillary data — you cannot pass a pty by name, because re-opening <code>/dev/pts/ptmx</code> gives a different terminal. The ordinary payload is just the tty's name. <code>socat</code> cannot do this: it relays bytes and never calls <code>recvmsg</code>.</p></details></li>
+<li>Which namespaces does <code>runc exec</code> re-enter, and what does it <em>not</em> inherit?
+<details class="reveal"><summary>Answer</summary><p>All of them — every inode matches the container's PID 1, and it joins the cgroup too. What it does not inherit is the container's <code>process</code> block from <code>config.json</code>: capabilities, environment and working directory are the exec's own. That is why a debug shell sometimes has powers the application does not.</p></details></li>
+<li>You <code>runc update --memory</code> a running container. Where is that change recorded?
+<details class="reveal"><summary>Answer</summary><p>Only in the kernel. Neither the bundle's <code>config.json</code> nor <code>/run/runc/&lt;id&gt;/state.json</code> is touched, so a recreate silently reverts to the bundle's value with nothing on disk to explain it. The same caveat applies to Kubernetes in-place pod resize (GA in v1.35): a container restart returns to the pod spec.</p></details></li>
+<li>Why is <code>init_process_start</code> stored next to <code>init_process_pid</code>?
+<details class="reveal"><summary>Answer</summary><p>PIDs are recycled. The start time — field 22 of <code>/proc/&lt;pid&gt;/stat</code> — makes the pair unforgeable, so runc can tell "my container" from "a stranger who inherited its number". Any tool that holds a PID across time and stores only the number has this bug.</p></details></li>
+<li>What is a container when nothing is running?
+<details class="reveal"><summary>Answer</summary><p>A name and a record. <code>namespace_paths</code> all point through <code>/proc/&lt;pid&gt;/ns/*</code>, so they dangle; the cgroup is an empty kernel object; the mounts died with the mount namespace. That is why <code>stopped</code> is a real state that still requires <code>delete</code> to leave.</p></details></li>
+<li>You fix <code>container with given ID already exists</code> with <code>rm -rf /run/runc/&lt;id&gt;</code>. What did you break?
+<details class="reveal"><summary>Answer</summary><p>Nothing visible — recreation succeeds, which is why the habit spreads. You destroyed the record of what to clean up, so the container's <strong>cgroup directory survives</strong> under <code>/sys/fs/cgroup</code> with nothing anywhere saying it exists. <code>runc delete</code> removes it. The leak accumulates one directory per incident.</p></details></li>
+<li>A hook gets the container's state on stdin. Why is the PID enough to configure networking?
+<details class="reveal"><summary>Answer</summary><p>Because <code>/proc/&lt;pid&gt;/ns/net</code> is a path, so a PID is a complete address for a namespace — usable by <code>nsenter</code> or <code>ip link set … netns</code>. That is the entire handoff, and CNI generalises exactly it. What hooks cannot do is answer back: there is no return channel, which is why CNI plugins print a result and hooks cannot.</p></details></li>
+<li><code>ping</code> from your container says "permission denied" but <code>nc</code> connects fine. What is wrong with the network?
+<details class="reveal"><summary>Answer</summary><p>Nothing. <code>ping</code> needs <code>CAP_NET_RAW</code> to open a raw socket, and that capability was dropped during creation. A failed ping is evidence about capabilities, not connectivity — a very common false diagnosis.</p></details></li>
+<li>Read <code>--tcp-established</code>, <code>--ext-unix-sk</code> and <code>--file-locks</code> as a single statement about processes.
+<details class="reveal"><summary>Answer</summary><p>A process is not self-contained — it is a bundle of relationships with the kernel, the filesystem and other machines, and a checkpoint captures only its half of each. Every flag names a relationship whose other end did not get checkpointed. That is why CRIU suits compute jobs and not connected services.</p></details></li>
+<li>Which Kubernetes feature is built on CRIU, and what is it for?
+<details class="reveal"><summary>Answer</summary><p><strong>Forensic container checkpointing</strong> — the kubelet's <code>POST /checkpoint/{namespace}/{pod}/{container}</code>, writing a tar to <code>/var/lib/kubelet/checkpoints/</code>. Alpha in v1.25, beta and enabled by default since v1.30, still beta. It is for moving a suspicious container to a sandbox for analysis, <em>not</em> live migration — and the archive contains all of the container's memory, so every secret it held is in there in plaintext.</p></details></li>
+<li>Your shim runs but always reports <code>exit=0</code> immediately, while the container keeps running. What did you forget?
+<details class="reveal"><summary>Answer</summary><p>The <code>prctl(PR_SET_CHILD_SUBREAPER, 1)</code> call. Without it the container is never your child — runc created it and exited — so <code>os.wait()</code> raises <code>ChildProcessError</code> at once and the shim falls out of its loop reporting a status it never received.</p></details></li>
+<li>A container "starts and immediately exits 0", with no output and no error. Where do you look?
+<details class="reveal"><summary>Answer</summary><p>At <code>process.args</code>, not at the runtime. Exit 0 means the program ran and chose to finish — an interactive shell with no terminal and no stdin reads EOF and leaves, successfully. In Kubernetes this is <code>CrashLoopBackOff</code> with <code>Exit Code: 0</code>, which is always this fault and never a crash.</p></details></li>
+<li><code>runc create</code> says the ID exists; <code>runc delete</code> says it cannot delete a container that is not stopped. What happened?
+<details class="reveal"><summary>Answer</summary><p>The supervisor died, not the container. A <code>SIGKILL</code>ed shim never reaches its cleanup, so the container runs on — re-parented to PID 1, because a dead subreaper stops collecting orphans. Both messages are true. The refusal is useful: it tells you a straight <code>--force</code> would have killed a live workload you had not noticed was live.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Trace container creation through all three <code>nsexec</code> stages and explain why each exists.</li>
+<li>Read the <code>_LIBCONTAINER_*</code> handshake and identify what every descriptor it names is for.</li>
+<li>Recite the setup order, verify each step in <code>/proc</code>, and re-derive the order from the dependency rule rather than from memory.</li>
+<li>Explain the <code>create</code>/<code>start</code> split from the evidence — same PID, same namespaces, different program.</li>
+<li>State exactly what is and is not running after a detached container starts, and enumerate what was lost with the parent.</li>
+<li>Use <code>--pid-file</code> correctly and demonstrate the race that makes the alternative wrong.</li>
+<li>Receive a pty master over a console socket and drive a container through it.</li>
+<li>Work <code>exec</code>, <code>ps</code>, <code>events</code> and <code>update</code>, and name where each change is — and is not — recorded.</li>
+<li>Read <code>state.json</code> and answer what a container is when nothing is running.</li>
+<li>Repair a stale container ID without leaking a cgroup, and tell a dead container from a dead supervisor.</li>
+<li>Configure a container's network from a hook, having anticipated most of CNI in the process.</li>
+<li>Describe checkpoint/restore's requirements and limits, and name the Kubernetes feature and its stability level.</li>
+<li>Write a working shim and state precisely which of runc's refusals it is covering.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html#b2">Beginner B2 · processes, re-parenting and signals, which this module leans on throughout →</a></div>
+
+<nav class="pager"><a href="i2.html">← I2 · The runtime spec</a><a href="../intermediate.html#i4">I4 · The image spec →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble"), kernel <b>6.8.0</b>, on Multipass, verified 2026-07-27. All output on this page was captured from a real run with <b>runc 1.5.1</b> (spec 1.3.0), against <b>OCI runtime-spec v1.3.0</b>. Version-sensitive findings from that run, worth re-checking before treating a mismatch as a bug on this page: runc uses <b>three</b> nsexec stages, not two, and re-executes a sealed clone of itself from <code>/proc/self/fd/N</code> rather than from a path; the live handshake is <code>INITPIPE</code>, <code>SYNCPIPE</code>, <code>LOGPIPE</code>, <code>LOGLEVEL</code>, <code>FIFOFD</code> and <code>INITTYPE</code> — older write-ups naming <code>_LIBCONTAINER_STATEDIR</code> or <code>_LIBCONTAINER_CONSOLE</code> describe runc 1.0 and are wrong here; <code>runc state</code> reports <code>pid: 0</code> for a stopped container, so the naive PID lookup loses <b>every</b> time against a short-lived container rather than intermittently; <code>runc update</code> writes to the kernel only, touching neither the bundle nor <code>state.json</code>; <code>rm -rf</code> on a state directory leaves the container's <b>cgroup</b> behind while appearing to work; and <code>criu</code> has no installation candidate on noble, so <code>runc checkpoint</code> fails with an executable-not-found error rather than a feature error. Kubernetes facts checked the same day: the kubelet checkpoint API is <b>beta and enabled by default since v1.30</b> and still beta; in-place pod resize is <b>GA in v1.35</b>.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
