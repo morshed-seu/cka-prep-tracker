@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Intermediate module I2: what a container is according to the OCI runtime specification — the filesystem bundle, config.json field by field, the four-state lifecycle, the five operations, hooks, and what the specification deliberately refuses to standardise.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📜</text></svg>">
+<title>I2 · What a container is, formally — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I2 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Intermediate tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · Missing primitives</a></li>
+    <li><a href="i2.html">I2 · The runtime spec</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i2">← Back to the intermediate tracker</a></p>
+<header class="hero">
+  <h1>I2 — What a container is, formally</h1>
+  <p>This is the hinge of the track. Up to now "a container" has been a thing you <em>did</em>: in <a href="b14.html">B14</a> you unshared some namespaces, pivoted into a root filesystem, wrote three numbers into a cgroup, and hung a veth off a bridge — and whatever came out the other end, you called a container. That definition is a procedure. It lives in one shell script and it cannot be handed to anybody.</p>
+  <p>The OCI runtime specification replaces the procedure with a <strong>document</strong>. It says: put a directory somewhere with two things in it — a JSON file called <code>config.json</code> and a root filesystem — and any compliant runtime on earth will produce the same container from it. That is the entire contract. No new kernel mechanism appears in this module; every namespace, cgroup and capability below is one you already drove by hand. What appears is <em>agreement</em>, and agreement is what let a scheduler written by one company drive a runtime written by another.</p>
+  <p>So the work here is reading. You will generate the reference document with <code>runc spec</code>, take it apart field by field, change one field at a time and prove the change in <code>/proc</code>, walk a container through all four of its states by hand, and finish by writing a program that turns <code>minibox.sh</code>'s environment variables into a <code>config.json</code> — and produces, from a different runtime, byte-identical observable output.</p>
+  <div class="weights">
+    <span>Checkpoints<b>16</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>I0, I1, B6, B7, B14</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>State the two-file contract that defines a filesystem bundle, and build one from a distro tarball.</li>
+<li>Read a whole <code>config.json</code> and say what each top-level key does — and which line of <code>minibox.sh</code> it replaces.</li>
+<li>Explain where bundles come from in a real stack, and find a live one on your own machine.</li>
+<li>Configure <code>process</code> — all five capability sets included — and verify every field in <code>/proc/&lt;pid&gt;/status</code>.</li>
+<li>Run with a read-only root, find what breaks, and repair it with mounts rather than with privilege.</li>
+<li>Share a namespace <strong>by path</strong>, which is the whole mechanism behind a Kubernetes pod.</li>
+<li>Map <code>linux.resources</code> onto the cgroup v2 files you wrote by hand in B7, including the names that changed.</li>
+<li>Recite the state machine, drive every transition, and say why <code>create</code> and <code>start</code> are two operations.</li>
+<li>Place all five hooks and determine, from evidence, which side of the isolation boundary each ran on.</li>
+<li>List what the runtime specification refuses to standardise, and name the module of this track that fills each gap.</li>
+<li>Run one byte-identical bundle under two independent runtimes and account for every difference.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><a href="b6.html">B6</a> (namespaces, <code>pivot_root</code>), <a href="b7.html">B7</a> (cgroups v2), <a href="b14.html">B14</a> (<code>minibox</code>), and <a href="i0.html">I0</a> + <a href="i1.html">I1</a> from this track. None of it is re-taught. When a lesson opens with "you already built this", follow the link, skim, come back.</p>
+<p><strong>Which machine.</strong> Any throwaway Ubuntu 24.04 VM with <code>runc</code> and <code>containerd</code> on it, which is what <a href="i0.html#cp-i0-1"><code>buildbox</code></a> was for. The output on this page was captured on a 2-vCPU / 4 GB box with <b>runc 1.5.1</b>, <b>crun 1.14.1</b> and <b>containerd 2.3.3</b>. One lesson pulls an image and one installs a package, so the machine needs internet. Everything runs as root.</p>
+<p><strong>Set up a scratch directory first</strong> — every lesson below builds bundles in it, and the debugging drill deliberately breaks them.</p>
+<pre class="cmd">mkdir -p ~/i2 &amp;&amp; cd ~/i2</pre>
+</div>
+
+<!-- ---------------- The bundle ---------------- -->
+<div class="grp" id="g-bundle"><h3>The bundle</h3>
+
+<article class="lesson" id="cp-i2-1" data-id="i2-1">
+<div class="lesson-head"><span class="cp-id">I2.1</span><h4>The whole contract in one sentence: a directory with two things in it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Before anything else, you need to know how little a runtime is actually given. Ask most engineers what Docker hands to <code>runc</code> and you will hear something about images, layers, registries, maybe a daemon socket. The truth is smaller and far more useful: <strong>a directory path</strong>. Inside that directory are exactly two things — a file called <code>config.json</code> and a root filesystem. That is everything. Once you have seen it, an enormous amount of container tooling stops being mysterious and starts being obviously replaceable.</p>
+
+<h5>The concept</h5>
+<p>The specification calls this directory a <abbr title="a directory containing config.json and a root filesystem, sufficient on its own for any compliant runtime to create a container">filesystem bundle</abbr>. In the track's analogy, <code>config.json</code> is <strong>the written work order</strong> and the runtime is the contractor: the order says what to build, and any contractor who can read it produces the same building. Nothing in the order refers back to the company that wrote it.</p>
+<p>A bundle is <em>self-contained by design</em>. It does not reference an image, because the runtime specification has never heard of images. It does not reference a registry, a daemon, a network, or a name. Everything the runtime needs is either in that JSON file or in that directory tree.</p>
+<div class="flow"><span>bundle/</span><em>→</em><span>config.json</span><em>+</em><span>rootfs/</span><em>→</em><span>runc</span><em>→</em><span>a container</span></div>
+<p>The root filesystem is an ordinary directory. There is nothing layered or magical about it at this level — an unpacked distro tarball is a perfectly legal one, which is exactly what you are about to prove. Layers, overlays and snapshots are how <em>images</em> get turned into one of these directories, and that is I4 and I7's business, not the runtime's.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Get a root filesystem that owes nothing to any container tooling. Alpine publishes theirs as a plain tarball; it is 3.6 MB and contains a complete userland.
+<pre class="cmd">cd ~/i2
+curl -sSLO https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.5-x86_64.tar.gz
+sha256sum alpine-minirootfs-3.22.5-x86_64.tar.gz</pre>
+<pre class="out">4b4daa9fe2fc696c4919c4412a4c3d3e770d8fb70292a004a2c72f5096175282  alpine-minirootfs-3.22.5-x86_64.tar.gz</pre>
+<p>Record that digest. Alpine moves patch releases, so a reader on a later day who gets a different number knows the tarball moved rather than that they typed something wrong.</p></li>
+
+<li>Make the bundle. Two commands, and one of them is <code>mkdir</code>.
+<pre class="cmd">mkdir -p hello/rootfs
+sudo tar -C hello/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+ls hello/rootfs
+du -sh hello/rootfs</pre>
+<pre class="out">bin  dev  etc  home  lib  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+8.6M	hello/rootfs</pre>
+<p><code>sudo</code> because the tarball carries ownership and device nodes that only root can recreate. The directory it produces is a filesystem tree and nothing else — <code>grep</code> it, edit it, delete a file in it; there is no metadata anywhere else that will disagree with you.</p></li>
+
+<li>Add the other half. <code>runc spec</code> writes a default <code>config.json</code> into the current directory; I2.2 reads it properly, and for now you only need it to exist.
+<pre class="cmd">cd hello
+sudo runc spec
+ls -la</pre>
+<pre class="out">-rw-r--r--  1 root   root   2500 Jul 27 15:54 <b>config.json</b>
+drwxr-xr-x 19 root   root   4096 Jun 22 01:05 <b>rootfs</b></pre></li>
+
+<li>Run it. The default spec asks for a terminal, and you have not given it one, so the first attempt fails — usefully.
+<pre class="cmd">sudo runc run hello</pre>
+<pre class="out">level=error msg="runc run failed: <b>open /dev/tty: no such device or address</b>"</pre>
+<p><code>process.terminal: true</code> means "allocate me a pseudo-terminal", which needs a controlling terminal to attach to. Turn it off and give the container something to say:</p>
+<pre class="cmd">sudo jq '.process.args = ["/bin/echo","a bundle is a directory"] | .process.terminal = false' \
+  config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json config.json
+sudo runc run hello</pre>
+<pre class="out"><b>a bundle is a directory</b></pre>
+<p>That <code>jq … &gt; /tmp/c.json &amp;&amp; cp</code> dance appears throughout this module. <code>jq</code> cannot edit in place, and writing straight back into <code>config.json</code> truncates it before <code>jq</code> reads it — which produces an empty file and a very confusing error.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p><code>find ~/i2/hello -maxdepth 1</code> lists exactly two entries besides the directory itself. Nothing outside <code>~/i2/hello</code> was consulted: <code>sudo runc run -b ~/i2/hello hello</code> works from any working directory, and moving the whole directory to another path and running it there works too.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The name is not negotiable.</strong> <code>config.json</code>, in the root of the bundle, exactly. <code>runc</code> reports <code>JSON specification file config.json not found</code> and readers routinely lose ten minutes to having run <code>runc run</code> from the parent directory rather than from inside the bundle. <code>-b &lt;dir&gt;</code> is the fix.</li>
+<li><strong>The bundle is not the container.</strong> The container is state that the runtime keeps elsewhere (I2.9). Two containers can be created from one bundle, and deleting the bundle out from under a running container does not stop it.</li>
+<li><strong>Untar as root or the tree is wrong.</strong> Unpacked as an ordinary user, every file is owned by you, the setuid bits are gone, and <code>/dev</code> has no device nodes. Things will half-work, which is worse than failing.</li>
+</ul>
+
+<div class="specref">
+<p>The specification's own definition, which is shorter than most people expect:</p>
+<blockquote>A set of files organized in a certain way, and containing all the necessary data and metadata for any compliant runtime to perform all standard operations against it.</blockquote>
+<p>And on the two artefacts:</p>
+<blockquote>This REQUIRED file MUST reside in the root of the bundle directory and MUST be named <code>config.json</code>. […] The directory referenced by <code>root.path</code>, if that property is set in <code>config.json</code>.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/bundle.md">bundle.md</a></cite>
+<p>Note the second quote's hedge: the root filesystem is required only <em>if <code>root.path</code> is set</em>, because a VM-based runtime may not use a host directory at all. The two-file rule is the common case, not a universal law.</p>
+</div>
+
+<div class="k8s-link">
+<p>When a pod starts, the kubelet never sees a bundle — it sends a CRI request and containerd assembles one. But the bundle is what actually exists on the node, and when you are staring at a container that will not start, it is the artefact worth reading. <a href="w1.html#cp-1-20">W1.20</a> walks the kubelet → CRI → containerd → runc path; everything on that path exists to produce the directory you just made by hand.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links">The whole of <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/bundle.md">runtime-spec <code>bundle.md</code></a> is 14 lines long — read it now, in full, because you will never have a cheaper opportunity. Then <code>man 8 runc-spec</code> and <code>man 8 runc-run</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i2-2" data-id="i2-2">
+<div class="lesson-head"><span class="cp-id">I2.2</span><h4>Read the generated default, top to bottom</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>There is a version of learning this material where you look up fields one at a time, forever, and never form a picture of the whole. Reading the default document once, end to end, costs twenty minutes and prevents that. It is also small — 2500 bytes — which is worth knowing, because the mental image most people carry of "container configuration" is much bigger than the thing itself.</p>
+
+<h5>The concept</h5>
+<p><code>runc spec</code> emits a minimal-but-real configuration, and it is a genuinely good reference document: every field in it is a field runtimes actually honour, with defaults chosen to be safe. Six top-level keys appear:</p>
+<ul>
+<li><code>ociVersion</code> — which edition of the standard this file claims to conform to. Not the runtime's version. I0.5 laboured this point; it is about to matter again in I2.14.</li>
+<li><code>process</code> — what to run and who to run it as. Replaces <code>minibox.sh</code>'s final <code>exec capsh … --shell=/bin/sh</code> line and its whole capability argument.</li>
+<li><code>root</code> — where the root filesystem is, and whether it is writable. Replaces <code>pivot_root</code>.</li>
+<li><code>hostname</code> — replaces <code>hostname "$NAME"</code>.</li>
+<li><code>mounts</code> — replaces every <code>mount -t proc proc /proc</code>-style line.</li>
+<li><code>linux</code> — the platform-specific everything: namespaces, cgroup limits, seccomp, devices, masked paths. Replaces the <code>unshare</code> flags and the whole <code>setup_cgroup</code> function.</li>
+</ul>
+<p>Two more keys are legal and simply absent from the default: <code>hooks</code> (I2.12) and <code>annotations</code> (free-form key/value metadata that the runtime ignores and higher layers — containerd, the CRI, Kubernetes — use heavily). Their absence is itself informative: neither is needed to run a container.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the top-level keys, so you know the shape before reading the contents.
+<pre class="cmd">cd ~/i2/hello
+jq 'keys' config.json</pre>
+<pre class="out">[
+  "hostname",
+  "linux",
+  "mounts",
+  "ociVersion",
+  "process",
+  "root"
+]</pre>
+<p>Six. Not <code>hooks</code>, not <code>annotations</code> — <code>runc spec</code> does not emit them because a container does not need them.</p></li>
+
+<li>Read the thing. Do not skim it; this is the exercise.
+<pre class="cmd">jq . config.json | less</pre>
+<p>As you go, keep a single question in your head for every field: <strong>which line of <code>minibox.sh</code> does this replace?</strong> Say the answer out loud. The ones with no answer — <code>maskedPaths</code>, <code>readonlyPaths</code>, the <code>devices</code> deny-rule, <code>noNewPrivileges</code> — are the places where the standard is stricter than the thing you wrote, and each is a lesson later in this module.</p></li>
+
+<li>Get a shape summary you can hold in your head, rather than 130 lines of JSON.
+<pre class="cmd">jq '{ociVersion, args: .process.args, user: .process.user,
+     caps: (.process.capabilities | to_entries | map("\(.key)=\(.value|length)")),
+     root, hostname,
+     mounts: [.mounts[].destination],
+     ns: [.linux.namespaces[].type],
+     masked: (.linux.maskedPaths|length), ro: (.linux.readonlyPaths|length)}' config.json</pre>
+<pre class="out">{
+  "ociVersion": "1.3.0",
+  "args": [ "/bin/echo", "a bundle is a directory" ],
+  "user": { "uid": 0, "gid": 0 },
+  "caps": [ "bounding=3", "effective=3", "permitted=3" ],
+  "root": { "path": "rootfs", "readonly": true },
+  "hostname": "runc",
+  "mounts": [ "/proc", "/dev", "/dev/pts", "/dev/shm", "/dev/mqueue", "/sys", "/sys/fs/cgroup" ],
+  "ns": [ "pid", "network", "ipc", "uts", "mount", "cgroup" ],
+  "masked": 10, "ro": 5
+}</pre>
+<p>Three notes worth pausing on. Only <strong>three</strong> capabilities by default, against the 37 <code>minibox</code> leaves in place. The root is <strong>read-only</strong> by default. And six namespaces are unshared — <code>minibox</code> unshares five, having no <code>cgroup</code> namespace.</p></li>
+
+<li>Confirm the version number means what I0.5 said it means.
+<pre class="cmd">jq -r .ociVersion config.json
+runc --version | head -3</pre>
+<pre class="out">1.3.0
+runc version <b>1.5.1</b>
+commit: v1.5.1-0-g8f2685a47
+spec: <b>1.3.0</b></pre>
+<p>Two versions, both real: runc is at 1.5.1 and implements edition 1.3.0 of the specification. The <code>spec:</code> line is a runtime declaring its conformance, and I2.14 turns that declaration into a failure you can watch.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Without looking, name all six top-level keys and one field inside each. Then name the two legal keys the default omits. If you can do that, the rest of this module is annotation on a structure you already hold.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The default is <code>runc</code>'s opinion, not the specification's.</strong> Almost everything in it is <code>OPTIONAL</code> in the standard. Another runtime's <code>spec</code> subcommand may emit something different and both are conformant. Never argue from "but the default says".</li>
+<li><strong>Absent is not the same as empty.</strong> <code>"seccomp"</code> missing means "apply no filter"; <code>"seccomp": {"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}</code> means "block everything", which is a container that dies instantly. The distinction bites hardest with <code>capabilities</code>, where an absent set inherits and an empty set drops.</li>
+<li><strong>2500 bytes is the floor, not the norm.</strong> A configuration generated for a Kubernetes pod runs to tens of kilobytes, most of it a seccomp profile. Do not be surprised by the size; be surprised if the <em>structure</em> differs, because it will not.</li>
+</ul>
+
+<div class="specref">
+<p>On what is actually mandatory:</p>
+<blockquote><code>ociVersion</code> (string, REQUIRED) MUST be in SemVer v2.0.0 format and specifies the version of the Open Container Initiative Runtime Specification with which the bundle complies.</blockquote>
+<p>Every other top-level key is <code>OPTIONAL</code>, with one conditional:</p>
+<blockquote><code>process</code> (object, OPTIONAL) specifies the container process. This property is REQUIRED when <code>start</code> is called.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">config.md</a></cite>
+<p>That conditional is the specification quietly telling you that <code>create</code> and <code>start</code> are separate operations with separate requirements — a fact I2.11 spends a whole lesson on.</p>
+</div>
+
+<div class="k8s-link">
+<p>Everything you just read is what a PodSpec is eventually compiled into. <code>command</code>/<code>args</code> become <code>process.args</code>; <code>env</code> becomes <code>process.env</code>; <code>resources.limits</code> become <code>linux.resources</code>; <code>volumeMounts</code> become entries in <code>mounts</code>. The pod API is a much larger document because it also describes scheduling, identity and lifecycle policy — none of which the runtime has any opinion about. <a href="w3.html#cp-3-1">W3.1</a> is the same document from the other end.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">runtime-spec <code>config.md</code></a> for the platform-neutral fields and <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md">config-linux.md</a> for everything under <code>linux</code>. Together they are about 2000 lines and are the reference for the rest of this module. <code>man 1 jq</code> for the query syntax used above.</p>
+</article>
+
+<article class="lesson" id="cp-i2-3" data-id="i2-3">
+<div class="lesson-head"><span class="cp-id">I2.3</span><h4>Where bundles come from, since nobody ships one</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You have now made a bundle by hand, and you will never do that again outside this module. Nobody publishes bundles; there is no registry of them, no <code>docker pull</code> that produces one. So the obvious question — if the runtime only accepts bundles and nobody distributes bundles, who makes them? — has an answer worth knowing precisely, because the answer <em>is</em> the architecture of the rest of the container stack.</p>
+
+<h5>The concept</h5>
+<p>A bundle is <strong>assembled on the node, moments before use, and destroyed after</strong>. Two different components each produce half of it:</p>
+<ul>
+<li>The <strong>snapshotter</strong> produces <code>rootfs/</code>. It takes the image's layers — which it already has on disk, unpacked — and mounts them as one directory using overlayfs, exactly the stack of transparent sheets from <a href="b5.html#cp-b5-14">B5.14</a>. Nothing is copied. The mount is created for this container and torn down when it dies.</li>
+<li>The <strong>runtime layer</strong> (containerd, via its CRI plugin) produces <code>config.json</code>. It merges two sources: the <em>image config</em> — the entrypoint, environment and working directory baked in when the image was built — and the <em>caller's request</em>, which for Kubernetes is the pod spec. I4 covers the first, I8 covers the second.</li>
+</ul>
+<div class="flow"><span>image layers</span><em>→</em><span>snapshotter</span><em>→</em><span>rootfs/</span><em>+</em><span>image config &amp; pod spec</span><em>→</em><span>containerd</span><em>→</em><span>config.json</span></div>
+<p>In the analogy: the <strong>room-prep crew</strong> (snapshotter) stacks the sheets to make the room, and the <strong>building-services company</strong> (containerd) writes the work order. The contractor (runc) arrives, reads the order, and leaves.</p>
+<p>The consequence to hold on to: <strong>the bundle is ephemeral, but it is on disk while the container runs, and you can read it.</strong> That makes it one of the best debugging artefacts on a node — it is the exact, final, fully-merged answer to "what did we actually ask for", after every default, every admission controller and every runtime option has had its say.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a container with containerd's own client, so nothing here depends on Kubernetes.
+<pre class="cmd">sudo ctr images pull docker.io/library/alpine:3.22
+sudo ctr run -d docker.io/library/alpine:3.22 demo sleep 300</pre>
+<p>Record the digest the tag resolved to, so a later run can tell a moved tag from a broken command:</p>
+<pre class="out">application/vnd.oci.image.index.v1+json <b>sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce</b>
+Completed pull from OCI Registry (docker.io/library/alpine:3.22)	elapsed: 9.5 s	total: 3.6 Mi</pre></li>
+
+<li>Find the bundle. It is under <code>/run</code>, which is a tmpfs — more evidence that it is scaffolding rather than storage.
+<pre class="cmd">sudo ls /run/containerd/io.containerd.runtime.v2.task/default/demo/</pre>
+<pre class="out">bootstrap.json  <b>config.json</b>  init.pid  log  log.json  options.json  <b>rootfs</b>  runtime  s  shim-binary-path  work</pre>
+<p>There are your two required entries, plus a handful of files that belong to the <em>shim</em> rather than to the runtime — the foreman's paperwork, which I7 reads properly.</p></li>
+
+<li>Confirm that <code>rootfs</code> is a mount and not a copy.
+<pre class="cmd">mount | grep demo</pre>
+<pre class="out"><b>overlay</b> on /run/containerd/io.containerd.runtime.v2.task/default/demo/rootfs type overlay
+  (rw,relatime,<b>lowerdir=</b>/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs,
+   <b>upperdir=</b>…/snapshots/2/fs,workdir=…/snapshots/2/work,uuid=on,nouserxattr)</pre>
+<p>One <code>lowerdir</code> because Alpine is a single-layer image; a multi-layer image produces a colon-separated list. The <code>upperdir</code> is this container's writable layer, and it is what disappears when the container is removed.</p></li>
+
+<li>Read the generated <code>config.json</code> and compare it with your hand-written one.
+<pre class="cmd">B=/run/containerd/io.containerd.runtime.v2.task/default/demo/config.json
+sudo jq '{ociVersion, root, hostname, mounts: (.mounts|length),
+          ns: [.linux.namespaces[].type], cgroupsPath: .linux.cgroupsPath,
+          seccomp: (.linux.seccomp.syscalls|length), args: .process.args,
+          caps: (.process.capabilities.bounding|length)}' $B</pre>
+<pre class="out">{
+  "ociVersion": "1.3.0",
+  "root": { "path": "rootfs" },
+  "hostname": null,
+  "mounts": 7,
+  "ns": [ "pid", "ipc", "uts", "mount", "network" ],
+  "cgroupsPath": "<b>/default/demo</b>",
+  "seccomp": null,
+  "args": [ "sleep", "300" ],
+  "caps": 14
+}</pre>
+<p>Four things to notice. <code>cgroupsPath</code> is derived from the namespace and container name — that is where containerd's naming ends up, since the runtime spec has no name field. There is <strong>no <code>cgroup</code> namespace</strong> and <strong>no seccomp profile</strong>: <code>ctr</code> is a debugging client and applies neither. <code>hostname</code> is unset. And the capability set is 14, which is Docker's historic default list, inherited by containerd. Under the CRI (I8) every one of these answers changes.</p></li>
+
+<li>Prove that containerd's containers are just runc containers, by asking runc directly. The trick is that containerd keeps runc's state under its own root directory.
+<pre class="cmd">sudo runc --root /run/containerd/runc/default list
+sudo runc --root /run/containerd/runc/default state demo | jq '{id,pid,status,bundle}'</pre>
+<pre class="out">ID     PID     STATUS    BUNDLE                                                       OWNER
+demo   26604   running   /run/containerd/io.containerd.runtime.v2.task/default/demo   root
+
+{
+  "id": "demo",
+  "pid": 26604,
+  "status": "running",
+  "bundle": "/run/containerd/io.containerd.runtime.v2.task/default/demo"
+}</pre>
+<p>That is the whole point of the module in one command. There is no separate "containerd container" concept; there is a bundle, and there is <code>runc</code>, and you can drive it with the same binary and the same subcommands you used on <code>hello</code>.</p></li>
+
+<li>Clean up.
+<pre class="cmd">sudo ctr task kill -s KILL demo; sudo ctr c rm demo</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>After <code>ctr c rm demo</code>, the directory under <code>/run/containerd/io.containerd.runtime.v2.task/default/</code> is gone and <code>mount | grep demo</code> is silent — the bundle really was scaffolding. The snapshot under <code>/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/</code> is <em>not</em> gone, because that belongs to the image, not to the container.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Do not edit a live bundle expecting anything to happen.</strong> <code>config.json</code> is read once, at <code>create</code>. Editing it afterwards changes nothing about the running container and will confuse whoever reads it next. It is a record, not a control surface.</li>
+<li><strong><code>runc list</code> with the wrong <code>--root</code> lies by omission.</strong> Plain <code>runc list</code> uses <code>/run/runc</code> and will cheerfully report an empty list on a node running fifty containers. Every runc command containerd's containers respond to needs <code>--root /run/containerd/runc/&lt;namespace&gt;</code>.</li>
+<li><strong>The path encodes the containerd namespace, not the Kubernetes namespace.</strong> <code>default</code> above is containerd's own tenancy concept; Kubernetes uses the containerd namespace <code>k8s.io</code> for everything, regardless of which Kubernetes namespace the pod is in.</li>
+</ul>
+
+<div class="specref">
+<p>The specification never says where bundles come from, and that silence is deliberate:</p>
+<blockquote>The Open Container Initiative Runtime Specification aims to specify the configuration, execution environment, and lifecycle of a container.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/spec.md">spec.md § Abstract</a></cite>
+<p>Configuration, execution, lifecycle. Not acquisition, not distribution, not assembly. Everything you watched containerd do above lives in the gap that sentence leaves open — which is why it took three more specifications and this whole track to fill it.</p>
+</div>
+
+<div class="k8s-link">
+<p>On a Kubernetes node this directory is the fastest way to answer "what did the kubelet <em>actually</em> ask for", when the pod spec and the observed behaviour disagree. The path is the same with <code>k8s.io</code> in place of <code>default</code>, and the container id is the long hash from <code>crictl ps</code>. <a href="w6.html#cp-6-6">W6.6</a> triages a container that will not start; reading its generated <code>config.json</code> belongs in that toolkit, and by I8 you will be able to explain every field in it.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/containerd/containerd/blob/main/docs/PLUGINS.md">containerd <code>docs/PLUGINS.md</code></a> for what a snapshotter is and which one is in use; <code>ctr --help</code> and <code>ctr snapshots --help</code>. The runtime specification is silent here by design, which is itself the thing to remember.</p>
+</article>
+</div>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
