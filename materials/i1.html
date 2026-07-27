@@ -671,6 +671,381 @@ cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelega
 <p class="docs-links"><code>Documentation/admin-guide/cgroup-v2.rst</code> for the <em>HugeTLB</em> section and for the v1-to-v2 conversion notes at the end, which are the best short summary of the differences. <code>Documentation/admin-guide/mm/hugetlbpage.rst</code> for the pool, <code>vm.nr_hugepages</code> and why reservation is a boot-time concern. <code>man 5 proc</code> for the <code>/proc/meminfo</code> huge-page fields and for the format of <code>/proc/&lt;pid&gt;/cgroup</code>.</p>
 </article>
 </div>
+
+<!-- ---------------- Seccomp ---------------- -->
+<div class="grp" id="g-seccomp"><h3>Filtering syscalls for real</h3>
+
+<article class="lesson" id="cp-i1-9" data-id="i1-9">
+<div class="lesson-head"><span class="cp-id">I1.9</span><h4>Write a seccomp filter by hand, and get killed by it on purpose</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A container dies instantly. There is no log line, no stack trace, no error message — the process simply stops. This is the most under-diagnosed failure in the container world, and it has one signature: exit status <strong>159</strong> and the words <code>Bad system call</code>. Once you have installed a filter yourself and been killed by it, you will recognise it forever. That is the entire purpose of this lesson.</p>
+<h5>The concept</h5>
+<p><a href="b3.html">B3</a> established that a system call is the only way a process reaches the kernel, and <a href="b12.html">B12</a> introduced seccomp as a name. <strong>seccomp-bpf</strong> is the mechanism: a small program, in the same restricted bytecode language as a packet filter, that the kernel runs <em>before</em> every system call your process makes. It sees a fixed structure — the syscall number, the architecture, the instruction pointer, and the six arguments — and it returns an action.</p>
+<p>The important actions are few:</p>
+<table>
+<tr><th>Action</th><th>Effect</th><th>What the process sees</th></tr>
+<tr><td><code>SECCOMP_RET_ALLOW</code></td><td>proceed</td><td>nothing</td></tr>
+<tr><td><code>SECCOMP_RET_ERRNO</code></td><td>do not run the call; return an errno</td><td>a normal failure it can handle</td></tr>
+<tr><td><code>SECCOMP_RET_KILL_PROCESS</code></td><td>terminate immediately with <code>SIGSYS</code></td><td>nothing — it is already dead</td></tr>
+<tr><td><code>SECCOMP_RET_LOG</code></td><td>allow, but record it</td><td>nothing; the audit log gets a line</td></tr>
+</table>
+<p>Two properties make seccomp safe to hand to unprivileged processes, and both mirror the <code>uid_map</code> rule from <a href="#cp-i1-1">I1.1</a> — one-way doors, for the same reason:</p>
+<ul>
+<li><strong>A filter can never be removed.</strong> It is inherited across <code>fork</code> and survives <code>exec</code>. Additional filters can be stacked on top, and the most restrictive result wins; nothing subtracts.</li>
+<li><strong><code>no_new_privs</code> must be set first</strong> for an unprivileged process to install one. Without it you could install a filter that neuters some security-relevant call and then <code>exec</code> a setuid-root binary straight into the trap — a real escalation, closed by requiring the process to first promise it will never gain privilege through <code>exec</code>.</li>
+</ul>
+<p>The bytecode itself is less frightening than it sounds. Every filter starts the same way — check the architecture, because syscall numbers differ between <code>x86_64</code> and <code>i386</code> and a filter that skips this check can be bypassed by invoking the 32-bit ABI — then loads the syscall number and branches.</p>
+<h5>Lab</h5>
+<ol>
+<li>Write the filter. Six instructions: check the arch, load the syscall number, kill on a match, allow everything else. Read the comments rather than the packing format; the shape is what matters.
+<pre class="cmd">cat &gt; ~/killgetpid.py &lt;&lt;'PY'
+import ctypes, os, struct
+BPF_LD, BPF_W, BPF_ABS, BPF_JMP, BPF_JEQ, BPF_K, BPF_RET = 0, 0, 0x20, 5, 0x10, 0, 6
+AUDIT_ARCH_X86_64, NR_getpid = 0xC000003E, 39
+KILL, ALLOW = 0x80000000, 0x7FFF0000
+PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, SECCOMP_MODE_FILTER = 38, 22, 2
+
+def stmt(code, k):         return struct.pack("HBBI", code, 0, 0, k)
+def jump(code, k, jt, jf): return struct.pack("HBBI", code, jt, jf, k)
+
+prog = b"".join([
+    stmt(BPF_LD | BPF_W | BPF_ABS, 4),                        # A = arch
+    jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 0, 3), # wrong arch -&gt; allow
+    stmt(BPF_LD | BPF_W | BPF_ABS, 0),                        # A = syscall nr
+    jump(BPF_JMP | BPF_JEQ | BPF_K, NR_getpid, 0, 1),         # getpid?
+    stmt(BPF_RET | BPF_K, KILL),
+    stmt(BPF_RET | BPF_K, ALLOW),
+])
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+libc  = ctypes.CDLL("libc.so.6", use_errno=True)
+buf   = ctypes.create_string_buffer(prog, len(prog))
+fprog = SockFprog(len(prog) // 8, ctypes.cast(buf, ctypes.c_void_p))
+
+assert libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+assert libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) == 0, \
+    os.strerror(ctypes.get_errno())
+
+print("filter loaded; /proc/self/status now says:", flush=True)
+for line in open("/proc/self/status"):
+    if line.startswith("Seccomp"): print("  " + line.strip(), flush=True)
+print("calling getpid() ...", flush=True)
+libc.syscall(NR_getpid)
+print("still here -- the filter did not fire", flush=True)
+PY</pre></li>
+<li>Run it as your ordinary user — no privilege is needed, which is the point of <code>no_new_privs</code>.
+<pre class="cmd">python3 ~/killgetpid.py; echo "exit status = $?"</pre>
+<pre class="out">filter loaded; /proc/self/status now says:
+  <b>Seccomp:	2</b>
+  <b>Seccomp_filters:	1</b>
+calling getpid() ...
+<b>Bad system call (core dumped)</b>
+exit status = <b>159</b></pre>
+<p>There it is, complete. <code>Seccomp: 2</code> means mode 2, filter mode (<code>0</code> is off, <code>1</code> is the ancient strict mode). <code>Seccomp_filters: 1</code> counts the filters stacked on this process. And 159 is <code>128 + 31</code>, where 31 is <code>SIGSYS</code> — the same arithmetic that makes a <code>SIGKILL</code>ed process exit 137.</p>
+<p>Note carefully that the last <code>print</code> never ran and produced no output at all. Nothing announced the death except the shell's own report. In a container, where the shell is not there to report it, you get silence.</p></li>
+<li>Confirm the arithmetic rather than believing it, and learn the two commands that identify any signal death.
+<pre class="cmd">kill -l 31
+kill -l 159</pre>
+<pre class="out">SYS
+<b>SYS</b></pre>
+<p><code>kill -l</code> maps in both directions: given 31 it names the signal, given 159 it subtracts 128 first. Whenever you meet an unexplained exit status above 128, that is the command.</p></li>
+<li>Look at a process with no filter for contrast, so you know what you are comparing against.
+<pre class="cmd">grep -E '^Seccomp' /proc/self/status</pre>
+<pre class="out">Seccomp:	0
+Seccomp_filters:	0</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Your script exits with status 159 and prints <code>Bad system call</code>; <code>/proc/self/status</code> showed <code>Seccomp: 2</code> before it died and shows <code>Seccomp: 0</code> for an ordinary shell. You can decode 159 without a reference.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Killing <code>getpid</code> is safe because nothing important calls it on the way out. Pick almost any other syscall and the process dies during Python's startup or during <code>print</code>, which produces a confusing "it dies before my code runs" and is not a bug in the filter. Choose your victim syscall deliberately when experimenting.</p>
+<p>Skipping the architecture check is a genuine vulnerability, not a style point. On an <code>x86_64</code> kernel a process can invoke the 32-bit syscall ABI, where the numbers are different — so a filter that blocks syscall 39 without checking the architecture blocks <code>getpid</code> on 64-bit and something else entirely on 32-bit. Every real profile starts with this check.</p>
+<p>The core dump can be a nuisance: on a machine with <code>systemd-coredump</code> installed, each run writes a dump and a journal entry. <code>ulimit -c 0</code> in the shell first if you are iterating.</p>
+<p>Finally, the diagnostic that works when you have nothing else: <code>grep Seccomp /proc/&lt;pid&gt;/status</code> on a still-running container process tells you whether it has a filter at all. A <code>Seccomp: 2</code> on a process that keeps dying mysteriously is most of the answer.</p>
+<div class="k8s-link">
+<p>Kubernetes attaches profiles through <code>securityContext.seccompProfile</code>, and since v1.27 the kubelet flag <code>--seccomp-default</code> applies the runtime's default profile to every pod that does not opt out. When a pod crash-loops with no logs and an exit code of 159, this is the first thing to check — and the fix is almost never "disable seccomp", it is to find the syscall and audit whether the workload should be making it.</p>
+<p>There is no <code>securityContext</code> anchor in the advanced track to send you to; that material is CKS, not CKA, and inventing a link here would be worse than saying so. What the advanced track does have is the diagnostic ladder for a container that will not stay up: <a href="w6.html#cp-6-3">W6.3 — CrashLoopBackOff, and reading the last state</a>, where <code>lastState.terminated.exitCode</code> is the field that carries the 159 up to you.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 seccomp</code> is the reference — the <em>Filter return actions</em> section lists every action and its precedence. <code>man 2 prctl</code> for <code>PR_SET_NO_NEW_PRIVS</code> and <code>PR_SET_SECCOMP</code>. The kernel's <code>Documentation/userspace-api/seccomp_filter.rst</code> explains the <code>seccomp_data</code> structure the filter reads, which is what the offsets <code>0</code> and <code>4</code> in the lab refer to.</p>
+</article>
+
+<article class="lesson" id="cp-i1-10" data-id="i1-10">
+<div class="lesson-head"><span class="cp-id">I1.10</span><h4>Deny-list versus allow-list, and why the action matters more than the list</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every seccomp profile you will ever meet in production is an allow-list of several hundred syscalls, and the interesting engineering is not in the list — it is in what happens to the calls that are not on it. Choosing <code>ERRNO</code> over <code>KILL</code> is the difference between a workload that degrades gracefully and one that vanishes, and it is also the source of a genuinely nasty class of silent bug.</p>
+<h5>The concept</h5>
+<p>A <strong>deny-list</strong> names the bad calls and permits the rest. A <strong>allow-list</strong> names the permitted calls and refuses the rest. The argument is the same as for firewalls and it is settled: deny-lists protect you only against attacks somebody already thought of, and the kernel adds new syscalls every release, so a deny-list decays automatically. Every profile worth deploying is an allow-list.</p>
+<p>The subtler decision is the <em>action</em> for the default case:</p>
+<ul>
+<li><strong><code>KILL</code></strong> is unambiguous and brutal. The process dies, you get the 159 from <a href="#cp-i1-9">I1.9</a>, and there is no chance of the workload limping on in a state you did not intend.</li>
+<li><strong><code>ERRNO</code></strong> returns a failure the program can handle — usually <code>EPERM</code> or <code>ENOSYS</code>. Well-written software falls back. This is precisely how the default profile can block syscalls that did not exist when a libc was compiled: the libc probes for the new call, gets <code>ENOSYS</code>, and quietly uses the old path.</li>
+</ul>
+<p>That same graceful fallback is the trap. A program can take a slow path for years because a syscall it wanted was refused and it handled the refusal correctly — no error, no log, just a performance mystery. If you have ever seen a container be inexplicably slower than the same binary on the host, this is on the short list of causes.</p>
+<p><code>SECCOMP_RET_LOG</code> exists to make allow-lists buildable in practice. You cannot write down three hundred syscalls from first principles; what you do is run the workload with everything logged, collect what it actually used, and permit that. Every real profile was built empirically.</p>
+<p>Real profiles are written in JSON, not bytecode, and compiled by <code>libseccomp</code>. The vocabulary is small: an array of <code>syscalls</code> entries, each with a list of <code>names</code>, an <code>action</code> (<code>SCMP_ACT_ALLOW</code>, <code>SCMP_ACT_ERRNO</code>, <code>SCMP_ACT_LOG</code>, <code>SCMP_ACT_KILL</code>), an optional <code>errnoRet</code>, and optional per-argument conditions — which is how the default profile allows <code>clone</code> but not <code>clone</code> with the <code>CLONE_NEWUSER</code> flag.</p>
+<h5>Lab</h5>
+<ol>
+<li>Change one word in the filter from <a href="#cp-i1-9">I1.9</a> and watch the failure mode change completely. <code>SECCOMP_RET_ERRNO</code> is <code>0x00050000</code> bitwise-ORed with the errno you want to return.
+<pre class="cmd">sed -e 's/^KILL, ALLOW = .*/KILL, ALLOW = 0x00050000 | 1, 0x7FFF0000   # ERRNO(EPERM)/' \
+    -e 's/NR_getpid = 39/NR_getpid = 92/' \
+    -e "s/libc.syscall(NR_getpid)/r = libc.syscall(NR_getpid, b'\/tmp\/x', 0, 0)\nprint(f'  returned {r}, errno = {ctypes.get_errno()}', flush=True)/" \
+    ~/killgetpid.py &gt; ~/errnochown.py
+touch /tmp/x
+python3 ~/errnochown.py; echo "exit status = $?"</pre>
+<pre class="out">filter loaded; /proc/self/status now says:
+  Seccomp:	2
+  Seccomp_filters:	1
+calling getpid() ...
+  returned <b>-1</b>, errno = <b>1</b>
+still here -- the filter did not fire
+exit status = <b>0</b></pre>
+<p>Syscall 92 is <code>chown</code>. Same filter, same six instructions, one constant changed — and instead of dying, the process gets an ordinary <code>EPERM</code> and carries on. Note the last line: from the program's point of view <em>nothing unusual happened</em>. A <code>chown</code> failed. Programs handle that.</p></li>
+<li>Get the syscall numbers from the tool rather than a table, because they differ per architecture and hard-coding them is how filters end up wrong.
+<pre class="cmd">sudo apt-get install -y seccomp
+scmp_sys_resolver -a x86_64 getpid
+scmp_sys_resolver -a x86_64 chown
+scmp_sys_resolver -a x86_64 mount
+scmp_sys_resolver -a x86_64 39</pre>
+<pre class="out">39
+92
+165
+<b>getpid</b></pre>
+<p>It resolves in both directions, which is what you want when reading someone else's filter or decoding an audit record that names a number.</p></li>
+<li>Read a real profile. Containerd and Docker ship the same default, maintained in its own repository; fetch it and <em>measure</em> it rather than trusting anybody's round number — including the "about 300" you will read almost everywhere.
+<pre class="cmd">curl -sL -o /tmp/default.json \
+  https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json
+jq -r '.defaultAction' /tmp/default.json
+jq '[.syscalls[].names[]] | length' /tmp/default.json
+jq -r '[.syscalls[].action] | unique[]' /tmp/default.json</pre>
+<pre class="out"><b>SCMP_ACT_ERRNO</b>
+<b>442</b>
+SCMP_ACT_ALLOW
+SCMP_ACT_ERRNO</pre>
+<p>442, not 300 — the figure everyone quotes is years old, and it grows every kernel release, which is exactly the argument against deny-lists made numerically. Measure, do not quote.</p>
+<p>Two other things in that output. The default action is <code>ERRNO</code>, not <code>KILL</code> — a container that touches something unlisted gets a refused syscall, not a corpse, which is a deliberate compatibility choice and is why most seccomp problems present as strange behaviour rather than as the clean 159 you produced in the previous lesson. And only two actions appear in the whole file: allow, or refuse with an errno. Nothing in the default profile kills anything.</p></li>
+<li>Find the argument conditions, which are the part people do not know exist.
+<pre class="cmd">jq -c '.syscalls[] | select(.args != null and (.names | index("clone"))) |
+    {names, action, args}' /tmp/default.json</pre>
+<pre class="out">{"names":["clone"],"action":"SCMP_ACT_ALLOW",
+ "args":[{"index":0,"value":<b>2114060288</b>,"op":"<b>SCMP_CMP_MASKED_EQ</b>"}]}
+{"names":["clone"],"action":"SCMP_ACT_ALLOW","args":[{"index":1,"value":2114060288,...}]}</pre>
+<p>2114060288 is <code>0x7E020000</code> — the bitwise OR of every <code>CLONE_NEW*</code> flag. <code>SCMP_CMP_MASKED_EQ</code> with that mask and an implied comparison value of zero reads: "allow <code>clone</code> only when <em>none</em> of the namespace-creation bits are set". So a default-profile container cannot create any new namespace at all, user namespaces included — which is the container-runtime counterpart of the AppArmor restriction from <a href="#cp-i1-4">I1.4</a>, reached by a completely different mechanism.</p>
+<p>There are two entries because the flags argument is in a different position on s390x than on every other architecture. A profile that hard-codes <code>index: 0</code> is silently ineffective on one platform, which is the kind of detail that makes hand-written profiles a bad idea.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>Your <code>ERRNO</code> variant exits 0 with a failed <code>chown</code>, while the <code>KILL</code> variant exits 159. <code>scmp_sys_resolver</code> round-trips a name to a number and back. You can say, in one sentence each, why every real profile is an allow-list and why its default action is usually <code>ERRNO</code>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Building an allow-list from a single run of a workload produces a profile that breaks the first time the workload takes an error path, a shutdown path, or a code path only some inputs reach. Empirical profiles need broad exercise, and they need re-derivation when the application is updated. This is why almost nobody writes custom profiles and almost everybody uses the runtime default.</p>
+<p>The syscall a profile blocks and the syscall a program appears to call are often different. <code>open</code> in your source becomes <code>openat</code> in the binary; <code>fork</code> becomes <code>clone</code>. Filter by what <code>strace</code> shows, never by what the source says.</p>
+<p><code>ENOSYS</code> and <code>EPERM</code> are not interchangeable as a default. <code>ENOSYS</code> means "this kernel does not have that call", which triggers the fallback paths libc already contains; <code>EPERM</code> means "you may not", which many programs treat as fatal. Choosing the wrong one turns a working container into a broken one for no security benefit.</p>
+<div class="k8s-link">
+<p><code>RuntimeDefault</code> in a pod's <code>seccompProfile</code> means exactly the JSON file you just measured — the container runtime's built-in allow-list, not something Kubernetes ships. <code>Localhost</code> means a file you have placed in the kubelet's seccomp directory on every node yourself, which is why custom profiles are an operational commitment rather than a YAML change.</p>
+<p>As with <a href="#cp-i1-9">I1.9</a>, there is no advanced-track anchor for this — <code>securityContext</code> and Pod Security Standards are CKS material and appear nowhere in the CKA curriculum. The connection you can make on the exam is at the runtime level: <a href="w1.html#cp-1-3">W1.3 — the container runtime interface and what the kubelet asks for</a>, which is where the profile is handed down.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 seccomp</code>, <em>Filter return actions</em>, for the precedence rules when filters are stacked. <code>man 3 seccomp_rule_add</code> for the <code>libseccomp</code> API and, in particular, <code>scmp_arg_cmp</code> — the argument-condition mechanism the <code>clone</code> rule above uses. <code>man 1 scmp_sys_resolver</code>. The <a href="https://github.com/moby/profiles/blob/main/seccomp/default.json">Moby default profile</a> is the file to read once, slowly — note that it lives in <code>moby/profiles</code>, having moved out of <code>moby/moby</code>, so most links to it on the web are dead.</p>
+</article>
+</div>
+
+<!-- ---------------- Networking ---------------- -->
+<div class="grp" id="g-net"><h3>Networking, the parts we skipped</h3>
+
+<article class="lesson" id="cp-i1-11" data-id="i1-11">
+<div class="lesson-head"><span class="cp-id">I1.11</span><h4>TUN and TAP — an interface whose other end is your program</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><a href="b9.html">B9</a> built veth pairs and bridges — interfaces whose other end is somewhere else in the kernel. TUN and TAP are the stranger and more powerful case: an interface whose other end is a <strong>file descriptor held by an ordinary program</strong>. Every VPN works this way, every rootless container network stack works this way, and understanding it is what makes "why is rootless networking slow?" a question with an answer rather than a shrug.</p>
+<h5>The concept</h5>
+<p>Open <code>/dev/net/tun</code>, issue one <code>ioctl</code>, and the kernel creates a network interface bound to your file descriptor. From then on:</p>
+<div class="flow"><span>kernel routes a packet to <code>tun0</code></span><em>→</em><span>your <code>read()</code> returns it</span><em>·</em><span>your <code>write()</code></span><em>→</em><span>kernel treats it as received</span></div>
+<p>The difference between the two modes is one line and one bit:</p>
+<table>
+<tr><th>&nbsp;</th><th>TUN</th><th>TAP</th></tr>
+<tr><td>Layer</td><td>3 — you read raw IP packets</td><td>2 — you read whole Ethernet frames</td></tr>
+<tr><td>Has a MAC address</td><td>no; point-to-point</td><td>yes; can join a bridge</td></tr>
+<tr><td>Typical user</td><td>VPNs, rootless network stacks</td><td>VM networking (QEMU), software switches</td></tr>
+</table>
+<p>Three properties follow directly from "the other end is a program", and all three are things you will observe in the lab rather than take on faith:</p>
+<ul>
+<li><strong>No holder, no carrier.</strong> An interface created with <code>ip tuntap add</code> but not opened by any process sits in <code>NO-CARRIER</code> — link-down, packets discarded — no matter how many times you <code>ip link set up</code>.</li>
+<li><strong>The holder's exit destroys it.</strong> Unless it was made persistent, the interface disappears when the last descriptor closes. There is nothing to clean up because there is nothing left.</li>
+<li><strong>It is slow, and for a legible reason.</strong> Every packet crosses the user/kernel boundary twice more than it otherwise would — once out to the program, once back in. That is the entire performance story of rootless container networking, and it is not a bug anyone can fix.</li>
+</ul>
+<h5>Lab</h5>
+<ol>
+<li>Write the holder. Twenty lines: one <code>ioctl</code> to create the interface, then a loop decoding IPv4 headers.
+<pre class="cmd">cat &gt; ~/tunread.py &lt;&lt;'PY'
+import fcntl, os, struct, socket, sys
+TUNSETIFF, IFF_TUN, IFF_NO_PI = 0x400454CA, 0x0001, 0x1000
+fd = os.open("/dev/net/tun", os.O_RDWR)
+fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH22s", b"tun0", IFF_TUN | IFF_NO_PI, b""))
+print("tun0 attached to fd", fd, "- waiting for packets", flush=True)
+for _ in range(int(sys.argv[1])):
+    pkt = os.read(fd, 2048)
+    ver_ihl, _, total_len = struct.unpack("!BBH", pkt[:4])
+    src, dst = socket.inet_ntoa(pkt[12:16]), socket.inet_ntoa(pkt[16:20])
+    name = {1: "ICMP", 6: "TCP", 17: "UDP"}.get(pkt[9], str(pkt[9]))
+    print(f"  IPv{ver_ihl &gt;&gt; 4} len={total_len:&lt;4} proto={name:&lt;4} {src} -&gt; {dst}", flush=True)
+PY</pre>
+<p><code>IFF_NO_PI</code> asks the kernel not to prepend a four-byte protocol-info header, so what you read starts exactly at the IP header. Leave it out and every offset in the parser is wrong by four — a classic first-attempt bug.</p></li>
+<li>First, create the interface with nobody holding it, and confirm the carrier claim.
+<pre class="cmd">sudo -i
+ip tuntap add dev tun0 mode tun
+sysctl -qw net.ipv6.conf.tun0.disable_ipv6=1
+ip addr add 10.9.0.1/24 dev tun0
+ip link set tun0 up
+ip -br link show tun0
+ping -c1 -W1 10.9.0.2</pre>
+<pre class="out">tun0    DOWN    &lt;<b>NO-CARRIER</b>,POINTOPOINT,MULTICAST,NOARP,<b>UP</b>&gt;
+1 packets transmitted, 0 received, 100% packet loss, time 0ms</pre>
+<p>Administratively <code>UP</code>, operationally <code>DOWN</code>, because no program is on the other end. This exact pair of states on a real VPN interface means the daemon has died.</p>
+<pre class="cmd">ip link del tun0</pre></li>
+<li>Now with a holder. Start the program first — it creates the interface — then address it.
+<pre class="cmd">python3 /home/ubuntu/tunread.py 2 &amp;
+sleep 1
+sysctl -qw net.ipv6.conf.tun0.disable_ipv6=1
+ip addr add 10.9.0.1/24 dev tun0; ip link set tun0 up
+ip -br link show tun0
+ping -c2 -W1 10.9.0.2 &gt;/dev/null</pre>
+<pre class="out">tun0 attached to fd 3 - waiting for packets
+tun0    UNKNOWN    &lt;POINTOPOINT,MULTICAST,NOARP,UP,<b>LOWER_UP</b>&gt;
+  IPv4 len=84   proto=ICMP <b>10.9.0.1 -&gt; 10.9.0.2</b>
+  IPv4 len=84   proto=ICMP 10.9.0.1 -&gt; 10.9.0.2</pre>
+<p><code>NO-CARRIER</code> is gone and <code>LOWER_UP</code> has appeared. The pings go nowhere — 10.9.0.2 does not exist — but your Python process received both of them as raw bytes. A VPN client is this program plus encryption plus a socket to the far end.</p></li>
+<li>Let the program exit, and watch the interface go with it.
+<pre class="cmd">wait; sleep 1; ip -br link show tun0</pre>
+<pre class="out">Device "tun0" does not exist.</pre>
+<p>To keep it after the holder exits you would create it with <code>ip tuntap add ... user ubuntu</code>, which marks it persistent — and which is also the mechanism that lets an unprivileged program attach to a pre-created interface it could not have made itself.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>ip -br link show tun0</code> reports <code>NO-CARRIER</code> with no holder and <code>LOWER_UP</code> with one; your program prints the source and destination of packets you generated with <code>ping</code>; the interface disappears when the program exits.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Disable IPv6 on the interface for this lab or the output fills with router solicitations and multicast listener reports, which the IPv4 parser above decodes as nonsense. That noise is real traffic, not an error — but it makes the demonstration unreadable.</p>
+<p>Reads are per-packet, not a byte stream. One <code>read()</code> returns exactly one packet or frame, and a buffer smaller than the interface MTU truncates it silently. Size the buffer from the MTU, not from a round number that looks big enough.</p>
+<p>TAP is not TUN with a flag you can ignore. A TAP holder must handle ARP itself, because it receives Ethernet frames including ARP requests and nothing else will answer them. Programs written against TUN that are switched to TAP fail in exactly this way, and the symptom is that nothing ever gets past address resolution.</p>
+<div class="k8s-link">
+<p>You will not find a TUN device on a normal Kubernetes node — the CNI plugins in <a href="i9.html">I9</a> use veth pairs and bridges, in the kernel, precisely because they have the privilege to. TUN appears at the edges: in rootless Kubernetes distributions, in VPN-based cluster access, in service meshes that terminate traffic in userspace, and in any CNI plugin implementing an overlay in a user process rather than in the kernel.</p>
+<p>The concept that <em>does</em> transfer everywhere is the one this lesson makes concrete: a network interface is an object with two ends, and knowing what holds the far end tells you where to look when packets stop. See <a href="w4.html#cp-4-3">W4.3 — the pod network datapath, veth by veth</a> for the kernel-to-kernel version of the same reasoning.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The kernel's <code>Documentation/networking/tuntap.rst</code> is the primary source and includes the C the Python above transliterates. <code>man 8 ip-tuntap</code> for the command-line side, including <code>user</code>/<code>group</code> persistence. <code>man 2 ioctl</code> for the call shape, and <code>man 7 netdevice</code> for what <code>IFF_*</code> flags such as <code>LOWER_UP</code> actually mean.</p>
+</article>
+
+<article class="lesson" id="cp-i1-12" data-id="i1-12">
+<div class="lesson-head"><span class="cp-id">I1.12</span><h4>VXLAN between two namespaces, and the 50 bytes that decide your MTU</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Your cluster's pod network is almost certainly a VXLAN overlay. Flannel's default backend is VXLAN, Calico's cross-subnet mode is VXLAN, and the reason every one of them gives pods an MTU of 1450 rather than 1500 is a piece of arithmetic you can do on paper. Get it wrong and you rebuild <a href="b8.html">B8</a>'s MTU black hole from the inside — small requests fine, TLS handshake fine, first large response gone.</p>
+<h5>The concept</h5>
+<p>An <strong>overlay network</strong> is a network built on top of another network by wrapping each packet in a second one. <strong>VXLAN</strong> is the common way to do it: the kernel takes your inner Ethernet frame, prepends an 8-byte VXLAN header carrying a 24-bit network identifier (the <abbr title="VXLAN Network Identifier — which of the 16 million possible overlay networks this frame belongs to">VNI</abbr>), and sends the result as an ordinary UDP datagram to port 4789 on the far host. The far kernel unwraps it and delivers the inner frame as though it had arrived on a local wire.</p>
+<p>The two networks get names worth keeping straight. The <strong>underlay</strong> is the real network between hosts. The <strong>overlay</strong> is the virtual one the containers see. Neither knows about the other, which is the point — pods get a flat address space regardless of how the hosts are subnetted.</p>
+<p>Everything about MTU follows from adding up the wrapper:</p>
+<table>
+<tr><th>Layer added</th><th>Bytes</th></tr>
+<tr><td>Outer IPv4 header</td><td>20</td></tr>
+<tr><td>Outer UDP header</td><td>8</td></tr>
+<tr><td>VXLAN header</td><td>8</td></tr>
+<tr><td>Inner Ethernet header</td><td>14</td></tr>
+<tr><td><strong>Total overhead</strong></td><td><strong>50</strong></td></tr>
+</table>
+<p>So a 1500-byte underlay yields a <strong>1450</strong>-byte overlay. That is where Flannel's number comes from; it is not a tuning choice. Over IPv6 the outer header is 40 bytes rather than 20, so the overhead is 70 and the overlay MTU is 1430.</p>
+<p><strong>GRE</strong> is the same idea with a leaner header — typically 24 bytes of overhead — and no UDP. That last part costs it dearly in practice: without a UDP header there is no source port to hash on, so load balancers and ECMP routers cannot spread GRE traffic across paths, and many cloud networks drop it outright. VXLAN's UDP wrapper is not accidental.</p>
+<p>One adjacent trap belongs here because it has the same shape. A bridge will not, by default, send a frame back out of the port it arrived on — sensible loop prevention, and exactly wrong when a pod connects to a Service address that load-balances back to itself. That is <strong>hairpin mode</strong>, and it is why <code>--hairpin-mode</code> exists on the kubelet and why "a pod can reach every replica of a Service except itself" was a famous bug class.</p>
+<h5>Lab</h5>
+<ol>
+<li>Build the underlay: two network namespaces on a bridge, standing in for two hosts.
+<pre class="cmd">sudo -i
+ip link add br-under type bridge; ip link set br-under up
+for n in red:1 blue:2; do
+  ns=${n%:*}; i=${n#*:}
+  ip netns add $ns
+  ip link add veth-$ns type veth peer name eth0 netns $ns
+  ip link set veth-$ns master br-under up
+  ip -n $ns addr add 192.168.50.$i/24 dev eth0
+  ip -n $ns link set eth0 up; ip -n $ns link set lo up
+done
+ip netns exec red ping -c1 -W1 192.168.50.2 | tail -2</pre>
+<pre class="out">1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 0.069/0.069/0.069 ms</pre></li>
+<li>Build the overlay on top of it. One command per end.
+<pre class="cmd">ip -n red  link add vxlan0 type vxlan id 42 dev eth0 remote 192.168.50.2 dstport 4789
+ip -n blue link add vxlan0 type vxlan id 42 dev eth0 remote 192.168.50.1 dstport 4789
+ip -n red  addr add 10.42.0.1/24 dev vxlan0; ip -n red  link set vxlan0 up
+ip -n blue addr add 10.42.0.2/24 dev vxlan0; ip -n blue link set vxlan0 up
+for i in eth0 vxlan0; do
+  echo "  $i  mtu $(ip -n red link show $i | grep -o 'mtu [0-9]*' | cut -d' ' -f2)"; done</pre>
+<pre class="out">  eth0  mtu <b>1500</b>
+  vxlan0  mtu <b>1450</b></pre>
+<p>The kernel did the arithmetic for you: it knows the lower device is 1500, it knows the encapsulation costs 50, and it set 1450 without being asked. Remember that it can only do this when it knows the lower device — which is the crack the failure gets in through.</p></li>
+<li>Ping across the overlay while capturing the underlay, so you see the wrapper with your own eyes.
+<pre class="cmd">timeout 6 ip netns exec red tcpdump -ni eth0 -c 4 udp port 4789 &gt; /tmp/cap.txt 2&gt;&amp;1 &amp;
+sleep 1
+ip netns exec red ping -c2 -W1 10.42.0.2 | tail -2
+wait; grep VXLAN /tmp/cap.txt</pre>
+<pre class="out">2 packets transmitted, 2 received, 0% packet loss, time 1032ms
+IP <b>192.168.50.2.55073 &gt; 192.168.50.1.4789: VXLAN, flags [I] (0x08), vni 42</b>
+IP 192.168.50.1.55073 &gt; 192.168.50.2.4789: VXLAN, flags [I] (0x08), vni 42</pre>
+<p>Underlay addresses on the outside, port 4789, <code>vni 42</code>, and your ICMP hidden inside. This is precisely what you would see with <code>tcpdump</code> on a node's primary interface in a Flannel cluster — which is worth doing once, because it makes "the pod network" stop being an abstraction.</p></li>
+<li>Try the naive mistake and discover the kernel now refuses it.
+<pre class="cmd">ip -n red link set vxlan0 mtu 1500</pre>
+<pre class="out">RTNETLINK answers: <b>Invalid argument</b></pre>
+<p>A modern kernel will not let an encapsulating interface exceed what its lower device can carry. This is a real improvement — the classic hand-written-1500 bug is now unreachable — but it protects you only while the kernel can see the lower device.</p></li>
+<li>So produce the mistake that still happens: size the overlay correctly, then let the underlay shrink underneath it. This is the real-world scenario — a VM moves to a network with a smaller MTU, or someone "standardises" an interface.
+<pre class="cmd">for x in "ip -n red link set eth0" "ip -n blue link set eth0" \
+         "ip link set veth-red" "ip link set veth-blue" "ip link set br-under"; do $x mtu 1550; done
+ip -n red link set vxlan0 mtu 1500; ip -n blue link set vxlan0 mtu 1500
+ip netns exec red ping -c1 -W1 -s 1472 -M do 10.42.0.2 | tail -2
+
+# ... and now someone puts the underlay back to 1500 and tells nobody
+for x in "ip -n red link set eth0" "ip -n blue link set eth0" \
+         "ip link set veth-red" "ip link set veth-blue" "ip link set br-under"; do $x mtu 1500; done</pre>
+<pre class="out">1 packets transmitted, 1 received, 0% packet loss, time 0ms</pre></li>
+<li>Now walk up the packet sizes, which is the diagnostic sequence itself.
+<pre class="cmd">ip netns exec red ip route flush cache
+for s in 100 500 1472; do
+  echo "-- payload $s --"
+  ip netns exec red ping -c1 -W2 -s $s -M do 10.42.0.2 | tail -1
+done</pre>
+<pre class="out">-- payload 100 --
+rtt min/avg/max/mdev = 0.047/0.047/0.047/0.000 ms
+-- payload 500 --
+rtt min/avg/max/mdev = 0.016/0.016/0.016/0.000 ms
+-- payload 1472 --
+<b>ping: local error: message too long, mtu=1450</b></pre>
+<p>Small fine, medium fine, large refused. If those three lines look familiar it is because they are the <em>same</em> three lines as B8's black hole, produced here by an overlay you built yourself.</p></li>
+<li>The best part: ask the kernel what it learned. Path MTU discovery ran, and the answer is cached on the route.
+<pre class="cmd">ip netns exec red ip route get 10.42.0.2</pre>
+<pre class="out">10.42.0.2 dev vxlan0 src 10.42.0.1 uid 0
+    cache expires 596sec <b>mtu 1450</b></pre>
+<p>This is the single most useful command in an MTU investigation, and it is also the boundary of the good case. Here the ICMP "fragmentation needed" message got back, so the sender learned the true MTU and now fails <em>loudly and locally</em> with the correct number in the message. In a real network, somebody's firewall or security group drops that ICMP — and then nothing is learned, nothing is cached, and the large packets simply vanish. That silence is what "black hole" names.</p>
+<p>So the diagnostic is: run <code>ip route get</code> after a failing large transfer. If it shows a reduced <code>mtu</code>, the loop closed and you have your number. If it shows nothing, the ICMP is being filtered and you must find the MTU by bisection with <code>ping -M do -s</code>.</p></li>
+<li>Fix and confirm, then clean up.
+<pre class="cmd">ip -n red link set vxlan0 mtu 1450; ip -n blue link set vxlan0 mtu 1450
+ip netns exec red ip route flush cache
+ip netns exec red ping -c2 -W2 -s 1422 -M do 10.42.0.2 | tail -2
+ip netns del red; ip netns del blue; ip link del br-under</pre>
+<pre class="out">2 packets transmitted, 2 received, <b>0% packet loss</b>, time 1036ms</pre>
+<p>1422 payload + 8 ICMP + 20 IP = 1450 exactly. Every byte accounted for.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>tcpdump</code> on the underlay shows your ICMP wrapped in UDP/4789 with the right VNI; the kernel chose 1450 for the overlay unprompted; and you can derive 50 from the four headers without the table. State what <code>ip route get</code> tells you and what its silence tells you.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The <code>remote</code> form used above is point-to-point and only works for two ends. Real overlays either use multicast (<code>group 239.1.1.1</code>) or, far more commonly, have a controller program the forwarding database directly — which is exactly what Flannel's daemon does, one <code>bridge fdb</code> entry per node. If you extend this lab to three namespaces, that is the piece you will have to add.</p>
+<p>MTU problems are invisible to every tool that sends small packets. <code>ping</code> without <code>-s</code>, <code>curl</code> against a short endpoint, a TCP handshake and a TLS handshake all fit comfortably. The first thing to break is the first full-size response — which is why the symptom is so often reported as "the app hangs after logging in" rather than as a network fault.</p>
+<p>Do not fix MTU by turning off <code>DF</code> or enabling fragmentation. Fragmentation is a performance disaster and many middleboxes drop fragments anyway. Set the interface MTU to the truth and let path MTU discovery do its job.</p>
+<p>Check both directions. An asymmetric MTU — correct one way, wrong the other — produces the delightful symptom of a connection that works until the server sends something large, and traffic captures taken at the client show nothing at all wrong.</p>
+<div class="k8s-link">
+<p>This is your cluster's pod network, at the byte level. Flannel's VXLAN backend gives pods an MTU of 1450 for exactly the arithmetic above, and the <code>flannel.1</code> interface on every node is the same kind of device you just built. Run <code>tcpdump -ni &lt;node-nic&gt; udp port 4789</code> on a cluster node and you will see pod traffic wrapped in node traffic.</p>
+<p>The advanced-track home for all of this is <a href="w4.html#cp-4-7">W4.7 — overlay networks, VXLAN and the MTU you must not get wrong</a>, with the datapath in <a href="w4.html#cp-4-3">W4.3</a>. When you meet it there, you will already have built one — including the failure, which is the part the lesson cannot hand you.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://www.rfc-editor.org/rfc/rfc7348">RFC 7348</a> defines VXLAN and its §5 gives the exact header layout the 50 bytes come from — worth reading once for the frame diagram alone. <code>man 8 ip-link</code>, the <em>VXLAN Type Support</em> section, for every option including <code>group</code>, <code>local</code> and <code>nolearning</code>. <code>man 8 bridge</code> for <code>fdb</code> and for <code>hairpin</code>. <code>man 8 ping</code> for <code>-M do</code>, which is the flag that turns a vague hang into a number.</p>
+</article>
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
