@@ -238,7 +238,7 @@ spec: <b>1.3.0</b></pre>
 </div>
 
 <div class="k8s-link">
-<p>Everything you just read is what a PodSpec is eventually compiled into. <code>command</code>/<code>args</code> become <code>process.args</code>; <code>env</code> becomes <code>process.env</code>; <code>resources.limits</code> become <code>linux.resources</code>; <code>volumeMounts</code> become entries in <code>mounts</code>. The pod API is a much larger document because it also describes scheduling, identity and lifecycle policy — none of which the runtime has any opinion about. <a href="w3.html#cp-3-1">W3.1</a> is the same document from the other end.</p>
+<p>Everything you just read is what a PodSpec is eventually compiled into. <code>command</code>/<code>args</code> become <code>process.args</code>; <code>env</code> becomes <code>process.env</code>; <code>resources.limits</code> become <code>linux.resources</code>; <code>volumeMounts</code> become entries in <code>mounts</code>. The pod API is a much larger document because it also describes scheduling, identity and lifecycle policy — none of which the runtime has any opinion about. <a href="w3.html#cp-3-1">W3.1</a> covers the three separate status vocabularies that extra machinery produces, and <a href="w1.html#cp-1-20">W1.20</a> traces the path a PodSpec takes to become the file you just read.</p>
 </div>
 
 <h5>Docs</h5>
@@ -255,7 +255,7 @@ spec: <b>1.3.0</b></pre>
 <h5>The concept</h5>
 <p>A bundle is <strong>assembled on the node, moments before use, and destroyed after</strong>. Two different components each produce half of it:</p>
 <ul>
-<li>The <strong>snapshotter</strong> produces <code>rootfs/</code>. It takes the image's layers — which it already has on disk, unpacked — and mounts them as one directory using overlayfs, exactly the stack of transparent sheets from <a href="b5.html#cp-b5-14">B5.14</a>. Nothing is copied. The mount is created for this container and torn down when it dies.</li>
+<li>The <strong>snapshotter</strong> produces <code>rootfs/</code>. It takes the image's layers — which it already has on disk, unpacked — and mounts them as one directory using overlayfs, exactly the stack of transparent sheets from <a href="b5.html#cp-b5-13">B5.13</a>. Nothing is copied. The mount is created for this container and torn down when it dies.</li>
 <li>The <strong>runtime layer</strong> (containerd, via its CRI plugin) produces <code>config.json</code>. It merges two sources: the <em>image config</em> — the entrypoint, environment and working directory baked in when the image was built — and the <em>caller's request</em>, which for Kubernetes is the pod spec. I4 covers the first, I8 covers the second.</li>
 </ul>
 <div class="flow"><span>image layers</span><em>→</em><span>snapshotter</span><em>→</em><span>rootfs/</span><em>+</em><span>image config &amp; pod spec</span><em>→</em><span>containerd</span><em>→</em><span>config.json</span></div>
@@ -338,7 +338,7 @@ demo   26604   running   /run/containerd/io.containerd.runtime.v2.task/default/d
 </div>
 
 <div class="k8s-link">
-<p>On a Kubernetes node this directory is the fastest way to answer "what did the kubelet <em>actually</em> ask for", when the pod spec and the observed behaviour disagree. The path is the same with <code>k8s.io</code> in place of <code>default</code>, and the container id is the long hash from <code>crictl ps</code>. <a href="w6.html#cp-6-6">W6.6</a> triages a container that will not start; reading its generated <code>config.json</code> belongs in that toolkit, and by I8 you will be able to explain every field in it.</p>
+<p>On a Kubernetes node this directory is the fastest way to answer "what did the kubelet <em>actually</em> ask for", when the pod spec and the observed behaviour disagree. The path is the same with <code>k8s.io</code> in place of <code>default</code>, and the container id is the long hash from <code>crictl ps</code>. <a href="w6.html#cp-6-16">W6.16</a> triages a container that keeps dying; reading its generated <code>config.json</code> belongs in that toolkit, and by I8 you will be able to explain every field in it.</p>
 </div>
 
 <h5>Docs</h5>
@@ -359,7 +359,7 @@ demo   26604   running   /run/containerd/io.containerd.runtime.v2.task/default/d
 <h5>The concept</h5>
 <p>The straightforward fields first. <code>args</code> is the argv the runtime will <code>exec</code> — element zero is the program, and it is resolved <em>inside the container's root filesystem</em> using the container's <code>PATH</code>. <code>env</code> is the complete environment; nothing from your shell leaks in. <code>cwd</code> must exist inside the rootfs or creation fails. <code>terminal</code> asks the runtime for a pseudo-terminal. <code>rlimits</code> are the same per-process limits <code>ulimit</code> sets. <code>oomScoreAdj</code> tunes which process the kernel kills first when the machine runs out of memory.</p>
 <p><code>user</code> carries <code>uid</code>, <code>gid</code> and <code>additionalGids</code>, all numeric. There is no username field anywhere in the specification — resolving <code>appuser</code> to a number by reading <code>/etc/passwd</code> inside the rootfs is a job for the layer above, and I2.16 shows you exactly the error it produces when it fails.</p>
-<p><code>noNewPrivileges</code> sets the <code>no_new_privs</code> bit from <a href="i1.html#cp-i1-10">I1.10</a>: a one-way promise that no <code>exec</code> from here can ever gain privilege, which is what makes setuid binaries inside the container inert.</p>
+<p><code>noNewPrivileges</code> sets the <code>no_new_privs</code> bit from <a href="i1.html#cp-i1-9">I1.9</a>: a one-way promise that no <code>exec</code> from here can ever gain privilege, which is what makes setuid binaries inside the container inert.</p>
 <p>Then <strong>capabilities</strong>, with all five sets from <a href="b4.html#cp-b4-12">B4.12</a>, each an explicit list of <code>CAP_</code> names:</p>
 <ul>
 <li><code>bounding</code> — the ceiling. Nothing in this process or any of its descendants can ever hold a capability outside this set. This is the one that matters.</li>
@@ -538,7 +538,7 @@ sudo runc run ro</pre>
 </div>
 
 <div class="k8s-link">
-<p><code>securityContext.readOnlyRootFilesystem: true</code> is this field, and the standard companion pattern — an <code>emptyDir</code> volume mounted at <code>/tmp</code> — is the writable-mount fix you just performed by hand. <a href="w5.html#cp-5-2">W5.2</a> covers <code>emptyDir</code>; it is a tmpfs or a node directory depending on its <code>medium</code>, and either way it becomes an entry in the <code>mounts</code> array.</p>
+<p><code>securityContext.readOnlyRootFilesystem: true</code> is this field, and the standard companion pattern — an <code>emptyDir</code> volume mounted at <code>/tmp</code> — is the writable-mount fix you just performed by hand. <a href="w5.html#cp-5-1">W5.1</a> covers <code>emptyDir</code>; it is a tmpfs or a node directory depending on its <code>medium</code>, and either way it becomes an entry in the <code>mounts</code> array.</p>
 </div>
 
 <h5>Docs</h5>
@@ -765,7 +765,7 @@ sudo runc run    -b c2 c2</pre>
 <li><code>/proc/acpi</code>, <code>/proc/scsi</code>, <code>/sys/firmware</code> — hardware inventory and, historically, writable interfaces that could power off or reconfigure the machine.</li>
 <li><code>readonlyPaths</code> — <code>/proc/sys</code>, <code>/proc/sysrq-trigger</code>, <code>/proc/irq</code>, <code>/proc/bus</code>, <code>/proc/fs</code>: not secrets, but <em>host-global controls</em>. <code>/proc/sys</code> is the machine's sysctls; <code>/proc/sysrq-trigger</code> can reboot it with one <code>echo</code>.</li>
 </ul>
-<p>The remaining fields, briefly: <code>seccomp</code> carries a filter in the structure <a href="i1.html#cp-i1-9">I1.9</a> built by hand; <code>devices</code> lists device nodes to create plus the eBPF allow/deny rules from <a href="i1.html#cp-i1-8">I1.8</a>; <code>sysctl</code> sets namespaced sysctls inside the container; <code>rootfsPropagation</code> sets whether mounts made inside the container are visible outside and vice versa.</p>
+<p>The remaining fields, briefly: <code>seccomp</code> carries a filter in the structure <a href="i1.html#cp-i1-9">I1.9</a> built by hand; <code>devices</code> lists device nodes to create plus the eBPF allow/deny rules from <a href="i1.html#cp-i1-7">I1.7</a>; <code>sysctl</code> sets namespaced sysctls inside the container; <code>rootfsPropagation</code> sets whether mounts made inside the container are visible outside and vice versa.</p>
 
 <h5>Lab</h5>
 <ol class="lab">
@@ -1163,7 +1163,7 @@ sudo readlink /proc/$P/exe</pre>
 </div>
 
 <div class="k8s-link">
-<p>The CRI splits a pod's startup along exactly this seam: <code>RunPodSandbox</code> creates the pause container and calls the CNI plugin to configure its network namespace, and only then does <code>CreateContainer</code>/<code>StartContainer</code> run the workload. That is why a pod gets its IP before any application container starts, and why a CNI failure shows up as a pod stuck in <code>ContainerCreating</code> rather than as a crashing application. <a href="w4.html#cp-4-2">W4.2</a> covers the CNI from the cluster side; I9 writes a plugin.</p>
+<p>The CRI splits a pod's startup along exactly this seam: <code>RunPodSandbox</code> creates the pause container and calls the CNI plugin to configure its network namespace, and only then does <code>CreateContainer</code>/<code>StartContainer</code> run the workload. That is why a pod gets its IP before any application container starts, and why a CNI failure shows up as a pod stuck in <code>ContainerCreating</code> rather than as a crashing application. <a href="w4.html#cp-4-5">W4.5</a> covers the CNI contract from the cluster side and <a href="w4.html#cp-4-2">W4.2</a> builds the same namespace-and-veth work by hand; I9 writes a plugin.</p>
 </div>
 
 <h5>Docs</h5>
@@ -1278,7 +1278,7 @@ The <code>startContainer</code> hooks MUST be called as part of the <code>start<
 </div>
 
 <div class="k8s-link">
-<p>The NVIDIA container toolkit is the canonical <code>createContainer</code> hook: it injects GPU device nodes and driver libraries into a container that was built without them. Sidecar-injection meshes and some CNI integrations use <code>createRuntime</code>. None of this is visible in a pod spec, which is exactly why a node where "the same pod behaves differently" is a node whose runtime configuration deserves reading — <a href="w6.html#cp-6-6">W6.6</a>'s node-level triage, with <code>config.json</code>'s <code>hooks</code> key added to the list.</p>
+<p>The NVIDIA container toolkit is the canonical <code>createContainer</code> hook: it injects GPU device nodes and driver libraries into a container that was built without them. Sidecar-injection meshes and some CNI integrations use <code>createRuntime</code>. None of this is visible in a pod spec, which is exactly why a node where "the same pod behaves differently" is a node whose runtime configuration deserves reading — <a href="w6.html#cp-6-11">W6.11</a>'s node-level triage, with <code>config.json</code>'s <code>hooks</code> key added to the list.</p>
 </div>
 
 <h5>Docs</h5>
@@ -1377,7 +1377,7 @@ such as <b>IP address assignment, routing, and DNS setup</b>.</pre>
 </div>
 
 <div class="k8s-link">
-<p>This is why Kubernetes could drop Docker as a runtime in v1.24 without pods noticing. The pod spec never described a Docker container; it described something that gets compiled into a bundle, and the bundle's definition was owned by a standard rather than by a vendor. <a href="w1.html#cp-1-19">W1.19</a> tells that story from the cluster side — and the reason it was a non-event is everything in this lesson.</p>
+<p>This is why Kubernetes could drop Docker as a runtime in v1.24 without pods noticing. The pod spec never described a Docker container; it described something that gets compiled into a bundle, and the bundle's definition was owned by a standard rather than by a vendor. The advanced track has no lesson on the dockershim removal itself — the nearest thing is <a href="w1.html#cp-1-20">W1.20</a>'s kubelet → containerd → shim → runc path, which is the arrangement that replaced it, and the reason the swap was a non-event is everything in this lesson.</p>
 </div>
 
 <h5>Docs</h5>
@@ -1503,13 +1503,327 @@ NoNewPrivs:	1</pre></li>
 </div>
 
 <div class="k8s-link">
-<p>This is the mechanism behind <code>RuntimeClass</code>. A cluster can run gVisor's <code>runsc</code> or Kata's VM-based runtime for untrusted workloads and runc for everything else, from identical pod specs, because all of them consume the same bundle. <a href="w3.html#cp-3-9">W3.9</a> covers the scheduling side; the reason it works at all is what you just measured.</p>
+<p>This is the mechanism behind <code>RuntimeClass</code>. A cluster can run gVisor's <code>runsc</code> or Kata's VM-based runtime for untrusted workloads and runc for everything else, from identical pod specs, because all of them consume the same bundle. The advanced track has no <code>RuntimeClass</code> lesson — don't go looking for one — so the nearest anchor is <a href="w1.html#cp-1-20">W1.20</a>, which is where the runtime gets chosen; the reason swapping it works at all is what you just measured.</p>
 </div>
 
 <h5>Docs</h5>
 <p class="docs-links"><a href="https://github.com/containers/crun">containers/crun</a> — its README is candid about where it differs from runc. <a href="https://github.com/opencontainers/runtime-tools">opencontainers/runtime-tools</a> carries the official conformance test suite if you want to check a runtime rather than trust it. <code>man 8 crun</code>.</p>
 </article>
 </div>
+
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-proj"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-i2-15" data-id="i2-15">
+<div class="lesson-head"><span class="cp-id">I2.15</span><h4>Mini project — <code>minibox2bundle.py</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the track's thesis executed as code. The claim has been that the container ecosystem added almost no mechanism — it added contracts. The test of that claim is whether <code>minibox.sh</code>'s configuration surface can be translated into a <code>config.json</code> such that a runtime you did not write produces an <em>indistinguishable</em> container. If the claim is true, the diff should be empty and the only interesting output should be the list of things that would not translate.</p>
+
+<h5>The task</h5>
+<p>Write a program that reads exactly the knobs <code>minibox.sh</code> reads — the environment variables <code>NAME</code>, <code>CPU_MAX</code>, <code>MEM_MAX</code>, <code>PIDS_MAX</code>, plus argv — and emits a valid <code>config.json</code>. Run the result with <code>runc</code>. Then diff the observable outcome against <code>minibox</code>'s own: namespaces via <code>readlink /proc/self/ns/*</code>, capability masks from <code>/proc/self/status</code>, the cgroup path, the hostname, and <code>NoNewPrivs</code>. Account for every difference you find, including the ones you decide not to fix.</p>
+<p>Four translation problems make this more than a mapping exercise:</p>
+<ul>
+<li><strong>Capabilities.</strong> <code>minibox</code> uses <code>capsh --drop=</code> — a <em>subtractive</em> interface. The spec's is <em>additive</em>: you list what is kept. So you must enumerate every capability the kernel has and remove four, which means reading <code>/proc/sys/kernel/cap_last_cap</code> rather than hard-coding a list that will be wrong on the next kernel.</li>
+<li><strong>Namespaces.</strong> <code>minibox</code> unshares five. <code>runc spec</code>'s default is six — it adds <code>cgroup</code>. If you leave the default in, the containers are not comparable, and the difference shows up in <code>/proc/self/cgroup</code>.</li>
+<li><strong>The overlay.</strong> <code>minibox</code> mounts it. The spec has no opinion about it. So <code>root.path</code> just names the already-merged directory — which is exactly the division of labour a snapshotter formalises.</li>
+<li><strong>Everything else.</strong> Networking, <code>/etc/resolv.conf</code>, the name. None of it translates, and saying why is the point.</li>
+</ul>
+
+<h5>A working implementation</h5>
+<pre class="cmd">#!/usr/bin/env python3
+"""minibox2bundle.py — turn minibox.sh's flags into an OCI config.json."""
+import json, os, subprocess, sys
+
+ROOT   = "/srv/minibox"
+BUNDLE = f"{ROOT}/bundle"
+
+# --- 1. read exactly the knobs minibox.sh reads, with minibox.sh's defaults ---
+name     = os.environ.get("NAME", "minibox")
+cpu_max  = os.environ.get("CPU_MAX", "50000 100000").split()
+mem_max  = os.environ.get("MEM_MAX", "128M")
+pids_max = os.environ.get("PIDS_MAX", "64")
+argv     = sys.argv[1:] or ["/bin/sh"]
+
+def bytes_of(v):                      # "128M" -&gt; 134217728, like the kernel's parser
+    units = {"K": 10, "M": 20, "G": 30}
+    return int(v[:-1]) &lt;&lt; units[v[-1].upper()] if v[-1].upper() in units else int(v)
+
+# --- 2. capabilities: minibox drops four from a full set; name the survivors ---
+dropped = {"CAP_SYS_ADMIN", "CAP_NET_ADMIN", "CAP_SYS_MODULE", "CAP_SYS_TIME"}
+last    = int(open("/proc/sys/kernel/cap_last_cap").read())
+decoded = subprocess.run(["capsh", "--decode=" + format((1 &lt;&lt; (last + 1)) - 1, "016x")],
+                         capture_output=True, text=True).stdout.strip()
+# capsh prints "0x...=cap_chown,cap_dac_override,..." — already CAP_-prefixed once
+# upper-cased. Prefixing again yields CAP_CAP_CHOWN, which runc *warns* about and
+# then silently drops, leaving an empty capability set. Ask how I know.
+all_caps = {c.upper() for c in decoded.split("=", 1)[1].split(",")}
+kept     = sorted(all_caps - dropped)
+
+spec = {
+    "ociVersion": "1.1.0",
+    "process": {
+        "terminal": False,
+        "user": {"uid": 0, "gid": 0},
+        "args": argv,
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "TERM=xterm"],
+        "cwd": "/",
+        "capabilities": {k: kept for k in ("bounding", "effective", "permitted")},
+        "noNewPrivileges": True,          # minibox's capsh --no-new-privs
+    },
+    "root": {"path": f"{ROOT}/merged", "readonly": False},
+    "hostname": name,                     # minibox's `hostname "$NAME"`
+    "mounts": [
+        {"destination": "/proc", "type": "proc", "source": "proc"},
+        {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+         "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+        {"destination": "/dev/pts", "type": "devpts", "source": "devpts",
+         "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666",
+                     "mode=0620", "gid=5"]},
+        {"destination": "/sys", "type": "sysfs", "source": "sysfs",
+         "options": ["nosuid", "noexec", "nodev", "ro"]},
+    ],
+    "linux": {
+        "cgroupsPath": "/" + name,        # minibox's /sys/fs/cgroup/$NAME
+        "resources": {
+            "cpu":    {"quota": int(cpu_max[0]), "period": int(cpu_max[1])},
+            "memory": {"limit": bytes_of(mem_max)},
+            "pids":   {"limit": int(pids_max)},
+        },
+        # five, not six — minibox does not unshare the cgroup namespace
+        "namespaces": [{"type": t} for t in
+                       ("mount", "pid", "uts", "ipc", "network")],
+        "maskedPaths":   ["/proc/acpi", "/proc/kcore", "/proc/keys",
+                          "/proc/timer_list", "/proc/scsi", "/sys/firmware"],
+        "readonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys",
+                          "/proc/sysrq-trigger"],
+    },
+}
+
+os.makedirs(BUNDLE, exist_ok=True)
+with open(f"{BUNDLE}/config.json", "w") as f:
+    json.dump(spec, f, indent=2)
+print(f"wrote {BUNDLE}/config.json  ({len(kept)} capabilities kept, "
+      f"{len(spec['mounts'])} mounts, {len(spec['linux']['namespaces'])} namespaces)")
+print("""
+Did NOT translate — and that is the point:
+  overlay mount     minibox mounts it; the spec has no opinion, so root.path just
+                    names the already-merged directory.   -&gt; a snapshotter (I7)
+  veth + bridge     the runtime spec does not standardise networking at all.
+                    -&gt; a CNI plugin (I9), reachable from here as a createRuntime hook
+  /etc/resolv.conf  minibox writes it into the rootfs; nothing in the spec says who
+                    should.                               -&gt; the CRI (I8)
+  the name          "minibox" is a cgroup directory and a hostname here; the spec
+                    has no container-name field at all.   -&gt; the runtime layer (I7)""")</pre>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make sure <code>minibox</code> itself is set up on this machine, and capture its baseline.
+<pre class="cmd">cd ~
+sudo ./minibox.sh --init
+PROBE='echo ns:; for n in mnt pid net uts ipc cgroup; do echo "  $n $(readlink /proc/self/ns/$n)"; done;
+       echo caps:; grep -E "^Cap(Prm|Eff|Bnd)" /proc/self/status;
+       echo hostname:; hostname; echo nnp:; grep NoNewPrivs /proc/self/status;
+       echo cgroup:; cat /proc/self/cgroup'
+sudo NAME=probe ./minibox.sh /bin/sh -c "$PROBE" 2&gt;/dev/null | sudo tee /tmp/out-minibox.txt</pre>
+<pre class="out">rootfs ready: 271 applets in /srv/minibox/lower-base/bin
+ns:
+  mnt mnt:[4026532275]
+  …
+caps:
+CapPrm:	<b>000001fffddeefff</b>
+CapEff:	000001fffddeefff
+CapBnd:	000001fffddeefff
+hostname:
+probe
+nnp:
+NoNewPrivs:	1
+cgroup:
+0::/probe</pre>
+<p>Check that capability mask by hand before going further: <code>cap_last_cap</code> is 40 on this kernel, so a full set is <code>0x1ffffffffff</code>; the four dropped bits are 12, 16, 21 and 25, worth <code>0x2211000</code> together; and <code>0x1ffffffffff − 0x2211000 = 0x1fffddeefff</code>. The number in <code>/proc</code> is arithmetic, not magic.</p></li>
+
+<li>Save the program, run it, and read what it says it could not do.
+<pre class="cmd">cd ~/i2
+chmod +x minibox2bundle.py
+sudo NAME=probe ./minibox2bundle.py /bin/sh -c "$PROBE"</pre>
+<pre class="out">wrote /srv/minibox/bundle/config.json  (<b>37 capabilities kept</b>, 4 mounts, 5 namespaces)</pre>
+<p>41 capabilities on this kernel, minus four, is 37 — which is the first check that the enumeration worked rather than silently producing nonsense.</p></li>
+
+<li>Run the bundle and diff.
+<pre class="cmd">sudo sh -c 'runc run -b /srv/minibox/bundle probe &gt; /tmp/out-bundle.txt 2&gt;&amp;1'
+sudo diff /tmp/out-minibox.txt /tmp/out-bundle.txt &amp;&amp; echo '(identical)'</pre>
+<pre class="out"><b>(identical)</b></pre>
+<p>Byte-for-byte. A bash script that unshares, pivots and drops privilege, and a JSON document handed to somebody else's Go program, producing indistinguishable output — including the capability mask to the bit and the cgroup path. That is the entire argument of this track, measured.</p></li>
+
+<li>Confirm the resource knobs travelled too, since the probe above does not show them.
+<pre class="cmd">sudo MEM_MAX=64M PIDS_MAX=16 CPU_MAX='20000 100000' NAME=probe ./minibox2bundle.py /bin/sh -c 'sleep 5' &gt;/dev/null
+sudo sh -c 'runc run -d -b /srv/minibox/bundle probe &gt;/dev/null 2&gt;&amp;1'
+for f in cpu.max memory.max pids.max; do printf '%-12s %s\n' $f "$(sudo cat /sys/fs/cgroup/probe/$f)"; done
+sudo runc delete -f probe</pre>
+<pre class="out">cpu.max      <b>20000 100000</b>
+memory.max   <b>67108864</b>
+pids.max     <b>16</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>The diff is empty. If it is not, the differences will be in this order of likelihood: the <code>cgroup</code> namespace left in the default six (shows up in <code>/proc/self/cgroup</code> as <code>0::/</code> instead of <code>0::/probe</code>); a capability mask of all zeroes (the <code>CAP_CAP_</code> bug, and runc's warning names it); or a hostname of <code>runc</code> (you forgot to set <code>hostname</code> from <code>NAME</code>).</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The empty-capability-set bug is worth causing on purpose once.</strong> Double-prefix the names, run it, and read runc's warning: <code>ignoring unknown or unavailable capabilities: [CAP_CAP_AUDIT_CONTROL …]</code>. It runs. The container works for everything that needs no privilege and fails inexplicably for anything that does. That is the shape of most capability bugs you will ever debug.</li>
+<li><strong><code>minibox</code>'s networking races.</strong> Its <code>setup_net</code> runs on the host against the child's PID, so a container that exits immediately produces <code>nsenter: cannot open /proc/&lt;pid&gt;/ns/net</code>. Harmless for this comparison, and a good illustration of why the runtime spec's <code>created</code> state exists: runc holds the container still until you say go, and <code>minibox</code> cannot.</li>
+<li><strong>Do not hard-code the capability list.</strong> <code>cap_last_cap</code> grows with kernel releases. A list baked in today produces a container with fewer capabilities than intended on next year's kernel — a bug that looks like an application regression.</li>
+<li><strong>Absolute <code>root.path</code> is a deliberate choice here.</strong> The bundle directory is <code>/srv/minibox/bundle</code> and the rootfs is <code>/srv/minibox/merged</code>, which is not under it. That is legal, and it is also exactly the mistake drill 1 in I2.16 is built from.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now written, in about eighty lines, the part of containerd that turns a request into a bundle. The real one differs in three ways: it merges an image config as well as a request, it has a snapshotter produce <code>rootfs/</code> instead of assuming one, and it generates a seccomp profile. Everything else is the same shape. <a href="w1.html#cp-1-20">W1.20</a> is that component from the Kubernetes side; I7 and I8 build both halves properly.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-tools">opencontainers/runtime-tools</a> ships <code>oci-runtime-tool generate</code>, which is the mature version of the program above and worth reading afterwards to see which fields it exposes. <code>man 7 capabilities</code>, <code>man 1 capsh</code>, and <code>python3 -m json.tool</code> for checking your output before runc does.</p>
+</article>
+
+<article class="lesson drill" id="cp-i2-16" data-id="i2-16">
+<div class="lesson-head"><span class="cp-id">I2.16</span><h4>Debugging drill — three broken bundles</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Three faults, each producing a distinct and memorable error. The third one is the reason this drill exists: it is the failure every reader will meet again, for years, as <code>CreateContainerError</code>, and the honest version of it is not the version the folklore describes. Work each fault before opening its reveal.</p>
+
+<h5>Setup</h5>
+<pre class="cmd">cd ~/i2
+sudo NAME=probe ./minibox2bundle.py /bin/sh -c 'echo alive' &gt;/dev/null
+cp /srv/minibox/bundle/config.json /tmp/good-config.json   # so you can always get back</pre>
+
+<h5>Fault 1 — the rootfs that is somewhere else</h5>
+<pre class="cmd">sudo jq '.root.path = "merged"' /tmp/good-config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x /srv/minibox/bundle/config.json
+sudo runc run -b /srv/minibox/bundle d1</pre>
+<p><em>Mission: the rootfs is definitely at <code>/srv/minibox/merged</code> and you can <code>ls</code> it. Why does runc disagree?</em></p>
+<details class="reveal"><summary>Hint 1</summary><p>Read the path in the error message character by character and compare it with the path you wrote. They are different. Where did the extra component come from?</p></details>
+<details class="reveal"><summary>Hint 2</summary><p>What is <code>-b</code> for, and what is a relative path relative to?</p></details>
+<details class="reveal"><summary>Cause &amp; fix</summary>
+<pre class="out">level=error msg="runc run failed: invalid rootfs: stat <b>/srv/minibox/bundle/merged</b>: no such file or directory"</pre>
+<p><strong>A relative <code>root.path</code> is resolved against the bundle directory</strong>, not against the current directory and not against anything else. The bundle is <code>/srv/minibox/bundle</code>, so <code>"merged"</code> means <code>/srv/minibox/bundle/merged</code>, which does not exist. The rootfs is one level up at <code>/srv/minibox/merged</code>.</p>
+<p>Two fixes, and the choice matters. <code>"root": {"path": "/srv/minibox/merged"}</code> is absolute and works from anywhere. <code>"path": "rootfs"</code> with the rootfs actually inside the bundle is the convention every real tool follows, because it makes the bundle relocatable — you can move or copy the whole directory and it still works.</p>
+<p><strong>The reflex:</strong> when a path error names a path you did not write, the path you did write was relative to something. Read the printed path, subtract yours, and the remainder is the base you forgot about.</p>
+<pre class="cmd">sudo cp /tmp/good-config.json /srv/minibox/bundle/config.json</pre>
+</details>
+
+<h5>Fault 2 — the namespace that used to be there</h5>
+<pre class="cmd">sudo ip netns add ghost
+sudo jq '(.linux.namespaces[] | select(.type == "network")) |= (.path = "/var/run/netns/ghost")' \
+  /tmp/good-config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x /srv/minibox/bundle/config.json
+sudo runc run -b /srv/minibox/bundle d2      # works
+sudo ip netns del ghost                       # something else cleaned up
+sudo runc run -b /srv/minibox/bundle d2      # now what?</pre>
+<p><em>Mission: this configuration worked sixty seconds ago and nobody edited it. Explain the failure and say what class of production bug it models.</em></p>
+<details class="reveal"><summary>Hint 1</summary><p>Nothing about the container changed. Something about the machine did. What does a namespace path actually point at, and what keeps it alive?</p></details>
+<details class="reveal"><summary>Hint 2</summary><p>Recall from I2.7 that <code>/var/run/netns/ghost</code> is zero bytes. It is not a file. What happens to a bind mount of a namespace when the last reference goes away?</p></details>
+<details class="reveal"><summary>Cause &amp; fix</summary>
+<pre class="out">level=error msg="runc run failed: unable to create new parent process:
+  namespace path: <b>lstat /var/run/netns/ghost: no such file or directory</b>"</pre>
+<p><strong>Sharing a namespace by path creates a dependency on something else staying alive.</strong> The path is a bind mount of a namespace inode; delete the mount and, if no process is inside, the namespace is destroyed. A configuration that referenced it is now referencing nothing — and the error is a plain <code>lstat</code> failure, which reads like a typo rather than like a lifetime problem.</p>
+<p>The production version is worse, because the reference is usually <code>/proc/&lt;pid&gt;/ns/net</code> rather than a persistent mount. Then the namespace dies whenever that process dies, and a container that restarts finds its network gone. <strong>This is exactly why the pause container exists</strong>: something has to sit in the pod's namespaces doing nothing, so that they survive every other container's crash and restart.</p>
+<p><strong>The reflex:</strong> when a namespace path fails, ask what is holding it open, not what is wrong with the path. <code>lsns -t net</code> lists live namespaces and their owning processes; <code>ls -l /proc/*/ns/net</code> shows which processes reference which.</p>
+<pre class="cmd">sudo cp /tmp/good-config.json /srv/minibox/bundle/config.json</pre>
+</details>
+
+<h5>Fault 3 — a user the rootfs has never heard of</h5>
+<pre class="cmd">sudo jq '.process.user = {uid:1000, gid:1000}
+ | .process.args = ["/bin/sh","-c","id; whoami; touch /root/x"]' \
+  /tmp/good-config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x /srv/minibox/bundle/config.json
+sudo runc run -b /srv/minibox/bundle d3</pre>
+<p><em>Mission: uid 1000 does not exist in this rootfs. Predict what happens before running it. Then explain why the thing everyone calls "the CreateContainerError" did not occur.</em></p>
+<details class="reveal"><summary>Hint 1</summary><p>Does the container start? Look carefully at which of the three commands succeeded and which failed, and at what the failures were about.</p></details>
+<details class="reveal"><summary>Hint 2</summary><p>Search the runtime specification for the word "username". Then ask which layer would have to read <code>/etc/passwd</code>, and whether that layer is runc.</p></details>
+<details class="reveal"><summary>Cause &amp; fix</summary>
+<pre class="out">uid=1000 gid=1000
+<b>whoami: unknown uid 1000</b>
+<b>touch: /root/x: Permission denied</b></pre>
+<p><strong>The container starts.</strong> This is the part the folklore gets wrong. <code>process.user.uid</code> is a number, the specification has no username field at all, and the kernel does not care whether a uid appears in any <code>/etc/passwd</code>. So runc sets uid 1000 and execs, and what you get is a working container whose processes cannot read their own image — because every file in it is owned by root and mode 644.</p>
+<p>The symptom is therefore <em>not</em> a startup failure. It is permission-denied errors from an application that ran fine as root yesterday, plus tools like <code>whoami</code>, <code>ps -u</code> and anything reading <code>$HOME</code> behaving strangely because the uid resolves to nothing.</p>
+<p>The real <code>CreateContainerError</code> lives one layer up, where somebody <em>does</em> have to resolve a name. Reproduce it:</p>
+<pre class="cmd">sudo ctr run --rm --user appuser docker.io/library/alpine:3.22 u1 id
+sudo ctr run --rm --user 1000:1000 docker.io/library/alpine:3.22 u2 id</pre>
+<pre class="out"><b>ctr: no users found</b>
+uid=1000 gid=1000 groups=1000</pre>
+<p>There it is. A <em>name</em> fails, because containerd must open <code>/etc/passwd</code> inside the image's rootfs and look it up before it can write a number into <code>config.json</code>. A <em>number</em> always succeeds. In Kubernetes this is <code>securityContext.runAsUser</code> (a number — always works, may break the app) versus an image whose Dockerfile says <code>USER appuser</code> (a name — fails at container creation if the image lacks the account, which is what <code>CreateContainerError</code> reports).</p>
+<p><strong>The reflex:</strong> when a container fails to <em>create</em> over a user, look for a name and check the image's <code>/etc/passwd</code>. When a container <em>runs</em> but everything is permission-denied, look for a number and check file ownership in the image. Different layers, different fixes — and only the first one is ever a <code>CreateContainerError</code>.</p>
+<pre class="cmd">sudo cp /tmp/good-config.json /srv/minibox/bundle/config.json</pre>
+</details>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#user">config.md § User</a> — note that every field in it is numeric, which is the whole of fault 3. <code>man 8 ip-netns</code> for what fault 2's bind mount is. <code>man 8 runc-run</code> for <code>-b</code>.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>I2 recall quiz</h3>
+<p>Answer out loud before revealing. Most of these are questions you would previously have answered with "Docker does that somehow".</p>
+<ol>
+<li>What, exactly, is a compliant runtime given?
+<details class="reveal"><summary>Answer</summary><p>A directory path. Inside it, a file that MUST be named <code>config.json</code> and MUST be in the root of the bundle, and a root filesystem directory named by <code>root.path</code>. Nothing else — no image, no registry, no daemon, no name.</p></details></li>
+<li>Who makes the bundle, given that nobody ships one?
+<details class="reveal"><summary>Answer</summary><p>Two components, on the node, moments before use. The <strong>snapshotter</strong> mounts the image's layers with overlayfs to produce <code>rootfs/</code>; the <strong>runtime layer</strong> (containerd) merges the image config with the caller's request to produce <code>config.json</code>. The bundle lives under <code>/run</code> and is destroyed with the container.</p></details></li>
+<li>A configuration lists <code>CAP_CHOWN</code> in <code>ambient</code> but not in <code>effective</code>. What does <code>/proc/&lt;pid&gt;/status</code> show?
+<details class="reveal"><summary>Answer</summary><p><code>cap_chown</code> in <code>CapEff</code>. The five sets are not independent — the kernel raises every ambient capability into permitted and effective at <code>exec</code>, because that is what ambient means. The config is a request; the kernel's rules are applied afterwards.</p></details></li>
+<li>Which capability set actually constrains a container, and why are the others commentary?
+<details class="reveal"><summary>Answer</summary><p><code>bounding</code>. It is a ceiling on what this process and every descendant can ever hold, so <code>permitted</code> is capped by it and <code>effective</code> is capped by <code>permitted</code>. Trimming <code>effective</code> while leaving <code>bounding</code> full buys nothing at all.</p></details></li>
+<li>You set <code>root.readonly: true</code> and the application logs <code>Unable to lock database</code>. What is happening and what is the correct fix?
+<details class="reveal"><summary>Answer</summary><p>It is trying to create a lock file on a read-only filesystem, and reporting it as a database error. The fix is a writable <code>tmpfs</code> mount at the path it needs — not <code>readonly: false</code>. In Kubernetes that is an <code>emptyDir</code> at <code>/tmp</code> alongside <code>readOnlyRootFilesystem: true</code>.</p></details></li>
+<li>You delete the <code>/proc</code> entry from <code>mounts</code>. What happens?
+<details class="reveal"><summary>Answer</summary><p>The container does not start. runc's own init resolves paths through <code>/proc/thread-self</code> to defend against symlink-swap attacks, so with no procfs it panics inside <code>libpathrs</code> and the operation fails with <code>procReady not received</code>. <code>/proc</code> is load-bearing for the runtime, not just for <code>ps</code>. Trying to shadow it with a tmpfs instead is refused outright by runc's proc-safety check.</p></details></li>
+<li>What single field turns two containers into a pod, and how do you prove they joined?
+<details class="reveal"><summary>Answer</summary><p><code>path</code> on a <code>linux.namespaces</code> entry. With no path the runtime creates a namespace; with one it <code>setns</code>es into the existing one. Proof is the namespace inode: <code>readlink /proc/self/ns/net</code> prints the same <code>net:[…]</code> number in both containers, and matches <code>ip netns exec &lt;name&gt; readlink /proc/self/ns/net</code>.</p></details></li>
+<li><code>cpu.shares: 1024</code> in the config. What is in <code>cpu.weight</code>?
+<details class="reveal"><summary>Answer</summary><p><code>100</code>. cgroup v1's shares range [2, 262144] is mapped logarithmically onto v2's weight range [1, 10000], with the historic default 1024 landing exactly on 100. The point is not the formula — it is that <strong>the number in the file will not be the number in the config</strong>.</p></details></li>
+<li>You set <code>memory.limit</code> and <code>memory.swap</code> to the same value and get <code>memory.swap.max: 0</code>. Why?
+<details class="reveal"><summary>Answer</summary><p><code>memory.swap</code> in the spec is memory <strong>plus</strong> swap, inherited from cgroup v1's <code>memsw</code> semantics. Equal values mean "no swap beyond the memory limit", so the runtime computes 0. To allow 128 MB of real swap alongside a 128 MB limit, set <code>swap</code> to 256 MB.</p></details></li>
+<li>What does a <em>stopped</em> container still own, and what finally releases it?
+<details class="reveal"><summary>Answer</summary><p>Its state directory and its id — the mounts and cgroup are already gone once the init process exits. Only <code>delete</code> removes the record, and until it does, creating another container with that id fails with <code>container with given ID already exists</code>. This is why supervisors that crash between kill and delete leak names.</p></details></li>
+<li>Why did <code>runc kill &lt;id&gt; TERM</code> do nothing?
+<details class="reveal"><summary>Answer</summary><p>PID 1 of a PID namespace does not receive signals it has no handler for — the kernel drops them, to stop a namespace's init being killed by accident. Add a <code>trap</code> and the identical command works. This is the most common reason a pod burns its entire termination grace period before being <code>SIGKILL</code>ed.</p></details></li>
+<li>Between <code>create</code> and <code>start</code>, what exists and what is that window for?
+<details class="reveal"><summary>Answer</summary><p>Everything except your program: namespaces, cgroup, mounted and pivoted rootfs, and a process — <code>runc init</code>, blocked on a pipe — holding all of it. The window is where the network plugin configures the namespace, and it is why the PID is unchanged after <code>start</code>: <code>execve</code> replaces the program inside the same process.</p></details></li>
+<li>Which hooks run inside the container's <em>filesystem</em>, and how would you find out without a table?
+<details class="reveal"><summary>Answer</summary><p>Only <code>startContainer</code>, because it is the only one that runs after <code>pivot_root</code>. <code>createContainer</code> runs in the container's <em>namespaces</em> but before the pivot, so its <code>path</code> is resolved in the host's filesystem. You find out by having each hook log <code>ls /</code> and its namespace inodes — which is more reliable than any table, including this one.</p></details></li>
+<li>Name five things the runtime specification does not standardise, and who fills each gap.
+<details class="reveal"><summary>Answer</summary><p>Images (OCI image spec, I4); registries (OCI distribution spec, I5); networking (CNI, I9); storage (CSI and snapshotters, I10); the orchestrator's interface (CRI, I8). Also building (nobody, formally — I6) and names, logging and restart policy (the runtime layer, I7).</p></details></li>
+<li>You hand a working bundle to <code>crun</code> and it says <code>unknown version specified</code>. What is wrong?
+<details class="reveal"><summary>Answer</summary><p>Nothing is wrong. <code>ociVersion</code> is a compatibility gate, and crun 1.14.1 implements spec 1.0.0 — it accepts up to 1.1.0 and refuses 1.2.0 and later rather than guessing at fields it does not know. Set <code>ociVersion</code> to 1.1.0 and the same file runs identically under both.</p></details></li>
+<li>The same bundle under runc and crun differs in exactly two lines. Which, and does it matter?
+<details class="reveal"><summary>Answer</summary><p>Two namespace inode numbers, which are kernel allocation bookkeeping and carry no meaning across runs. Everything with semantic content — capability masks to the bit, hostname, <code>NoNewPrivs</code>, the cgroup values and path — is identical between two codebases sharing no source. That is the contract being real rather than aspirational.</p></details></li>
+<li>A container is configured with <code>process.user.uid: 1000</code> and the image has no such account. What happens?
+<details class="reveal"><summary>Answer</summary><p>It starts and runs. The specification's user fields are all numeric and the kernel does not consult <code>/etc/passwd</code>. What you get is permission-denied errors against the image's own root-owned files and a <code>whoami</code> that reports <code>unknown uid 1000</code>. The real <code>CreateContainerError</code> comes from a <em>name</em> — <code>ctr run --user appuser</code> gives <code>no users found</code> — because resolving names is the runtime layer's job, not the runtime's.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>State the bundle contract exactly, build one from a tarball, and find a live one on a running node.</li>
+<li>Read any <code>config.json</code> — including the one containerd generates for a pod — and predict what the container will be able to do.</li>
+<li>Configure and verify all five capability sets, and explain why <code>bounding</code> is the only one with teeth.</li>
+<li>Run with a read-only root and repair what breaks with mounts rather than privilege.</li>
+<li>Share a namespace by path, and explain the pause container as a consequence rather than a convention.</li>
+<li>Translate between <code>linux.resources</code> and the cgroup v2 files, including the two fields whose values change on the way.</li>
+<li>Drive the four-state lifecycle by hand and say why <code>create</code>/<code>start</code> is the split every shim, CNI plugin and <code>kubectl exec</code> depends on.</li>
+<li>Place all five hooks correctly, having derived the placement rule from evidence.</li>
+<li>List what the specification refuses to cover, and name the module that fills each gap.</li>
+<li>Convert a hand-written runtime's flags into a <code>config.json</code> that produces byte-identical observable output.</li>
+<li>Diagnose the three classic bundle faults on sight, and distinguish the two failure modes people both call <code>CreateContainerError</code>.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html#b14">Beginner B14 · where <code>minibox</code> is built one layer at a time →</a></div>
+
+<nav class="pager"><a href="i1.html">← I1 · Missing primitives</a><a href="../intermediate.html#i3">I3 · runc internals →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble"), kernel <b>6.8.0</b>, on Multipass, verified 2026-07-27. All output on this page was captured from a real run with <b>runc 1.5.1</b> (spec 1.3.0), <b>crun 1.14.1</b> (spec 1.0.0) and <b>containerd 2.3.3</b>, against <b>OCI runtime-spec v1.3.0</b>. Version-sensitive findings from that run, worth re-checking before treating a mismatch as a bug on this page: <code>runc spec</code> emits six top-level keys and <b>no</b> <code>hooks</code> or <code>annotations</code>; deleting the <code>/proc</code> mount makes runc <b>fail to start the container</b> rather than merely breaking <code>ps</code>, and mounting anything but procfs at <code>/proc</code> is refused by an explicit proc-safety check; <code>cpu.shares</code> is rescaled logarithmically to <code>cpu.weight</code> with 1024↔100; crun accepts <code>ociVersion</code> up to <b>1.1.0</b> and refuses 1.2.0 and later; and a numeric <code>process.user.uid</code> that is absent from the rootfs <b>starts successfully</b> — only a user <em>name</em>, resolved one layer up, produces the failure people call <code>CreateContainerError</code>.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
