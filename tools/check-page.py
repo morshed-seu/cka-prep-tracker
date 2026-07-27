@@ -55,10 +55,14 @@ def check(path):
     #    eaten as a tag; a bare '>' and a '<' before a space or digit are legal
     #    character data and are used deliberately all over the site ("a -> b",
     #    "if x < 3"). Flagging those produces noise nobody reads.
-    for m in re.finditer(r'<pre[^>]*>(.*?)</pre>', src, re.S):
+    # Comments are not rendered, so scan the comment-free text. And require a
+    # word boundary after "pre": prose like "<previous chain ID>" otherwise
+    # matches <pre[^>]*> and swallows the rest of the page.
+    visible = re.sub(r'<!--.*?-->', '', src, flags=re.S)
+    for m in re.finditer(r'<pre(?:\s[^>]*)?>(.*?)</pre>', visible, re.S):
         body = strip_inline(m.group(1))
         for hit in re.finditer(r'<[a-zA-Z/][a-zA-Z0-9/]*[\s>]', body):
-            line = src[:m.start()].count('\n') + 1
+            line = visible[:m.start()].count('\n') + 1
             bad(path, f"raw <tag> in <pre> near line {line}: {hit.group(0)!r} "
                       f"— the browser will eat this; escape to &lt;")
 
