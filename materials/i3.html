@@ -991,6 +991,208 @@ ls: cannot access '…/z2': <b>No such file or directory</b></pre>
 
 </div><!-- /g-state -->
 
+<!-- ---------------- Beyond the basics ---------------- -->
+<div class="grp" id="g-beyond"><h3>Beyond the basics</h3>
+
+<article class="lesson" id="cp-i3-11" data-id="i3-11">
+<div class="lesson-head"><span class="cp-id">I3.11</span><h4>Hooks in anger: networking a container from outside it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>In <a href="i2.html#cp-i2-13">I2.13</a> you worked out, from evidence, <em>where</em> each hook runs. This lesson spends that knowledge: you are going to make a hook do the single most important job hooks are actually used for. When you are finished you will have hand-built the invocation pattern that <a href="../beginner.html#b9">CNI</a> standardises — and I9 will feel like meeting something you already designed.</p>
+
+<h5>The concept</h5>
+<p>Recall the problem the runtime cannot solve alone. A container's network namespace is empty except for a down <code>lo</code>. Something has to put an interface in it, address it, and route it. But that something cannot be the container — the container has no privilege and, by the time it runs, no host tooling. And it cannot be the runtime, because the runtime has no opinion about your network. So it must be a <em>third party</em>, running at a very specific moment: after the namespace exists, and before the workload starts.</p>
+<p>That moment is the <code>createRuntime</code> hook, and I2 already established what it looks like from the inside: it runs on the <strong>host</strong>, in the host's namespaces, with the host's filesystem and the runtime's full privileges. Which is exactly what you need — host tooling in hand, and a container namespace to reach into.</p>
+<p>The handoff is deliberately minimal. The runtime writes the container's <strong>state JSON on the hook's stdin</strong> — the same document <code>runc state</code> prints — and the hook takes one field from it: the PID. A PID is a complete address for a namespace, because <code>/proc/&lt;pid&gt;/ns/net</code> is a path you can hand to <code>nsenter</code> or <code>ip link set … netns</code>. That is the entire interface: <em>here is a process; its namespaces are yours to configure</em>.</p>
+<div class="flow"><span>runc: namespaces made</span><em>→</em><span>state JSON<br><em>on stdin</em></span><em>→</em><span>hook: veth + addr + route</span><em>→</em><span>runc: pivot_root, exec</span></div>
+<p>Everything the hook does, you already did by hand in <a href="b9.html">B9</a> — create a veth pair, put one end on a bridge, move the other into a namespace, address it, add a default route. Nothing new is happening at the kernel level. What is new is <em>who decides when</em>: the runtime, at a guaranteed point in the lifecycle, from a declaration inside the bundle rather than from a script somebody has to remember to run.</p>
+<p>That is the whole idea CNI generalises. A CNI plugin is this hook with the interface written down: instead of the runtime's state JSON on stdin it gets a CNI config on stdin plus <code>CNI_*</code> environment variables, and instead of exiting quietly it prints a result. Same moment, same privilege, same namespace-by-PID handle — standardised so that any runtime can call any plugin.</p>
+
+<div class="specref">
+<p>The spec defines the stdin contract exactly:</p>
+<blockquote>The state of the container MUST be passed to hooks over stdin so that they may do work appropriate to the current state of the container.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">config.md</a>, "POSIX-platform Hooks"</cite>
+<p>Note what is <em>not</em> promised. There is no schema for what a hook may do, no way to return data to the runtime, and no notion of a plugin. A hook is an executable with a JSON document on stdin and an exit code — and that thinness is why CNI had to exist. If you want a plugin to tell the runtime which IP it assigned, hooks give you nowhere to put the answer.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the hook. Read the state, take the PID, and do B9's work with it.
+<pre class="cmd">sudo tee /usr/local/bin/nethook.sh &gt; /dev/null &lt;&lt;'SH'
+#!/bin/bash
+# createRuntime hook. Runs on the HOST, after the container's namespaces
+# exist but before pivot_root. The runtime writes container state to stdin.
+set -eu
+exec 2&gt;&gt;/tmp/nethook.log
+
+STATE=$(cat)
+PID=$(echo "$STATE" | jq -r .pid)
+ID=$(echo "$STATE" | jq -r .id)
+echo "hook fired: id=$ID pid=$PID" &gt;&amp;2
+
+BR=mb0; IP=10.88.0.77/24; GW=10.88.0.1
+
+# Host end onto the bridge, container end into the netns we were handed.
+ip link add "veth-$ID" type veth peer name "tmp-$ID"
+ip link set "veth-$ID" master "$BR"
+ip link set "veth-$ID" up
+ip link set "tmp-$ID" netns "$PID"
+
+# Configure from outside, reaching in by PID.
+nsenter -t "$PID" -n ip link set lo up
+nsenter -t "$PID" -n ip link set "tmp-$ID" name eth0
+nsenter -t "$PID" -n ip addr add "$IP" dev eth0
+nsenter -t "$PID" -n ip link set eth0 up
+nsenter -t "$PID" -n ip route add default via "$GW"
+
+echo "hook done: veth-$ID on $BR, container eth0=$IP" &gt;&amp;2
+SH
+sudo chmod +x /usr/local/bin/nethook.sh
+bash -n /usr/local/bin/nethook.sh &amp;&amp; echo 'syntax ok'</pre>
+<p>Reuse the <code>mb0</code> bridge from <a href="b14.html">B14</a>'s minibox if you still have it; otherwise <code>ip link add mb0 type bridge; ip addr add 10.88.0.1/24 dev mb0; ip link set mb0 up</code>. Make sure it is <code>up</code> — a down bridge silently drops everything.</p></li>
+
+<li>Declare the hook in the bundle. This is the part that matters conceptually: the networking is now <em>part of the container's definition</em>, not a side effect of a script somebody ran.
+<pre class="cmd">cd ~/i3
+sudo cp -a box hookbox &amp;&amp; cd hookbox
+sudo jq '.process.args = ["sleep","600"] |
+  .hooks = {createRuntime: [{path: "/usr/local/bin/nethook.sh"}]}' \
+  config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json config.json
+sudo jq -c '.hooks' config.json</pre>
+<pre class="out">{"createRuntime":[{"path":"/usr/local/bin/nethook.sh"}]}</pre></li>
+
+<li>Run it. Nothing in this command mentions networking.
+<pre class="cmd">sudo rm -f /tmp/nethook.log
+sudo runc delete --force h1 2&gt;/dev/null
+sudo runc run --detach h1 &lt; /dev/null &gt; /tmp/h1.out 2&gt;&amp;1
+echo "rc=$?"; sudo cat /tmp/nethook.log</pre>
+<pre class="out">rc=0
+hook fired: id=h1 pid=<b>35745</b>
+hook done: veth-h1 on mb0, container eth0=10.88.0.77/24</pre></li>
+
+<li>Check both sides of the wire.
+<pre class="cmd">sudo runc exec h1 ip addr show eth0 | head -4
+ip -br link show veth-h1</pre>
+<pre class="out">30: <b>eth0@if31</b>: &lt;BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN&gt; mtu 1500 … state UP
+    link/ether 3a:e1:7a:2f:5c:91 brd ff:ff:ff:ff:ff:ff
+    inet <b>10.88.0.77/24</b> scope global eth0
+<b>veth-h1@if30</b>     UP    9a:32:e9:1d:30:6b  &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt;</pre>
+<p><code>eth0@if31</code> inside and <code>veth-h1@if30</code> outside — each naming the other's interface index. That cross-reference is the veth pair, and it is the same one <a href="b9.html">B9</a> taught you to read.</p></li>
+
+<li>Prove it carries traffic. Put a listener on the bridge address and connect to it from inside.
+<pre class="cmd">sudo setsid bash -c 'echo HELLO-FROM-THE-HOST | nc -l -p 9099 -s 10.88.0.1' &amp;
+sleep 1
+sudo runc exec h1 /bin/sh -c 'nc -w3 10.88.0.1 9099'</pre>
+<pre class="out"><b>HELLO-FROM-THE-HOST</b></pre>
+<p>A real TCP connection, out of a container whose configuration never mentioned a network, over an interface placed by a hook the runtime invoked on its own.</p></li>
+
+<li>One instructive failure, because it ties the module together. Try to <code>ping</code> instead.
+<pre class="cmd">sudo runc exec h1 ping -c2 -W2 10.88.0.1
+sudo runc exec h1 grep CapEff /proc/self/status</pre>
+<pre class="out">PING 10.88.0.1 (10.88.0.1): 56 data bytes
+ping: <b>permission denied (are you root?)</b>
+CapEff:	<b>0000000020000420</b></pre>
+<p>The network is fine — TCP just worked. <code>ping</code> needs <code>CAP_NET_RAW</code> to open a raw socket, and that capability was dropped during creation, exactly as I3.3 showed and I3.4 explained. This is a genuinely common false alarm: <em>"the container has no network"</em> reported on the evidence of a failed ping, when the real answer is a missing capability.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Your container has an address and a working TCP path to the host, placed entirely by a hook, and you can explain why a failed <code>ping</code> from it is not evidence of a network problem.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A failing hook fails the container.</strong> A non-zero exit from <code>createRuntime</code> aborts creation, which is correct — you do not want a workload running with no network — but it makes hook bugs look like runtime bugs. Always log to a file, as this one does; the hook's stderr is easy to lose.</li>
+<li><strong>Hooks run as root on the host with the host's filesystem.</strong> Anything that can write a bundle's <code>hooks</code> can run arbitrary code as root on the node. This is why Kubernetes gives no pod-spec field for them and never will.</li>
+<li><strong>Interface names are capped at 15 characters.</strong> <code>veth-$ID</code> is fine for short IDs and silently fails for a 64-character container ID — which is exactly what real runtimes hand you. Real CNI plugins hash the ID for this reason.</li>
+<li><strong>The hook cannot tell the runtime anything.</strong> No return channel exists, so the assigned IP is hard-coded above. Handling that properly — a plugin reporting back what it allocated — is precisely the gap CNI's result JSON fills.</li>
+<li><strong>Nothing cleans up.</strong> The host veth outlives the container unless you add a <code>poststop</code> hook to remove it. Leaked veths accumulate exactly like the leaked cgroups in I3.10.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have just built, by hand, the thing that runs between <code>create</code> and <code>start</code> for every pod on every Kubernetes node. In the real stack the shim asks the CNI plugin rather than the bundle declaring a hook, but the moment, the privilege and the namespace-by-PID handle are identical — which is why a CNI failure produces a pod stuck in <code>ContainerCreating</code> with <code>failed to set up sandbox network</code> rather than a crashing container: the workload never started, because the window it was waiting in never closed. The pause container exists to hold that namespace open across restarts (<a href="w1.html#cp-1-21">W1.21</a>), and the cluster network is <a href="w4.html#cp-4-1">W4.1</a>. I9 replaces this hook with the real specification.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the runtime spec's <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">config.md</a> hooks section for the stdin contract and the <code>timeout</code> field this lab omits; <a href="https://github.com/containernetworking/cni/blob/main/SPEC.md">the CNI specification</a>, worth skimming now purely to see how much of it you just anticipated.</p>
+</article>
+
+<article class="lesson" id="cp-i3-12" data-id="i3-12">
+<div class="lesson-head"><span class="cp-id">I3.12</span><h4>Checkpoint and restore, without needing it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the one lesson in the module you are unlikely to use, and it is here for two reasons. First, it appears in <code>runc --help</code>, so you should know what it is rather than wondering. Second, and more usefully, understanding <em>why</em> it is rarely used teaches you something durable about what a process actually consists of — because the list of things that make a process hard to freeze is the list of things that make it a process at all.</p>
+
+<h5>The concept</h5>
+<p><strong>Checkpoint/restore</strong> means freezing a running process tree, writing everything about it to disk, and later reconstructing it so it continues from that exact instruction. Not restarting it — <em>continuing</em> it. Open files still open, memory contents intact, the program unaware anything happened.</p>
+<p>runc does not implement this itself. It shells out to <a href="https://criu.org/">CRIU</a> ("Checkpoint/Restore In Userspace"), a separate project, and <code>runc checkpoint</code> is a thin wrapper. CRIU walks <code>/proc</code> for everything it can learn about the processes, uses specialised kernel interfaces for the things it cannot, and writes a directory of image files.</p>
+<p>What has to be captured is more than you would guess: every memory page of every process, the register state of every thread, all open file descriptors and their offsets, the process tree's parent/child structure, pending signals, timers, and network sockets with their in-kernel buffers.</p>
+<p>Now the important part — <strong>the reason it is rare.</strong> You do not have to take anybody's word for it, because <code>runc checkpoint --help</code> confesses. Read the flag list as a list of things that do not work by default:</p>
+<table class="langpair"><thead><tr><th>flag</th><th>what its existence admits</th></tr></thead><tbody>
+<tr><td><code>--tcp-established</code></td><td>Open TCP connections are not handled unless you ask. The peer at the other end never agreed to be paused, and its kernel is still counting timeouts.</td></tr>
+<tr><td><code>--ext-unix-sk</code></td><td>Unix sockets to anything outside the container are a problem, because the other end is not part of the checkpoint.</td></tr>
+<tr><td><code>--file-locks</code></td><td>File locks, "for safety" — a lock is a relationship with the kernel that another process may be waiting on.</td></tr>
+<tr><td><code>--link-remap</code></td><td>Deleted-but-still-open files need reconstructing, because the path is gone but the inode is in use.</td></tr>
+<tr><td><code>--shell-job</code></td><td>A process attached to a terminal needs the terminal back — and it may not exist any more.</td></tr>
+</tbody></table>
+<p>The pattern is one idea: <strong>a process is not self-contained.</strong> It is a bundle of relationships with the kernel, the filesystem, and other machines — and a checkpoint can only capture the process's half of each. Everything on that list is a relationship whose other end did not get checkpointed. That is why checkpoint/restore works beautifully for a compute job with a big array in memory, and poorly for anything holding a connection.</p>
+<p>Requirements, briefly: CRIU installed on the node (it is <em>not</em> in Ubuntu 24.04's repositories, as the lab shows), a kernel with the interfaces CRIU needs, and <code>CAP_SYS_ADMIN</code> — plus, for anything containerised, matching kernel and CPU features on the restore host.</p>
+
+<div class="specref">
+<p>Neither operation is in the specification. The Operations section, in full, is <em>Query State, Create, Start, Kill, Delete</em> — <code>checkpoint</code> and <code>restore</code> appear nowhere, in the same way <code>exec</code> and <code>update</code> did not in I3.8.</p>
+<p>This is the practical consequence of that gap: because the OCI does not define checkpointing, Kubernetes could not simply expose "the runtime's checkpoint operation". It had to define its own kubelet endpoint, and its behaviour depends on which runtime is underneath. A feature built on an unstandardised operation inherits the runtime's variability — which is a large part of why the Kubernetes feature has stayed in beta for several releases.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask runc to checkpoint the container from I3.11 and read the error carefully.
+<pre class="cmd">sudo runc checkpoint --image-path /tmp/ckpt h1</pre>
+<pre class="out">level=error msg="<b>CRIU version check failed: exec: \"criu\": executable
+file not found in $PATH</b>"</pre>
+<p>runc has no checkpointing code of its own to fail — it looked for another program and did not find one. That error is the architecture, stated out loud.</p></li>
+
+<li>Confirm it is not a one-command install, which is itself part of the answer to "why is this rare?".
+<pre class="cmd">apt-cache policy criu</pre>
+<pre class="out">criu:
+  Installed: (none)
+  <b>Candidate: (none)</b></pre>
+<p>Not packaged in Ubuntu 24.04 at all. A feature that requires building a kernel-coupled tool from source on every node is a feature most clusters will not have.</p></li>
+
+<li>Read the confession. This is the lesson's real lab: the flag list, understood as a list of limitations.
+<pre class="cmd">sudo runc checkpoint --help | grep -E '^   --'</pre>
+<pre class="out">   --image-path value       path for saving criu image files
+   --leave-running          leave the process running after checkpointing
+   <b>--tcp-established        allow open tcp connections</b>
+   --tcp-skip-in-flight     skip in-flight tcp connections
+   <b>--link-remap             allow one to link unlinked files back when possible</b>
+   <b>--ext-unix-sk            allow external unix sockets</b>
+   <b>--shell-job              allow shell jobs</b>
+   --lazy-pages             use userfaultfd to lazily restore memory pages
+   <b>--file-locks             handle file locks, for safety</b>
+   --pre-dump               dump container's memory information only …</pre>
+<p>Go through them and name, for each, the relationship whose other end is missing. Do that once and you will never again be surprised that live migration is hard.</p></li>
+
+<li>Two flags reward a second look, because they are not limitations but techniques worth knowing. <code>--pre-dump</code> writes memory while the container keeps running, so a later full checkpoint only has to capture what changed — the same incremental idea behind live VM migration. And <code>--lazy-pages</code> uses <code>userfaultfd</code> to restore a process <em>before</em> its memory arrives, faulting pages in over the network on demand. That is how "migrate a running container between machines with milliseconds of downtime" demonstrations work.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Without notes: say what CRIU captures, name three relationships that make a process hard to checkpoint and why each is hard, and name the Kubernetes feature built on this along with its current stability level.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Checkpoint images contain all of the container's memory.</strong> Every secret, token and key the process had loaded is in that tar, in plaintext, on disk. Treat a checkpoint as the most sensitive artefact your cluster can produce — this is the main security caveat in Kubernetes' own documentation for the feature.</li>
+<li><strong>Restore is not portable.</strong> A different kernel version, or a CPU lacking an instruction set the checkpointed process was using, will fail the restore or corrupt it. Checkpoints are not backups.</li>
+<li><strong><code>runc checkpoint</code> stops the container by default.</strong> Use <code>--leave-running</code> if you meant to take a snapshot rather than move it, or you will have paused production to look at it.</li>
+<li><strong>A missing CRIU looks like a runc bug.</strong> The error names an executable, not a feature, so it reads as a broken installation. It is neither — it is a component nobody installed.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The Kubernetes feature built on this is <strong>forensic container checkpointing</strong>, via the kubelet's checkpoint API: <code>POST /checkpoint/{namespace}/{pod}/{container}</code>, which writes a tar archive to <code>/var/lib/kubelet/checkpoints/</code>. It went alpha in v1.25, reached <strong>beta and enabled-by-default in v1.30</strong>, and is still beta — the long stay is itself the lesson about building on an unstandardised runtime operation. Note the framing: <em>forensic</em>. The archive is meant to be moved to a sandbox and analysed, so a compromised container can be examined without leaving it running in production. Live migration of pods is <em>not</em> what the feature is for, and Kubernetes does not offer it — pods are designed to be replaceable, which is why the reconciliation model (<a href="w0.html#cp-0-6">W0.6</a>) never needs to move one.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <a href="https://kubernetes.io/docs/reference/node/kubelet-checkpoint-api/">the kubelet checkpoint API reference</a> for the endpoint, the output path and the security caveat; <a href="https://criu.org/What_cannot_be_checkpointed">CRIU's own "What cannot be checkpointed"</a>, which is the definitive version of the flag table above.</p>
+</article>
+
+</div><!-- /g-beyond -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
