@@ -413,6 +413,180 @@ rc=1</pre>
 
 </div><!-- /g-create -->
 
+<!-- ---------------- Living with a runtime that exits ---------------- -->
+<div class="grp" id="g-exits"><h3>Living with a runtime that exits</h3>
+
+<article class="lesson" id="cp-i3-5" data-id="i3-5">
+<div class="lesson-head"><span class="cp-id">I3.5</span><h4>The runtime does not stay: foreground, detached, and who the parent becomes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the fact the whole module turns on, and it is worth being blunt about it: <strong>after <code>runc run --detach</code> returns, there is no runc process anywhere on the machine.</strong> Your container is running, and nothing is supervising it. Nobody is waiting to hear its exit code. Nobody will notice when it dies. If that sounds like a serious gap in a container platform — it is, and filling it is a job with a name. Understanding why runc refuses to fill it is what makes a shim make sense instead of looking like accidental complexity.</p>
+
+<h5>The concept</h5>
+<p>runc is a <strong>daemonless</strong> runtime. It is a command-line program that does a piece of work and exits, in the tradition of <code>mkdir</code> or <code>mount</code> — not a service that lives alongside what it made. In the track's analogy the contractor finishes the building and drives away; if you want somebody on site afterwards, that is a different person with a different job.</p>
+<p>There are two modes, and the difference between them is not cosmetic:</p>
+<ul>
+<li><code>runc run &lt;id&gt;</code> — <strong>foreground</strong>. runc creates the container, starts it, and then simply <em>waits</em>. It stays as the container's parent for the container's entire life, holds its stdio, and finally exits with the container's own exit code.</li>
+<li><code>runc run --detach &lt;id&gt;</code> — <strong>detached</strong>. runc creates the container, starts it, and returns immediately with exit code 0. Exit code 0 here means "I successfully started something", <em>not</em> "your program succeeded" — it cannot mean that, because your program has barely begun.</li>
+</ul>
+<p>When runc exits in detached mode, the container's init process is orphaned, and the kernel does what it always does with orphans: re-parents them to PID&nbsp;1 — or, on a systemd machine, to the nearest ancestor that has marked itself a subreaper. You verified this mechanism in <a href="b2.html">B2</a> with ordinary processes; here it happens to something you are supposed to be managing.</p>
+<p>Now list what is lost along with that parent, because this list <em>is</em> the specification for a shim:</p>
+<table class="langpair"><thead><tr><th>lost when runc exits</th><th>why it matters</th></tr></thead><tbody>
+<tr><td>The <strong>exit code</strong></td><td>Only a process's parent can reap it and read its status. systemd reaps the orphan and discards the number. "Did it exit 0 or 137?" becomes unanswerable.</td></tr>
+<tr><td><strong>stdout and stderr</strong></td><td>The container inherited runc's file descriptors. Once runc is gone, whatever those pointed at is where logs go — with nobody to rotate, tag or forward them.</td></tr>
+<tr><td>A <strong>signal path</strong></td><td>There is no process to send <code>SIGTERM</code> to that would forward it. You can still <code>runc kill</code>, but that requires the state directory and a runc binary, not a pipe to a supervisor.</td></tr>
+<tr><td>The <strong>moment of death</strong></td><td>Nobody is in <code>wait()</code>, so nothing learns that the container exited except by polling.</td></tr>
+</tbody></table>
+<p>Why not just keep runc running, then? Because a foreground runc has to stay alive for the container's whole life, and that ties the container's fate to a process that was never designed to be long-lived. Upgrade the runtime and every running container's supervisor is the old binary. A daemonless runtime is easier to reason about, easier to replace, and easier to make correct — and the supervision problem is handed to something whose only job is supervision.</p>
+
+<div class="specref">
+<p>Here is the interesting part. Search the runtime specification for a requirement about the runtime process's lifetime and you will find <strong>nothing at all</strong> — no MUST, no SHOULD, not a mention. The spec defines <code>create</code>, <code>start</code>, <code>kill</code>, <code>delete</code> and <code>state</code> as operations with observable effects, and is completely silent on whether the program implementing them sticks around.</p>
+<blockquote>This operation MUST run the user-specified program as specified by <code>process</code>.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "Start" — the entire requirement</cite>
+<p>So "the runtime exits" is <em>runc's design decision</em>, not a rule you can rely on across runtimes. It happens to be near-universal — crun, youki and runsc all do the same — but a conformant runtime that stayed resident would break nothing. When you hear "OCI runtimes are daemonless", that is a description of the field, not a clause in the standard.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a container in the foreground and look at its ancestry. Run it under <code>setsid</code> with output to a file so it does not tie up your shell.
+<pre class="cmd">cd ~/i3/box
+sudo setsid runc run fg2 &lt; /dev/null &gt; /tmp/fg2.out 2&gt;&amp;1 &amp;
+sleep 1
+F=$(sudo runc state fg2 | jq -r .pid)
+sudo ps -o pid,ppid,comm -p $F
+sudo ps -o pid,ppid,comm -p $(sudo ps -o ppid= -p $F | tr -d ' ')</pre>
+<pre class="out">    PID    PPID COMMAND
+  34547   34533 sleep
+    PID    PPID COMMAND
+  34533   34531 <b>runc</b></pre>
+<p>The container's parent is runc, exactly as you would hope. Somebody is watching.</p></li>
+
+<li>Now the detached case — the same container, one extra flag.
+<pre class="cmd">sudo runc run --detach --pid-file /tmp/dt2.pid dt2 &lt; /dev/null &gt; /tmp/dt2.out 2&gt;&amp;1
+echo "runc exited rc=$?"
+D=$(cat /tmp/dt2.pid)
+sudo ps -o pid,ppid,comm -p $D
+sudo ps -o pid,ppid,comm -p $(sudo ps -o ppid= -p $D | tr -d ' ')</pre>
+<pre class="out">runc exited rc=<b>0</b>
+    PID    PPID COMMAND
+  34581       <b>1</b> sleep
+    PID    PPID COMMAND
+      1       0 <b>systemd</b></pre>
+<p>The container's parent is <code>systemd</code>. Not because systemd was told about this container — it has no idea what it is — but because it is PID&nbsp;1 and it inherits every orphan on the machine. Your container is now, from the operating system's point of view, an anonymous stray process.</p></li>
+
+<li>Confirm the absence directly. This is the line worth remembering.
+<pre class="cmd">sudo pgrep -a runc</pre>
+<pre class="out">32425 runc run fg1
+34533 runc run fg2</pre>
+<p>The foreground containers have a runc each. The detached one, <code>dt2</code>, appears nowhere — and it is still running. Check with <code>runc list</code> if you doubt it.</p></li>
+
+<li>Watch the consequence bite. Kill the detached container's process directly and try to find out how it died.
+<pre class="cmd">sudo kill -9 $D
+sleep 0.5
+sudo runc state dt2 | jq -c '{status, pid}'</pre>
+<pre class="out">{"status":"stopped","pid":0}</pre>
+<p>"Stopped." That is all you get — no exit code, no signal number, no timestamp of death. The kernel handed the status to systemd, which discarded it. Compare what Kubernetes shows you for a dead container (<code>Exit Code: 137</code>, <code>Reason: OOMKilled</code>, timestamps) and you can see precisely how much work something in the middle is doing.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state what is running after <code>runc run --detach</code> returns, name the four things lost when runc exits, and explain why <code>rc=0</code> from a detached run tells you nothing about your program.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>--detach</code>'s exit code is about the launch, not the workload.</strong> Scripts that treat <code>runc run --detach && echo success</code> as meaning the container is healthy are testing that the container was <em>created</em>. It may have exited a millisecond later.</li>
+<li><strong>Foreground <code>runc</code> holds your terminal's file descriptors.</strong> Close the terminal and the container's stdio disappears with it; a container writing to a closed pipe gets <code>SIGPIPE</code>. This is why every real launcher detaches and hands stdio to something durable.</li>
+<li><strong>The re-parent target is not always PID 1.</strong> Anything that called <code>prctl(PR_SET_CHILD_SUBREAPER)</code> claims orphans below it first — and that is exactly the trick a shim uses. If you see a detached container parented to something other than PID&nbsp;1, you have found a subreaper.</li>
+<li><strong>Do not run <code>runc</code> from a shell you will close</strong> while testing, foreground or not. Use <code>setsid</code> as the labs do; otherwise your experiment ends when your SSH session does.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This lesson is the direct answer to "why is there a <code>containerd-shim-runc-v2</code> process for every pod on my node?" Each one exists to be the parent runc refused to be: it holds the container's stdio, sits in <code>wait()</code> to catch the exit code, survives containerd restarts so a containerd upgrade does not kill every pod, and reports the status upward. The <code>Exit Code: 137</code> in <code>kubectl describe pod</code> travelled from the kernel, through a shim's <code>wait()</code>, to containerd, to the kubelet, to the API server. Remove the shim and that field is permanently empty. The stack is <a href="w1.html#cp-1-20">W1.20</a>; the exit codes are <a href="w6.html#cp-6-16">W6.16</a>. I7 takes the real shim apart and puts it beside the one you write in I3.13.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 prctl</code> under <code>PR_SET_CHILD_SUBREAPER</code>, the mechanism that lets a shim claim orphans; <code>man 2 wait</code> on why only a parent can read an exit status — the constraint the entire shim design exists to satisfy.</p>
+</article>
+
+<article class="lesson" id="cp-i3-6" data-id="i3-6">
+<div class="lesson-head"><span class="cp-id">I3.6</span><h4><code>--pid-file</code>, and the race a supervisor loses without it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>If runc exits and leaves you a container, the very first thing you need is its PID — you cannot signal it, inspect it, or wait for it otherwise. There is an obvious way to get that number and a correct way, and they differ. The obvious one works every time you test it by hand and fails in production, which is the worst possible combination. This lesson makes it fail on demand so you never write it.</p>
+
+<h5>The concept</h5>
+<p>The naive approach is to ask afterwards: run the container, then call <code>runc state &lt;id&gt;</code> and read the <code>pid</code> field. The problem is the word <em>afterwards</em>. Between runc exiting and your query landing, time passes — and in that gap the container may already have finished. Once its init process is gone there is no PID to report, and the answer you wanted no longer exists.</p>
+<p><code>--pid-file &lt;path&gt;</code> closes the gap by moving the reporting to the only moment when the answer is certainly available: runc writes the PID to that file <em>before it exits</em>, while it still has the container in hand. Your supervisor reads a file that was written by the process that knew.</p>
+<p>This is a specific instance of a general rule worth carrying: <strong>when you need a fact about a transient thing, arrange for the fact to be recorded by whoever held it, not queried by whoever wants it.</strong> The same reasoning is why pid files exist at all, why <code>CLONE_PIDFD</code> was added to the kernel, and why the shim you write in I3.13 takes the PID from a file rather than looking it up.</p>
+<p>Note that <code>--pid-file</code> does <em>not</em> solve everything. There remains a smaller race in the other direction: PIDs are recycled, so a PID you read from a file may later refer to a different process entirely. runc guards against that in its own state by recording the process's <strong>start time</strong> alongside its PID — I3.9 shows the field. A number alone is never a safe handle to a process.</p>
+
+<div class="specref">
+<p>The spec makes the PID available, but only conditionally — and the condition is precisely the one this lesson is about:</p>
+<blockquote><code>pid</code> (int, REQUIRED when <code>status</code> is <code>created</code> or <code>running</code> on Linux, OPTIONAL on other platforms) is the ID of the container process.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "State"</cite>
+<p>Read the parenthesis as a warning rather than a detail. The PID is required to be present <em>only</em> while the container is created or running. For a <code>stopped</code> container the runtime owes you nothing, and runc takes that literally — you are about to watch it return <code>0</code>. <code>--pid-file</code> is not a spec feature at all; it is runc's answer to a gap the spec leaves open by design.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a bundle whose container exits the instant it starts. This is not a contrived edge case — it is every short-lived job, every misconfigured command, and every crash on startup.
+<pre class="cmd">cd ~/i3
+sudo cp -a box fast &amp;&amp; cd fast
+sudo jq '.process.args = ["/bin/true"]' config.json &gt; /tmp/c.json \
+  &amp;&amp; sudo cp /tmp/c.json config.json</pre></li>
+
+<li>Run it detached with a pid file, then immediately try both ways of finding the PID.
+<pre class="cmd">sudo runc delete --force f1 2&gt;/dev/null
+sudo runc run --detach --pid-file /tmp/f1.pid f1 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+echo "pid-file  : $(sudo cat /tmp/f1.pid)"
+echo "runc state: $(sudo runc state f1 | jq -c '{status, pid}')"</pre>
+<pre class="out">pid-file  : <b>33323</b>
+runc state: {"status":"stopped","<b>pid":0</b>}</pre>
+<p>There it is. The file has a real PID, written while the container existed. The query returns <code>0</code>, because by the time it ran there was nothing left to report.</p></li>
+
+<li>Do not trust one run — races are supposed to be intermittent, so measure. Twenty attempts, printing both answers each time.
+<pre class="cmd">for i in $(seq 1 20); do
+  sudo runc delete --force f1 2&gt;/dev/null
+  sudo runc run --detach --pid-file /tmp/f1.pid f1 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+  printf '%s/%s ' "$(sudo cat /tmp/f1.pid)" \
+    "$(sudo runc state f1 2&gt;/dev/null | jq -r .pid)"
+done; echo</pre>
+<pre class="out">32605/<b>0</b> 32636/<b>0</b> 32670/<b>0</b> 32703/<b>0</b> 32736/<b>0</b> 32771/<b>0</b> 32802/<b>0</b> 32835/<b>0</b>
+32869/<b>0</b> 32902/<b>0</b> 32934/<b>0</b> 32970/<b>0</b> 33001/<b>0</b> 33036/<b>0</b> 33070/<b>0</b> 33102/<b>0</b>
+33134/<b>0</b> 33167/<b>0</b> 33199/<b>0</b> 33234/<b>0</b></pre>
+<p><strong>Twenty out of twenty.</strong> This is worth pausing on, because it is stronger than "a race you might lose". For a container that exits quickly, the naive lookup does not <em>sometimes</em> fail — it fails every single time, and it will do so on your laptop just as reliably as in production. The reason people are nevertheless surprised by it is that they test with <code>sleep 1000</code>, where the race is unwinnable in the other direction.</p></li>
+
+<li>Prove the distinction is about timing and nothing else, by re-running with a long-lived container.
+<pre class="cmd">cd ~/i3/box
+sudo runc delete --force f2 2&gt;/dev/null
+sudo runc run --detach --pid-file /tmp/f2.pid f2 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+echo "pid-file  : $(sudo cat /tmp/f2.pid)"
+echo "runc state: $(sudo runc state f2 | jq -c '{status, pid}')"</pre>
+<pre class="out">pid-file  : 34694
+runc state: {"status":"running","pid":<b>34694</b>}</pre>
+<p>Identical answers. The naive method is not wrong in some abstract way — it is correct exactly when the container is still alive to be asked about, which is the case you will always accidentally test.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain why <code>runc state</code> returns <code>pid: 0</code> rather than an error, show the failure twenty times out of twenty with a fast container and zero times with a slow one, and say what <code>--pid-file</code> guarantees that a query cannot.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>pid: 0</code> is not an error and will not be caught by error handling.</strong> A supervisor that does <code>kill(pid, SIGTERM)</code> with <code>pid=0</code> sends the signal <em>to its own process group</em> — a genuinely dangerous outcome that has killed supervisors and everything they were supervising. Always validate the number before using it.</li>
+<li><strong>The pid file is not cleaned up.</strong> runc writes it and never removes it, so a stale file from a previous run reads perfectly well and gives you a PID that now belongs to something else. Delete it before each run, and treat an old file as no answer at all.</li>
+<li><strong>A PID alone is not a safe handle.</strong> Even a correctly-written pid file goes stale the moment the process exits and the number is recycled. Pair it with the process start time (I3.9) or a <code>pidfd</code> if you need certainty.</li>
+<li><strong>Testing with <code>sleep</code> hides this entire class of bug.</strong> When you write a supervisor, test it against a container that exits immediately — that is where every interesting failure lives.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the race behind a symptom that looks like nonsense: a pod whose container has clearly run — there are logs, there is an exit code — but which spent time in <code>ContainerCreating</code> with the kubelet apparently unable to find it. Everything between the kubelet and runc is built to avoid exactly the lookup you just watched fail. The shim takes the PID from a file at creation and holds a handle to the process for its whole life, so a container that exits in three milliseconds still has its status recorded by something that was already waiting. When you meet a very-short-lived container in Kubernetes and still get a clean <code>Exit Code</code> in <a href="w6.html#cp-6-16">W6.16</a>'s output, this is the machinery you are being handed for free.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>runc run --help</code> for <code>--pid-file</code>'s exact wording; <code>man 2 kill</code> on what <code>pid == 0</code> means, which is the gotcha above and is worth reading once so it never bites you.</p>
+</article>
+
+</div><!-- /g-exits -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
