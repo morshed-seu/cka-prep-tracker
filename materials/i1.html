@@ -400,6 +400,277 @@ CapEff:	000001ffffffffff</pre>
 <p class="docs-links"><code>man 5 apparmor.d</code> for the profile syntax, particularly the <em>Rules</em> section covering <code>userns</code>; <code>man 8 apparmor_parser</code> for <code>-r</code>. Ubuntu's own write-up lives at <a href="https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces">ubuntu.com — restricted unprivileged user namespaces</a> and is worth reading once for the threat model. Then <code>man 7 user_namespaces</code>, <em>Security</em> section, for why anyone thought this was necessary.</p>
 </article>
 </div>
+
+<!-- ---------------- Resource control ---------------- -->
+<div class="grp" id="g-res"><h3>Resource control, the parts we skipped</h3>
+
+<article class="lesson" id="cp-i1-5" data-id="i1-5">
+<div class="lesson-head"><span class="cp-id">I1.5</span><h4>PSI — the question load average cannot answer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Is this thing slow because it is overloaded, or because it is waiting on something, or is it just idle?" is the first question in every performance investigation, and load average answers it badly. <strong>Pressure stall information</strong> — PSI — answers it directly, it has been in the kernel since 4.20, it is four files, and almost nobody reads it. It is the highest-value-per-minute thing in this module.</p>
+<h5>The concept</h5>
+<p><a href="b7.html">B7</a> taught you <code>cpu.stat</code>, which counts how much CPU a cgroup used and how often it was throttled. That tells you what happened to the <em>resource</em>. PSI tells you what happened to the <em>work</em>: how much wall-clock time was lost because something that wanted to run could not.</p>
+<p>Load average cannot do this, and the reason is worth stating precisely rather than as a slogan. Load average counts runnable tasks. A machine with 40 threads on 40 CPUs and a machine with 40 threads on 4 CPUs both report a load around 40; one is perfectly healthy and the other is dying. The number has no denominator.</p>
+<p>PSI has one — wall-clock time — and reports two different percentages:</p>
+<table>
+<tr><th>Line</th><th>Percentage of time in which…</th><th>What it means</th></tr>
+<tr><td><code>some</code></td><td><strong>at least one</strong> task was stalled waiting for the resource</td><td>there is contention; work is being delayed</td></tr>
+<tr><td><code>full</code></td><td><strong>every</strong> runnable task was stalled, so nothing useful happened at all</td><td>real damage; the machine is losing throughput outright</td></tr>
+</table>
+<p>Each line carries decaying averages over 10, 60 and 300 seconds, plus a monotonic <code>total</code> in microseconds — which is the one to use if you are recording it, because the averages are for humans looking at a terminal and the total is for anything that subtracts two samples.</p>
+<p>System-wide values live in <code>/proc/pressure/{cpu,memory,io}</code>. Every cgroup v2 directory also carries <code>cpu.pressure</code>, <code>memory.pressure</code> and <code>io.pressure</code> with the same format, scoped to that cgroup and its descendants — which is what makes PSI useful per-workload rather than per-machine.</p>
+<h5>Lab</h5>
+<ol>
+<li>Read the system-wide files on an idle box first, so you know what "nothing wrong" looks like.
+<pre class="cmd">head -20 /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io</pre>
+<pre class="out">==&gt; /proc/pressure/cpu &lt;==
+some avg10=0.18 avg60=0.03 avg300=0.00 total=31733351
+<b>full avg10=0.00 avg60=0.00 avg300=0.00 total=0</b>
+
+==&gt; /proc/pressure/memory &lt;==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=288
+full avg10=0.00 avg60=0.00 avg300=0.00 total=288
+
+==&gt; /proc/pressure/io &lt;==
+some avg10=1.34 avg60=0.25 avg300=0.05 total=34870652
+full avg10=1.16 avg60=0.22 avg300=0.04 total=26089773</pre>
+<p>Note the bolded line: system-wide <code>cpu full</code> is always zero, by definition. If every task on the machine were stalled on CPU there would be no task to run, which is not a state the CPU can be in. It is meaningful at the <em>cgroup</em> level — where "every task in this cgroup" is a much smaller claim — and that is where you will use it.</p>
+<p>The <code>io</code> numbers being non-zero on an idle VM is also normal: journald and the cloud-init machinery do enough writing to register.</p></li>
+<li>Make a cgroup with a hard CPU limit, and put two busy loops in it. This is the throttled case — the one B7 taught you to recognise.
+<pre class="cmd">sudo -i
+CG=/sys/fs/cgroup/i1demo; mkdir -p $CG
+echo "10000 100000" &gt; $CG/cpu.max        # 10% of one CPU
+for i in 1 2; do ( echo $BASHPID &gt; $CG/cgroup.procs; while :; do :; done ) &amp; done
+sleep 12</pre></li>
+<li>Read both stories at once — what happened to the resource, and what happened to the work.
+<pre class="cmd">cat $CG/cpu.stat; echo '---'; cat $CG/cpu.pressure</pre>
+<pre class="out">usage_usec 1211659
+user_usec 1196462
+system_usec 15196
+core_sched.force_idle_usec 0
+nr_periods 120
+<b>nr_throttled 120
+throttled_usec 22699444</b>
+---
+some avg10=<b>59.49</b> avg60=14.43 avg300=3.17 total=11392698
+full avg10=<b>59.49</b> avg60=14.43 avg300=3.17 total=11392698</pre>
+<p>Throttled in all 120 periods, 22.7 seconds of enforced idling, and roughly 60% of wall time lost to waiting. The two files <em>agree</em>, and that agreement is the signature of a genuine CPU-limit problem: the limit is the cause, so raising it is the fix.</p>
+<p>Here <code>some</code> and <code>full</code> are equal because both tasks are throttled simultaneously — the bandwidth controller stops the whole cgroup at once. Remember that; <a href="#cp-i1-6">I1.6</a> produces a case where they are very different.</p>
+<pre class="cmd">kill %1 %2; rmdir $CG</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can say what <code>some avg10=59</code> means without hedging (59% of the last ten seconds had at least one task stalled), why system-wide <code>cpu full</code> is structurally zero, and which field to record if you are graphing this rather than reading it (<code>total</code>).</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The averages are exponentially decaying, so a burst that ended 30 seconds ago still colours <code>avg60</code> and a burst that started two seconds ago barely moves <code>avg10</code>. Sampling PSI once, immediately after a complaint, tends to show you nothing. Sample <code>total</code> twice a few seconds apart and divide by the elapsed time if you need a number you can defend.</p>
+<p><code>memory.pressure</code> going up is not the same as approaching <code>memory.max</code>. It measures time lost to reclaim, refaults and swap — so a cgroup nowhere near its limit but thrashing its page cache shows high memory pressure and a comfortable <code>memory.current</code>. That combination is a real and commonly-missed diagnosis: the workload's working set no longer fits, and the limit is not the thing to change.</p>
+<p>A cgroup's pressure includes its descendants. Reading pressure at a slice and concluding a particular service is stalled is a mistake if the slice has other children — walk down to the leaf.</p>
+<div class="k8s-link">
+<p>The kubelet uses eviction <em>signals</em> rather than PSI for its own decisions — <code>memory.available</code>, <code>nodefs.available</code> and friends, thresholds you set with <code>--eviction-hard</code>. PSI is what you reach for when the kubelet's signals say the node is fine and the pods on it are visibly not, which is exactly the case eviction thresholds cannot see: nothing is out of memory, everything is waiting.</p>
+<p>See <a href="w3.html#cp-3-18">W3.18 — node-pressure eviction and the QoS classes</a> for what the kubelet does act on, and <a href="w6.html#cp-6-12">W6.12 — node Conditions</a> for how a node reports pressure upward. Reading a node's <code>/proc/pressure/io</code> during a <code>DiskPressure</code> investigation will very often tell you in one line what a long <code>describe</code> will not.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links">The authoritative document is the kernel's own <code>Documentation/accounting/psi.rst</code> — search "kernel psi.rst" — which is two pages and defines <code>some</code>/<code>full</code> exactly. Then <code>Documentation/admin-guide/cgroup-v2.rst</code>, the <em>PSI</em> section, for the per-cgroup files and the poll interface that OOM daemons use. <code>man 5 proc</code> covers <code>/proc/pressure</code> only briefly.</p>
+</article>
+
+<article class="lesson" id="cp-i1-6" data-id="i1-6">
+<div class="lesson-head"><span class="cp-id">I1.6</span><h4><code>cpuset</code> — restricting <em>where</em>, not <em>how much</em></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There are two entirely different ways to limit a workload's CPU, they produce nearly identical symptoms, and only one of them shows up in the file everyone checks. <code>cpu.max</code> caps how much CPU time you get. <code>cpuset.cpus</code> caps <em>which cores you may use</em>. A workload starved by the second looks throttled and has zero throttling recorded — and that disagreement is the diagnosis this module's drill is built on.</p>
+<h5>The concept</h5>
+<p><a href="b7.html">B7</a> covered <code>cpu.max</code>: a quota and a period, enforced by stopping the cgroup when it has spent its allowance. <code>cpuset</code> is a different controller entirely. <code>cpuset.cpus</code> takes a list or range of CPU numbers — <code>0</code>, <code>2-3</code>, <code>0,4-7</code> — and every task in the cgroup is confined to those cores. There is no quota, no period and no accounting; the scheduler simply never considers the other CPUs.</p>
+<div class="flow"><span><code>cpu.max</code> = <b>how much</b></span><em>·</em><span><code>cpuset.cpus</code> = <b>where</b></span><em>·</em><span>only the first is counted in <code>cpu.stat</code></span></div>
+<p>Two details about the v2 interface catch people out. Like every controller, <code>cpuset</code> must be enabled in the <em>parent's</em> <code>cgroup.subtree_control</code> before the files appear in a child. And an <strong>empty</strong> <code>cpuset.cpus</code> means "inherit from the parent", not "no CPUs" — so a cgroup you have created but not written to is unrestricted, and <code>cpuset.cpus.effective</code> is the file that tells you what is actually in force.</p>
+<p><code>cpuset.mems</code> is the same idea for memory: it restricts which <strong>NUMA</strong> nodes a task's pages may be allocated from. On a multi-socket machine, memory attached to another socket is reachable but meaningfully slower, so a latency-sensitive workload wants its threads and its pages on the same node — pinning one without the other buys you very little. On a single-socket machine or a VM there is one node, <code>0</code>, and the file is a formality you should still know exists.</p>
+<h5>Lab</h5>
+<ol>
+<li>Enable the controller and make a cgroup pinned to a single CPU. On a 4-vCPU box use <code>2-3</code>; the captures below are from a 2-vCPU box, so they use <code>0</code>.
+<pre class="cmd">sudo -i
+echo "+cpu +cpuset" &gt; /sys/fs/cgroup/cgroup.subtree_control
+CG=/sys/fs/cgroup/pinned; mkdir -p $CG
+echo 0 &gt; $CG/cpuset.cpus
+echo "cpu.max     = $(cat $CG/cpu.max)"
+echo "cpuset.cpus = $(cat $CG/cpuset.cpus)  effective = $(cat $CG/cpuset.cpus.effective)"
+echo "cpuset.mems.effective = $(cat $CG/cpuset.mems.effective)"</pre>
+<pre class="out">cpu.max     = <b>max 100000</b>
+cpuset.cpus = 0  effective = 0
+cpuset.mems.effective = 0</pre>
+<p><code>cpu.max</code> is <code>max</code> — there is deliberately no bandwidth limit here. Everything that follows happens with the limit switched off.</p></li>
+<li>Create contention on that one CPU from <em>outside</em> the cgroup, then put two busy loops <em>inside</em> it. Three runnable tasks, one core.
+<pre class="cmd">taskset -c 0 bash -c 'while :; do :; done' &amp;
+for i in 1 2; do ( echo $BASHPID &gt; $CG/cgroup.procs; while :; do :; done ) &amp; done
+sleep 15
+taskset -pc $(head -1 $CG/cgroup.procs)</pre>
+<pre class="out">pid 21581's current affinity list: <b>0</b></pre>
+<p><code>taskset -pc</code> reads the affinity mask the cgroup imposed — you never called <code>taskset</code> on that process, but the mask is there. That is the confirmation that <code>cpuset.cpus</code> and <code>taskset</code> are two interfaces onto the same kernel field.</p></li>
+<li>Now the point of the whole lesson. Read the two files a tired engineer would read.
+<pre class="cmd">head -7 $CG/cpu.stat; echo '---'; cat $CG/cpu.pressure</pre>
+<pre class="out">usage_usec 7503330
+user_usec 7503330
+system_usec 0
+core_sched.force_idle_usec 0
+nr_periods <b>0</b>
+nr_throttled <b>0</b>
+throttled_usec <b>0</b>
+---
+some avg10=<b>75.18</b> avg60=20.71 avg300=4.67 total=15002540
+full avg10=<b>37.37</b> avg60=10.29 avg300=2.32 total=7498732</pre>
+<p>Zero throttling — not "a little", zero, and <code>nr_periods 0</code> because the bandwidth controller is not running at all. And 75% of wall time with at least one task stalled. The workload is being starved and <code>cpu.stat</code> has nothing to say about it.</p>
+<p>Notice too that <code>some</code> and <code>full</code> now differ sharply, unlike <a href="#cp-i1-5">I1.5</a>. With two tasks sharing one core, one of them is usually running while the other waits — that is <code>some</code>. Only when a third task (ours from outside) holds the core do <em>both</em> stall at once — that is <code>full</code>. The gap between the two lines is telling you how much of the contention is internal to the cgroup versus imposed from outside.</p>
+<pre class="cmd">kill %1 %2 %3; rmdir $CG</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>taskset -pc &lt;pid&gt;</code> on a process you moved into the cgroup reports only the CPUs you wrote, and <code>cpu.stat</code> shows <code>nr_throttled 0</code> while <code>cpu.pressure</code> is high. State the difference between <code>cpu.max</code> and <code>cpuset.cpus</code> in one sentence each — one is a budget, the other is a seating chart.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Writing a CPU number that does not exist, or that the parent cgroup does not have, fails with <code>EINVAL</code> and no explanation. Check <code>cpuset.cpus.effective</code> on the <em>parent</em> before writing a child, because v2 enforces that a child's set is a subset of its parent's — this is the usual cause of "the file rejects a value that is obviously valid".</p>
+<p>An empty <code>cpuset.cpus</code> is inherit, not deny. A cgroup you created and never wrote to imposes no restriction at all, which means "I set up the cpuset and nothing changed" is usually "I created the directory and stopped".</p>
+<p>Pinning without measuring is a common own goal. Confining a workload to two cores on an otherwise-idle 8-core machine makes it slower, not more predictable, unless something else was actually interfering with it. Exclusive cores are a latency optimisation, and they cost throughput; buy them deliberately.</p>
+<div class="k8s-link">
+<p>Kubernetes writes this exact file. The kubelet's <strong>CPU Manager</strong>, with <code>--cpu-manager-policy=static</code>, gives Guaranteed-QoS pods whose CPU requests are whole numbers a set of exclusive cores by setting <code>cpuset.cpus</code> on the pod's cgroup — and simultaneously removes those cores from every other pod's cpuset. The companion <strong>Memory Manager</strong> and Topology Manager do the same for <code>cpuset.mems</code> and NUMA alignment.</p>
+<p>The failure this produces on a real node is exactly the drill in <a href="#cp-i1-14">I1.14</a>: a pod's CPU usage looks fine, its throttling counters are zero, and it is slow anyway, because the cores it was given are shared with something the CPU Manager does not know about. For the Kubernetes-side view of requests, limits and QoS classes, see <a href="w3.html#cp-3-17">W3.17 — requests, limits and the three QoS classes</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>Documentation/admin-guide/cgroup-v2.rst</code>, the <em>Cpuset</em> section, is the reference for every file named above including <code>cpuset.cpus.partition</code>, which is how you take cores away from the kernel's general scheduling domain entirely. <code>man 7 cpuset</code> describes the v1 interface and the NUMA reasoning, which has not changed. <code>man 1 taskset</code> and <code>man 2 sched_setaffinity</code> for the per-process equivalent.</p>
+</article>
+
+<article class="lesson" id="cp-i1-7" data-id="i1-7">
+<div class="lesson-head"><span class="cp-id">I1.7</span><h4>The device controller moved to eBPF, and stopped being readable</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Which device nodes may this container open?" is a security question with a concrete answer, and in cgroup v2 that answer is not in a file. This is the biggest single v1→v2 surprise, it invalidates a decade of blog posts, and the practical consequence is that you cannot audit device policy with <code>cat</code> — you need a different tool, and knowing which one is most of the lesson.</p>
+<h5>The concept</h5>
+<p>In cgroup v1 the device controller was an ordinary interface file. You wrote rules like <code>c 1:3 rwm</code> into <code>devices.allow</code> or <code>devices.deny</code>, and you read the current policy back out of <code>devices.list</code>. It was inspectable, greppable and scriptable.</p>
+<p>Cgroup v2 has no such file. The kernel dropped the controller and replaced it with an <strong>eBPF program</strong> — a small verified program, loaded into the kernel, attached to the cgroup with type <code>BPF_PROG_TYPE_CGROUP_DEVICE</code>, invoked on every attempt to open a device node, returning allow or deny. eBPF ("extended Berkeley Packet Filter") is the kernel's general mechanism for running user-supplied, verified-safe code at fixed hook points; you will meet it again in <a href="#cp-i1-9">I1.9</a> as seccomp and in the advanced track as the datapath under some CNI plugins.</p>
+<p>Two consequences follow, and both are operational rather than theoretical:</p>
+<ul>
+<li><strong>Policy is invisible to the filesystem.</strong> There is nothing to <code>cat</code>. <code>bpftool cgroup show &lt;path&gt;</code> tells you a program is attached and what it is called; it does not decompile it into rules. To know what a container may open, you read the runtime's <code>config.json</code> — which is why <a href="i2.html">I2</a>'s <code>linux.resources.devices</code> is the practical source of truth, not the kernel.</li>
+<li><strong>The denial has no diagnostic.</strong> The <code>open(2)</code> returns <code>EPERM</code>. There is no log line, no audit record by default, and no file to consult. A container that "cannot see the GPU" and a container that has been denied the GPU are indistinguishable from inside.</li>
+</ul>
+<p>The failure signature to memorise is therefore just this: <code>Operation not permitted</code> when opening something under <code>/dev</code>, from a process that appears to have the right file permissions. If the mode bits say you may and the kernel says you may not, a cgroup device program is the reason.</p>
+<h5>Lab</h5>
+<ol>
+<li>Confirm the absence first. This is one of those facts that is easier to believe after you have failed to find the file.
+<pre class="cmd">ls /sys/fs/cgroup/ | grep -i device || echo "(no device* file anywhere in the root cgroup)"</pre>
+<pre class="out">(no device* file anywhere in the root cgroup)</pre></li>
+<li>Now make a cgroup that <em>does</em> have a device policy. The quickest source of one is systemd, which sets device policy on any unit that asks — and does it by attaching exactly the kind of program described above.
+<pre class="cmd">sudo systemd-run --unit=i1dev --property=DevicePolicy=strict \
+  --property=DeviceAllow='/dev/null rw' /bin/bash -c 'sleep 45'
+sleep 2
+CG=/sys/fs/cgroup/system.slice/i1dev.service
+ls $CG | grep -i device || echo "  (still no devices.* file — the policy is not in the filesystem)"</pre>
+<pre class="out">  (still no devices.* file — the policy is not in the filesystem)</pre></li>
+<li>Find it with the right tool.
+<pre class="cmd">sudo bpftool cgroup show $CG
+sudo bpftool prog show id $(sudo bpftool cgroup show $CG | awk 'NR==2{print $1}')</pre>
+<pre class="out">ID       AttachType      AttachFlags     Name
+<b>244      cgroup_device   multi           sd_devices</b>
+
+244: <b>cgroup_device</b>  name sd_devices  tag 54d60d413603ec9a  gpl
+	loaded_at 2026-07-27T09:11:25+0600  uid 0
+	xlated 472B  jited 296B  memlock 4096B</pre>
+<p><code>sd_devices</code> is systemd's name for it — a runtime would attach its own. 472 bytes of bytecode is the entire device policy for that unit, and <code>bpftool</code> will not tell you which devices it permits. That is the point being made.</p></li>
+<li>Feel the denial from inside. Move a shell into that cgroup and try to open something the policy does not list.
+<pre class="cmd">sudo bash -c 'echo $BASHPID &gt; '"$CG"'/cgroup.procs
+  echo hi &gt; /dev/null      &amp;&amp; echo "write /dev/null    -&gt; OK"
+  head -c 4 /dev/zero      &gt;/dev/null; echo "read  /dev/zero    -&gt; exit $?"
+  head -c 4 /dev/urandom   &gt;/dev/null'</pre>
+<pre class="out">write /dev/null    -&gt; OK
+read  /dev/zero    -&gt; exit 1
+head: cannot open '/dev/zero' for reading: <b>Operation not permitted</b>
+head: cannot open '/dev/urandom' for reading: <b>Operation not permitted</b></pre>
+<p><code>/dev/null</code> was allowed by name; everything else was refused at <code>open</code>. Check the mode bits on <code>/dev/zero</code> — <code>crw-rw-rw-</code>, world-readable — and note that they had no bearing on the outcome.</p>
+<pre class="cmd">sudo systemctl stop i1dev; sudo systemctl reset-failed</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>bpftool cgroup show</code> on the unit's cgroup lists a <code>cgroup_device</code> program, and reading <code>/dev/zero</code> from inside that cgroup fails with <code>EPERM</code> despite world-readable permissions. You can name the tool you would reach for on a node where a container cannot open a device.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>systemd's <code>DevicePolicy=closed</code> — the more common setting — still permits a default list including <code>/dev/null</code>, <code>/dev/zero</code>, <code>/dev/full</code>, <code>/dev/random</code>, <code>/dev/urandom</code> and the tty devices. If you are trying to demonstrate a denial and everything keeps working, that is why; <code>strict</code> is the one that allows only what you list.</p>
+<p><code>bpftool</code> lives in <code>linux-tools-common</code> plus a kernel-specific package on Ubuntu, and the generic <code>bpftool</code> binary sometimes warns about a version mismatch with the running kernel. It still lists attached programs correctly. It also needs root — an unprivileged <code>bpftool cgroup show</code> silently returns nothing rather than an error, which looks exactly like "no policy attached".</p>
+<p>Device policy is inherited down the cgroup tree, and a child cannot grant itself something an ancestor denied. So the program you find on a container's own cgroup may not be the one doing the denying — walk up toward the root and check each level.</p>
+<div class="k8s-link">
+<p>Device access is how GPUs, FUSE mounts and raw block volumes reach a pod, and it is mediated by exactly this mechanism: the kubelet asks the runtime, the runtime writes <code>linux.resources.devices</code> into the OCI config, and <code>runc</code> compiles that into the BPF program you just found. A device plugin's entire job is to get the right entries into that list.</p>
+<p>The advanced track meets the consequence rather than the mechanism, in storage: <a href="w5.html#cp-5-9">W5.9 — volume types and what the kubelet actually mounts</a>. When a raw-block PVC produces "permission denied" on a device node that plainly has the right mode bits, this lesson is the explanation.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>Documentation/admin-guide/cgroup-v2.rst</code> — the <em>Device controller</em> section is four sentences and says exactly this. <code>man 8 bpftool-cgroup</code> and <code>man 8 bpftool-prog</code> for the tool. <code>man 5 systemd.resource-control</code> for <code>DeviceAllow</code> and the <code>DevicePolicy</code> values, which is also the clearest written description of the default lists.</p>
+</article>
+
+<article class="lesson" id="cp-i1-8" data-id="i1-8">
+<div class="lesson-head"><span class="cp-id">I1.8</span><h4>hugetlb, and recognising a cgroup v1 node in three seconds</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two loose ends, both of which you will meet on somebody else's machine rather than your own. Huge pages are the clearest example of a resource that cannot be throttled — you get them or you fail — and cgroup v1 is the layout half of what you learned in <a href="b7.html">B7</a> does not apply to. Neither is deep; both are expensive to not know.</p>
+<h5>The concept</h5>
+<p><strong>Huge pages</strong> are memory mapped in 2 MB or 1 GB units instead of the usual 4 KB. The benefit is not the size but the <abbr title="translation lookaside buffer — the CPU's cache of virtual-to-physical address translations">TLB</abbr>: a database with a 64 GB buffer pool needs sixteen million 4 KB translations and only thirty-two thousand 2 MB ones, and the difference in cache misses is measurable. This is why real database deployments ask for them.</p>
+<p>The controller — <code>hugetlb.2MB.max</code>, <code>hugetlb.1GB.max</code> and their <code>.current</code> counterparts — limits how many a cgroup may hold. What makes it pedagogically useful is that huge pages are a <strong>countable, non-compressible</strong> resource. You cannot be throttled into having fewer of them the way you can be throttled into less CPU. The pool is reserved at boot or by a sysctl, it is either big enough or it is not, and a workload that asks for huge pages and cannot get them fails <em>at startup</em> with an allocation error rather than degrading under load. That failure timing is the whole reason to know the file exists.</p>
+<p><strong>Cgroup v1</strong> is the other loose end. You will not meet it on 24.04, and you will meet it on a long-lived node someone stood up years ago. The differences that matter:</p>
+<table>
+<tr><th>&nbsp;</th><th>v2 (unified)</th><th>v1 (legacy)</th></tr>
+<tr><td>Hierarchy</td><td>one tree, all controllers</td><td>one tree <em>per controller</em>, mounted separately</td></tr>
+<tr><td>A process's cgroup</td><td>one path</td><td>a different path per controller</td></tr>
+<tr><td>Enabling controllers</td><td><code>cgroup.subtree_control</code></td><td>no equivalent — mount it or don't</td></tr>
+<tr><td>Memory limit file</td><td><code>memory.max</code></td><td><code>memory.limit_in_bytes</code></td></tr>
+<tr><td>Filesystem type</td><td><code>cgroup2fs</code></td><td><code>tmpfs</code> with <code>cgroup</code> mounts beneath</td></tr>
+</table>
+<p>The three-second test is <code>stat -fc %T /sys/fs/cgroup</code>, and the confirming detail is the shape of <code>/proc/self/cgroup</code>: a single <code>0::/path</code> line means unified v2; several numbered lines naming controllers means v1 or hybrid.</p>
+<h5>Lab</h5>
+<ol>
+<li>Look for the hugetlb files and find them missing, which is the ordinary state. The controller exists but is not enabled in the root's subtree.
+<pre class="cmd">sudo -i
+CG=/sys/fs/cgroup/hugedemo; mkdir -p $CG
+ls $CG | grep hugetlb || echo "(no hugetlb.* — not enabled in the parent's subtree_control)"
+echo "root controllers     : $(cat /sys/fs/cgroup/cgroup.controllers)"
+echo "root subtree_control : $(cat /sys/fs/cgroup/cgroup.subtree_control)"</pre>
+<pre class="out">(no hugetlb.* — not enabled in the parent's subtree_control)
+root controllers     : cpuset cpu io memory <b>hugetlb</b> pids rdma misc
+root subtree_control : cpuset cpu io memory pids</pre>
+<p>Present in <code>cgroup.controllers</code>, absent from <code>cgroup.subtree_control</code>. That is the distinction B7 drew between "the kernel has this" and "children may use it".</p></li>
+<li>Enable it and read the limits.
+<pre class="cmd">echo "+hugetlb" &gt; /sys/fs/cgroup/cgroup.subtree_control
+ls $CG | grep -E 'hugetlb\.(2MB|1GB)\.(max|current)$'
+for f in $CG/hugetlb.*.max $CG/hugetlb.*.current; do
+  echo "$(basename $f) = $(cat $f)"; done</pre>
+<pre class="out">hugetlb.1GB.current
+hugetlb.1GB.max
+hugetlb.2MB.current
+hugetlb.2MB.max
+hugetlb.1GB.max = <b>max</b>
+hugetlb.2MB.max = <b>max</b>
+hugetlb.1GB.current = 0
+hugetlb.2MB.current = 0</pre>
+<p>Two page sizes, because x86-64 supports both. A limit of <code>max</code> is unlimited — but see the next step for why that is not the same as "available".</p></li>
+<li>Check the pool itself, which is the number that actually decides whether a workload starts.
+<pre class="cmd">grep -i huge /proc/meminfo | head -4</pre>
+<pre class="out">AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+FileHugePages:         0 kB
+<b>HugePages_Total:       0</b></pre>
+<p><code>HugePages_Total: 0</code> — the pool is empty, so a workload asking for huge pages on this box fails immediately regardless of any cgroup limit. Nothing is misconfigured; nobody reserved any. Reserving is <code>sysctl vm.nr_hugepages=N</code> or a kernel command-line parameter, and it must happen early because it needs contiguous physical memory.</p>
+<pre class="cmd">rmdir $CG</pre></li>
+<li>The three-second test, and the confirming detail.
+<pre class="cmd">stat -fc %T /sys/fs/cgroup
+mount | grep -w cgroup2
+cat /proc/self/cgroup</pre>
+<pre class="out"><b>cgroup2fs</b>
+cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot)
+<b>0::</b>/user.slice/user-1000.slice/session-191.scope</pre>
+<p>On a v1 or hybrid host the first line reads <code>tmpfs</code>, and <code>/proc/self/cgroup</code> has one numbered line per controller — <code>12:memory:/…</code>, <code>11:cpu,cpuacct:/…</code> and so on. Once you have seen both, you will never need to look twice.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>stat -fc %T /sys/fs/cgroup</code> prints <code>cgroup2fs</code> and <code>/proc/self/cgroup</code> is a single <code>0::</code> line. You enabled <code>hugetlb</code> in the root subtree and the files appeared, and you can say why a hugetlb limit of <code>max</code> does not mean a workload will get any.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Do not leave <code>+hugetlb</code> enabled if you did not need it — writing to <code>cgroup.subtree_control</code> on the root affects every service on the machine, and although enabling a controller is harmless, the habit of casually editing the root cgroup is not. Remove it with <code>echo "-hugetlb" &gt; /sys/fs/cgroup/cgroup.subtree_control</code>.</p>
+<p>A cgroup directory cannot be removed while any process is in it, and <code>rmdir</code> reports <code>EBUSY</code> rather than saying so. <code>cat &lt;cg&gt;/cgroup.procs</code> lists the holdouts. Every lab in this group ends with a <code>rmdir</code> that will fail if you skipped a <code>kill</code>.</p>
+<p>Do not spend long on v1. Learn the two tells, learn that <code>memory.limit_in_bytes</code> is v1's <code>memory.max</code>, and move on. The reason to recognise it is so that when someone's runbook does not work on your machine you know instantly that it was written for a different layout, rather than concluding the runbook is wrong.</p>
+<div class="k8s-link">
+<p>Huge pages are a first-class Kubernetes resource — a pod requests <code>hugepages-2Mi</code> alongside <code>cpu</code> and <code>memory</code>, and the scheduler treats it as countable, exactly like the kernel does. There is no "huge page throttling" because there cannot be. If the node's pool is exhausted, the pod stays <code>Pending</code>.</p>
+<p>The cgroup version matters to Kubernetes too: the kubelet's <code>cgroupDriver</code> must match the one the container runtime uses (<code>systemd</code> on any modern install), and a mismatch produces pods that start and then behave strangely under memory pressure. See <a href="w1.html#cp-1-4">W1.4 — the kubelet, containerd and the cgroup driver</a>, which is the single most common kubeadm-era misconfiguration this module gives you the background to understand.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>Documentation/admin-guide/cgroup-v2.rst</code> for the <em>HugeTLB</em> section and for the v1-to-v2 conversion notes at the end, which are the best short summary of the differences. <code>Documentation/admin-guide/mm/hugetlbpage.rst</code> for the pool, <code>vm.nr_hugepages</code> and why reservation is a boot-time concern. <code>man 5 proc</code> for the <code>/proc/meminfo</code> huge-page fields and for the format of <code>/proc/&lt;pid&gt;/cgroup</code>.</p>
+</article>
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
