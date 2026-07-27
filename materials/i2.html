@@ -868,6 +868,423 @@ rc=1
 <p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#control-groups">config-linux.md § Control groups</a> for the whole <code>resources</code> object, and <code>Documentation/admin-guide/cgroup-v2.rst</code> in the kernel tree for what each destination file actually does. <code>man 5 proc</code> for what every masked path contains.</p>
 </article>
 </div>
+
+<!-- ---------------- Lifecycle ---------------- -->
+<div class="grp" id="g-life"><h3>Lifecycle</h3>
+
+<article class="lesson" id="cp-i2-9" data-id="i2-9">
+<div class="lesson-head"><span class="cp-id">I2.9</span><h4>Four states, and a stopped container that still exists</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Almost every confusing thing about container tooling — why <code>docker ps -a</code> shows dead containers, why a Kubernetes pod can be <code>Terminating</code> for ten minutes, why disk fills up with things that are not running — comes from one fact: <strong>a stopped container still exists.</strong> The specification's state machine says so explicitly, and driving it by hand once makes the rest obvious rather than arbitrary.</p>
+
+<h5>The concept</h5>
+<p>Four states, and a compliant runtime must report exactly one of them:</p>
+<div class="flow"><span>creating</span><em>→</em><span>created</span><em>→</em><span>running</span><em>→</em><span>stopped</span></div>
+<ul>
+<li><strong><code>creating</code></strong> — the runtime is in the middle of <code>create</code>. Transient; you will rarely observe it.</li>
+<li><strong><code>created</code></strong> — <code>create</code> has finished. Namespaces, cgroup and rootfs all exist and a process is waiting, but <em>the user's program has not run</em>. This is the state I2.11 is about.</li>
+<li><strong><code>running</code></strong> — the user's program has been <code>exec</code>ed and has not exited.</li>
+<li><strong><code>stopped</code></strong> — the process has exited. <em>The container still exists.</em> Its state, its cgroup and its bundle are all still there until something calls <code>delete</code>.</li>
+</ul>
+<p>The last one is the load-bearing one. "Stopped" is not "gone". Somebody has to clean up, and the design decision the specification makes is that <em>the caller</em> decides when — because the caller may want to read the exit code, collect logs, or inspect the corpse first. Every layer above inherits that: Docker keeps stopped containers until <code>docker rm</code>, and Kubernetes keeps a dead container until the kubelet's garbage collector decides it has enough history.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a bundle whose workload announces itself, then define a helper so every transition is checked the same way.
+<pre class="cmd">cd ~/i2
+sudo rm -rf life &amp;&amp; sudo mkdir -p life/rootfs
+sudo tar -C life/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+cd life &amp;&amp; sudo runc spec
+sudo jq '.process.terminal = false
+ | .process.args = ["/bin/sh","-c","echo workload started; sleep 600"]' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+
+st() { printf '%-22s ' "$1"; sudo runc state life 2&gt;/dev/null | jq -c '{status,pid}' || echo '(no such container)'; }</pre></li>
+
+<li>Walk the machine, checking after every step.
+<pre class="cmd">st "before create:"
+sudo runc create life
+st "after create:"
+sudo runc start life; sleep 0.3
+st "after start:"
+sudo runc kill life TERM; sleep 0.5
+st "after kill TERM:"
+sudo runc kill life KILL; sleep 0.3
+st "after kill KILL:"
+sudo runc list
+sudo runc delete life
+st "after delete:"</pre>
+<pre class="out">before create:         (no such container)
+after create:          {"status":"<b>created</b>","pid":28509}
+workload started
+after start:           {"status":"<b>running</b>","pid":28509}
+after kill TERM:       {"status":"<b>running</b>","pid":28509}
+after kill KILL:       {"status":"<b>stopped</b>","pid":0}
+
+ID     PID   STATUS     BUNDLE                 CREATED                          OWNER
+life   0     <b>stopped</b>    /home/ubuntu/i2/life   2026-07-27T10:00:37.742916299Z   root
+
+after delete:          (no such container)</pre>
+<p>Three things in that transcript are worth more than the state names. The PID is the <strong>same</strong> in <code>created</code> and <code>running</code> — I2.11. <code>runc list</code> shows the stopped container with <code>PID 0</code>: it is a record, not a process. And <code>TERM</code> did nothing at all, which is the next lab.</p></li>
+
+<li>Find out why <code>TERM</code> was ignored, because the answer is one of the most valuable facts in this track. Give the workload a signal handler and nothing else changes:
+<pre class="cmd">sudo jq '.process.args = ["/bin/sh","-c","trap \"echo caught TERM; exit 0\" TERM; sleep 600 &amp; wait"]' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc run -d life; sleep 0.3
+sudo runc kill life TERM; sleep 0.5
+sudo runc state life | jq -c '{status,pid}'</pre>
+<pre class="out"><b>caught TERM</b>
+{"status":"<b>stopped</b>","pid":0}</pre>
+<p>The rule is a kernel one, not a runtime one: <strong>PID 1 of a PID namespace does not receive signals it has no handler for.</strong> The kernel drops them, to stop a namespace's init from being killed by accident. So the identical <code>runc kill … TERM</code> is ignored by a process with no handler and honoured by one with a handler. Nothing in the container tooling is involved.</p></li>
+
+<li>Read the full state document, since it is the runtime's entire public answer about a container.
+<pre class="cmd">sudo jq '.process.args = ["/bin/sleep","600"]' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc delete -f life 2&gt;/dev/null; sudo runc create life
+sudo runc state life</pre>
+<pre class="out">{
+  "ociVersion": "1.3.0",
+  "id": "life",
+  "<b>pid</b>": 28697,
+  "<b>status</b>": "created",
+  "<b>bundle</b>": "/home/ubuntu/i2/life",
+  "rootfs": "/home/ubuntu/i2/life/rootfs",
+  "created": "2026-07-27T10:00:51.974569756Z",
+  "owner": ""
+}</pre>
+<p>Three fields do all the work. <code>status</code> is the state machine. <code>bundle</code> tells you where to read the configuration. <code>pid</code> is the host-side PID of the container's first process — the handle for every <code>/proc</code>-based investigation in this module and every <code>nsenter</code> you will ever run.</p></li>
+
+<li>Clean up.
+<pre class="cmd">sudo runc delete -f life</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>After the container is stopped but before <code>delete</code>, <code>ls /run/runc/life</code> still lists a <code>state.json</code> and the bundle directory is untouched. After <code>delete</code>, the first is gone and the second is not — deleting a container never deletes its bundle.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>pid: 0</code> in a stopped container is not an error.</strong> It is the runtime saying "there is no process". Tooling that treats the state JSON's <code>pid</code> as always valid will try to read <code>/proc/0</code> and produce a baffling message.</li>
+<li><strong>The specification does not define a "paused" state.</strong> <code>runc pause</code> exists and uses the cgroup freezer, but a paused container still reports <code>running</code> — because pausing is not in the standard. If you rely on state to mean "is doing work", it does not.</li>
+<li><strong>A container whose bundle you deleted keeps running.</strong> The rootfs is already mounted and the configuration is already read. You get a container you cannot inspect, which is a good reason not to build bundles in a directory something else cleans up.</li>
+<li><strong>The PID-1 signal rule is why your pod takes 30 seconds to terminate.</strong> If the container's entrypoint is a shell that <code>exec</code>s nothing, or an application with no <code>SIGTERM</code> handler, <code>TERM</code> is discarded and the grace period runs out before <code>KILL</code> arrives.</li>
+</ul>
+
+<div class="specref">
+<blockquote><code>creating</code>: the container is being created (step 2 in the lifecycle)<br>
+<code>created</code>: the runtime has finished the create operation, and the container process has neither exited nor executed the user-specified program<br>
+<code>running</code>: the container process has executed the user-specified program but has not exited<br>
+<code>stopped</code>: the container process has exited</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#state">runtime.md § State</a></cite>
+<p>Read the <code>created</code> definition slowly: "has neither exited nor executed the user-specified program". A process exists that is not yours and has not become yours. That sentence is the whole of I2.11.</p>
+</div>
+
+<div class="k8s-link">
+<p>A pod's container statuses — <code>waiting</code>, <code>running</code>, <code>terminated</code> — are a lossy projection of this machine plus the kubelet's own bookkeeping, which is why <code>terminated</code> carries an <code>exitCode</code> that came from a stopped-but-not-yet-deleted container. The kubelet's container garbage collection is what eventually calls <code>delete</code>. <a href="w3.html#cp-3-5">W3.5</a> covers graceful termination, and the PID-1 signal rule above is the single most common reason a pod ignores its grace period.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime-spec <code>runtime.md</code></a> — 112 lines, the whole lifecycle, worth reading in one sitting. <code>man 7 pid_namespaces</code> for the signal rule; <code>man 8 runc-state</code>, <code>man 8 runc-list</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i2-10" data-id="i2-10">
+<div class="lesson-head"><span class="cp-id">I2.10</span><h4>Five operations, and nothing else</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>runc --help</code> lists about twenty subcommands and <code>docker --help</code> lists many more, so it is easy to assume the standard is correspondingly large. It is not. A compliant runtime must implement <strong>five</strong> operations, and everything else you have ever typed at a container tool is convenience built on top of those five by some layer above. Knowing which five is knowing where the boundary is.</p>
+
+<h5>The concept</h5>
+<ul>
+<li><strong><code>state &lt;id&gt;</code></strong> — report the container's state. The only read operation.</li>
+<li><strong><code>create &lt;id&gt; &lt;bundle&gt;</code></strong> — build everything the configuration describes, and stop short of running the user's program.</li>
+<li><strong><code>start &lt;id&gt;</code></strong> — run the user's program.</li>
+<li><strong><code>kill &lt;id&gt; &lt;signal&gt;</code></strong> — send a signal to the container process. Note the name: it sends <em>any</em> signal, and "kill" is the system call's name, not the intent.</li>
+<li><strong><code>delete &lt;id&gt;</code></strong> — release the container's resources and forget it.</li>
+</ul>
+<p>What is <em>not</em> in that list is more informative. No <code>exec</code> — attaching a second process to a running container is not standardised, which is why <code>runc exec</code>, <code>docker exec</code> and <code>kubectl exec</code> each had to invent it. No <code>pause</code>, no <code>logs</code>, no <code>stats</code>, no <code>restart</code>, no <code>build</code>, no <code>pull</code>, no <code>attach</code>. Each of those is somebody's extension, and the fact that they all behave slightly differently across tools is the direct consequence.</p>
+<p><code>delete</code> is worth stating precisely, because the difference from <code>kill</code> is the difference between "the process is dead" and "the container is gone". <code>kill</code> signals; the container stays, in state <code>stopped</code>, holding its cgroup and its rootfs mount. <code>delete</code> unmounts, removes the cgroup, discards the state directory, and runs the <code>poststop</code> hooks. Nothing else does that.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run each of the five by hand, watching what the machine looks like between them.
+<pre class="cmd">cd ~/i2/life
+sudo jq '.process.args = ["/bin/sh","-c","echo up; sleep 600"]' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc create life
+sudo runc state life | jq -r .status
+sudo runc start life
+sudo runc state life | jq -r .status</pre>
+<pre class="out">created
+up
+running</pre></li>
+
+<li>Show that <code>kill</code> leaves things behind, by looking at what still exists after it.
+<pre class="cmd">sudo runc kill life KILL; sleep 0.3
+sudo runc state life | jq -c '{status,pid}'
+sudo ls -d /sys/fs/cgroup/life 2&gt;/dev/null || echo "(no cgroup by that name)"
+mount | grep -c 'i2/life/rootfs'
+sudo ls /run/runc/life</pre>
+<pre class="out">{"status":"stopped","pid":0}
+(no cgroup by that name)
+0
+<b>state.json</b></pre>
+<p>The process is gone and so are the mounts — runc tears those down when the init process exits. What survives is <code>state.json</code>: the container as a <em>record</em>. Until that is removed, the id is taken, and creating another container called <code>life</code> fails.</p></li>
+
+<li>Prove the id is taken, which is what <code>delete</code> is really for.
+<pre class="cmd">sudo runc create life</pre>
+<pre class="out">level=error msg="runc create failed: <b>container with given ID already exists</b>"</pre>
+<pre class="cmd">sudo runc delete life
+sudo runc create life &amp;&amp; sudo runc state life | jq -r .status</pre>
+<pre class="out">created</pre></li>
+
+<li>Now the flag that exists because people kept getting this wrong.
+<pre class="cmd">sudo runc start life
+sudo runc delete life</pre>
+<pre class="out">level=error msg="<b>cannot delete container life that is not stopped: running</b>"</pre>
+<pre class="cmd">sudo runc delete <b>-f</b> life
+sudo runc state life 2&gt;&amp;1 | tail -1</pre>
+<pre class="out">container does not exist</pre>
+<p><code>delete -f</code> is <code>kill KILL</code> followed by <code>delete</code>, in one step. It is not in the specification — it is runc being kind. Every <code>-f</code> you have ever typed at a container tool is this.</p></li>
+
+<li>Finally, note what <code>runc run</code> actually is.
+<pre class="cmd">sudo runc run --help | head -4</pre>
+<p><code>run</code> is <code>create</code> + <code>start</code> + wait + <code>delete</code>, bundled. It is the only command in this module that is not a specified operation, and it is the one every example uses — including most of this page — because for a one-shot container the four-step dance adds nothing. Reach for the four steps the moment you need to inspect, attach, or configure anything between <code>create</code> and <code>start</code>.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Between <code>kill</code> and <code>delete</code>, <code>runc list</code> shows the container as <code>stopped</code> and <code>/run/runc/&lt;id&gt;/state.json</code> exists. After <code>delete</code>, both are gone and the bundle directory is untouched.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Leaked state directories are a real production failure.</strong> A supervisor that crashes between <code>kill</code> and <code>delete</code> leaves the id taken forever. The container will never restart, because create fails on a name collision — and the error blames the name, not the crash that caused it.</li>
+<li><strong><code>kill</code> signals only the container's first process by default.</strong> <code>runc kill --all</code> signals every process in the cgroup, which is what you want if the workload forked. Killing PID 1 does not kill its children; the PID namespace collapsing does, and only once PID 1 has actually exited.</li>
+<li><strong><code>exec</code> is not standardised, so it is not portable.</strong> <code>runc exec</code> exists and works, but a runtime can conform to the specification without it. Anything you build that assumes exec is assuming an implementation, not a standard.</li>
+<li><strong>Signal names vs numbers.</strong> <code>runc kill life 9</code> and <code>runc kill life KILL</code> are the same; <code>runc kill life SIGKILL</code> also works on runc but is not required to. Prefer the bare name.</li>
+</ul>
+
+<div class="specref">
+<p>The specification lists exactly five operations a runtime must support — Query State, Create, Start, Kill, Delete — and constrains what each may do. On <code>delete</code>:</p>
+<blockquote>Deleting a container MUST delete the resources that were created during the <code>create</code> step. Note that resources associated with the container, but not created by this container, MUST NOT be deleted.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#delete">runtime.md § Delete</a></cite>
+<p>That second sentence is why <code>delete</code> does not remove your bundle, and why a container that <em>joined</em> a network namespace by path does not destroy it on the way out. Create it, own it; join it, leave it alone.</p>
+</div>
+
+<div class="k8s-link">
+<p>The CRI's <code>RemoveContainer</code> is this <code>delete</code>, and the reason a Kubernetes node accumulates stopped containers is that nothing calls it until the kubelet's GC thresholds are crossed. The five operations map almost one-to-one onto the CRI's container verbs, which is not a coincidence — <a href="w1.html#cp-1-20">W1.20</a> covers the CRI, and I8 builds a server that speaks it.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#operations">runtime.md § Operations</a>, then <code>man 8 runc</code> and compare its subcommand list against those five. <code>man 7 signal</code> for the names.</p>
+</article>
+
+<article class="lesson" id="cp-i2-11" data-id="i2-11">
+<div class="lesson-head"><span class="cp-id">I2.11</span><h4>Why <code>create</code> and <code>start</code> are two operations</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the design decision that makes the whole container ecosystem possible, and it is invisible until you look for it. If <code>create</code> and <code>start</code> were one operation, there would be no moment at which a container exists but is not yet running — and without that moment there could be no CNI plugin, no shim that survives a daemon restart, no <code>kubectl exec</code> that attaches before the process starts, and no way to set anything up inside a container's namespaces using ordinary tools. One split in the API buys all of it.</p>
+
+<h5>The concept</h5>
+<p>After <code>create</code> returns, everything the configuration describes exists: the namespaces are created, the cgroup is created and populated, the rootfs is mounted and pivoted into, the mounts are performed, the capabilities are computed. A process is sitting inside all of it. That process is <strong>not your program</strong> — it is the runtime's own helper, <code>runc init</code>, blocked on a pipe, waiting to be told to proceed.</p>
+<p>When <code>start</code> arrives, the runtime writes to that pipe and <code>runc init</code> calls <code>execve</code> on your program. Because <code>execve</code> replaces the program inside the existing process, <strong>the PID does not change</strong>. Everything that was set up around that PID — namespaces, cgroup, root — carries straight over.</p>
+<div class="flow"><span>create</span><em>→</em><span>runc init, blocked</span><em>→</em><span>anyone may act on this PID</span><em>→</em><span>start</span><em>→</em><span>execve, same PID</span></div>
+<p>The window between the two is where the rest of the stack does its work. The network plugin needs a network namespace to configure, and it needs it before the application starts listening — so it runs in this window, against <code>/proc/&lt;pid&gt;/ns/net</code>. In the analogy, the room is rented, wired and furnished, and only then does the guest walk in.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create — but do not start — and find out what is actually there.
+<pre class="cmd">cd ~/i2/life
+sudo jq '.process.args = ["/bin/sleep","600"]' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc delete -f life 2&gt;/dev/null; sudo runc create life
+P=$(sudo runc state life | jq -r .pid); echo "pid=$P"
+sudo cat /proc/$P/cmdline | tr '\0' ' '; echo
+sudo readlink /proc/$P/exe</pre>
+<pre class="out">pid=28697
+<b>runc init</b>
+<b>/runc</b></pre>
+<p>Not <code>sleep</code>. The process running inside your container's namespaces is a copy of the runtime binary, waiting.</p></li>
+
+<li>Confirm that everything else is already built.
+<pre class="cmd">sudo lsns -p $P
+sudo cat /proc/$P/cgroup
+sudo ls /proc/$P/root | head -5</pre>
+<pre class="out">        NS TYPE   NPROCS   PID USER COMMAND
+4026531834 time      131     1 root /usr/lib/systemd/systemd …
+4026531837 user      131     1 root /usr/lib/systemd/systemd …
+<b>4026532275 mnt         1 28697 root ├─runc init</b>
+<b>4026532277 uts         1 28697 root ├─runc init</b>
+<b>4026532278 ipc         1 28697 root ├─runc init</b>
+<b>4026532279 pid         1 28697 root ├─runc init</b>
+<b>4026532280 cgroup      1 28697 root ├─runc init</b>
+<b>4026532281 net         1 28697 root └─runc init</b>
+
+0::/user.slice/user-1000.slice/<b>life</b>
+
+bin  dev  etc  home  lib</pre>
+<p>Six fresh namespaces, a cgroup named after the container, and <code>/proc/$P/root</code> already showing the Alpine tree rather than the host's. The container is, for every purpose except running your code, complete.</p></li>
+
+<li>This is the window. Use it the way a network plugin would — do something inside the container's namespaces with an ordinary host tool, before the workload exists.
+<pre class="cmd">sudo nsenter -t $P -n ip link add dummy9 type dummy
+sudo nsenter -t $P -n ip addr add 10.55.0.1/24 dev dummy9
+sudo nsenter -t $P -n ip link set dummy9 up
+sudo nsenter -t $P -n ip -o -4 addr show dummy9</pre>
+<pre class="out">2: dummy9    inet <b>10.55.0.1/24</b> scope global dummy9\       valid_lft forever preferred_lft forever</pre>
+<p>Nothing about that used a container tool. A veth pair, an address and a route, moved into a namespace by PID — which is precisely what <code>minibox</code>'s <code>setup_net</code> function did in <a href="b14.html#cp-b14-4">B14.4</a>, and precisely what a CNI plugin does in I9. The specification made room for it by not running your program yet.</p></li>
+
+<li>Now start it, and watch the same PID become the workload.
+<pre class="cmd">sudo runc start life
+sudo runc state life | jq -c '{status,pid}'
+sudo cat /proc/$P/cmdline | tr '\0' ' '; echo
+sudo readlink /proc/$P/exe</pre>
+<pre class="out">{"status":"running","pid":<b>28697</b>}
+<b>/bin/sleep 600</b>
+<b>/bin/busybox</b></pre>
+<p>Same PID, different program, different executable — and the namespaces, the cgroup and the interface you just added are all still there, because none of them belonged to the program. They belonged to the process.</p></li>
+
+<li>Clean up.
+<pre class="cmd">sudo runc delete -f life</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>The PID printed after <code>create</code> and the PID printed after <code>start</code> are identical, while <code>/proc/&lt;pid&gt;/exe</code> changes from <code>/runc</code> to the workload's interpreter. <code>nsenter -t $P -n ip addr</code> shows <code>dummy9</code> both before and after <code>start</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A <code>created</code> container consumes everything a running one does.</strong> Its cgroup counts against limits, its rootfs is mounted, its IP is allocated. A supervisor that creates containers and then fails before starting them leaks the entire footprint, invisibly, because nothing is <em>running</em>.</li>
+<li><strong>The window is not unbounded.</strong> runc holds an open pipe to <code>runc init</code>; if the parent dies, init exits and the container goes straight to <code>stopped</code>. You cannot create a container on Monday and start it on Tuesday.</li>
+<li><strong><code>runc run</code> hides all of this.</strong> If you are trying to configure something between the two steps and using <code>run</code>, there is no between. This is the most common reason a hand-rolled CNI experiment "does nothing".</li>
+<li><strong>The <code>createRuntime</code> hook is the standardised way to use this window</strong> (I2.12). <code>nsenter</code> by PID is what the lab does because it is transparent; a real integration puts the same work in a hook so it is part of the bundle rather than a separate script that can be forgotten.</li>
+</ul>
+
+<div class="specref">
+<blockquote>The runtime MUST generate an error if this operation is invoked on a container that is not <code>created</code>. […] the user-specified program (from <code>process</code>) MUST NOT be run at this time.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#create">runtime.md §§ Create, Start</a></cite>
+<p>"MUST NOT be run at this time" is the most consequential negative requirement in the document. Every architecture in this track — shims, CNI, the CRI's separate sandbox and container calls — is built in the space that sentence reserves.</p>
+</div>
+
+<div class="k8s-link">
+<p>The CRI splits a pod's startup along exactly this seam: <code>RunPodSandbox</code> creates the pause container and calls the CNI plugin to configure its network namespace, and only then does <code>CreateContainer</code>/<code>StartContainer</code> run the workload. That is why a pod gets its IP before any application container starts, and why a CNI failure shows up as a pod stuck in <code>ContainerCreating</code> rather than as a crashing application. <a href="w4.html#cp-4-2">W4.2</a> covers the CNI from the cluster side; I9 writes a plugin.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#lifecycle">runtime.md § Lifecycle</a> — the twelve numbered steps, which are worth reading against the transcript above. <code>man 2 execve</code> for why the PID survives, and <code>man 1 nsenter</code> for the tool that made the window visible.</p>
+</article>
+
+<article class="lesson" id="cp-i2-12" data-id="i2-12">
+<div class="lesson-head"><span class="cp-id">I2.12</span><h4>Hooks — and working out which side of the boundary each ran on</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Hooks are the specification's extension point: five named moments at which the runtime will execute a program you nominate. They are how GPU support, network plugins and half of every vendor's container integration are implemented. They are also easy to get subtly wrong, because <em>which side of the isolation boundary a hook runs on</em> is not obvious from its name — and the answer determines which filesystem its path is resolved in. Rather than memorise a table, this lesson has each hook report its own coordinates and derives the table from the evidence.</p>
+
+<h5>The concept</h5>
+<p>Each hook is <code>{"path": "...", "args": [...]}</code> under a named key in <code>config.json</code>. The runtime executes it and passes the container's state JSON on <strong>standard input</strong> — that is how a hook knows which container it was called for. A hook that exits non-zero aborts the operation.</p>
+<p>The five, in the order they fire:</p>
+<ul>
+<li><code>createRuntime</code> — during <code>create</code>, in the <em>runtime's</em> namespaces. The window from I2.11, standardised.</li>
+<li><code>createContainer</code> — during <code>create</code>, in the <em>container's</em> namespaces, but <strong>before <code>pivot_root</code></strong>. So it sees the container's namespaces and the host's filesystem.</li>
+<li><code>startContainer</code> — during <code>start</code>, in the container's namespaces, <strong>after <code>pivot_root</code></strong>, just before <code>execve</code>. Its path is resolved <em>inside the container's rootfs</em>.</li>
+<li><code>poststart</code> — after the workload starts, in the runtime's namespaces.</li>
+<li><code>poststop</code> — after <code>delete</code>, in the runtime's namespaces. Runs even if start failed.</li>
+</ul>
+<p>The pair to keep straight is <code>createContainer</code> and <code>startContainer</code>: both run "in the container", but only the second one runs in the container's <em>filesystem</em>. Put a path in the wrong one and the runtime cannot find the binary.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write one hook script that records where it is, and install it in both filesystems so either resolution can work.
+<pre class="cmd">cd ~/i2
+sudo rm -rf hooks &amp;&amp; sudo mkdir -p hooks/rootfs
+sudo tar -C hooks/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+cat &gt; /tmp/hook.sh &lt;&lt;'EOF'
+#!/bin/sh
+# argv[1] = which hook. The container state arrives on stdin.
+out=/tmp/i2-hooks.log
+read -r state
+printf '%-16s pid=%-7s mnt=%s net=%s pidns=%s root=%s\n' \
+  "$1" "$$" "$(readlink /proc/self/ns/mnt)" "$(readlink /proc/self/ns/net)" \
+  "$(readlink /proc/self/ns/pid)" "$(ls / | tr '\n' ',' | cut -c1-24)" &gt;&gt; $out
+echo "$state" | head -c 100 &gt;&gt; $out; echo &gt;&gt; $out
+EOF
+sudo install -m755 /tmp/hook.sh /usr/local/bin/i2hook
+sudo install -m755 /tmp/hook.sh hooks/rootfs/hook.sh</pre>
+<p>It logs its own PID, its three most telling namespace inodes, and the first few entries of <code>/</code> — which is the field that reveals whether <code>pivot_root</code> has happened.</p></li>
+
+<li>Wire all five up. Deliberately point <code>createContainer</code> at the in-container path, to find out whether that is right.
+<pre class="cmd">cd hooks &amp;&amp; sudo runc spec
+sudo jq '.process.terminal = false | .root.readonly = false
+ | .process.args = ["/bin/echo","workload"]
+ | .hooks = {
+     createRuntime:   [{path:"/usr/local/bin/i2hook", args:["i2hook","createRuntime"]}],
+     createContainer: [{path:"/hook.sh",              args:["hook.sh","createContainer"]}],
+     startContainer:  [{path:"/hook.sh",              args:["hook.sh","startContainer"]}],
+     poststart:       [{path:"/usr/local/bin/i2hook", args:["i2hook","poststart"]}],
+     poststop:        [{path:"/usr/local/bin/i2hook", args:["i2hook","poststop"]}] }' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo rm -f /tmp/i2-hooks.log rootfs/tmp/i2-hooks.log
+sudo runc run hk</pre>
+<pre class="out">level=error msg="runc run failed: unable to start container process: error during container init:
+  error running <b>createContainer</b> hook #0: fork/exec <b>/hook.sh: no such file or directory</b>"</pre>
+<p>Answer obtained, by experiment rather than by table: <code>createContainer</code>'s path is resolved in the <strong>runtime's</strong> filesystem, because <code>pivot_root</code> has not happened yet. Fix it and re-run:</p>
+<pre class="cmd">sudo jq '.hooks.createContainer = [{path:"/usr/local/bin/i2hook", args:["i2hook","createContainer"]}]' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo rm -f /tmp/i2-hooks.log rootfs/tmp/i2-hooks.log
+sudo runc run hk</pre>
+<pre class="out">workload</pre></li>
+
+<li>Read the evidence. Four hooks logged to the host's <code>/tmp</code>; one did not.
+<pre class="cmd">sudo cat /tmp/i2-hooks.log</pre>
+<pre class="out">createRuntime    pid=29013   mnt=mnt:[<b>4026531841</b>] net=net:[<b>4026531840</b>] pidns=pid:[4026531836] root=<b>bin,bin.usr-is-merged,bo</b>
+{"ociVersion":"1.3.0","id":"hk","status":"creating","<b>pid":29006</b>,"bundle":"/home/ubuntu/i2/hooks"}
+
+createContainer  pid=<b>7</b>       mnt=mnt:[<b>4026532275</b>] net=net:[<b>4026532281</b>] pidns=pid:[4026532279] root=<b>bin,bin.usr-is-merged,bo</b>
+{"ociVersion":"1.3.0","id":"hk","status":"creating","<b>pid":1</b>,"bundle":"/home/ubuntu/i2/hooks"}
+
+poststart        pid=29035   mnt=mnt:[4026531841] net=net:[4026531840] pidns=pid:[4026531836] root=bin,bin.usr-is-merged,bo
+{"ociVersion":"1.3.0","id":"hk","status":"created","pid":29006,"bundle":"/home/ubuntu/i2/hooks"}
+
+poststop         pid=29055   mnt=mnt:[4026531841] net=net:[4026531840] pidns=pid:[4026531836] root=bin,bin.usr-is-merged,bo
+{"ociVersion":"1.3.0","id":"hk","status":"stopped","bundle":"/home/ubuntu/i2/hooks"}</pre>
+<pre class="cmd">sudo cat rootfs/tmp/i2-hooks.log</pre>
+<pre class="out">startContainer   pid=<b>17</b>      mnt=mnt:[<b>4026532275</b>] net=net:[<b>4026532281</b>] pidns=pid:[4026532279] root=<b>bin,dev,etc,home,hook.sh</b>
+{"ociVersion":"1.3.0","id":"hk","status":"created","pid":1,"bundle":"/home/ubuntu/i2/hooks"}</pre></li>
+
+<li>Derive the table from what you just read, rather than accepting one:
+<table class="langpair"><thead><tr><th>hook</th><th>the evidence</th><th>therefore</th></tr></thead><tbody>
+<tr><td><code>createRuntime</code></td><td>host PID 29013, host namespace inodes, host <code>/</code></td><td>runtime side, entirely outside</td></tr>
+<tr><td><code>createContainer</code></td><td>PID <b>7</b>, container namespace inodes, but <b>host <code>/</code></b></td><td>inside the namespaces, before <code>pivot_root</code></td></tr>
+<tr><td><code>startContainer</code></td><td>PID 17, container namespaces, <b>container <code>/</code></b> (<code>hook.sh</code> is visible)</td><td>fully inside, after <code>pivot_root</code></td></tr>
+<tr><td><code>poststart</code> / <code>poststop</code></td><td>host PIDs, host namespaces, host <code>/</code></td><td>runtime side</td></tr>
+</tbody></table>
+<p>The <code>pid</code> field in the state JSON tells the same story from the other direction: host-side hooks are told the container's real host PID (29006), and container-side hooks are told <code>1</code>, because they read it through the container's own PID namespace. And the log written by <code>createContainer</code> landed in the <em>host's</em> <code>/tmp</code> — its mount namespace is the container's, but until <code>pivot_root</code> that namespace is still a copy of the host's mount table.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p><code>poststop</code> appears in the log even when the container fails to start — re-run the broken <code>createContainer</code> version and check. That is the property that makes <code>poststop</code> the right place for cleanup, and the wrong place for anything that assumes the workload ran.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A hook that fails aborts the container.</strong> Non-zero exit from any <code>create*</code> or <code>startContainer</code> hook fails the operation. A flaky hook is an outage, and the error message names the hook — which is at least a good error message, when you know to look for it.</li>
+<li><strong>Hooks run with the runtime's privileges.</strong> <code>createRuntime</code>, <code>poststart</code> and <code>poststop</code> execute as root on the host with the host's filesystem. Anything that can put a path into a bundle's <code>hooks</code> can run arbitrary code as root on the node. This is why Kubernetes does not let a pod spec set hooks.</li>
+<li><strong><code>prestart</code> is deprecated but still everywhere.</strong> It was split into <code>createRuntime</code> and <code>createContainer</code> in runtime-spec 1.0.2 because the original was ambiguous about exactly the question this lesson answers. runc still honours it; new work should not use it.</li>
+<li><strong>Do not confuse these with Kubernetes lifecycle hooks.</strong> <code>postStart</code> and <code>preStop</code> in a pod spec are executed by the <em>kubelet</em>, inside the container, via exec or HTTP. Same words, different layer, different guarantees — Kubernetes' <code>postStart</code> is not this <code>poststart</code>.</li>
+</ul>
+
+<div class="specref">
+<blockquote>The <code>createRuntime</code> hooks MUST be called as part of the <code>create</code> operation after the runtime environment has been created […] but before the <code>pivot_root</code> or any equivalent operation has been executed.<br>
+The <code>createContainer</code> hooks MUST be called as part of the <code>create</code> operation […] The hooks MUST be called in the container namespace.<br>
+The <code>startContainer</code> hooks MUST be called as part of the <code>start</code> operation […] immediately before executing the user-specified process. These hooks MUST be called in the container namespace.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#posix-platform-hooks">config.md § POSIX-platform Hooks</a></cite>
+<p>Read the first two together and the distinction the lab found is right there: both happen during <code>create</code>, one is in the runtime's namespace and one in the container's, and neither is after <code>pivot_root</code>. Only <code>startContainer</code> is.</p>
+</div>
+
+<div class="k8s-link">
+<p>The NVIDIA container toolkit is the canonical <code>createContainer</code> hook: it injects GPU device nodes and driver libraries into a container that was built without them. Sidecar-injection meshes and some CNI integrations use <code>createRuntime</code>. None of this is visible in a pod spec, which is exactly why a node where "the same pod behaves differently" is a node whose runtime configuration deserves reading — <a href="w6.html#cp-6-6">W6.6</a>'s node-level triage, with <code>config.json</code>'s <code>hooks</code> key added to the list.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#posix-platform-hooks">config.md § POSIX-platform Hooks</a> for the full table including timeouts and the deprecated <code>prestart</code>. <a href="https://github.com/NVIDIA/nvidia-container-toolkit">NVIDIA/nvidia-container-toolkit</a> if you want to read a hook that people actually run in production.</p>
+</article>
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
