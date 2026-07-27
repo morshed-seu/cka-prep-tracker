@@ -585,6 +585,215 @@ runc state: {"status":"running","pid":<b>34694</b>}</pre>
 <p class="docs-links"><b>Docs:</b> <code>runc run --help</code> for <code>--pid-file</code>'s exact wording; <code>man 2 kill</code> on what <code>pid == 0</code> means, which is the gotcha above and is worth reading once so it never bites you.</p>
 </article>
 
+<article class="lesson" id="cp-i3-7" data-id="i3-7">
+<div class="lesson-head"><span class="cp-id">I3.7</span><h4>The console socket: passing a terminal through a hole in the wall</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Ask for a terminal in a detached container and runc refuses outright. The error is precise and, until you know the mechanism, completely opaque: <code>cannot allocate tty if runc will detach without setting console socket</code>. Behind that sentence is one of the most elegant pieces of plumbing in the whole runtime — and it is a direct, practical application of the file-descriptor passing you did by hand in <a href="b9.html">B9</a>. This is where that lesson pays off.</p>
+
+<h5>The concept</h5>
+<p>Start with why there is a problem at all. A <abbr title="a pair of linked character devices: whatever is written to the master appears as terminal input on the slave, and vice versa">pseudo-terminal</abbr> comes in two halves. The <strong>slave</strong> (<code>/dev/pts/N</code>) goes to the program that thinks it is talking to a terminal — the container's shell. The <strong>master</strong> is the other end, held by whoever is driving that terminal. For an interactive container the slave belongs inside and the master must belong outside.</p>
+<p>runc creates the pty. But in detached mode runc is about to exit — so it cannot be the one holding the master. It has to hand it to you. And a master pty is not something you can hand over by name: the file descriptor is the terminal, and re-opening <code>/dev/pts/ptmx</code> by path gets you a <em>different</em> pty, not the same one.</p>
+<p>The kernel does provide a way to move an open file descriptor between unrelated processes: <code>SCM_RIGHTS</code> over a unix-domain socket. It is a genuine hole in the process boundary — the receiving process ends up with a real descriptor to the same open file, with its own number. That is the mechanism <a href="b9.html">B9</a> built by hand, and the console socket is precisely it: <strong>you</strong> create and listen on a unix socket, you pass its path to runc, and runc connects to it and sends the pty master through.</p>
+<div class="flow"><span>you: listen()</span><em>→</em><span>runc: connect()</span><em>→</em><span>SCM_RIGHTS<br><em>pty master fd</em></span><em>→</em><span>you hold the terminal</span><em>→</em><span>runc exits</span></div>
+<p>The direction is worth dwelling on because it is the opposite of most people's guess. runc does not open a socket for you to connect to — <strong>you are the server and the runtime is the client</strong>. That inversion is deliberate: it means the terminal's owner is whoever was already listening, so there is no window in which the master exists but nobody responsible holds it.</p>
+<p>Along with the descriptor, runc sends a small ordinary payload: the pty's name. It is not needed to use the terminal — you already have the fd — but it makes debugging output legible.</p>
+
+<div class="specref">
+<p>The specification asks for the terminal and says nothing about how it is delivered:</p>
+<blockquote><code>terminal</code> (bool, OPTIONAL) specifies whether a terminal is attached to the process, defaults to false.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">config.md</a>, "Process"</cite>
+<p>That is the whole field. The surrounding text goes on to say that on Linux a pseudoterminal pair is allocated and the <em>slave</em> is duplicated onto the process's standard streams — and then simply does not mention the master. Where the master goes is left to the runtime, because the spec has no concept of a caller to hand it to. <code>--console-socket</code> is runc's invention filling that silence, and containerd's shim uses it exactly as you are about to.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>First, meet the error, so the rest of the lesson has something to fix. Make a bundle that asks for a terminal.
+<pre class="cmd">cd ~/i3
+sudo cp -a box tty &amp;&amp; cd tty
+sudo jq '.process.args = ["/bin/sh"] | .process.terminal = true' \
+  config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json config.json
+sudo runc create t1</pre>
+<pre class="out">level=error msg="runc create failed: <b>cannot allocate tty if runc will
+detach without setting console socket</b>"</pre>
+<p>runc is telling you it has a master pty it cannot keep and cannot give away. Give it somewhere to send it.</p></li>
+
+<li>Write the receiver. The interesting part is four lines long — <code>recvmsg</code> with space for ancillary data, then pulling the descriptor out of the <code>SCM_RIGHTS</code> control message.
+<pre class="cmd">cat &gt; ~/i3/getconsole.py &lt;&lt;'PY'
+import array, os, socket, sys
+path = sys.argv[1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path); srv.listen(1)
+print("listening", flush=True)
+conn, _ = srv.accept()
+msg, anc, _, _ = conn.recvmsg(4096, socket.CMSG_SPACE(4))
+fds = array.array("i")
+for level, typ, data in anc:
+    if typ == socket.SCM_RIGHTS:
+        fds.frombytes(data[:len(data) - (len(data) % 4)])
+master = fds[0]
+print("payload   =", msg, flush=True)
+print("master fd =", master, flush=True)
+print("readlink  =", os.readlink(f"/proc/self/fd/{master}"), flush=True)
+print("isatty    =", os.isatty(master), flush=True)
+os.write(master, b"echo HELLO-FROM-THE-MASTER-FD\n")
+import time; time.sleep(1)
+print("read back =", os.read(master, 400), flush=True)
+PY
+python3 -c 'import ast;ast.parse(open("/home/ubuntu/i3/getconsole.py").read())' &amp;&amp; echo ok</pre></li>
+
+<li>Run the receiver, then create and start the container against it. Order matters — the listener must exist before runc tries to connect.
+<pre class="cmd">rm -f /tmp/console.sock
+sudo python3 ~/i3/getconsole.py /tmp/console.sock &gt; /tmp/recv.out 2&gt;&amp;1 &amp;
+sleep 1
+sudo runc create --console-socket /tmp/console.sock t1 &lt; /dev/null
+sudo runc start t1
+sleep 2
+cat /tmp/recv.out</pre>
+<pre class="out">listening
+payload   = b'<b>/dev/pts/ptmx</b>'
+master fd = <b>5</b>
+readlink  = /dev/pts/ptmx
+isatty    = <b>True</b>
+read back = b'echo HELLO-FROM-THE-MASTER-FD\r\n/ # echo HELLO-FROM-THE-MASTER-FD\r\n<b>HELLO-FROM-THE-MASTER-FD</b>\r\n/ # \x1b[6n'</pre>
+<p>Read that last line carefully, because it contains the whole proof. Your write went into the master; the container's shell received it as keyboard input, echoed it back (the first copy), executed it (<code>HELLO-FROM-THE-MASTER-FD</code>), and printed a fresh prompt. The <code>\r\n</code> line endings are the terminal discipline doing its job — a pipe would give you bare <code>\n</code>. And <code>\x1b[6n</code> is the shell asking the terminal where the cursor is, which is a question a program only bothers to ask something it believes is a real terminal.</p></li>
+
+<li>Confirm the descriptor genuinely crossed a process boundary, rather than being inherited.
+<pre class="cmd">sudo pgrep -af 'runc.*t1' || echo '(no runc process for t1)'
+sudo runc list | grep t1</pre>
+<pre class="out">(no runc process for t1)
+t1   34876   running   /home/ubuntu/i3/tty   2026-07-27T14:24:20Z</pre>
+<p>Note this only works if your receiver is still holding the descriptor — the container's shell dies with its terminal, so a receiver that exits takes the container with it. runc, meanwhile, is gone and the terminal still works. The fd in your Python process is not a copy of anything runc still holds — it <em>is</em> the master, now owned by an unrelated program that was never runc's child.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain who listens and who connects, name what travels in the ancillary data versus the ordinary payload, and point at the two pieces of evidence in the read-back that prove a real terminal rather than a pipe.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The listener must be running first.</strong> runc connects during <code>create</code> and fails immediately if nothing is listening. Starting them in the wrong order gives a connection-refused error that reads like a permissions problem.</li>
+<li><strong><code>recvmsg</code> without <code>CMSG_SPACE</code> silently drops the descriptor.</strong> If you allocate no ancillary buffer, the kernel discards the fd and closes it — you get the payload, no error, and no terminal. This is the single most common bug when writing one of these by hand.</li>
+<li><strong>The socket path is not cleaned up.</strong> A leftover socket file makes the next <code>bind()</code> fail with "address already in use"; <code>rm -f</code> it first, as the lab does.</li>
+<li><strong><code>socat</code> is often suggested for this and cannot do it.</strong> <code>socat</code> relays bytes; it has no way to accept an <code>SCM_RIGHTS</code> descriptor and adopt it. You need something that calls <code>recvmsg</code> — a few lines of Python, or runc's own <code>recvtty</code> helper.</li>
+<li><strong>Terminal mode is not free.</strong> With a pty, stdout and stderr are merged onto one stream and line endings become <code>\r\n</code>. Log collectors that assume separated streams get confused, which is why non-interactive containers should leave <code>terminal: false</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism behind <code>kubectl exec -it</code> and the <code>tty: true</code> field in a pod spec. The chain is longer — your terminal, the API server, the kubelet's streaming endpoint, the CRI runtime, the shim — but the last hop is exactly what you just built: a console socket, and a pty master passed over it by <code>SCM_RIGHTS</code>. It also explains a puzzle people hit constantly: a pod with <code>tty: true</code> whose logs arrive with stdout and stderr interleaved and <code>\r</code> characters everywhere. That is not Kubernetes mangling the output; that is a terminal doing what terminals do, three layers down. <code>kubectl exec</code>'s path through the stack is <a href="w1.html#cp-1-20">W1.20</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 7 unix</code> under <code>SCM_RIGHTS</code> — the authoritative description of descriptor passing, including the truncation behaviour behind the <code>CMSG_SPACE</code> gotcha; <code>man 4 pts</code> and <code>man 3 posix_openpt</code> for the master/slave split; <a href="https://github.com/opencontainers/runc/tree/main/contrib/cmd/recvtty">runc's <code>recvtty</code></a>, the reference receiver in Go.</p>
+</article>
+
+<article class="lesson" id="cp-i3-8" data-id="i3-8">
+<div class="lesson-head"><span class="cp-id">I3.8</span><h4>The rest of the surface: <code>exec</code>, <code>ps</code>, <code>events</code>, <code>update</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Four commands remain, and each one is the ancestor of something you already use in Kubernetes. <code>runc exec</code> is <code>kubectl exec</code>. <code>runc events --stats</code> is what metrics-server ultimately reads. <code>runc update</code> is the machinery behind in-place pod resizing, which went GA in v1.35. Meeting them at this level means that when the Kubernetes version misbehaves you know what it was asking for underneath.</p>
+
+<h5>The concept</h5>
+<p><strong><code>runc exec</code></strong> starts a second process inside an existing container. Mechanically it is the <em>same binary doing the same re-exec</em> you traced in I3.1, with one environment variable changed: <code>_LIBCONTAINER_INITTYPE=setns</code> instead of <code>standard</code>. Where the standard path calls <code>unshare</code> to make namespaces, the setns path calls <code>setns</code> to join existing ones. One program, two directions.</p>
+<p>The natural question is which namespaces it joins, and the answer for runc is refreshingly simple: <strong>all of them</strong>. You will verify inode-by-inode below that an exec'd process is in the container's mount, PID, network, UTS, IPC and cgroup namespaces, and in its cgroup. What it does <em>not</em> inherit is the container's <code>process</code> configuration from <code>config.json</code> — the exec'd process gets its own capabilities, its own environment and its own working directory, defaulting to values that are not necessarily the ones your container was started with. That mismatch is the source of the most confusing exec bugs: a shell that can do things the application cannot, or the reverse.</p>
+<p><strong><code>runc ps</code></strong> lists the processes in the container's cgroup. Note the implementation detail, because it explains the output: it reads the cgroup's <code>cgroup.procs</code> and then shells out to the host's <code>ps</code> with those PIDs. So the numbers you see are <em>host</em> PIDs, not the container's own view.</p>
+<p><strong><code>runc events --stats</code></strong> takes a one-shot resource snapshot and prints it as JSON — CPU time, memory, pids, and block I/O, read straight out of the cgroup files you drove by hand in <a href="b7.html">B7</a>. Without <code>--stats</code> the same command streams events instead, blocking until something happens.</p>
+<p><strong><code>runc update</code></strong> changes resource limits on a <em>running</em> container. This is the one that surprises people: cgroup limits are not fixed at creation, because a cgroup is a live kernel object and writing a new number into <code>cpu.max</code> takes effect immediately. There is an important catch, though, and the lab makes you look at it — <code>update</code> changes the kernel's state and <strong>nothing else</strong>. Not the bundle, not runc's own saved state.</p>
+
+<div class="specref">
+<p>Of these four, the specification defines exactly none — and this time the evidence is an absence rather than a sentence. Here is every operation heading in the spec's "Operations" section, in full:</p>
+<blockquote>Query State · Create · Start · Kill · Delete</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "Operations" — the complete list</cite>
+<p>That is the whole standard surface. <code>exec</code>, <code>ps</code>, <code>events</code>, <code>update</code>, <code>pause</code> and <code>resume</code> appear nowhere in the document. Five operations are standardised; everything in this lesson is runc going beyond the contract. It matters practically: a CRI implementation cannot assume any runtime offers <code>update</code>, which is why in-place pod resize took so long to stabilise and why it is negotiated through CRI's own <code>UpdateContainerResources</code> call rather than assumed.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Work out which namespaces <code>exec</code> re-enters — by comparing inode numbers, not by trusting documentation. Print them from inside an exec'd process and from the container's PID 1.
+<pre class="cmd">cd ~/i3/box
+P=$(sudo runc state s5 | jq -r .pid)
+sudo runc exec s5 /bin/sh -c \
+  'for n in mnt pid net uts ipc cgroup user time; do
+     printf "%-8s %s\n" $n $(readlink /proc/self/ns/$n); done'
+echo '--- container PID 1 for comparison:'
+for n in mnt pid net uts ipc cgroup user time; do
+  printf '%-8s %s\n' $n $(sudo readlink /proc/$P/ns/$n); done</pre>
+<pre class="out">mnt      mnt:[4026532403]        mnt      mnt:[4026532403]
+pid      pid:[4026532406]        pid      pid:[4026532406]
+net      net:[4026532408]        net      net:[4026532408]
+uts      uts:[4026532404]        uts      uts:[4026532404]
+ipc      ipc:[4026532405]        ipc      ipc:[4026532405]
+cgroup   cgroup:[4026532407]     cgroup   cgroup:[4026532407]
+user     user:[4026531837]       user     user:[4026531837]
+time     time:[4026531834]       time     time:[4026531834]</pre>
+<p>Every inode matches. <code>exec</code> joins all eight — including <code>user</code> and <code>time</code>, which match trivially here because this container did not create its own; had it done so, those would match too. There is no namespace <code>runc exec</code> leaves behind.</p></li>
+
+<li>Confirm it joins the cgroup as well, which is a separate mechanism from namespaces and a separate decision.
+<pre class="cmd">sudo runc exec s5 /bin/sh -c 'cat /proc/self/cgroup; echo ---; cat /proc/1/cgroup'</pre>
+<pre class="out">0::/
+---
+0::/</pre>
+<p>Both report <code>/</code> — which looks like no information until you remember why: they are inside a <em>cgroup namespace</em>, so each sees its own cgroup as the root. Identical output means identical cgroup. This is what makes <code>kubectl exec</code> subject to the pod's memory limit; a debugging shell can push a pod into <code>OOMKilled</code>.</p></li>
+
+<li>List the container's processes, and notice whose PID numbers you are being shown.
+<pre class="cmd">sudo runc ps s5</pre>
+<pre class="out">UID    PID     PPID  C STIME TTY   TIME      CMD
+root   <b>33759</b>   <b>1</b>     0 20:11 ?     00:00:00  sleep 1000</pre>
+<p>PID <code>33759</code> is the host's number — inside the container this process is PID&nbsp;1. And its parent is PID&nbsp;1 on the host, which is I3.5's re-parenting, visible from a different angle.</p></li>
+
+<li>Take a resource snapshot.
+<pre class="cmd">sudo runc events --stats s5 | jq '{type,
+  cpu: .data.cpu.usage,
+  memory: {usage: .data.memory.usage.usage, limit: .data.memory.usage.limit},
+  pids: .data.pids}'</pre>
+<pre class="out">{
+  "type": "stats",
+  "cpu": { "total": 35858000, "kernel": 27356000, "user": 8502000 },
+  "memory": { "usage": 319488, "limit": <b>18446744073709551615</b> },
+  "pids": { "current": 1 }
+}</pre>
+<p>CPU figures are nanoseconds from <code>cpu.stat</code>. That memory limit is not a bug — it is 2<sup>64</sup>−1, the kernel's way of saying <code>max</code>, because this bundle set no memory limit. Any monitoring system that graphs "percent of limit" without special-casing that number produces a memorably useless chart.</p></li>
+
+<li>Now change the limits on a container that is already running, and watch the cgroup file change under it.
+<pre class="cmd">C=/sys/fs/cgroup/user.slice/user-1000.slice/s5
+sudo cat $C/cpu.max $C/memory.max
+sudo runc update --cpu-quota 20000 --cpu-period 100000 s5
+sudo runc update --memory 134217728 s5
+sudo cat $C/cpu.max $C/memory.max</pre>
+<pre class="out">max 100000        <i># before: no quota</i>
+max               <i># before: no memory limit</i>
+<b>20000 100000</b>     <i># after:  20% of one CPU</i>
+<b>134217728</b>        <i># after:  128 MiB</i></pre>
+<p>No restart, no new PID, no interruption — the <code>sleep</code> never noticed. A cgroup is a live object and its limits are just files.</p></li>
+
+<li>Now the catch. Ask both places that might have recorded the change what they think the limits are.
+<pre class="cmd">sudo jq -c '.linux.resources' ~/i3/box/config.json
+sudo jq -c '.config.cgroups.resources | {CpuQuota, CpuPeriod, Memory}' \
+  /run/runc/s5/state.json</pre>
+<pre class="out">{"devices":[{"allow":false,"access":"rwm"}]}
+{"CpuQuota":<b>null</b>,"CpuPeriod":<b>null</b>,"Memory":<b>null</b>}</pre>
+<p><strong>Neither.</strong> The bundle is untouched, which you might expect — but runc's own persisted state does not record the update either. The new limits exist in exactly one place: the kernel. Delete and recreate the container and it silently reverts to the bundle's values, with nothing on disk to explain why the limit you set is gone.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state which namespaces <code>runc exec</code> joins and show the evidence, explain why two <code>/proc/self/cgroup</code> outputs both reading <code>/</code> is meaningful, change a live container's CPU quota, and name the only place that change is recorded.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>runc update</code> is invisible to everything but the kernel.</strong> It is not in the bundle and not in <code>state.json</code>, so it does not survive a recreate and leaves no audit trail. Treat it as a live intervention, never as configuration.</li>
+<li><strong><code>runc exec</code> does not inherit the container's <code>process</code> block.</strong> Capabilities, environment and working directory come from the exec's own arguments and defaults. A shell that behaves differently from your application is usually this, not a broken image.</li>
+<li><strong>An exec'd process shares the container's memory limit.</strong> A debugging session that loads a large file can OOM-kill the workload you were debugging. This is a real way to turn an investigation into an outage.</li>
+<li><strong><code>events</code> without <code>--stats</code> blocks.</strong> It streams OOM notifications and waits for them; typed casually into a terminal it looks like a hang.</li>
+<li><strong>The cgroup path is not stable across environments.</strong> <code>/user.slice/user-1000.slice/s5</code> is what you get from a user's <code>sudo</code>; read it from <code>state.json</code>'s <code>cgroup_paths</code> rather than assuming.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Every one of these has a Kubernetes descendant. <code>runc exec</code>'s namespace-joining is why <code>kubectl exec</code> sees the pod's network and filesystem — and its <em>separate</em> process config is why <code>kubectl exec</code> sometimes has capabilities the application does not. <code>events --stats</code> is the bottom of the metrics pipeline that ends in <code>kubectl top</code>. And <code>update</code> is the primitive behind <strong>in-place pod resize, GA in v1.35</strong>: changing a running pod's <code>resources</code> reaches the node as CRI's <code>UpdateContainerResources</code>, which lands as exactly the cgroup write you just made. The gotcha above has a Kubernetes twin worth remembering — because the change is only in the kernel, a container restart returns it to the value in the pod spec, which is the correct behaviour and still catches people out. Requests and limits are <a href="w3.html#cp-3-16">W3.16</a>; the CRI call itself is I8's material.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>runc exec --help</code> and <code>runc update --help</code> for the flags this lesson skips (notably <code>--resources -</code>, which reads a whole JSON resources block from stdin); the kernel's <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">cgroup v2 documentation</a> for <code>cpu.max</code>'s two-number format.</p>
+</article>
+
 </div><!-- /g-exits -->
 
 </main>
