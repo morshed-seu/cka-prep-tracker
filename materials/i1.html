@@ -207,7 +207,7 @@ CapBnd:	000001ffffffffff
 <p>65,536 IDs is a lot until you nest. A rootless container that itself runs a user namespace can only sub-allocate from its own range, so the inner container's "root" is drawn from the outer container's block. Nesting three deep with software that expects a fresh 65,536 each time is where rootless setups run out of numbers, and the error message is never about numbers.</p>
 <p>These helpers are frequently absent. Ubuntu server images do not ship <code>uidmap</code>, and Podman or Buildah installed without it fail with a message about <code>newuidmap</code> not being found that reads like a bug in the container tool. It is not; it is one <code>apt install</code>.</p>
 <div class="k8s-link">
-<p>The kubelet does this allocation itself when a pod sets <code>hostUsers: false</code> — it hands each pod a distinct 65,536-ID block from a node-wide pool, for exactly the non-overlap reason above, and writes the map into the OCI config that <a href="i2.html">I2</a> takes apart. The <code>/etc/subuid</code> mechanism is the single-machine version of the same idea, done by the distribution instead of by a scheduler.</p>
+<p>The kubelet does this allocation itself when a pod sets <code>hostUsers: false</code> — it hands each pod a distinct 65,536-ID block from a node-wide pool, for exactly the non-overlap reason above, and writes the map into the OCI config that <a href="../intermediate.html#i2">I2</a> takes apart. The <code>/etc/subuid</code> mechanism is the single-machine version of the same idea, done by the distribution instead of by a scheduler.</p>
 <p>The volume-ownership pain has an exact Kubernetes counterpart in <code>fsGroup</code> and the <code>fsGroupChangePolicy</code> field, which exist because a pod and a volume can disagree about which numeric group may read a file. <a href="w5.html#cp-5-4">W5.4 — PersistentVolumeClaims and access modes</a> is where volume ownership first bites in the advanced track.</p>
 </div>
 <h5>Docs</h5>
@@ -294,7 +294,7 @@ minibox</pre>
 <p>Order matters when you join several at once. Join the mount namespace first and the <code>/proc</code> you were about to read from is a different <code>/proc</code>; join the user namespace last and you may no longer have the capability to join the rest. <code>nsenter</code> has a fixed, carefully chosen order — if you write your own, copy it rather than inventing one.</p>
 <p>The fd must be opened by a process that can see the target's <code>/proc</code> entry. Inside a PID namespace where the target is invisible, there is no path to open, and the failure is <code>ENOENT</code> rather than <code>EPERM</code> — which sends people looking for a permissions problem that is not there.</p>
 <div class="k8s-link">
-<p>This is the mechanism under <code>kubectl exec</code>, end to end. The apiserver streams to the kubelet, the kubelet asks the runtime over CRI (<a href="i8.html">I8</a>) for an exec, and the runtime creates a process that <code>setns</code>es into the target container's namespaces — one <code>open</code> and one <code>setns</code> per type, exactly as above. Nothing crosses a machine boundary except the stream.</p>
+<p>This is the mechanism under <code>kubectl exec</code>, end to end. The apiserver streams to the kubelet, the kubelet asks the runtime over CRI (<a href="../intermediate.html#i8">I8</a>) for an exec, and the runtime creates a process that <code>setns</code>es into the target container's namespaces — one <code>open</code> and one <code>setns</code> per type, exactly as above. Nothing crosses a machine boundary except the stream.</p>
 <p>It is also what an <strong>ephemeral debug container</strong> does with <code>shareProcessNamespace</code> or <code>kubectl debug --target</code>: join the target's PID and network namespaces, keep your own mount namespace, and you have your tools plus their view. See <a href="w6.html#cp-6-6">W6.6 — debugging a pod that has no shell</a>, which is the practical form of everything on this page.</p>
 </div>
 <h5>Docs</h5>
@@ -544,7 +544,7 @@ full avg10=<b>37.37</b> avg60=10.29 avg300=2.32 total=7498732</pre>
 <p>Cgroup v2 has no such file. The kernel dropped the controller and replaced it with an <strong>eBPF program</strong> — a small verified program, loaded into the kernel, attached to the cgroup with type <code>BPF_PROG_TYPE_CGROUP_DEVICE</code>, invoked on every attempt to open a device node, returning allow or deny. eBPF ("extended Berkeley Packet Filter") is the kernel's general mechanism for running user-supplied, verified-safe code at fixed hook points; you will meet it again in <a href="#cp-i1-9">I1.9</a> as seccomp and in the advanced track as the datapath under some CNI plugins.</p>
 <p>Two consequences follow, and both are operational rather than theoretical:</p>
 <ul>
-<li><strong>Policy is invisible to the filesystem.</strong> There is nothing to <code>cat</code>. <code>bpftool cgroup show &lt;path&gt;</code> tells you a program is attached and what it is called; it does not decompile it into rules. To know what a container may open, you read the runtime's <code>config.json</code> — which is why <a href="i2.html">I2</a>'s <code>linux.resources.devices</code> is the practical source of truth, not the kernel.</li>
+<li><strong>Policy is invisible to the filesystem.</strong> There is nothing to <code>cat</code>. <code>bpftool cgroup show &lt;path&gt;</code> tells you a program is attached and what it is called; it does not decompile it into rules. To know what a container may open, you read the runtime's <code>config.json</code> — which is why <a href="../intermediate.html#i2">I2</a>'s <code>linux.resources.devices</code> is the practical source of truth, not the kernel.</li>
 <li><strong>The denial has no diagnostic.</strong> The <code>open(2)</code> returns <code>EPERM</code>. There is no log line, no audit record by default, and no file to consult. A container that "cannot see the GPU" and a container that has been denied the GPU are indistinguishable from inside.</li>
 </ul>
 <p>The failure signature to memorise is therefore just this: <code>Operation not permitted</code> when opening something under <code>/dev</code>, from a process that appears to have the right file permissions. If the mode bits say you may and the kernel says you may not, a cgroup device program is the reason.</p>
@@ -928,7 +928,7 @@ tun0    UNKNOWN    &lt;POINTOPOINT,MULTICAST,NOARP,UP,<b>LOWER_UP</b>&gt;
 <p>Reads are per-packet, not a byte stream. One <code>read()</code> returns exactly one packet or frame, and a buffer smaller than the interface MTU truncates it silently. Size the buffer from the MTU, not from a round number that looks big enough.</p>
 <p>TAP is not TUN with a flag you can ignore. A TAP holder must handle ARP itself, because it receives Ethernet frames including ARP requests and nothing else will answer them. Programs written against TUN that are switched to TAP fail in exactly this way, and the symptom is that nothing ever gets past address resolution.</p>
 <div class="k8s-link">
-<p>You will not find a TUN device on a normal Kubernetes node — the CNI plugins in <a href="i9.html">I9</a> use veth pairs and bridges, in the kernel, precisely because they have the privilege to. TUN appears at the edges: in rootless Kubernetes distributions, in VPN-based cluster access, in service meshes that terminate traffic in userspace, and in any CNI plugin implementing an overlay in a user process rather than in the kernel.</p>
+<p>You will not find a TUN device on a normal Kubernetes node — the CNI plugins in <a href="../intermediate.html#i9">I9</a> use veth pairs and bridges, in the kernel, precisely because they have the privilege to. TUN appears at the edges: in rootless Kubernetes distributions, in VPN-based cluster access, in service meshes that terminate traffic in userspace, and in any CNI plugin implementing an overlay in a user process rather than in the kernel.</p>
 <p>The concept that <em>does</em> transfer everywhere is the one this lesson makes concrete: a network interface is an object with two ends, and knowing what holds the far end tells you where to look when packets stop. See <a href="w4.html#cp-4-3">W4.3 — the pod network datapath, veth by veth</a> for the kernel-to-kernel version of the same reasoning.</p>
 </div>
 <h5>Docs</h5>
@@ -1038,6 +1038,13 @@ ip netns del red; ip netns del blue; ip link del br-under</pre>
 <p>MTU problems are invisible to every tool that sends small packets. <code>ping</code> without <code>-s</code>, <code>curl</code> against a short endpoint, a TCP handshake and a TLS handshake all fit comfortably. The first thing to break is the first full-size response — which is why the symptom is so often reported as "the app hangs after logging in" rather than as a network fault.</p>
 <p>Do not fix MTU by turning off <code>DF</code> or enabling fragmentation. Fragmentation is a performance disaster and many middleboxes drop fragments anyway. Set the interface MTU to the truth and let path MTU discovery do its job.</p>
 <p>Check both directions. An asymmetric MTU — correct one way, wrong the other — produces the delightful symptom of a connection that works until the server sends something large, and traffic captures taken at the client show nothing at all wrong.</p>
+<div class="specref">
+<p>Almost everything in this module is implementation detail rather than standard, which is why this is the only place in I1 where a specification can settle an argument. And the interesting part is what it does <em>not</em> say. VXLAN's normative text on MTU is one sentence:</p>
+<blockquote>To ensure end-to-end traffic delivery without fragmentation, it is <strong>RECOMMENDED</strong> that the MTUs (Maximum Transmission Units) across the physical network infrastructure be set to a value that accommodates the larger frame size due to the encapsulation.</blockquote>
+<cite>RFC 7348 — <a href="https://www.rfc-editor.org/rfc/rfc7348#section-4.3">§4.3, Physical Infrastructure Requirements</a></cite>
+<p>Read that with <a href="i0.html#cp-i0-7">I0.7</a>'s vocabulary in hand. <strong>RECOMMENDED</strong> is <code>SHOULD</code> — do it unless you have a stated reason not to — so an implementation that ignores it is still conforming, which is exactly why you meet networks that have. And the number <strong>50 appears nowhere in the RFC</strong>. §5 gives you the frame-format diagrams for the outer Ethernet, outer IP, outer UDP and VXLAN headers, and you are expected to add them up yourself; the total depends on whether the outer header is IPv4 or IPv6 and whether there is a VLAN tag, which is precisely why the document declines to state one figure.</p>
+<p>So the well-known "1450" is not in any standard. It is what you get from RFC 7348's diagrams for the ordinary case, and it is the value the Linux kernel computes for you — which is a much better reason to trust it than having read it in a blog post.</p>
+</div>
 <div class="k8s-link">
 <p>This is your cluster's pod network, at the byte level. Flannel's VXLAN backend gives pods an MTU of 1450 for exactly the arithmetic above, and the <code>flannel.1</code> interface on every node is the same kind of device you just built. Run <code>tcpdump -ni &lt;node-nic&gt; udp port 4789</code> on a cluster node and you will see pod traffic wrapped in node traffic.</p>
 <p>The advanced-track home for all of this is <a href="w4.html#cp-4-7">W4.7 — overlay networks, VXLAN and the MTU you must not get wrong</a>, with the datapath in <a href="w4.html#cp-4-3">W4.3</a>. When you meet it there, you will already have built one — including the failure, which is the part the lesson cannot hand you.</p>
@@ -1046,6 +1053,281 @@ ip netns del red; ip netns del blue; ip link del br-under</pre>
 <p class="docs-links"><a href="https://www.rfc-editor.org/rfc/rfc7348">RFC 7348</a> defines VXLAN and its §5 gives the exact header layout the 50 bytes come from — worth reading once for the frame diagram alone. <code>man 8 ip-link</code>, the <em>VXLAN Type Support</em> section, for every option including <code>group</code>, <code>local</code> and <code>nolearning</code>. <code>man 8 bridge</code> for <code>fdb</code> and for <code>hairpin</code>. <code>man 8 ping</code> for <code>-M do</code>, which is the flag that turns a vague hang into a number.</p>
 </article>
 </div>
+
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-i1-13" data-id="i1-13">
+<div class="lesson-head"><span class="cp-id">I1.13</span><h4>Mini project — run <code>minibox</code>'s layers rootless, and document what breaks</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every lesson in this group is a piece of the same machine, and this is where you assemble it: a container built and run by an unprivileged user, with no <code>sudo</code> anywhere in the command. Three of the four layers work. The fourth does not, and the honest documentation of <em>why</em> is worth more than the three that do — because "rootless containers have bad networking" is a sentence everyone repeats and almost nobody can justify.</p>
+<h5>The concept</h5>
+<p><a href="b14.html">B14</a>'s <code>minibox.sh</code> has four layers. Take them one at a time and ask what each one needs from the host:</p>
+<table>
+<tr><th>Layer</th><th>Needs</th><th>Rootless?</th></tr>
+<tr><td>Filesystem — overlayfs + <code>pivot_root</code></td><td><code>CAP_SYS_ADMIN</code> in <em>a</em> user namespace</td><td>✅ works on Ubuntu 24.04</td></tr>
+<tr><td>Isolation — the namespaces</td><td>the ability to create a user namespace with capabilities</td><td>✅ with the <a href="#cp-i1-4">I1.4</a> profile</td></tr>
+<tr><td>Limits — a cgroup</td><td>a delegated subtree, and the right way in</td><td>✅ with a caveat worth the whole lesson</td></tr>
+<tr><td>Network — veth into a host bridge, NAT</td><td><code>CAP_NET_ADMIN</code> <strong>on the host</strong></td><td>❌ genuinely impossible</td></tr>
+</table>
+<p>Two of those rows deserve their reasoning spelled out before you type anything.</p>
+<p><strong>Overlayfs works, and the folklore says it does not.</strong> Mounting overlayfs from inside a user namespace was refused by mainline for years, which is why every rootless guide reaches for <code>fuse-overlayfs</code>. Since kernel 5.11 it is permitted, and Ubuntu has carried it longer still. Test it on your kernel rather than assuming either way — the answer is a one-line experiment, and it decides whether you need a FUSE daemon in the path of every file read.</p>
+<p><strong>Cgroup delegation is subtler than "you own the directory".</strong> systemd delegates <code>user@&lt;uid&gt;.service</code> to you, with a <em>reduced</em> controller set — no <code>cpuset</code>, no <code>io</code>. But owning that directory does not let you move a process into it, because the kernel checks migration permission on the <strong>common ancestor</strong> of the source and destination cgroups, and your login shell lives in <code>session-N.scope</code>, whose parent <code>user-1000.slice</code> is root's. So the natural code — <code>mkdir</code> a cgroup, write your pid into <code>cgroup.procs</code> — fails with <code>EPERM</code> and a message about neither of those things. The answer is to have systemd place the process for you with <code>systemd-run --user --scope</code>, which is exactly what Podman does.</p>
+<h5>Lab</h5>
+<ol>
+<li>You need the AppArmor profile from <a href="#cp-i1-4">I1.4</a> and a busybox. Confirm the first and install the second.
+<pre class="cmd">~/bin/rootless-lab id -u
+sudo apt-get install -y busybox-static</pre>
+<pre class="out"><b>0</b></pre></li>
+<li>Write the inner half — the part that runs once you are already isolated. It is nine lines and each one is a layer.
+<pre class="cmd">cat &gt; ~/bin/rootless-inner &lt;&lt;'IN'
+#!/bin/busybox sh
+ROOT=$1
+echo "cgroup : $(cut -d: -f3 /proc/self/cgroup)"
+CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+echo "limits : memory.max=$(cat $CG/memory.max) pids.max=$(cat $CG/pids.max)"
+mount -t overlay overlay -o \
+  lowerdir=$ROOT/lower,upperdir=$ROOT/upper,workdir=$ROOT/work $ROOT/merged || exit 21
+echo "overlay: mounted unprivileged"
+cd $ROOT/merged &amp;&amp; mkdir -p .old &amp;&amp; pivot_root . .old || exit 22
+cd / &amp;&amp; mount -t proc proc /proc || exit 23
+umount -l /.old
+exec /bin/sh -c 'echo "--- inside ---"; id; ls /; ps'
+IN
+chmod +x ~/bin/rootless-inner</pre></li>
+<li>Write the outer half. Note that there is no <code>sudo</code> and no <code>unshare</code> — <code>rootless-lab</code> is the profiled wrapper, and <code>systemd-run</code> is what solves the delegation problem.
+<pre class="cmd">cat &gt; ~/rootless-box.sh &lt;&lt;'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${ROOT:-$HOME/rootless-box}
+[ "$(id -u)" -ne 0 ] || { echo "run this WITHOUT sudo — that is the point" &gt;&amp;2; exit 1; }
+
+case ${1:-run} in
+--init)
+  mkdir -p "$ROOT"/{lower,upper,work,merged} "$ROOT"/lower/{bin,dev,etc,proc,sys,tmp,root}
+  cp "$(command -v busybox)" "$ROOT/lower/bin/"
+  ( cd "$ROOT/lower/bin" &amp;&amp; for a in sh ls cat id mount ps echo sleep hostname; do
+      ln -sf busybox $a; done )
+  echo 'root:x:0:0:root:/root:/bin/sh' &gt; "$ROOT/lower/etc/passwd"
+  echo "rootfs ready in $ROOT/lower"; exit 0 ;;
+--clean) rm -rf "$ROOT"; echo cleaned; exit 0 ;;
+esac
+
+# Layer 3. We cannot write our own pid into a cgroup we made by hand: migration
+# is checked on the common ancestor, and user-1000.slice belongs to root.
+exec systemd-run --user --scope -q -p MemoryMax=100M -p TasksMax=64 -- \
+  "$HOME/bin/rootless-lab" --mount --pid --uts --ipc --fork \
+  "$HOME/bin/rootless-inner" "$ROOT"
+SH
+chmod +x ~/rootless-box.sh
+~/rootless-box.sh --init</pre>
+<pre class="out">rootfs ready in /home/ubuntu/rootless-box/lower</pre></li>
+<li>Run it. No privilege is involved at any point.
+<pre class="cmd">~/rootless-box.sh; echo "exit=$?"</pre>
+<pre class="out">cgroup : /user.slice/user-1000.slice/user@1000.service/app.slice/run-r062….scope
+limits : memory.max=<b>104857600</b> pids.max=<b>64</b>
+overlay: <b>mounted unprivileged</b>
+--- inside ---
+uid=<b>0(root)</b> gid=0(root) groups=65534,…,0(root)
+bin
+dev
+etc
+proc
+root
+sys
+tmp
+PID   USER     COMMAND
+    <b>1 root</b>     /bin/sh -c echo "--- inside ---"; id; ls /; ps
+exit=<b>0</b></pre>
+<p>Root inside, PID 1 inside, its own <code>/proc</code>, a 100 MiB memory limit and a 64-task limit — and the invoking user never had a capability the system did not already give them.</p></li>
+<li>Now the mapping, which is where "root inside, nobody outside" earns or loses its meaning. Create a file inside and look at it from outside.
+<pre class="cmd">~/bin/rootless-lab sh -c 'id -u; touch ~/rootless-box/upper/f; ls -ln ~/rootless-box/upper/f'
+echo '--- from the host ---'
+ls -ln ~/rootless-box/upper/f</pre>
+<pre class="out">0
+-rw-rw-r-- 1 <b>0 0</b> 0 Jul 27 09:49 /home/ubuntu/rootless-box/upper/f
+--- from the host ---
+-rw-rw-r-- 1 <b>1000 1000</b> 0 Jul 27 09:49 /home/ubuntu/rootless-box/upper/f</pre>
+<p>Uid 0 inside is uid <strong>1000</strong> outside — <em>your own account</em>, not an unused subuid. That is because <code>--map-root-user</code> installs a single-ID map, which is the only thing a process may write for itself. To get the 65,536-ID range from <a href="#cp-i1-2">I1.2</a> you need <code>newuidmap</code>, which must be run by a <em>different</em> process while the child waits — the fifo dance from that lesson. Worth doing as an extension; the security difference is real, since an escape from this version lands as you rather than as nobody.</p></li>
+<li>Finally, prove the fourth layer is impossible rather than merely difficult.
+<pre class="cmd">~/bin/rootless-lab --net sh -c '
+  ip link add v0 type veth peer name v1 &amp;&amp; echo "veth pair inside our own netns: OK"
+  ip link set v1 netns 1 || echo "  -&gt; move one end to the host netns: DENIED"
+  ip addr add 10.99.0.1/24 dev v0 &amp;&amp; ip link set v0 up &amp;&amp; echo "  addressing inside: OK"
+  ping -c1 -W1 8.8.8.8'</pre>
+<pre class="out">veth pair inside our own netns: OK
+RTNETLINK answers: Operation not permitted
+  -&gt; move one end to the host netns: <b>DENIED</b>
+  addressing inside: OK
+ping: connect: <b>Network is unreachable</b></pre>
+<p>You have full <code>CAP_NET_ADMIN</code> <em>in your own network namespace</em> — you can create interfaces, address them, add routes, write netfilter rules. What you cannot do is touch the <strong>host's</strong> network namespace, and connecting to the outside world requires exactly that: moving one end of a veth into it, or adding a NAT rule there. No capability you hold applies.</p>
+<p>So the real answer is <a href="#cp-i1-11">I1.11</a>'s: a userspace network stack over a TUN device. <code>slirp4netns</code> and <code>pasta</code> both do this — a process in your namespace holds a TUN fd, implements TCP and UDP in userspace, and makes ordinary socket calls on the host side as you. Every packet crosses the boundary twice extra, which is the performance cost, and it is structural. Install one and connect it if you want the complete picture:</p>
+<pre class="cmd">apt-cache policy slirp4netns passt | grep -E '^(slirp4netns|passt):|Candidate'</pre>
+<pre class="out">slirp4netns:
+  Candidate: <b>1.2.1-1build2</b>
+passt:
+  Candidate: 0.0~git20240220.1e6f92b-1</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>~/rootless-box.sh</code> exits 0, printing <code>uid=0(root)</code>, a <code>memory.max</code> of 104857600 and <code>PID 1</code> inside, with no <code>sudo</code> on the command line. The veth experiment succeeds inside and is denied at the host boundary. You can name, for each of the four layers, the specific capability it needs and where it needs it.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>systemd-run --user</code> needs <code>XDG_RUNTIME_DIR</code> set, which your login shell has and a <code>multipass exec</code> or a cron job does not. The failure is <code>Failed to connect to bus</code>, which reads like systemd is broken. <code>export XDG_RUNTIME_DIR=/run/user/$(id -u)</code> fixes it.</p>
+<p>The delegated controller set has no <code>cpuset</code> and no <code>io</code>, so a rootless container cannot pin CPUs or limit disk bandwidth at all. That is not a bug you can configure around from user space — it is the delegation policy, and changing it means editing the slice as root, at which point you should ask what rootless was buying you.</p>
+<p>Do not conclude from this project that rootless is a lesser form of containers. It is the same four layers with one of them implemented differently and a much better answer to "what happens when this escapes". The trade is throughput for blast radius, and for most workloads that is a good trade.</p>
+<div class="k8s-link">
+<p>Rootless Kubernetes exists — <a href="https://rootlesscontaine.rs/">rootlesscontaine.rs</a>, and k3s and Usernetes both ship it — and it is built out of exactly these pieces: a user namespace per node process, delegated cgroups, and <code>slirp4netns</code> or <code>pasta</code> for the outside world. It is not what you will meet on the CKA, and knowing the shape of it explains several things about the normal case.</p>
+<p>The mainstream form is <code>hostUsers: false</code> on a pod (GA in v1.33), which keeps the kubelet privileged and makes only the workload rootless — the parts that must be privileged stay so, and the part that runs your code does not. For the node-level view of what has to keep its privilege, see <a href="w1.html#cp-1-2">W1.2 — what runs privileged on a node</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 systemd.resource-control</code>, the <em>Delegate</em> section, for exactly which controllers systemd hands to a user and why. <code>man 1 systemd-run</code> for <code>--user --scope</code>. <code>man 2 pivot_root</code> and <code>man 8 mount.fuse3</code> if you end up needing <code>fuse-overlayfs</code>. <code>man 1 slirp4netns</code> and <code>man 1 pasta</code> for the userspace network stacks. <a href="https://rootlesscontaine.rs/">rootlesscontaine.rs</a> is the maintained reference for the whole subject.</p>
+</article>
+
+<article class="lesson drill" id="cp-i1-14" data-id="i1-14">
+<div class="lesson-head"><span class="cp-id">I1.14</span><h4>Debugging drill — throttled without throttling, and the response that never arrives</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Both faults here are things you will actually be paged for, and both are misdiagnosed the same way: the first tool you reach for gives you a confident, wrong answer. In the first, <code>cpu.stat</code> says everything is fine while the workload starves. In the second, every connectivity check passes while the application hangs. Reproducing both by hand is what turns "I have read about MTU" into "I have caused this".</p>
+<h5 class="verify">Symptom 1 — it behaves like a CPU limit, and there is no CPU limit</h5>
+<ol class="lab">
+<li>Plant it. A workload pinned to one core, on a machine where that core is already busy with something else. This is a two-vCPU box; adjust the numbers if yours is larger, but keep the shape — the cgroup gets one core, and something outside the cgroup competes for it.
+<pre class="cmd">sudo -i
+echo "+cpu +cpuset" &gt; /sys/fs/cgroup/cgroup.subtree_control
+CG=/sys/fs/cgroup/pinned; mkdir -p $CG; echo 0 &gt; $CG/cpuset.cpus
+taskset -c 0 bash -c 'while :; do :; done' &amp;
+for i in 1 2; do ( echo $BASHPID &gt; $CG/cgroup.procs; while :; do :; done ) &amp; done
+sleep 15</pre></li>
+<li>Investigate the way you would at 3am: the workload is slow, so check whether it is being throttled.
+<pre class="cmd">grep -E 'nr_periods|nr_throttled|throttled_usec' $CG/cpu.stat
+cat $CG/cpu.max</pre>
+<pre class="out">nr_periods <b>0</b>
+nr_throttled <b>0</b>
+throttled_usec <b>0</b>
+<b>max 100000</b></pre>
+<p>No limit set, nothing throttled, not even a single accounting period. Every conventional check says this workload is not being restricted. If you stop here you will go and look at the application.</p></li>
+<li>Ask the other question — not "was it limited" but "was it waiting".
+<pre class="cmd">cat $CG/cpu.pressure
+taskset -pc $(head -1 $CG/cgroup.procs)</pre>
+<pre class="out">some avg10=<b>75.18</b> avg60=20.71 avg300=4.67 total=15002540
+full avg10=<b>37.37</b> avg60=10.29 avg300=2.32 total=7498732
+pid 21581's current affinity list: <b>0</b></pre></li>
+</ol>
+<details class="reveal"><summary>Hint 1</summary><p>The two files disagree, and both are telling the truth. <code>cpu.stat</code> reports on the <em>bandwidth</em> controller, which is not running here. <code>cpu.pressure</code> reports on time lost to waiting, whatever the cause. Ask what could make a task wait for CPU when nothing is capping its CPU time.</p></details>
+<details class="reveal"><summary>Hint 2</summary><p><code>taskset -pc</code> on a process you never called <code>taskset</code> on is showing you an affinity mask that came from somewhere. Compare it with <code>nproc</code>. Then look for a cgroup file that could have set it, and check whether anything <em>outside</em> the cgroup is running on the same core.</p></details>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>A <code>cpuset</code> pin, not a CPU limit.</strong> <code>cpuset.cpus = 0</code> confines every task in the cgroup to one core, and something outside the cgroup is also using that core. The workload is starved by contention, not by a quota — so the bandwidth controller never runs, <code>nr_periods</code> stays at 0, and every throttling counter is honestly zero. The <em>disagreement</em> between <code>cpu.stat</code> (nothing wrong) and <code>cpu.pressure</code> (75% of wall time stalled) is the whole diagnosis, and there is no single file that states it.</p>
+<p>The fix depends on intent. If the pin was deliberate — a latency-sensitive workload wanting exclusive cores — then the bug is that the cores are not actually exclusive, and the fix is to keep everything else off them (in Kubernetes: the CPU Manager's <code>static</code> policy plus <code>reservedSystemCPUs</code>). If the pin was accidental, widen it: <code>echo 0-1 &gt; $CG/cpuset.cpus</code>.</p>
+<p><strong>The reflex:</strong> when a workload behaves as though it is throttled and <code>cpu.stat</code> says it is not, read <code>cpu.pressure</code> next and then check <code>cpuset.cpus</code>. "Throttled" and "starved" produce the same complaint and have different evidence.</p>
+<pre class="cmd">kill %1 %2 %3; rmdir /sys/fs/cgroup/pinned</pre></details>
+
+<h5 class="verify">Symptom 2 — everything connects, then the first large response disappears</h5>
+<ol class="lab">
+<li>Plant it. Build the overlay from <a href="#cp-i1-12">I1.12</a>, size it against a 1550-byte underlay, and then let the underlay go back to 1500 — as happens when a VM is moved, a NIC is reconfigured, or a tunnel is added beneath you.
+<pre class="cmd">sudo -i
+ip link add br-under type bridge; ip link set br-under up
+for n in red:1 blue:2; do
+  ns=${n%:*}; i=${n#*:}
+  ip netns add $ns; ip link add veth-$ns type veth peer name eth0 netns $ns
+  ip link set veth-$ns master br-under up
+  ip -n $ns addr add 192.168.50.$i/24 dev eth0; ip -n $ns link set eth0 up
+done
+for x in "ip -n red link set eth0" "ip -n blue link set eth0" "ip link set veth-red" \
+         "ip link set veth-blue" "ip link set br-under"; do $x mtu 1550; done
+ip -n red  link add vxlan0 type vxlan id 42 dev eth0 remote 192.168.50.2 dstport 4789
+ip -n blue link add vxlan0 type vxlan id 42 dev eth0 remote 192.168.50.1 dstport 4789
+ip -n red  addr add 10.42.0.1/24 dev vxlan0; ip -n red  link set vxlan0 up mtu 1500
+ip -n blue addr add 10.42.0.2/24 dev vxlan0; ip -n blue link set vxlan0 up mtu 1500
+for x in "ip -n red link set eth0" "ip -n blue link set eth0" "ip link set veth-red" \
+         "ip link set veth-blue" "ip link set br-under"; do $x mtu 1500; done
+ip netns exec red ip route flush cache</pre></li>
+<li>Investigate the way you would when a user reports "the app hangs": check connectivity.
+<pre class="cmd">ip netns exec red ping -c2 -W1 10.42.0.2 | tail -2
+ip netns exec red ping -c1 -W1 -s 500 -M do 10.42.0.2 | tail -1</pre>
+<pre class="out">2 packets transmitted, 2 received, <b>0% packet loss</b>
+rtt min/avg/max/mdev = 0.016/0.016/0.016/0.000 ms</pre>
+<p>Connectivity is perfect. Latency is excellent. Every check an ordinary runbook asks for passes, which is exactly why this fault survives so long.</p></li>
+<li>Ask the question the runbook does not: does a <em>full-size</em> packet get through?
+<pre class="cmd">for s in 100 500 1472; do
+  echo "-- payload $s --"
+  ip netns exec red ping -c1 -W2 -s $s -M do 10.42.0.2 | tail -1
+done</pre>
+<pre class="out">-- payload 100 --
+rtt min/avg/max/mdev = 0.047/0.047/0.047/0.000 ms
+-- payload 500 --
+rtt min/avg/max/mdev = 0.016/0.016/0.016/0.000 ms
+-- payload 1472 --
+<b>ping: local error: message too long, mtu=1450</b></pre></li>
+</ol>
+<details class="reveal"><summary>Hint 1</summary><p><code>-M do</code> sets the "don't fragment" bit, which is what every modern TCP stack does. Without it, <code>ping</code> quietly fragments and everything looks fine — which is why an ordinary <code>ping</code> is useless for this class of fault. Compare the interface MTUs on both sides of the encapsulation.</p></details>
+<details class="reveal"><summary>Hint 2</summary><p>Run <code>ip netns exec red ip route get 10.42.0.2</code>. Path MTU discovery has already worked out the answer and cached it on the route. Then compare that number with what <code>ip -n red link show vxlan0</code> claims.</p></details>
+<details class="reveal"><summary>Cause &amp; fix</summary><p><strong>The overlay MTU is 50 bytes too large for its underlay.</strong> <code>vxlan0</code> is 1500 and <code>eth0</code> is 1500, but every overlay packet gains 20 (outer IP) + 8 (UDP) + 8 (VXLAN) + 14 (inner Ethernet) = <strong>50</strong> bytes on the way out. A full-size overlay packet becomes a 1550-byte underlay packet, which does not fit, carries <code>DF</code>, and so is dropped.</p>
+<p>Here the loop closed: the ICMP "fragmentation needed" reply got back, the sender cached <code>mtu 1450</code> on the route, and subsequent sends fail loudly and locally with the correct number in the message. That is the <em>good</em> case. In a real network somebody's firewall or cloud security group drops that ICMP, nothing is learned, nothing is cached, and full-size packets simply vanish — which is what "MTU black hole" names, and why the symptom is reported as "the app hangs after login" rather than as a network fault.</p>
+<p>The fix is one command: <code>ip -n red link set vxlan0 mtu 1450</code> on both ends. Confirm with <code>ping -s 1422 -M do</code>, which is 1422 + 8 + 20 = 1450 exactly.</p>
+<p><strong>The reflex:</strong> when small requests work and large responses hang, walk the packet size up with <code>ping -M do -s</code> until it breaks, then run <code>ip route get</code>. A cached <code>mtu</code> gives you the answer directly; no cached <code>mtu</code> means the ICMP is being filtered and you must bisect. Never fix it by disabling <code>DF</code>.</p>
+<pre class="cmd">ip netns del red; ip netns del blue; ip link del br-under</pre></details>
+<h5>Docs</h5>
+<p class="docs-links"><code>Documentation/accounting/psi.rst</code> and <code>Documentation/admin-guide/cgroup-v2.rst</code> (<em>Cpuset</em>) for the first fault. <code>man 8 ping</code> for <code>-M do</code> and <code>man 8 ip-route</code> for <code>get</code> and the cached <code>mtu</code> attribute for the second. <a href="https://www.rfc-editor.org/rfc/rfc7348">RFC 7348</a> §5 if you want to count the 50 bytes yourself.</p>
+</article>
+</div>
+
+<!-- ---------------- Quiz ---------------- -->
+<div class="quiz" id="quiz"><h3>I1 recall quiz</h3>
+<p>Answer out loud before revealing. Every one of these is a symptom you can now explain rather than guess at — which is the only thing this module was for.</p>
+<ol>
+<li>What do the three columns of <code>uid_map</code> mean, and what happens on the second write?
+<details class="reveal"><summary>Answer</summary><p>First ID <strong>inside</strong> the namespace, the ID it corresponds to <strong>outside</strong>, and how many consecutive IDs the range covers — so <code>0 100000 65536</code> means "uid 0 in here is uid 100000 out there, for 65,536 IDs". The second write fails with <code>EPERM</code>, always and for everyone. That single-write rule is what stops a process widening the mapping it was born with.</p></details></li>
+<li>A container shows every file as owned by <code>nobody</code>. What is the most likely cause?
+<details class="reveal"><summary>Answer</summary><p>An ID that no line of the map covers renders as 65534. Either the map was never written, or the file's owner falls outside the mapped range — the classic case being a host volume owned by uid 1000 mounted into a container whose map starts at 100000.</p></details></li>
+<li>Where does <code>newuidmap</code> get its authority, and what stops you mapping any range you like?
+<details class="reveal"><summary>Answer</summary><p>It is <strong>setuid-root</strong>, so it holds <code>CAP_SETUID</code>, which is what writing a multi-range map requires. It refuses anything outside the range the administrator granted you in <code>/etc/subuid</code>/<code>/etc/subgid</code>. Those two files are the entire policy surface for rootless container identity.</p></details></li>
+<li>On Ubuntu 24.04, does <code>unshare --user</code> fail for an unprivileged user?
+<details class="reveal"><summary>Answer</summary><p><strong>No</strong> — and this is the most commonly mis-stated fact in the area. The namespace is created; the stock <code>unprivileged_userns</code> AppArmor profile carries <code>allow userns</code>. What it also carries is <code>audit deny capability</code>, so the process lands with <code>CapEff: 0000000000000000</code>. Every downstream symptom — the <code>uid_map</code> write failing, <code>setresuid</code> failing, mounts failing — is that empty effective set, and none of the error messages mention AppArmor. <code>dmesg | grep apparmor</code> is what names it.</p></details></li>
+<li>What is the right way past that restriction, and why is the popular way wrong?
+<details class="reveal"><summary>Answer</summary><p>A named AppArmor profile granting <code>userns,</code> for one binary by absolute path — verifiably works with <code>kernel.apparmor_restrict_unprivileged_userns</code> left at <code>1</code>. The popular answer, setting that sysctl to 0, removes the mitigation for <strong>every process on the machine</strong>, produces an identical-looking result, and is a straightforward reduction in the box's defence against container escapes.</p></details></li>
+<li>What question does PSI answer that load average cannot?
+<details class="reveal"><summary>Answer</summary><p>"How much time was lost to waiting?" Load average counts runnable tasks and has no denominator, so 40 threads on 40 CPUs and 40 threads on 4 CPUs look similar while one is healthy and one is dying. PSI reports the percentage of <em>wall-clock time</em> in which at least one task was stalled (<code>some</code>) or every runnable task was stalled (<code>full</code>). <code>full</code> is the one that means real damage.</p></details></li>
+<li>A cgroup's <code>cpu.stat</code> shows <code>nr_throttled 0</code> and its <code>cpu.pressure</code> shows <code>some avg10=75</code>. What is happening?
+<details class="reveal"><summary>Answer</summary><p>It is being <strong>starved, not throttled</strong> — almost always a <code>cpuset.cpus</code> pin onto cores that something else is also using. The bandwidth controller is not running at all, which is why even <code>nr_periods</code> is 0, so every throttling counter is honestly zero. The disagreement between the two files <em>is</em> the diagnosis; no single file states it.</p></details></li>
+<li>How do you find out which devices a cgroup may open, in cgroup v2?
+<details class="reveal"><summary>Answer</summary><p>You largely cannot from the filesystem — v2 has no <code>devices.allow</code>, <code>devices.deny</code> or <code>devices.list</code>. The policy is an eBPF program of type <code>BPF_PROG_TYPE_CGROUP_DEVICE</code> attached to the cgroup, findable with <code>bpftool cgroup show &lt;path&gt;</code>, which tells you a program is there but not what it permits. The practical source of truth is the runtime's <code>config.json</code>. The failure signature is <code>EPERM</code> at <code>open</code> on a device whose mode bits plainly allow it.</p></details></li>
+<li>What does exit status 159 mean, and where else would you look to confirm it?
+<details class="reveal"><summary>Answer</summary><p>128 + 31, where 31 is <code>SIGSYS</code> — a seccomp filter killed the process. The shell prints <code>Bad system call</code>; nothing else announces it. Confirm with <code>grep Seccomp /proc/&lt;pid&gt;/status</code>, where <code>Seccomp: 2</code> means filter mode and <code>Seccomp_filters</code> counts the stacked filters. <code>kill -l 159</code> decodes it.</p></details></li>
+<li>Why is every real seccomp profile an allow-list, and why is its default action usually <code>ERRNO</code> rather than <code>KILL</code>?
+<details class="reveal"><summary>Answer</summary><p>Allow-list because the kernel adds syscalls every release, so a deny-list decays automatically and protects only against attacks somebody already thought of. <code>ERRNO</code> because well-written software handles a failed syscall and falls back — which is how the default profile blocks calls that did not exist when a libc was compiled without breaking it. The cost is a silent-slow-path class of bug, which is why <code>SCMP_ACT_LOG</code> exists.</p></details></li>
+<li>Why must <code>no_new_privs</code> be set before an unprivileged process installs a filter?
+<details class="reveal"><summary>Answer</summary><p>Otherwise you could install a filter that neuters a security-relevant syscall and then <code>exec</code> a setuid-root binary straight into the trap. Requiring the process to first promise it will never gain privilege through <code>exec</code> closes that. Like the <code>uid_map</code> rule, it is a one-way door — a filter is inherited across <code>fork</code>, survives <code>exec</code>, and can never be removed.</p></details></li>
+<li>What is on the other end of a TUN interface, and how can you tell it is missing?
+<details class="reveal"><summary>Answer</summary><p>A <strong>file descriptor held by an ordinary program</strong> — whatever the kernel routes in, that program reads; whatever it writes, the kernel treats as received. With no holder the interface sits in <code>NO-CARRIER</code> however many times you set it <code>up</code>, and it is destroyed when the last descriptor closes. On a real VPN interface, administratively <code>UP</code> and operationally <code>NO-CARRIER</code> means the daemon has died.</p></details></li>
+<li>Where does 1450 come from, and what changes over IPv6?
+<details class="reveal"><summary>Answer</summary><p>20 (outer IPv4) + 8 (UDP) + 8 (VXLAN) + 14 (inner Ethernet) = <strong>50</strong> bytes of encapsulation, so a 1500-byte underlay yields a 1450-byte overlay. Over IPv6 the outer header is 40 rather than 20, so the overhead is 70 and the overlay MTU is 1430. This is where Flannel's number comes from; it is arithmetic, not a tuning choice.</p></details></li>
+<li>Small requests work, the TLS handshake works, the first large response hangs. What do you run?
+<details class="reveal"><summary>Answer</summary><p>Walk the size up with <code>ping -M do -s &lt;n&gt;</code> until it breaks, then <code>ip route get &lt;dst&gt;</code>. A cached <code>mtu</code> on the route means path MTU discovery worked and hands you the correct number directly. <em>No</em> cached mtu means the ICMP "fragmentation needed" is being filtered somewhere — the true black hole — and you must find the MTU by bisection. Never fix it by clearing <code>DF</code> or enabling fragmentation.</p></details></li>
+<li>Which of <code>minibox</code>'s four layers cannot be done rootless, and why is it not merely difficult?
+<details class="reveal"><summary>Answer</summary><p><strong>Networking.</strong> You get full <code>CAP_NET_ADMIN</code> inside your own network namespace, so interfaces, addresses, routes and netfilter rules all work there. Reaching the outside world requires modifying the <strong>host's</strong> network namespace — moving a veth end into it, or adding a NAT rule — and no capability you hold applies there. The real answer is a userspace TCP/IP stack over a TUN device (<code>slirp4netns</code>, <code>pasta</code>), which costs two extra user/kernel crossings per packet. That cost is structural, which is the honest reason rootless networking is slow.</p></details></li>
+<li>You own <code>user@1000.service</code> in the cgroup tree, but writing your pid into a cgroup you created there fails with <code>EPERM</code>. Why?
+<details class="reveal"><summary>Answer</summary><p>Migration permission is checked on the <strong>common ancestor</strong> of the source and destination cgroups. Your login shell is in <code>session-N.scope</code>, whose parent <code>user-1000.slice</code> belongs to root — so the check happens somewhere you do not own. The answer is to have systemd place the process for you: <code>systemd-run --user --scope</code>. That is exactly what Podman does. Note also that the delegated controller set is reduced — <code>cpu memory pids</code>, with no <code>cpuset</code> and no <code>io</code>.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Read and write ID mappings, and explain the single-write rule and the <code>/etc/subuid</code> allocation model behind every rootless container.</li>
+<li>Enter another process's namespaces by file descriptor, and describe <code>kubectl exec</code> as two system calls rather than as magic.</li>
+<li>Diagnose Ubuntu 24.04's AppArmor userns restriction from the symptom, and get past it without weakening the whole machine.</li>
+<li>Use PSI to tell a starved workload from a throttled one, and know that the two files disagreeing is itself the diagnosis.</li>
+<li>Find a cgroup's device policy with <code>bpftool</code> when there is no file to read, and recognise its <code>EPERM</code> signature.</li>
+<li>Write a seccomp filter, recognise exit status 159 on sight, and say why every deployed profile is an allow-list with an <code>ERRNO</code> default.</li>
+<li>Build a TUN device and a VXLAN overlay, derive the 50-byte overhead from the headers, and diagnose an MTU black hole with <code>ping -M do</code> and <code>ip route get</code>.</li>
+<li>Run a container as an unprivileged user, and account for each layer that works and the one that cannot.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html#b6">Beginner B6 · where the other seven namespace types are built by hand →</a></div>
+
+<nav class="pager"><a href="i0.html">← I0 · Your build box</a><a href="../intermediate.html#i2">I2 · What a container is, formally →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 LTS ("noble"), kernel <b>6.8.0</b>, on Multipass, verified 2026-07-27. All output on this page was captured from a real run on a 2-vCPU / 4 GB VM — CPU numbers and pressure percentages will differ on a larger box, everything else will not. Version-sensitive facts checked the same day: the containerd/Docker default seccomp profile now lives in <b>moby/profiles</b> (not <code>moby/moby</code>) and lists <b>442</b> syscall names; <code>kernel.apparmor_restrict_unprivileged_userns</code> defaults to <b>1</b> and gates <em>capabilities</em>, not namespace creation; unprivileged overlayfs mounts inside a user namespace <b>work</b> on this kernel, so <code>fuse-overlayfs</code> is not required; and the kernel now <b>refuses</b> to set an encapsulating interface's MTU above what its lower device can carry. Re-check each of these before treating a mismatch as a bug on this page.
+</footer>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
