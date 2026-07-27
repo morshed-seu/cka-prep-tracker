@@ -796,6 +796,201 @@ sudo jq -c '.config.cgroups.resources | {CpuQuota, CpuPeriod, Memory}' \
 
 </div><!-- /g-exits -->
 
+<!-- ---------------- State on disk ---------------- -->
+<div class="grp" id="g-state"><h3>State on disk</h3>
+
+<article class="lesson" id="cp-i3-9" data-id="i3-9">
+<div class="lesson-head"><span class="cp-id">I3.9</span><h4>Where a daemonless runtime keeps its memory</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Here is a puzzle that follows directly from I3.5. If runc exits after every command, how does the <em>next</em> runc command know anything? You type <code>runc kill mycontainer</code> and a brand-new process, with no memory of anything, has to work out what <code>mycontainer</code> is. There is no daemon holding that knowledge. So it must be on disk — and finding out exactly what is written there tells you what a container really consists of when nobody is looking at it.</p>
+
+<h5>The concept</h5>
+<p>Every runc invocation is amnesiac, so runc keeps its entire memory in one directory: <code>/run/runc/&lt;id&gt;/</code>, containing a single file, <code>state.json</code>. That is the whole database. <code>runc list</code> is a directory listing; <code>runc state</code> is a file read; <code>runc kill</code> reads the PID out of the file and calls <code>kill(2)</code>. There is no other bookkeeping anywhere.</p>
+<p><code>/run</code> is a <code>tmpfs</code> — memory, not disk — which means the whole thing evaporates on reboot. That is intentional and correct: every container it described died with the reboot too, so records of them would be lies.</p>
+<p>The file has eight top-level keys, and three of them repay careful reading:</p>
+<table class="langpair"><thead><tr><th>key</th><th>what it is, and why it is there</th></tr></thead><tbody>
+<tr><td><code>init_process_pid</code></td><td>The container's PID on the host. The obvious one.</td></tr>
+<tr><td><code>init_process_start</code></td><td>The <strong>start time</strong> of that process, in clock ticks since boot — field 22 of <code>/proc/&lt;pid&gt;/stat</code>. This is the guard against PID reuse, and it is the most interesting field in the file.</td></tr>
+<tr><td><code>namespace_paths</code></td><td>Paths of the form <code>/proc/&lt;pid&gt;/ns/net</code> — the namespaces named by <em>where they can be found</em>, not by identity.</td></tr>
+<tr><td><code>cgroup_paths</code></td><td>Absolute paths under <code>/sys/fs/cgroup</code>, so <code>delete</code> knows what to remove and <code>update</code> knows what to write.</td></tr>
+<tr><td><code>config</code></td><td>The configuration — but <em>not</em> your <code>config.json</code>. It is libcontainer's internal translation of it, with different key names.</td></tr>
+</tbody></table>
+<p>The <code>init_process_start</code> field deserves the attention because it solves a real problem elegantly. PIDs are recycled. If runc stored only the number, then a container that died could have its PID reassigned to your database, and <code>runc kill mycontainer</code> would kill your database. Storing the <em>start time</em> alongside makes the pair unforgeable: no other process can have both that PID and that exact boot-relative start tick. Any tool that holds a PID across time and does not do this has the bug.</p>
+<p>And now the question the checkpoint asks: <strong>when nothing is running, what is a container?</strong> Look at what is in the file and what is not. <code>namespace_paths</code> point <em>through</em> the process — kill it and every one of those paths 404s. The cgroup is a real kernel object but an empty one. The rootfs mounts live in a mount namespace that ceases to exist with its last member. So the honest answer is: <strong>a container is a name, a record, and a process</strong> — and when the process is gone, what remains is the name and the record. That is precisely why the lifecycle has a <code>stopped</code> state that still requires <code>delete</code>, and precisely why the next lesson's fault exists.</p>
+
+<div class="specref">
+<p>The spec requires the information to be <em>obtainable</em> and says nothing about storing it:</p>
+<blockquote>This operation MUST generate an error if it is not provided the ID of a container. Attempting to query a container that does not exist MUST generate an error. This operation MUST return the state of a container as specified in the <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">State</a> section.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "Query State"</cite>
+<p>A daemon-based runtime could answer that query from memory and write nothing to disk at all. runc must write, because runc does not persist — the state directory is the direct consequence of the design choice in I3.5. The two facts are the same fact seen from different ends, and noticing that is most of what it means to understand a daemonless runtime.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find the whole database.
+<pre class="cmd">sudo find /run/runc -maxdepth 2
+sudo jq 'keys' /run/runc/s5/state.json</pre>
+<pre class="out">/run/runc
+/run/runc/s5
+/run/runc/s5/<b>state.json</b>
+
+["cgroup_paths", "config", "created", "external_descriptors",
+ "id", "init_process_pid", "init_process_start", "namespace_paths"]</pre>
+<p>One directory per container, one file in it. That is the entire persistent state of every container on this machine.</p></li>
+
+<li>Read the fields that matter.
+<pre class="cmd">sudo jq '{id, init_process_pid, init_process_start, created,
+          cgroup_paths, namespace_paths}' /run/runc/s5/state.json</pre>
+<pre class="out">{
+  "id": "s5",
+  "init_process_pid": 33759,
+  "init_process_start": <b>21431452</b>,
+  "created": "2026-07-27T14:11:41.175631738Z",
+  "cgroup_paths": { "": "/sys/fs/cgroup/user.slice/user-1000.slice/s5" },
+  "namespace_paths": {
+    "NEWNET": "<b>/proc/33759/ns/net</b>",
+    "NEWPID": "/proc/33759/ns/pid",
+    …
+  }
+}</pre>
+<p>Every namespace path runs through PID 33759. The record does not own the namespaces; it points at a process that does.</p></li>
+
+<li>Prove <code>init_process_start</code> is what the concept claims — field 22 of the process's <code>stat</code>.
+<pre class="cmd">P=$(sudo runc state s5 | jq -r .pid)
+sudo jq -r .init_process_start /run/runc/s5/state.json
+sudo awk '{print $22}' /proc/$P/stat</pre>
+<pre class="out">21431452
+<b>21431452</b></pre>
+<p>Identical. runc reads that number at creation and re-checks it on every subsequent command; if a PID is alive but its start time has changed, runc knows the container is gone and the number belongs to a stranger.</p></li>
+
+<li>Confirm the <code>config</code> key is not your <code>config.json</code>. This catches people out when they try to edit it.
+<pre class="cmd">sudo jq '.config | keys' /run/runc/s5/state.json | tr -d '\n ' </pre>
+<pre class="out">["capabilities","cgroups","devices","hostname","labels","<b>mask_paths</b>",
+"mounts","namespaces","networks","no_new_privileges","<b>readonly_paths</b>",
+"<b>readonlyfs</b>","rootfs","version"]</pre>
+<p>Compare with the OCI keys from <a href="i2.html#cp-i2-2">I2.2</a>: <code>ociVersion</code>, <code>process</code>, <code>root</code>, <code>hostname</code>, <code>mounts</code>, <code>linux</code>. Different names, different shape — <code>root.readonly</code> has become <code>readonlyfs</code>, <code>linux.maskedPaths</code> has become <code>mask_paths</code>. This is libcontainer's internal struct, serialised. It is readable, and it is not an interface.</p></li>
+
+<li>Watch the record outlive the process — the fact that makes I3.10 possible.
+<pre class="cmd">cd ~/i3/box
+sudo runc run --detach --pid-file /tmp/z1.pid z1 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+sudo kill -9 $(sudo cat /tmp/z1.pid); sleep 0.5
+sudo ls /run/runc/z1/
+sudo runc list | grep z1</pre>
+<pre class="out">state.json
+z1   <b>0</b>   <b>stopped</b>   /home/ubuntu/i3/box   2026-07-27T14:25:38Z   root</pre>
+<p>The process is unambiguously dead and the container is still listed. It has a name, a record, a bundle path and a creation time — everything except the thing that made it a container.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name the one file that holds all of runc's memory, explain why <code>init_process_start</code> is stored next to the PID, show that both come from the same source, and answer "what is a container when nothing is running" from the file's contents rather than from a definition.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>/run/runc</code> is only root's copy.</strong> Rootless runc defaults its state root to <code>$XDG_RUNTIME_DIR/runc</code> — <code>/run/user/1000/runc</code> for uid 1000 — so a container you started without <code>sudo</code> is invisible to <code>sudo runc list</code> and vice versa. Almost every "but I just started it, where did it go?" is this. Confirm with <code>runc --help</code>, which prints the default for whoever is asking.</li>
+<li><strong>Do not edit <code>state.json</code>.</strong> It is an internal serialisation with no compatibility promise, and runc reads it expecting itself to have written it. The supported way to change a running container is <code>runc update</code>.</li>
+<li><strong>The state directory is <code>tmpfs</code>.</strong> Nothing here survives a reboot, which is correct — but it also means a filesystem-level backup of a node captures no container state at all.</li>
+<li><strong><code>cgroup_paths</code> has an empty-string key.</strong> That <code>""</code> is a cgroup v1 leftover, where the map was keyed by controller. On v2 there is one unified path and the key means nothing. Do not write a parser that expects a controller name there.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>/run/runc</code> is the bottom of a stack of exactly this pattern. containerd keeps its own metadata in a bolt database under <code>/var/lib/containerd</code>; the kubelet keeps a pod checkpoint under <code>/var/lib/kubelet/pods</code>; etcd keeps the cluster's copy. Each layer records what the layer below cannot be asked. When those records disagree — a pod the API server believes is running, on a node where <code>runc list</code> shows nothing — you are looking at a reconciliation problem, and knowing which layer stores what is how you decide which one is lying. The reconciliation model is <a href="w0.html#cp-0-6">W0.6</a>; node-level state is <a href="w6.html#cp-6-4">W6.4</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 5 proc</code> under <code>/proc/[pid]/stat</code> for field 22, <code>starttime</code> — worth reading once so the anti-reuse trick is available to you when you write something that holds a PID; <code>runc --help</code> for the <code>--root</code> default, which is how you settle the rootless-state question on any given box.</p>
+</article>
+
+<article class="lesson" id="cp-i3-10" data-id="i3-10">
+<div class="lesson-head"><span class="cp-id">I3.10</span><h4><code>container with given ID already exists</code>, on purpose</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This error is a rite of passage, and the reason it is worth manufacturing deliberately is that the obvious fix is the wrong one. Faced with "already exists" when nothing exists, almost everyone reaches for <code>rm -rf</code> on the state directory. It works — the next create succeeds, the incident closes — and it quietly leaves something behind. Doing it both ways once, on purpose, is how you learn to prefer the correct one under pressure.</p>
+
+<h5>The concept</h5>
+<p>The error is a direct consequence of I3.9. A container's identity lives in <code>/run/runc/&lt;id&gt;/</code>, and creating a container means creating that directory. If it already exists, runc refuses — because the alternative is silently adopting or clobbering something that might be a live container.</p>
+<p>The interesting case is when the directory outlives the container. That happens whenever a container's process dies without anybody calling <code>delete</code>: a <code>SIGKILL</code>, an OOM kill, a supervisor that crashed between killing and cleaning up, or a node that lost power mid-operation. In every case the record says a container exists and the reality says otherwise, and runc believes the record.</p>
+<p>Two ways to resolve it, and they are not equivalent:</p>
+<ul>
+<li><code>runc delete --force &lt;id&gt;</code> — the correct fix. runc kills anything still alive, <strong>removes the cgroup</strong>, unmounts what needs unmounting, and then removes the state directory. It knows what it created because <code>state.json</code> told it.</li>
+<li><code>rm -rf /run/runc/&lt;id&gt;</code> — the tempting fix. It removes the <em>record of what to clean up</em> without doing any cleaning. The next create succeeds, so it looks like it worked. But the cgroup directory is still there, with no record anywhere that it exists or who made it.</li>
+</ul>
+<p>Reach for the destructive one habitually and you get a slow leak: cgroup directories accumulating in <code>/sys/fs/cgroup</code>, one per incident, each one a live kernel object holding memory. It is a small leak per container and a real one on a node that has been restarting things for months.</p>
+
+<div class="specref">
+<p>Both halves of this behaviour are required:</p>
+<blockquote>If the ID provided is not unique across all containers within the scope of the runtime, or is not valid in any other way, the implementation MUST generate an error and a new container MUST NOT be created. […] Deleting a container MUST delete the resources that were created during the create step. Note that resources associated with the container, but not created by this container, MUST NOT be deleted. Once a container is deleted its ID MAY be used by a subsequent container.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "Create" and "Delete"</cite>
+<p>The refusal is a MUST, so the error is conformant behaviour rather than runc being fussy. And read the delete clause as a job description: <em>delete the resources that were created during the create step</em>. That is exactly the job <code>rm -rf</code> does not do — it destroys the only record of what those resources were.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Manufacture the fault. Kill a container's process without telling runc.
+<pre class="cmd">cd ~/i3/box
+sudo runc delete --force z1 2&gt;/dev/null
+sudo runc run --detach --pid-file /tmp/z1.pid z1 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+sudo kill -9 $(sudo cat /tmp/z1.pid); sleep 0.5
+sudo ls /run/runc/z1/
+sudo runc run --detach z1 &lt; /dev/null</pre>
+<pre class="out">state.json
+level=error msg="runc run failed: <b>container with given ID already exists</b>"</pre>
+<p>There it is, reproduced in four lines. Note how little it took — one uncaught <code>SIGKILL</code>.</p></li>
+
+<li>Before fixing anything, look at what the dead container is still holding. This is the part the error message does not mention.
+<pre class="cmd">ls -d /sys/fs/cgroup/user.slice/user-1000.slice/z1</pre>
+<pre class="out">/sys/fs/cgroup/user.slice/user-1000.slice/z1</pre>
+<p>The cgroup outlived its only process. It is empty, but it is a real kernel object and it will sit there indefinitely.</p></li>
+
+<li>Now the <strong>improper</strong> fix, so you can see exactly what it misses.
+<pre class="cmd">sudo rm -rf /run/runc/z1
+ls -d /sys/fs/cgroup/user.slice/user-1000.slice/z1
+sudo runc run --detach --pid-file /tmp/z1.pid z1 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+echo "recreate rc=$?"</pre>
+<pre class="out">/sys/fs/cgroup/user.slice/user-1000.slice/z1     <i># still there</i>
+recreate rc=<b>0</b></pre>
+<p>This is what makes the bad fix dangerous: <strong>it appears to work perfectly</strong>. The container recreates, the error is gone, and the leaked cgroup is now completely undiscoverable — there is no record left that says it should not be there.</p></li>
+
+<li>Now the <strong>proper</strong> fix on a fresh instance of the same fault, and check the same place.
+<pre class="cmd">sudo runc delete --force z1
+sudo runc run --detach --pid-file /tmp/z2.pid z2 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+sudo kill -9 $(sudo cat /tmp/z2.pid); sleep 0.5
+sudo runc list | grep z2
+sudo runc delete z2
+ls -d /sys/fs/cgroup/user.slice/user-1000.slice/z2</pre>
+<pre class="out">z2   0   <b>stopped</b>   /home/ubuntu/i3/box   2026-07-27T14:25:38Z   root
+ls: cannot access '…/z2': <b>No such file or directory</b></pre>
+<p>The cgroup is gone. That single line is the entire difference between the two fixes, and it is invisible unless you go looking for it.</p>
+<p>Note also that plain <code>runc delete</code> — without <code>--force</code> — was enough here, because the container was already <code>stopped</code>. <code>--force</code> is only needed when something is still alive.</p></li>
+
+<li>Finally, settle the rootless question, since "already exists" for a container you cannot see is usually this.
+<pre class="cmd">runc --help | grep -A1 'root directory'</pre>
+<pre class="out">--root value   root directory for storage of container state
+               (this should be located in tmpfs) (default: "<b>/run/user/1000/runc</b>")</pre>
+<p>Run as your own user, runc's whole database moves to <code>$XDG_RUNTIME_DIR/runc</code>. A root container and a rootless container can hold the same ID simultaneously without conflict, because they are different databases — and each is invisible to the other's <code>runc list</code>.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can produce the error deliberately, name the resource <code>rm -rf</code> leaves behind, show it present after the bad fix and absent after the good one, and state where a rootless container's state lives.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The bad fix succeeds, which is why it spreads.</strong> Nothing about the outcome tells you it was wrong; you have to know to check <code>/sys/fs/cgroup</code>. Treat "the workaround worked" as the weakest possible evidence that it was correct.</li>
+<li><strong><code>runc delete</code> without <code>--force</code> refuses a running container</strong> — the spec requires that refusal. If it errors, check the status before reaching for <code>--force</code>; a "stale" container that is actually running is a different problem.</li>
+<li><strong>Leaked cgroups are near-invisible.</strong> They do not appear in <code>runc list</code>, <code>ps</code>, or any container tooling — only as directories under <code>/sys/fs/cgroup</code>. On a node with a long uptime, counting them is a good health check.</li>
+<li><strong>An ID is only unique within one runtime root.</strong> Root and rootless are separate namespaces of names, and so are two runc invocations with different <code>--root</code> values. This is a feature, and it is also how people end up with two containers they think are one.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the runtime-level ancestor of a specific and famously irritating pod failure: a pod stuck in <code>ContainerCreating</code> whose events read <code>failed to create containerd task: … already exists</code>. The chain is the same one you just built by hand — something killed a container without a clean delete, the runtime's state directory survived, and the next attempt to create by the same ID is refused. The kubelet retries forever, because retrying is not the fix. The real fix is at the layer that owns the stale record, which is why the operational advice is to clean up through <code>crictl rm</code> rather than by deleting directories — <code>crictl</code> is the tool that knows what to remove, in exactly the way <code>runc delete</code> does and <code>rm -rf</code> does not. The pod-lifecycle failure catalogue is <a href="w6.html#cp-6-16">W6.16</a>; <code>crictl</code> itself is I8.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>runc delete --help</code> for what <code>--force</code> changes; the kernel's <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">cgroup v2 admin guide</a> on why an empty cgroup directory persists until explicitly removed — the mechanism behind the leak.</p>
+</article>
+
+</div><!-- /g-state -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
