@@ -545,6 +545,328 @@ sudo runc run ro</pre>
 <p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#root">config.md § Root</a>, and <code>man 8 mount</code> for the <code>tmpfs</code> options used above (<code>mode=1777</code> is the sticky world-writable mode <code>/tmp</code> must have).</p>
 </article>
 
+<article class="lesson" id="cp-i2-6" data-id="i2-6">
+<div class="lesson-head"><span class="cp-id">I2.6</span><h4><code>mounts</code> — and what happens without <code>/proc</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The default <code>mounts</code> array is seven entries long and every one of them corresponds to a line you wrote by hand in <code>minibox.sh</code> — or, more accurately, to a line you wrote and six you did not, and whose absence you never noticed because nothing you ran needed them. Reading them side by side is the clearest demonstration in the whole module of what "the standard added contracts, not mechanism" actually means.</p>
+
+<h5>The concept</h5>
+<p>Each entry has a <code>destination</code> (a path inside the container), a <code>type</code>, a <code>source</code>, and <code>options</code> passed straight to <code>mount(2)</code>. The runtime performs them <strong>in array order</strong>, after pivoting into the rootfs. That ordering is load-bearing: <code>/dev/pts</code> cannot be mounted before <code>/dev</code> exists.</p>
+<p>Here is the default array against <code>minibox</code>:</p>
+<table class="langpair"><thead><tr><th><code>config.json</code> entry</th><th>what it is for, and what <code>minibox</code> did</th></tr></thead><tbody>
+<tr><td><code>/proc</code> type <code>proc</code></td><td>Process table and per-process state. <code>minibox</code>'s <code>mount -t proc proc /proc</code>, the one its comment calls "the step everyone forgets".</td></tr>
+<tr><td><code>/dev</code> type <code>tmpfs</code>, <code>mode=755</code></td><td>An empty writable directory for device nodes, which the runtime then populates. <code>minibox</code> never did this — it inherited whatever <code>/dev</code> was baked into its lower layer.</td></tr>
+<tr><td><code>/dev/pts</code> type <code>devpts</code>, <code>newinstance</code></td><td>Pseudo-terminals. <code>newinstance</code> is the important word: a private pty namespace, so the container cannot see the host's terminals.</td></tr>
+<tr><td><code>/dev/shm</code> type <code>tmpfs</code>, 64 MB</td><td>POSIX shared memory. Absent, anything using <code>shm_open</code> — which includes Chrome, PostgreSQL and most JVMs — fails oddly.</td></tr>
+<tr><td><code>/dev/mqueue</code> type <code>mqueue</code></td><td>POSIX message queues, namespaced by the IPC namespace.</td></tr>
+<tr><td><code>/sys</code> type <code>sysfs</code>, <code>ro</code></td><td>Kernel and device information, read-only so the container cannot retune the machine.</td></tr>
+<tr><td><code>/sys/fs/cgroup</code> type <code>cgroup</code>, <code>ro</code></td><td>The container's own cgroup, read-only. Combined with the cgroup namespace it appears as <code>/</code>, which is how a container reads its own limits without seeing anyone else's.</td></tr>
+</tbody></table>
+<p>Notice the shape of the difference. <code>minibox</code> had <em>one</em> of these because one was enough to make <code>ps</code> work. The other six are what "works on somebody else's machine, for somebody else's program" costs.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the result from inside, which is more informative than reading the array.
+<pre class="cmd">cd ~/i2/hello
+sudo jq '.process.args = ["/bin/sh","-c","mount | head -20; echo ---; ps -o pid,comm; echo ---; ls /dev"]' \
+  config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run m</pre>
+<pre class="out">/dev/sda1 on / type ext4 (<b>ro</b>,relatime,discard,errors=remount-ro,commit=30)
+proc on /proc type proc (rw,relatime)
+tmpfs on /dev type tmpfs (rw,nosuid,size=65536k,mode=755,inode64)
+devpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=666)
+shm on /dev/shm type tmpfs (rw,nosuid,nodev,noexec,relatime,size=65536k,inode64)
+mqueue on /dev/mqueue type mqueue (rw,nosuid,nodev,noexec,relatime)
+sysfs on /sys type sysfs (ro,nosuid,nodev,noexec,relatime)
+cgroup on /sys/fs/cgroup type cgroup2 (ro,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot)
+tmpfs on /tmp type tmpfs (rw,nosuid,nodev,relatime,size=16384k,inode64)
+<b>proc on /proc/bus type proc (ro,relatime)</b>
+<b>proc on /proc/sys type proc (ro,relatime)</b>
+<b>tmpfs on /proc/kcore type tmpfs (rw,nosuid,size=65536k,mode=755,inode64)</b>
+tmpfs on /sys/firmware type tmpfs (ro,relatime,size=4k,nr_inodes=1,inode64)
+---
+PID   COMMAND
+    1 sh
+    8 ps
+---
+core  fd  full  mqueue  null  ptmx  pts  random  shm  stderr  stdin  stdout  tty  urandom  zero</pre>
+<p>More mounts appear than the array contains. The bold ones come from <code>maskedPaths</code> and <code>readonlyPaths</code> (I2.8) — the runtime implements those as extra mounts, layered on top. And <code>/dev</code> is populated: those device nodes and the <code>stdin</code>/<code>stdout</code>/<code>stderr</code> symlinks are created by the runtime after mounting the empty tmpfs, because the specification requires them.</p></li>
+
+<li>Now delete the <code>/proc</code> entry and see what "the step everyone forgets" really costs on a modern runtime.
+<pre class="cmd">sudo jq 'del(.mounts[] | select(.destination == "/proc"))' config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run m</pre>
+<pre class="out">thread '&lt;unnamed&gt;' panicked at src/procfs.rs:200:14:
+<b>at least one candidate /proc/thread-self path should work</b>
+SIGABRT: abort
+…
+level=error msg="runc run failed: unable to start container process: error during
+  container init: <b>procReady not received</b>"</pre>
+<p>The container does not start at all. <code>ps</code> never gets the chance to stop working, because <code>/proc</code> is not a convenience for the workload — <strong>the runtime itself needs it</strong>. runc's own init process resolves paths through <code>/proc/thread-self</code> to avoid a family of symlink-swap attacks, so a container without procfs is a container runc cannot safely construct. (The Rust in that traceback is <code>libpathrs</code>, the safe-path-resolution library runc links; the Go traceback underneath is runc proper.)</p></li>
+
+<li>Try the sneakier version — keep <code>/proc</code>, then shadow it with a later mount, exploiting the fact that mounts are applied in order.
+<pre class="cmd">sudo jq '.mounts = [{destination:"/proc",type:"proc",source:"proc"}] + .mounts
+ + [{destination:"/proc",type:"tmpfs",source:"tmpfs",options:["ro","size=4k"]}]' \
+  config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run m</pre>
+<pre class="out">level=error msg="runc run failed: unable to start container process: error during container init:
+  error mounting \"tmpfs\" to rootfs at \"/proc\": create mountpoint for /proc mount:
+  <b>check proc-safety of /proc mount: \"…/rootfs/proc\" cannot be mounted because it is not of type proc</b>"</pre>
+<p>runc refuses. A container that can put something it controls at <code>/proc</code> can lie to every security check that reads <code>/proc</code>, including runc's own, so modern runc verifies the filesystem type before mounting over that path. This is the module's most important lesson in miniature: <strong>the specification lets you write anything; a good runtime refuses some of it.</strong> Conformance is a floor, not a description.</p></li>
+
+<li>Restore a sane array.
+<pre class="cmd">cd ~/i2 &amp;&amp; sudo rm -rf hello/config.json &amp;&amp; (cd hello &amp;&amp; sudo runc spec)</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>With the default array, <code>ps</code> inside shows PID 1 as your own process and nothing else on the machine; <code>ls /dev</code> shows about fourteen entries rather than the host's hundreds; and <code>cat /sys/fs/cgroup/cgroup.controllers</code> works while writing to anything under <code>/sys</code> fails.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Order is significant and there is no dependency resolution.</strong> Append a <code>/dev/something</code> mount before the <code>/dev</code> tmpfs and it is silently wiped out when the tmpfs lands on top. The symptom is a mount that "did not happen", with no error anywhere.</li>
+<li><strong><code>bind</code> is an option, not a type.</strong> To bind a host directory in, set <code>type</code> to <code>bind</code> (or <code>none</code>) and put <code>"bind"</code> or <code>"rbind"</code> in <code>options</code> — omitting it produces a confusing failure about an unknown filesystem type.</li>
+<li><strong>The source directory must exist on the host; the destination need not exist in the container.</strong> runc creates missing destinations. That asymmetry means a typo in <code>destination</code> silently creates a new empty directory instead of erroring, and your config map appears to be empty.</li>
+<li><strong>Do not try to be clever about <code>/proc</code>.</strong> Both experiments above are things people genuinely attempt when trying to hide process information from a container. The supported mechanism is <code>maskedPaths</code>, plus a PID namespace, which you already have.</li>
+</ul>
+
+<div class="specref">
+<blockquote><code>mounts</code> (array of objects, OPTIONAL) specifies additional mounts beyond <code>root</code>. The runtime MUST mount entries in the listed order.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#mounts">config.md § Mounts</a></cite>
+<p>"MUST mount entries in the listed order" is one of the shortest normative sentences in the document and one of the most consequential — it is what makes the array a program rather than a set.</p>
+</div>
+
+<div class="k8s-link">
+<p>Every <code>volumeMount</code> in a pod becomes an entry in this array, and the ordering rule is why two volumes mounted at overlapping paths behave the way they do. The projected mounts Kubernetes adds without being asked — the service account token, <code>/etc/hosts</code>, <code>/etc/resolv.conf</code>, the termination-log path — also land here, which is why a running pod always has more mounts than its spec lists. <a href="w5.html#cp-5-1">W5.1</a> introduces volumes; this is where they end up.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#mounts">config.md § Mounts</a> and <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#default-devices">config-linux.md § Default Devices</a> for the <code>/dev</code> nodes the runtime must create. <code>man 2 mount</code> and <code>man 8 mount</code> for the options; <code>man 4 pts</code> for <code>newinstance</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i2-7" data-id="i2-7">
+<div class="lesson-head"><span class="cp-id">I2.7</span><h4><code>linux.namespaces</code> — and the field that explains pods</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the single most valuable field in the document, and it is four characters long. Every namespace entry has a <code>type</code> and an optional <code>path</code>. With no path, the runtime creates a new namespace. With a path, it <em>joins an existing one</em>. That is the entire mechanism behind a Kubernetes pod — containers that share an address space and a <code>localhost</code> — and once you have seen it, the pause container and half of the CNI stop being surprising.</p>
+
+<h5>The concept</h5>
+<p>You already know the mechanism from <a href="i1.html#cp-i1-3">I1.3</a>: <code>setns(2)</code> takes a file descriptor for a namespace and moves the calling process into it. A namespace stays alive as long as something references it — a process inside, or a bind mount of its <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> file somewhere persistent. <code>ip netns add</code> makes exactly such a bind mount, under <code>/var/run/netns/</code>, which is why a network namespace created that way survives with no processes in it.</p>
+<p>So <code>"path": "/var/run/netns/pod"</code> in a namespace entry means: do not create one, open that file, <code>setns</code> into it. Two containers pointed at the same path land in the same namespace and become, for that namespace's purposes, one machine.</p>
+<div class="flow"><span>container A</span><em>→</em><span>/var/run/netns/pod</span><em>←</em><span>container B</span></div>
+<p>In the analogy this is the <strong>room rented and wired before any guest checks in</strong>: somebody creates the network namespace and configures it, and then every container in the pod moves into the room that already has a phone line. A Kubernetes pod does this with the network, IPC and UTS namespaces while giving each container its own mount namespace — which is exactly why pod containers share an IP and a <code>localhost</code> but not a filesystem.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a persistent network namespace and put something recognisable in it, so "did they join?" has an unambiguous answer.
+<pre class="cmd">cd ~/i2
+sudo ip netns add pod
+sudo ip netns exec pod ip link set lo up
+sudo ip netns exec pod ip link add dummy0 type dummy
+sudo ip netns exec pod ip addr add 10.99.0.7/24 dev dummy0
+sudo ip netns exec pod ip link set dummy0 up
+ls -l /var/run/netns/pod</pre>
+<pre class="out">-r--r--r-- 1 root root <b>0</b> Jul 27 15:58 /var/run/netns/pod</pre>
+<p>Zero bytes, because it is not a file — it is a bind mount of a namespace inode, and it is the reference that keeps the namespace alive with no processes in it.</p></li>
+
+<li>Build two bundles that both join it. Everything else about them is identical.
+<pre class="cmd">for n in c1 c2; do
+  sudo rm -rf $n; sudo mkdir -p $n/rootfs
+  sudo tar -C $n/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+  (cd $n &amp;&amp; sudo runc spec &amp;&amp; sudo jq '
+      .process.terminal = false | .root.readonly = false
+    | (.linux.namespaces[] | select(.type == "network")) |= (.path = "/var/run/netns/pod")
+    | .process.args = ["/bin/sh","-c","ip addr show | grep -E \"^[0-9]+:|inet \"; readlink /proc/self/ns/net"]
+  ' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json)
+done</pre>
+<p>That <code>(.linux.namespaces[] | select(…)) |= (.path = …)</code> form is worth stealing: it edits the matching array element in place rather than rebuilding the array.</p></li>
+
+<li>Run them and compare.
+<pre class="cmd">sudo runc run -b c1 c1
+sudo runc run -b c2 c2</pre>
+<pre class="out">1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN qlen 1000
+    inet 127.0.0.1/8 scope host lo
+2: dummy0: &lt;BROADCAST,NOARP,UP,LOWER_UP&gt; mtu 1500 qdisc noqueue state UNKNOWN qlen 1000
+    inet <b>10.99.0.7/24</b> scope global dummy0
+net:[<b>4026532216</b>]
+
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN qlen 1000
+    inet 127.0.0.1/8 scope host lo
+2: dummy0: &lt;BROADCAST,NOARP,UP,LOWER_UP&gt; mtu 1500 qdisc noqueue state UNKNOWN qlen 1000
+    inet <b>10.99.0.7/24</b> scope global dummy0
+net:[<b>4026532216</b>]</pre>
+<p>Same interfaces, same address, and — the part that is proof rather than inference — the same namespace <strong>inode number</strong>. Confirm it belongs to the namespace you made:</p>
+<pre class="cmd">sudo ip netns exec pod readlink /proc/self/ns/net</pre>
+<pre class="out">net:[4026532216]</pre></li>
+
+<li>Prove the thing that actually matters day to day: they share <code>localhost</code>.
+<pre class="cmd">sudo jq '.process.args = ["/bin/sh","-c","echo I-am-c1 | nc -l -p 5000"]' c1/config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x c1/config.json
+sudo jq '.process.args = ["/bin/sh","-c","sleep 1; nc 127.0.0.1 5000"]'    c2/config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x c2/config.json
+sudo runc run -d -b c1 c1
+sudo runc run    -b c2 c2</pre>
+<pre class="out"><b>I-am-c1</b></pre>
+<p>Two separate containers, two separate mount namespaces, two separate PID namespaces — one loopback interface. That is a pod, built from a four-character field.</p></li>
+
+<li>Clean up.
+<pre class="cmd">sudo runc delete -f c1 2&gt;/dev/null; sudo ip netns del pod</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>The <code>net:[…]</code> inode printed by both containers matches the one <code>ip netns exec pod readlink /proc/self/ns/net</code> prints. Remove the <code>path</code> from <code>c2</code> and re-run: its inode changes, its <code>dummy0</code> disappears, and the <code>nc</code> connection is refused. One field, and the difference between two containers and a pod.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An unreferenced namespace evaporates.</strong> Point <code>path</code> at <code>/proc/&lt;pid&gt;/ns/net</code> and the namespace dies with that process, taking your container's networking with it. This is the second debugging drill in I2.16 and a genuine class of production bug — it is why the pause container exists.</li>
+<li><strong>Joining a namespace needs the capability for that namespace type.</strong> <code>setns</code> into a network namespace requires <code>CAP_SYS_ADMIN</code> in the namespace's owning user namespace. Rootless containers can share namespaces only among themselves.</li>
+<li><strong>You cannot join a PID namespace as PID 1.</strong> A process that <code>setns</code>es into an existing PID namespace has its <em>children</em> placed in it, not itself. This is why pods that share a PID namespace still have a distinct PID 1, and why <code>shareProcessNamespace</code> behaves oddly if you expect otherwise.</li>
+<li><strong><code>/var/run</code> is a symlink to <code>/run</code>.</strong> Both paths work; <code>ip netns</code> writes <code>/var/run/netns</code>, tooling often reads <code>/run/netns</code>, and a <code>find</code> that follows one and not the other will convince you the namespace does not exist.</li>
+</ul>
+
+<div class="specref">
+<blockquote>The value of <code>path</code> is the path to namespace file corresponding to a namespace type. […] If <code>path</code> is not specified, the runtime MUST create a new container namespace of type <code>type</code>.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#namespaces">config-linux.md § Namespaces</a></cite>
+<p>Two sentences, and the entire pod abstraction is downstream of them. Nothing in the runtime specification mentions pods, groups of containers, or sidecars — Kubernetes did not need a new mechanism, only this optional field.</p>
+</div>
+
+<div class="k8s-link">
+<p>The <strong>pause container</strong> exists to be the thing that holds the namespaces open. It starts first, does nothing but block forever, and every other container in the pod joins its namespaces by path — so an application container can crash, restart, and rejoin the same network namespace with the same IP. <a href="w1.html#cp-1-21">W1.21</a> is the pause container from the Kubernetes side; this lesson is why it has to exist at all.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#namespaces">config-linux.md § Namespaces</a>, <code>man 2 setns</code>, <code>man 8 ip-netns</code> (especially the section on why the bind mount under <code>/var/run/netns</code> exists), and <code>man 7 pid_namespaces</code> for the PID-1 rule above.</p>
+</article>
+
+<article class="lesson" id="cp-i2-8" data-id="i2-8">
+<div class="lesson-head"><span class="cp-id">I2.8</span><h4>The rest of <code>linux</code> — resources, cgroupsPath, masks, sysctl</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everything left in the <code>linux</code> object is a knob you already turned by hand in <a href="b7.html">B7</a> — under a different name. Learning the translation table is dull and unavoidable: it is the difference between reading a generated configuration fluently and looking each field up. Two of them, <code>maskedPaths</code> and <code>readonlyPaths</code>, are pure security and worth understanding entry by entry, because each one names a specific thing a container would otherwise learn about its host.</p>
+
+<h5>The concept</h5>
+<p><code>linux.resources</code> is the cgroup, in JSON. The names come from cgroup <em>v1</em>, because the specification predates v2, and the runtime translates:</p>
+<table class="langpair"><thead><tr><th><code>config.json</code></th><th>cgroup v2 file</th></tr></thead><tbody>
+<tr><td><code>cpu.quota</code> + <code>cpu.period</code></td><td><code>cpu.max</code> — the two numbers, space-separated, in that order</td></tr>
+<tr><td><code>cpu.shares</code></td><td><code>cpu.weight</code> — <em>rescaled</em>, see below</td></tr>
+<tr><td><code>cpu.cpus</code> / <code>cpu.mems</code></td><td><code>cpuset.cpus</code> / <code>cpuset.mems</code> (<a href="i1.html#cp-i1-6">I1.6</a>)</td></tr>
+<tr><td><code>memory.limit</code></td><td><code>memory.max</code>, in bytes</td></tr>
+<tr><td><code>memory.reservation</code></td><td><code>memory.low</code></td></tr>
+<tr><td><code>memory.swap</code></td><td><code>memory.swap.max</code>, but see the gotcha — it is memory <em>plus</em> swap</td></tr>
+<tr><td><code>pids.limit</code></td><td><code>pids.max</code></td></tr>
+<tr><td><code>blockIO.weight</code></td><td><code>io.weight</code></td></tr>
+</tbody></table>
+<p><code>cgroupsPath</code> says where in the tree that cgroup goes, relative to the cgroup mount. Absent, runc derives one from the container id and its own current cgroup.</p>
+<p><code>maskedPaths</code> and <code>readonlyPaths</code> are implemented as mounts, and the mechanism differs by target: a <strong>file</strong> is masked by bind-mounting <code>/dev/null</code> over it, a <strong>directory</strong> by mounting an empty read-only tmpfs. Read the default list as a list of leaks:</p>
+<ul>
+<li><code>/proc/kcore</code> — the whole of physical memory as an ELF core file. Unmasked, it is every secret on the machine.</li>
+<li><code>/proc/keys</code> — the kernel keyring, including keys belonging to other containers.</li>
+<li><code>/proc/timer_list</code>, <code>/proc/sched_debug</code>, <code>/proc/latency_stats</code> — per-process scheduling data for <em>every</em> process on the host, PID namespace notwithstanding. Enough to fingerprint the node's other tenants.</li>
+<li><code>/proc/acpi</code>, <code>/proc/scsi</code>, <code>/sys/firmware</code> — hardware inventory and, historically, writable interfaces that could power off or reconfigure the machine.</li>
+<li><code>readonlyPaths</code> — <code>/proc/sys</code>, <code>/proc/sysrq-trigger</code>, <code>/proc/irq</code>, <code>/proc/bus</code>, <code>/proc/fs</code>: not secrets, but <em>host-global controls</em>. <code>/proc/sys</code> is the machine's sysctls; <code>/proc/sysrq-trigger</code> can reboot it with one <code>echo</code>.</li>
+</ul>
+<p>The remaining fields, briefly: <code>seccomp</code> carries a filter in the structure <a href="i1.html#cp-i1-9">I1.9</a> built by hand; <code>devices</code> lists device nodes to create plus the eBPF allow/deny rules from <a href="i1.html#cp-i1-8">I1.8</a>; <code>sysctl</code> sets namespaced sysctls inside the container; <code>rootfsPropagation</code> sets whether mounts made inside the container are visible outside and vice versa.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set every resource field at once and watch the cgroup appear.
+<pre class="cmd">cd ~/i2
+sudo rm -rf lim &amp;&amp; sudo mkdir -p lim/rootfs
+sudo tar -C lim/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+cd lim &amp;&amp; sudo runc spec
+sudo jq '
+   .process.terminal = false | .process.args = ["/bin/sleep","600"]
+ | .linux.cgroupsPath = "/i2demo/lim"
+ | .linux.resources.cpu = {quota:50000, period:100000, shares:512}
+ | .linux.resources.memory = {limit:134217728, swap:134217728}
+ | .linux.resources.pids = {limit:64}
+ | .linux.sysctl = {"net.ipv4.ip_unprivileged_port_start":"0"}
+ | .linux.rootfsPropagation = "rslave"
+' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc run -d --pid-file /tmp/lim.pid lim
+P=$(cat /tmp/lim.pid)
+sudo cat /proc/$P/cgroup
+CG=/sys/fs/cgroup/i2demo/lim
+for f in cpu.max cpu.weight memory.max memory.swap.max pids.max; do
+  printf '%-16s %s\n' $f "$(sudo cat $CG/$f)"
+done</pre>
+<pre class="out">0::/i2demo/lim
+cpu.max          <b>50000 100000</b>
+cpu.weight       <b>59</b>
+memory.max       <b>134217728</b>
+memory.swap.max  <b>0</b>
+pids.max         <b>64</b></pre>
+<p>Three of those are the numbers you wrote. Two are not, and both surprises are worth understanding.</p></li>
+
+<li><code>shares: 512</code> became <code>cpu.weight: 59</code>. Map the curve rather than guessing at it.
+<pre class="cmd">for s in 2 512 1024 4096 262144; do
+  sudo jq ".linux.resources.cpu.shares = $s" config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+  sudo runc run -d --pid-file /tmp/lim.pid lim &gt;/dev/null 2&gt;&amp;1
+  printf 'shares=%-8s cpu.weight=%s\n' $s "$(sudo cat /sys/fs/cgroup/i2demo/lim/cpu.weight)"
+  sudo runc delete -f lim
+done</pre>
+<pre class="out">shares=2        cpu.weight=1
+shares=512      cpu.weight=59
+shares=<b>1024</b>     cpu.weight=<b>100</b>
+shares=4096     cpu.weight=303
+shares=262144   cpu.weight=10000</pre>
+<p>The endpoints tell the story: v1's range [2, 262144] is mapped onto v2's [1, 10000], logarithmically, with the historic default 1024 landing exactly on 100. The formula runc uses is <code>10^((log₂x² + 125·log₂x)/612 − 7/34)</code>, and you do not need to memorise it — you need to know that <strong>the number in the file will not be the number in the config</strong>, and that 1024↔100 is the anchor point.</p></li>
+
+<li><code>memory.swap.max</code> came out as 0 despite asking for 128 MB. That is correct and it is the most common resource-field mistake: in the specification, <code>memory.swap</code> is <em>memory plus swap</em>, inherited from cgroup v1's <code>memsw</code>. Asking for a 128 MB limit and 128 MB of "swap" is asking for 128 MB total — that is, no swap at all. To allow 128 MB of actual swap, set <code>swap: 268435456</code>.</li>
+
+<li>Look at how masking is actually implemented.
+<pre class="cmd">sudo jq '.process.args = ["/bin/sh","-c","ls -l /proc/kcore; mount | grep -E \"/proc/(bus|fs|irq|sys|sysrq)|/sys/firmware\""]' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc run lim</pre>
+<pre class="out"><b>crw-rw-rw-    1 root     root        1,   3</b> Jul 27 09:59 /proc/kcore
+proc on /proc/bus type proc (ro,relatime)
+proc on /proc/fs type proc (ro,relatime)
+proc on /proc/irq type proc (ro,relatime)
+proc on /proc/sys type proc (ro,relatime)
+proc on /proc/sysrq-trigger type proc (ro,relatime)
+<b>tmpfs on /sys/firmware type tmpfs (ro,relatime,size=4k,nr_inodes=1,inode64)</b></pre>
+<p>Device <code>1, 3</code> is <code>/dev/null</code> — the file <code>/proc/kcore</code> has been replaced by a bind mount of it. The directory <code>/sys/firmware</code> got a 4 KB read-only tmpfs with room for exactly one inode. Both mechanisms are exactly what the specification prescribes, and both are visible from inside, so a container can always tell it is being masked.</p></li>
+
+<li>Prove <code>readonlyPaths</code> is doing something real, by removing it and reaching for a host-global control.
+<pre class="cmd">sudo jq '.linux.readonlyPaths = []
+ | .process.args = ["/bin/sh","-c","cat /proc/sys/kernel/pid_max; echo 300 &gt; /proc/sys/kernel/pid_max; echo rc=$?"]' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc run lim
+cat /proc/sys/kernel/pid_max</pre>
+<pre class="out">4194304
+<b>sh: write error: Invalid argument</b>
+rc=1
+4194304</pre>
+<p>The write reached the <strong>host's</strong> <code>pid_max</code> — it failed only because 300 is below the kernel's minimum, not because anything stopped the container. <code>/proc/sys</code> is not namespaced except for a handful of specific keys, so with <code>readonlyPaths</code> emptied, a root container can retune the machine every other tenant is running on. Put it back:</p>
+<pre class="cmd">sudo jq '.linux.readonlyPaths = ["/proc/bus","/proc/fs","/proc/irq","/proc/sys","/proc/sysrq-trigger"]' \
+  config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p><code>sudo cat /sys/fs/cgroup/i2demo/lim/cpu.max</code> reads back the quota and period you set, and <code>/sys/fs/cgroup/i2demo/</code> disappears when the last container in it is deleted. Inside the container, <code>cat /proc/kcore</code> returns nothing at all rather than an error — the classic signature of a <code>/dev/null</code> mask.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>memory.swap</code> is a total, not an increment.</strong> Repeated above because it is genuinely the most common error in this object, and because the symptom — swapping when you expected none, or the reverse — surfaces as a latency mystery weeks later.</li>
+<li><strong>An empty <code>maskedPaths</code> is a real config, not a missing one.</strong> Tools that merge configurations sometimes replace the array with <code>[]</code>. The container works perfectly and quietly exposes <code>/proc/kcore</code>. Grep generated configurations for the array's <em>length</em>, not its presence.</li>
+<li><strong><code>sysctl</code> only accepts namespaced keys.</strong> Setting <code>net.core.somaxconn</code> works (network namespace); setting <code>vm.max_map_count</code> fails, because it is host-global. The error names the key, which is the only clue you get about which category it is in.</li>
+<li><strong><code>cgroupsPath</code> is interpreted differently under systemd.</strong> With runc's systemd cgroup driver, <code>slice:prefix:name</code> syntax is expected and a plain path is an error. On a Kubernetes node this is set by the kubelet's <code>cgroupDriver</code>, and a mismatch between kubelet and containerd produces containers that start and are then never accounted for.</li>
+</ul>
+
+<div class="specref">
+<blockquote><code>maskedPaths</code> (array of strings, OPTIONAL) will mask over the provided paths inside the container so that they cannot be read. The values MUST be absolute paths in the container namespace.</blockquote>
+<blockquote><code>readonlyPaths</code> (array of strings, OPTIONAL) will set the provided paths as readonly inside the container. The values MUST be absolute paths in the container namespace.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#masked-paths">config-linux.md §§ Masked Paths, Readonly Paths</a></cite>
+<p>Notice that neither says <em>how</em>. The <code>/dev/null</code>-for-files and tmpfs-for-directories mechanism you just observed is runc's choice; another runtime could mask differently and still conform. What is normative is the outcome: unreadable, and unwritable, respectively.</p>
+</div>
+
+<div class="k8s-link">
+<p>A pod's <code>resources.limits.cpu: "500m"</code> becomes <code>cpu.quota: 50000, cpu.period: 100000</code> — the exact numbers in the lab above — and <code>resources.requests.cpu</code> becomes <code>cpu.shares</code>, which is why requests influence scheduling and contention but never cap anything. <code>limits.memory</code> becomes <code>memory.limit</code>, and exceeding it is the OOM kill. <a href="w3.html#cp-3-16">W3.16</a> is requests and limits from the Kubernetes side; this is the file they are written into.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#control-groups">config-linux.md § Control groups</a> for the whole <code>resources</code> object, and <code>Documentation/admin-guide/cgroup-v2.rst</code> in the kernel tree for what each destination file actually does. <code>man 5 proc</code> for what every masked path contains.</p>
+</article>
 </div>
 </main>
 </div>
