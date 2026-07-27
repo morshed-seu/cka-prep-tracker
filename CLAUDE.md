@@ -12,16 +12,33 @@ Decisions already made (don't re-ask): fully self-contained lesson depth; all fo
 
 ## Commands
 
+**Authoring a module page? Read [`docs/AUTHORING.md`](docs/AUTHORING.md) — the one-page session runbook.** It supersedes re-reading the long tables below.
+
 ```bash
-python3 -m http.server 8000        # serve locally → http://localhost:8000
-tools/check-links.sh                # both tracks: tracker checkpoint <-> lesson anchor bidirectional check
+python3 -m http.server 8000         # serve locally → http://localhost:8000
+
+# checkers — run all four before considering a phase finished
+tools/check-links.sh                # all three tracks: tracker checkpoint <-> lesson anchor, both ways
                                     #   index.html    data-id="wN-M" <-> materials/wN.html  id="cp-N-M"
                                     #   beginner.html data-id="bN-M" <-> materials/bN.html  id="cp-bN-M"
-tools/check-html.py                  # tag-balance check; defaults to every root tracker (index/beginner) + materials/cheatsheets/mock, or pass specific files
+                                    #   intermediate.html data-id="iN-M" <-> materials/iN.html id="cp-iN-M"
+tools/check-html.py                 # tag-balance; defaults to every tracker + materials/cheatsheets/mock
+tools/check-page.py [--anatomy]     # raw <word> in <pre> (check-html.py CANNOT see this), &-as-entity,
+                                    #   broken links, dangling deep anchors, lesson.js wiring,
+                                    #   un-captured output. Tuned to zero false positives: if it
+                                    #   fires it is real. --anatomy adds advisory block-structure checks.
 node --check assets/lesson.js       # syntax-check the shared JS
+
+# authoring helpers
+tools/scaffold-module.py i4         # generate materials/i4.html from the tracker section:
+                                    #   every stub, id and boilerplate, with each checkpoint's text
+                                    #   and "Under the hood" note inlined as comments. Write prose only.
+tools/publish-module.sh i4          # PUBLISHED bump + sibling Site lists + previous pager next + verify.
+                                    #   Pre-flights the page and refuses one containing TODO.
+tools/vm.sh run|cap|put|get|clean   # run lab snippets on the `sandbox` VM without the hang/transfer traps
 ```
 
-There is no build step, package manager, linter, or test framework beyond the two `tools/` scripts above — run all three (plus a visual spot-check in the browser: theme toggle, done-sync with the tracker, anchors landing right) before considering a phase finished.
+There is no build step, package manager, linter, or test framework beyond the `tools/` scripts above — run the four checkers (plus a visual spot-check in the browser: theme toggle, done-sync with the tracker, anchors landing right) before considering a phase finished.
 
 ## Architecture
 
@@ -108,7 +125,7 @@ Full spec: [`docs/INTERMEDIATE-TRACK.md`](docs/INTERMEDIATE-TRACK.md) — 14 mod
 | I-S9 … I-S18 | `materials/i4.html` … `materials/i13.html`, one module per session | |
 | I-S19 | `labs/intermediate/i13-*.sh` + `mock/intermediate-final*.html` + cross-track QA | |
 
-**Resume recipe:** same as the beginner track — read this table → read the target module's section in `docs/INTERMEDIATE-TRACK.md` → `git log --oneline -8` → three checkers for a green baseline → work → checkers → commit → tick the row here and update the `intermediate-track-plan` memory.
+**Resume recipe:** **[`docs/AUTHORING.md`](docs/AUTHORING.md) is the runbook — follow it, not this paragraph.** In short: read this table → read only the target module's section in `docs/INTERMEDIATE-TRACK.md` → `git log --oneline -5` → four checkers for a green baseline → `tools/scaffold-module.py iN` → capture every lab live with `tools/vm.sh cap` → write prose one checkpoint group per commit → `tools/publish-module.sh iN` → tick the row here and update the `intermediate-track-plan` memory.
 
 Intermediate specifics that differ from both other tracks: anchors are `data-id="iN-M"` ↔ `id="cp-iN-M"` (the existing one rule covers it); labs run on a **second** throwaway Multipass VM named `buildbox` (Ubuntu 24.04, 4 vCPU / 8 GB / 40 GB) that **needs internet** for registry pulls, never on `sandbox` or the CKA cluster — **in practice I1 and I2 were both authored on `sandbox`**, which has the full intermediate toolchain installed (containerd 2.3.3, runc 1.5.1, nerdctl, the `~/.venv-intermediate` venv) and working internet — I1 needs no container tooling at all, and I2 needs only `runc`, `crun` and one image pull, so neither justified a second VM; from I4 on, image builds and a local registry make the 4 vCPU / 40 GB `buildbox` worth standing up; every conceptual lesson carries **both** a `.specref` ("What the spec actually says") and the inherited `.k8s-link`, plus an inline back-reference to the beginner lesson that built the primitive by hand; **Docs** links point at the OCI/CNI/CRI specs and the containerd/runc repos. Language policy: **CLI-first (`ctr`/`crictl`/`nerdctl`/`runc`/`skopeo`/`cnitool`/`curl`/`jq`), Python 3 where the subject genuinely is a program** — the ecosystem's Go is linked and explained, never required; Python labs assume the `~/.venv-intermediate` venv from I0 because 24.04 enforces PEP 668. The analogy registry gains an intermediate extension (runtime spec = the written work order, runc = the contractor, shim = the on-site foreman, containerd = the building-services company, image = a flat-pack kit, registry = the parts warehouse, sandbox = the room rented before any guest checks in) — it lives in `docs/INTERMEDIATE-TRACK.md` § "Analogy registry — intermediate extension" and extends, never competes with, the two tables below.
 
