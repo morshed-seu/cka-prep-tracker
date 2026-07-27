@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Intermediate module I1: the Linux primitives the beginner track deliberately deferred — user namespaces and ID mapping, setns by file descriptor, Ubuntu 24.04's AppArmor userns restriction, PSI, cpuset, the eBPF device controller, hand-written seccomp filters, TUN/TAP and VXLAN overlays.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧩</text></svg>">
+<title>I1 · The primitives the beginner track left out — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I1 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Intermediate tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · Missing primitives</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i1">← Back to the intermediate tracker</a></p>
+<header class="hero">
+  <h1>I1 — The primitives the beginner track left out</h1>
+  <p>This is a bridge module, and it is the only one in the track that teaches raw kernel machinery rather than a contract. Everything here is a <em>delta</em>: each lesson names the beginner lesson that built the thing, and then adds the one part that was deliberately left out because it only earns its keep once containers are the subject.</p>
+  <p>There are six such parts, and every one of them turns up later as a symptom you would otherwise misdiagnose. <strong>User namespaces</strong> are how a container can have a root that is not the machine's root. <strong>PSI</strong> is how you tell "starved" from "idle" when a load average cannot. <strong>cpuset</strong> is how Kubernetes hands a pod exclusive cores — and how it accidentally starves one. The <strong>device controller</strong> moved to eBPF in cgroup v2 and stopped being readable with <code>cat</code>. <strong>seccomp</strong> is the single most common cause of a container that dies with no log line at all. And <strong>VXLAN</strong> is what your cluster's pod network is actually made of, MTU arithmetic included.</p>
+  <div class="weights">
+    <span>Checkpoints<b>14</b></span>
+    <span>Hours<b>~5</b></span>
+    <span>Prerequisites<b>B2, B5, B6, B7, B9</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Explain user namespaces and ID mapping well enough to reason about rootless containers — including the single-write rule and why it exists.</li>
+<li>Install a mapped range with <code>newuidmap</code> from an unprivileged process, and say where the range came from.</li>
+<li>Enter a namespace by file descriptor with <code>setns(2)</code>, and name the three ways a namespaced process comes into existence.</li>
+<li>Diagnose Ubuntu 24.04's AppArmor restriction on unprivileged user namespaces, and choose between the three responses knowingly.</li>
+<li>Read PSI to distinguish a starved workload from an idle one, and say what load average cannot tell you.</li>
+<li>Pin a workload with <code>cpuset.cpus</code>, and explain how that differs from <code>cpu.max</code>.</li>
+<li>Find a cgroup's device policy when there is no file to read, using <code>bpftool</code>.</li>
+<li>Write a seccomp filter by hand, get killed by it, and recognise the signature without being told.</li>
+<li>Build a TUN device held open by your own program, and a VXLAN overlay between two namespaces — then compute its MTU and prove the arithmetic.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><a href="b2.html">B2</a> (processes and signals), <a href="b5.html">B5</a> (overlayfs), <a href="b6.html">B6</a> (namespaces), <a href="b7.html">B7</a> (cgroups v2) and <a href="b9.html">B9</a> (veth, bridges, NAT). None of that is re-taught here. If a lesson below opens with "you already did this", it means it — follow the link, skim, come back.</p>
+<p><strong>Which machine.</strong> I1 is the one module in this track that touches no container tooling at all: no containerd, no registry, no internet. Any throwaway Ubuntu 24.04 VM with at least 2 vCPU works, so the beginner track's <code>sandbox</code> is as good a home as <a href="i0.html#cp-i0-1"><code>buildbox</code></a>, and you may prefer to keep <code>buildbox</code>'s <code>clean</code> snapshot untouched. Everything below runs as root on that VM unless a lesson says otherwise, and several labs deliberately leave the machine in a strange state — take a snapshot first.</p>
+<p>The output on this page was captured on a 2-vCPU box, so CPU numbers like <code>cpuset.cpus = 0</code> reflect that. On a 4-vCPU <code>buildbox</code>, the same lessons work with a range such as <code>2-3</code>; the file takes either.</p>
+</div>
+
+<!-- ---------------- Isolation ---------------- -->
+<div class="grp" id="g-iso"><h3>Isolation, the parts we skipped</h3>
+
+<article class="lesson" id="cp-i1-1" data-id="i1-1">
+<div class="lesson-head"><span class="cp-id">I1.1</span><h4>The eighth namespace: <code>uid_map</code>, and the rule that you may write it once</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every container you have ever run had a process claiming to be root. On a normal node, that claim is true — the process really is uid 0, and the only things standing between it and the machine are capabilities, seccomp and luck. A <strong>user namespace</strong> is the mechanism that makes the claim false in a useful way: root inside, an ordinary unprivileged account outside. It is the difference between a container escape that hands the attacker the node and one that hands them a user with no permissions at all.</p>
+<p><a href="b6.html">B6</a> walked through the other seven namespace types and stopped short of this one on purpose, because on its own it does very little. It is only interesting once you can read the translation table, and that table is a file.</p>
+<h5>The concept</h5>
+<p>A user namespace does one thing: it installs a <strong>translation table for user and group IDs</strong>. Inside the namespace, a process sees one set of numbers; outside, the kernel sees another. Nothing about the kernel's permission checks changes — a file owned by uid 100000 is still owned by uid 100000 — only which number a given process reads and writes.</p>
+<p>The table lives in <code>/proc/&lt;pid&gt;/uid_map</code> and <code>/proc/&lt;pid&gt;/gid_map</code>, and each line has exactly three columns:</p>
+<div class="flow"><span>first ID <b>inside</b></span><em>→</em><span>first ID <b>outside</b></span><em>→</em><span>how many IDs</span></div>
+<p>So the line <code>0 100000 65536</code> reads: "uid 0 in here is uid 100000 out there, and the next 65,535 follow in order." A process that is uid 0 inside that namespace writes a file, and on the host that file belongs to 100000. That single sentence is the whole of rootless containers.</p>
+<p>Two properties make the feature safe enough to hand to unprivileged users, and both are worth internalising now because both produce confusing errors later:</p>
+<ul>
+<li><strong>Each map file may be written exactly once.</strong> The second write fails with <code>EPERM</code>, always, no matter who you are. This is what stops a process from widening its own mapping after the fact — you get the table you were given at birth, and you are stuck with it.</li>
+<li><strong>Until the map is written, everything is <code>nobody</code>.</strong> A fresh user namespace starts with an <em>empty</em> map, and every unmapped ID renders as <code>65534</code> (<code>nobody</code>/<code>nogroup</code>). That is not an error state; it is the pre-configuration state, and it is exactly what you see when something forgot to write the map.</li>
+</ul>
+<p>One more thing to have straight before the lab: <code>/proc/&lt;pid&gt;/status</code> shows a process's IDs <em>as the reader's namespace sees them</em>, not as the process sees itself. Reading it from the host will tell you the outside numbers. This trips people up constantly.</p>
+<h5>Lab</h5>
+<ol>
+<li>Start with the command every tutorial opens with, so you meet Ubuntu 24.04's answer to it immediately rather than in an hour. Run it as your ordinary user.
+<pre class="cmd">unshare --user --map-root-user bash -c id</pre>
+<pre class="out">unshare: write failed /proc/self/uid_map: <b>Operation not permitted</b></pre>
+<p>That is not a broken machine and not a typo — it is a deliberate Ubuntu mitigation, and <a href="#cp-i1-4">I1.4</a> takes it apart and fixes it properly. For the next three lessons, put <code>sudo</code> in front and carry on.</p></li>
+<li>Now the same thing with privilege, and look at what you actually got.
+<pre class="cmd">sudo unshare --user --map-root-user bash -c \
+  'id; cat /proc/self/uid_map; grep -E "^Cap(Eff|Bnd)" /proc/self/status'</pre>
+<pre class="out">uid=<b>0(root)</b> gid=0(root) groups=0(root),65534(nogroup)
+         <b>0          0          1</b>
+CapEff:	<b>000001ffffffffff</b>
+CapBnd:	000001ffffffffff</pre>
+<p>A one-line map — inside 0 is outside 0, for one ID — and a full capability set. Full capabilities <em>in this namespace</em>, which is a much smaller claim than it looks; the rest of the machine is unaffected.</p></li>
+<li>Watch the pre-configuration state, which is the one you will actually meet in the wild. Create a namespace and write nothing.
+<pre class="cmd">sudo unshare --user bash -c 'id; echo "map: [$(cat /proc/self/uid_map)]"'</pre>
+<pre class="out">uid=<b>65534(nobody)</b> gid=65534(nogroup) groups=65534(nogroup)
+map: <b>[]</b></pre>
+<p>Empty map, everything is <code>nobody</code>. If a container ever shows you <code>nobody</code> where you expected a real user, this is the reason: an ID that no line covers.</p></li>
+<li>Write a map from outside, the way a real runtime does. Start a process in a fresh, unmapped namespace and leave it running.
+<pre class="cmd">sudo unshare --user sleep 60 &amp;
+sleep 1; P=$(pgrep -x sleep | tail -1); echo "child = $P"</pre>
+<pre class="out">child = 21081</pre></li>
+<li>Install the map, then try to change your mind. This is the single-write rule, demonstrated.
+<pre class="cmd">sudo sh -c "echo '0 100000 65536' &gt; /proc/$P/uid_map"
+cat /proc/$P/uid_map
+sudo sh -c "echo '0 200000 65536' &gt; /proc/$P/uid_map"</pre>
+<pre class="out">         0     100000      65536
+sh: 1: echo: <b>echo: I/O error</b></pre>
+<p>The shell reports that unhelpfully. Ask for the errno directly and it is unambiguous:</p>
+<pre class="cmd">sudo python3 -c '
+import os
+for i, line in enumerate([b"0 100000 65536\n", b"0 200000 65536\n"], 1):
+    try:
+        fd = os.open("/proc/'$P'/uid_map", os.O_WRONLY); os.write(fd, line); os.close(fd)
+        print(f"write {i}: OK")
+    except OSError as e:
+        print(f"write {i}: errno={e.errno} ({os.strerror(e.errno)})")'</pre>
+<pre class="out">write 1: OK
+write 2: <b>errno=1 (Operation not permitted)</b></pre>
+<p>(The first write succeeds because that <code>python3</code> is a new process in a new namespace; re-running against the same still-mapped child would fail both times.)</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p>You can state, without looking: what the three columns of <code>uid_map</code> mean; what a process's <code>id</code> shows before the map is written; and what happens on the second write. If you can also say <em>why</em> the second write is forbidden — so a process cannot widen the mapping it was born with — you have the security argument as well as the mechanism.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>gid_map</code> has a companion you will forget exactly once. Before an unprivileged process may write <code>gid_map</code>, it must usually write the string <code>deny</code> into <code>/proc/&lt;pid&gt;/setgroups</code>, which permanently disables <code>setgroups(2)</code> for that namespace. The reason is a real historical escalation: without it, a process could drop a group that was being used to <em>deny</em> access to a file and thereby gain access. If a <code>gid_map</code> write fails with <code>EPERM</code> and the <code>uid_map</code> write succeeded, this is almost always why.</p>
+<p>Reading <code>/proc/&lt;pid&gt;/status</code> from the host shows host-side IDs, so a container's "root" appears there as <code>Uid: 100000</code>. That is correct and is the point of the feature — but it means <code>ps</code> on the node and <code>ps</code> inside the container legitimately disagree about who is running, and neither is lying.</p>
+<div class="k8s-link">
+<p>Kubernetes exposes exactly this as <code>spec.hostUsers: false</code> on a Pod — user namespaces reached GA in v1.33, and setting it makes the pod's uid 0 an unprivileged host uid drawn from a per-pod range the kubelet allocates. It is the strongest single mitigation available against a container escape, and it is off by default because it interacts badly with volumes whose files are owned by real host uids.</p>
+<p>The advanced track has <strong>no</strong> <code>securityContext</code> or Pod Security Standards coverage — that is CKS territory, not CKA — so there is no anchor here to send you to, and you should be suspicious of anything that claims otherwise. What the advanced track does cover is the layer this sits under: <a href="w1.html#cp-1-2">W1.2 — what runs privileged on a node</a>, and <a href="w3.html#cp-3-2">W3.2 — the pod spec fields the exam actually asks for</a>.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 user_namespaces</code> is the authoritative reference and is unusually readable — the <em>User and group ID mappings</em> section is the one to know. Then <code>man 2 setns</code>, <code>man 7 capabilities</code> for what "full capabilities in a namespace" does and does not buy, and <code>man 5 subuid</code> for where the ranges in <a href="#cp-i1-2">I1.2</a> come from.</p>
+</article>
+
+<article class="lesson" id="cp-i1-2" data-id="i1-2">
+<div class="lesson-head"><span class="cp-id">I1.2</span><h4><code>newuidmap</code>, <code>/etc/subuid</code>, and what "root inside, nobody outside" costs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><a href="#cp-i1-1">I1.1</a> wrote a mapping as root. That is what a privileged runtime does, and it explains nothing about how <em>rootless</em> containers work — because there, nobody has root to spare. This lesson is the allocation model that makes it possible, and it is genuinely simple once you see it: the distribution hands every user a block of 65,536 ID numbers at account-creation time, and the container's "root" is the first one.</p>
+<h5>The concept</h5>
+<p>An unprivileged process may write its <em>own</em> single ID into a map — one line, one ID, the one it already is. That is all the kernel will let it do without <code>CAP_SETUID</code> in the parent namespace. A useful container needs a whole range, because the software inside expects uid 0 <em>and</em> uid 33 <em>and</em> uid 1000 to be distinct.</p>
+<p>The gap is bridged by two small setuid-root helpers, <code>newuidmap</code> and <code>newgidmap</code>. They have <code>CAP_SETUID</code> because they are setuid-root, so they can write a multi-range map — and they refuse to write anything outside the range an administrator granted you in <code>/etc/subuid</code> and <code>/etc/subgid</code>. Those two files are the entire policy surface:</p>
+<div class="flow"><span><code>/etc/subuid</code></span><em>→</em><span><code>newuidmap</code> (setuid)</span><em>→</em><span><code>/proc/PID/uid_map</code></span><em>→</em><span>root inside</span></div>
+<p>The consequence is worth sitting with, because it is the security argument for rootless containers in one sentence. A process that breaks out of a rootless container arrives on the host as uid 100000 — an account that owns nothing, is in no groups, and has no entry in <code>/etc/passwd</code>. Compare that with breaking out of a conventional container, where the process arrives as uid 0.</p>
+<p>The price is the mirror image, and it is why rootless is not simply better: files created by the container are owned by host uids nobody else can read or write. Sharing a directory between a rootless container and a normal user requires either matching ID mapping on both sides or an ID-shifting mount, and "why can't I read the file my container just wrote" is the single most common rootless support question.</p>
+<h5>Lab</h5>
+<ol>
+<li>Install the helpers and read your allocation. On Ubuntu they are in the <code>uidmap</code> package, which is not installed by default on a server image.
+<pre class="cmd">sudo apt-get install -y uidmap
+grep "^$USER:" /etc/subuid /etc/subgid
+ls -l /usr/bin/newuidmap</pre>
+<pre class="out">/etc/subuid:ubuntu:<b>100000:65536</b>
+/etc/subgid:ubuntu:100000:65536
+-rw<b>s</b>r-xr-x 1 root root 41864 May 30  2024 /usr/bin/newuidmap</pre>
+<p>The <code>s</code> in the permission bits is the whole trick: it runs as root regardless of who invoked it, and it is small and audited precisely because of that.</p></li>
+<li>Start an unmapped namespace and hand its pid to <code>newuidmap</code> — as your ordinary user, no <code>sudo</code> anywhere.
+<pre class="cmd">unshare --user sleep 90 &amp; C=$!
+sleep 1
+echo "uid_map is empty: [$(cat /proc/$C/uid_map)]"
+newuidmap $C 0 100000 65536
+newgidmap $C 0 100000 65536
+cat /proc/$C/uid_map</pre>
+<pre class="out">uid_map is empty: []
+         <b>0     100000      65536</b></pre>
+<p>The three arguments after the pid are the same three columns as the file: inside, outside, count. <code>newuidmap</code> accepts several triples in a row if you want a non-contiguous map.</p></li>
+<li>Try to map a range you were not granted, so you see the policy enforce itself rather than taking its existence on faith.
+<pre class="cmd">unshare --user sleep 30 &amp; C2=$!
+sleep 1
+newuidmap $C2 0 500000 65536</pre>
+<pre class="out">newuidmap: <b>uid range [0-65536) -&gt; [500000-565536) not allowed</b></pre></li>
+<li>Look at the mapped child from inside and from outside at the same time. This is the "root inside, nobody outside" claim, made concrete.
+<pre class="cmd">nsenter -t $C -U --preserve-credentials -- id
+grep -E '^(Uid|Gid)' /proc/$C/status</pre>
+<pre class="out">uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+Uid:	1000	1000	1000	1000</pre>
+<p>Both lines are surprising and both are correct. <code>--preserve-credentials</code> keeps your uid 1000 as you enter, and 1000 is <em>not in the map</em> (the map covers 100000–165535), so inside you are <code>nobody</code>. And <code>/proc/&lt;pid&gt;/status</code> is rendered for the reader — you are on the host, so you see host numbers.</p></li>
+<li>Now do it properly, with the child becoming root once the map exists. The synchronisation matters: the child must wait, because it cannot map itself.
+<pre class="cmd">mkfifo /tmp/go
+unshare --user bash -c 'read _ &lt; /tmp/go; exec setpriv --reuid 0 --regid 0 \
+   --clear-groups sh -c "id; touch /tmp/rf; ls -ln /tmp/rf"' &amp;
+C=$!; sleep 1
+newuidmap $C 0 100000 65536 &amp;&amp; newgidmap $C 0 100000 65536
+echo go &gt; /tmp/go</pre>
+<pre class="out">setpriv: setresuid failed: <b>Operation not permitted</b></pre>
+<p>It fails, on Ubuntu 24.04, and the reason is <em>not</em> the mapping — the map installed fine. It is the AppArmor restriction from <a href="#cp-i1-4">I1.4</a>, which leaves the process with an empty effective capability set, and <code>setuid(2)</code> to another user needs <code>CAP_SETUID</code>. Confirm that diagnosis rather than guessing at it:</p>
+<pre class="cmd">unshare --user bash -c 'read _ &lt; /tmp/go; grep -E "^Cap(Eff|Bnd)" /proc/self/status
+   cat /proc/self/attr/current' &amp;
+C=$!; sleep 1; newuidmap $C 0 100000 65536; echo go &gt; /tmp/go</pre>
+<pre class="out">CapEff:	<b>0000000000000000</b>
+CapBnd:	000001ffffffffff
+<b>unprivileged_userns (enforce)</b></pre>
+<p>Bounding set full, effective set empty, and an AppArmor profile named in the third line. Hold that thought for two lessons — <a href="#cp-i1-4">I1.4</a> makes this exact command work.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>newuidmap $C 0 100000 65536</code> succeeds as an unprivileged user and <code>/proc/$C/uid_map</code> shows the range; the same command with an out-of-range base is refused by name. You can say where the number 100000 came from without looking at the file.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>Ranges are per-user and must not overlap, and nothing enforces that for you if you edit <code>/etc/subuid</code> by hand. Two users sharing a range means two users' containers share host identities — which quietly undoes the entire isolation argument, since one user's escaped container lands as the other user's container files' owner. Use <code>usermod --add-subuids</code> rather than an editor.</p>
+<p>65,536 IDs is a lot until you nest. A rootless container that itself runs a user namespace can only sub-allocate from its own range, so the inner container's "root" is drawn from the outer container's block. Nesting three deep with software that expects a fresh 65,536 each time is where rootless setups run out of numbers, and the error message is never about numbers.</p>
+<p>These helpers are frequently absent. Ubuntu server images do not ship <code>uidmap</code>, and Podman or Buildah installed without it fail with a message about <code>newuidmap</code> not being found that reads like a bug in the container tool. It is not; it is one <code>apt install</code>.</p>
+<div class="k8s-link">
+<p>The kubelet does this allocation itself when a pod sets <code>hostUsers: false</code> — it hands each pod a distinct 65,536-ID block from a node-wide pool, for exactly the non-overlap reason above, and writes the map into the OCI config that <a href="i2.html">I2</a> takes apart. The <code>/etc/subuid</code> mechanism is the single-machine version of the same idea, done by the distribution instead of by a scheduler.</p>
+<p>The volume-ownership pain has an exact Kubernetes counterpart in <code>fsGroup</code> and the <code>fsGroupChangePolicy</code> field, which exist because a pod and a volume can disagree about which numeric group may read a file. <a href="w5.html#cp-5-4">W5.4 — PersistentVolumeClaims and access modes</a> is where volume ownership first bites in the advanced track.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 subuid</code> and <code>man 5 subgid</code> for the files; <code>man 1 newuidmap</code> for the helper's exact argument shape; <code>man 8 usermod</code> for <code>--add-subuids</code>. <code>man 7 user_namespaces</code> again, this time the <em>Defining the mappings</em> section, which spells out precisely which writes are permitted to whom.</p>
+</article>
+
+<article class="lesson" id="cp-i1-3" data-id="i1-3">
+<div class="lesson-head"><span class="cp-id">I1.3</span><h4><code>setns(2)</code> by file descriptor — and the three ways a process gets a namespace</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have used <code>nsenter</code>. This lesson is what <code>nsenter</code> does, which turns out to be two system calls in a loop — and once you have seen them, <code>kubectl exec</code> stops being magic. Nothing "enters the pod". A process already on the node opens some files and calls <code>setns</code>.</p>
+<h5>The concept</h5>
+<p>A namespace has no name. It is not a path, not a string, not an entry in a table you can list. It is an object in the kernel, and the only handle you get on it is a <strong>file descriptor</strong> — obtained by opening <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code>, which is a magic symlink whose text is <code>&lt;type&gt;:[&lt;inode&gt;]</code>. That inode number <em>is</em> the namespace's identity: two processes are in the same network namespace if and only if <code>/proc/A/ns/net</code> and <code>/proc/B/ns/net</code> read the same inode.</p>
+<p>Referencing namespaces by descriptor rather than by name explains several things at once that otherwise look like unrelated trivia:</p>
+<ul>
+<li><strong>Lifetime.</strong> A namespace lives as long as something refers to it — a process inside it, or an open fd. That is why <code>ip netns add</code> works by bind-mounting the fd onto <code>/run/netns/&lt;name&gt;</code>: the mount is a reference, so the namespace survives with no processes in it. "Pinning" is nothing more exotic than that.</li>
+<li><strong>Transferability.</strong> A file descriptor can be passed to another process over a unix socket. So one program can create a namespace and hand it to another, which is how a runtime and its network plugin can cooperate without either being the other's child.</li>
+<li><strong>Granularity.</strong> <code>setns</code> takes one namespace at a time, so a process can join a pod's network namespace while keeping its own mount namespace. That is not a curiosity — it is precisely how a debug container sees the pod's network but its own filesystem.</li>
+</ul>
+<p>Three ways exist to get a process into a namespace, and it is worth having the distinction crisp because the error signatures differ:</p>
+<table>
+<tr><th>Mechanism</th><th>What it does</th><th>Who uses it</th></tr>
+<tr><td><code>fork</code>/<code>clone</code> with no flags</td><td>inherit the parent's namespaces</td><td>everything, all the time</td></tr>
+<tr><td><code>unshare(2)</code></td><td>leave the current namespaces and make new ones, in place</td><td>the <code>unshare</code> tool; shell-script runtimes</td></tr>
+<tr><td><code>clone3</code> with <code>CLONE_NEW*</code></td><td>create a process that is <em>already inside</em> new namespaces</td><td>real runtimes: <code>runc</code>, <code>crun</code></td></tr>
+<tr><td><code>setns(2)</code></td><td>join namespaces that already exist</td><td><code>nsenter</code>, <code>kubectl exec</code>, CNI plugins</td></tr>
+</table>
+<p>The reason <code>clone3</code> matters to a runtime is subtle but real: <code>unshare</code>-then-configure leaves a window in which a half-configured process exists, briefly, with new namespaces and old everything-else. <code>clone3</code> closes that window by creating the process already inside. A shell-script runtime cannot do this, which is one of several honest reasons <code>minibox.sh</code> is a teaching tool and not a product.</p>
+<h5>Lab</h5>
+<ol>
+<li>Make a target: a process with its own UTS and network namespaces, so there is something distinguishable to enter.
+<pre class="cmd">sudo unshare --uts --net bash -c 'hostname minibox; sleep 90' &amp;
+sleep 1; T=$(pgrep -f "sleep 90" | head -1); echo "target = $T"</pre>
+<pre class="out">target = 23625</pre></li>
+<li>Read the identities. Compare the target's inode numbers with your own — the ones that differ are the namespaces it left.
+<pre class="cmd">sudo readlink /proc/$T/ns/uts /proc/$T/ns/net /proc/$T/ns/mnt
+readlink /proc/self/ns/uts /proc/self/ns/net /proc/self/ns/mnt</pre>
+<pre class="out">uts:[<b>4026532336</b>]
+net:[<b>4026532339</b>]
+mnt:[4026531841]
+uts:[<b>4026531838</b>]
+net:[<b>4026531840</b>]
+mnt:[4026531841]</pre>
+<p>Two differ, one matches — it unshared <code>uts</code> and <code>net</code> and kept the host's mount namespace, which is exactly what the command asked for.</p></li>
+<li>Enter by fd from a program of your own. Write this file; it is about fifteen lines and it is the entire mechanism.
+<pre class="cmd">cat &gt; ~/enter.py &lt;&lt;'PY'
+import ctypes, os, sys
+TYPES = {"mnt": 0x00020000, "uts": 0x04000000, "pid": 0x20000000, "net": 0x40000000}
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+target, wanted = sys.argv[1], sys.argv[2].split(",")
+for t in wanted:
+    path = f"/proc/{target}/ns/{t}"
+    fd = os.open(path, os.O_RDONLY)
+    print(f"  open({path}) = fd {fd}  -&gt; {os.readlink(path)}")
+    if libc.setns(fd, TYPES[t]) != 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()), path)
+    print(f"  setns(fd {fd}, CLONE_NEW{t.upper()}) = 0")
+    os.close(fd)
+print("--- now running inside those namespaces ---")
+os.execvp(sys.argv[3], sys.argv[3:])
+PY
+sudo python3 ~/enter.py $T uts,net hostname</pre>
+<pre class="out">  open(/proc/23625/ns/uts) = fd 3  -&gt; uts:[4026532336]
+  setns(fd 3, CLONE_NEWUTS) = 0
+  open(/proc/23625/ns/net) = fd 3  -&gt; net:[4026532339]
+  setns(fd 3, CLONE_NEWNET) = 0
+--- now running inside those namespaces ---
+<b>minibox</b></pre></li>
+<li>Now watch the real tool do the identical thing, so you know the lesson is not a simplification.
+<pre class="cmd">sudo strace -f -e trace=openat,setns nsenter -t $T -u -n hostname 2&gt;&amp;1 \
+  | grep -E 'ns/(uts|net)|setns|minibox'</pre>
+<pre class="out">openat(AT_FDCWD, "/proc/23625/ns/uts", O_RDONLY) = 3
+openat(AT_FDCWD, "/proc/23625/ns/net", O_RDONLY) = 4
+<b>setns(3, CLONE_NEWUTS)                  = 0
+setns(4, CLONE_NEWNET)                  = 0</b>
+minibox</pre>
+<p>Two opens, two <code>setns</code> calls, in the same order. <code>nsenter</code> keeps both descriptors open at once rather than reusing fd 3; that is the only difference.</p>
+<pre class="cmd">sudo kill $T</pre></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>readlink /proc/&lt;pid&gt;/ns/net</code> prints matching inode numbers for two processes you believe share a network namespace, and different ones for two you believe do not. Your <code>enter.py</code> prints a hostname belonging to the target, not to the host.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p><code>setns</code> into a <strong>PID namespace</strong> does not move the calling process — it only affects the children it forks afterwards. That is why <code>/proc/&lt;pid&gt;/ns/pid_for_children</code> exists as a separate link, and why <code>nsenter -p</code> without <code>-f</code> sometimes appears to do nothing. A process's own pid cannot change underneath it, so the kernel does not try.</p>
+<p>Order matters when you join several at once. Join the mount namespace first and the <code>/proc</code> you were about to read from is a different <code>/proc</code>; join the user namespace last and you may no longer have the capability to join the rest. <code>nsenter</code> has a fixed, carefully chosen order — if you write your own, copy it rather than inventing one.</p>
+<p>The fd must be opened by a process that can see the target's <code>/proc</code> entry. Inside a PID namespace where the target is invisible, there is no path to open, and the failure is <code>ENOENT</code> rather than <code>EPERM</code> — which sends people looking for a permissions problem that is not there.</p>
+<div class="k8s-link">
+<p>This is the mechanism under <code>kubectl exec</code>, end to end. The apiserver streams to the kubelet, the kubelet asks the runtime over CRI (<a href="i8.html">I8</a>) for an exec, and the runtime creates a process that <code>setns</code>es into the target container's namespaces — one <code>open</code> and one <code>setns</code> per type, exactly as above. Nothing crosses a machine boundary except the stream.</p>
+<p>It is also what an <strong>ephemeral debug container</strong> does with <code>shareProcessNamespace</code> or <code>kubectl debug --target</code>: join the target's PID and network namespaces, keep your own mount namespace, and you have your tools plus their view. See <a href="w6.html#cp-6-6">W6.6 — debugging a pod that has no shell</a>, which is the practical form of everything on this page.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 2 setns</code> — the <em>Description</em> section lists which namespace types have which restrictions. <code>man 2 unshare</code> and <code>man 2 clone</code> (search for <code>clone3</code>) for the other two mechanisms. <code>man 1 nsenter</code>, whose options map one-to-one onto the <code>CLONE_NEW*</code> flags. <code>man 7 namespaces</code> for the <code>/proc/&lt;pid&gt;/ns/</code> layout including <code>pid_for_children</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i1-4" data-id="i1-4">
+<div class="lesson-head"><span class="cp-id">I1.4</span><h4>Ubuntu 24.04's AppArmor wall, and the three honest ways past it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Two lessons ago a command failed, and the fix was "use <code>sudo</code>". That was a stopgap. This restriction is the single biggest obstacle to running rootless containers on a modern Ubuntu box, it is deliberate, it is a good idea, and the internet's standard advice about it — flip a sysctl — is the worst of the three available answers. It deserves an explanation rather than a workaround.</p>
+<h5>The concept</h5>
+<p>Unprivileged user namespaces have been an unusually rich source of kernel privilege escalations. The reason is structural rather than accidental: creating one hands an ordinary user <code>CAP_SYS_ADMIN</code> <em>inside</em> the namespace, and a great deal of kernel code that was written on the assumption "only root reaches this" is suddenly reachable — mount option parsing, netfilter, filesystem drivers, and every obscure ioctl behind them. The isolation boundary holds; the bugs are in the newly-exposed surface behind it.</p>
+<p>Ubuntu's answer was not to disable the feature. It was to <strong>gate the capabilities</strong>, using AppArmor. When an unconfined process creates a user namespace, the kernel transitions it into a stock profile called <code>unprivileged_userns</code>, and that profile's first line is the whole mitigation:</p>
+<pre class="out">profile unprivileged_userns {
+     <b>audit deny capability,</b>
+     audit deny change_profile,
+     allow network,
+     allow signal,
+     ...
+     allow userns,
+}</pre>
+<p>Read that carefully, because it is not what most write-ups describe. The namespace is <strong>created successfully</strong> — <code>allow userns</code> is right there. What is denied is <em>capability</em>: the process inside gets an empty effective set. So the classic claim "you get full capabilities inside your own user namespace" is simply not true on stock 24.04, and the symptoms are downstream of that: <code>unshare --map-root-user</code> fails at the <code>uid_map</code> write, <code>setpriv --reuid 0</code> fails at <code>setresuid</code>, mounting fails, and none of the error messages mention AppArmor.</p>
+<p>Three responses exist, and they are genuinely different in what they cost:</p>
+<table>
+<tr><th>Response</th><th>What it changes</th><th>Cost</th></tr>
+<tr><td><strong>A named AppArmor profile</strong> with <code>userns,</code></td><td>one program, by path, gets real capabilities in its own namespaces</td><td>a file in <code>/etc/apparmor.d/</code> and a reload; <strong>this is the right answer</strong></td></tr>
+<tr><td><code>sysctl kernel.apparmor_restrict_unprivileged_userns=0</code></td><td>removes the mitigation for <em>every process on the machine</em></td><td>fine on a VM you will throw away; never on a node</td></tr>
+<tr><td>Accept it and use <code>sudo</code></td><td>nothing</td><td>you are no longer studying rootless containers, you are studying containers</td></tr>
+</table>
+<p>The profile route wins because it is the one that scales: it is what a packaged application ships, it names a single binary, and everything else on the box stays denied. The sysctl route is the one to understand precisely so you can recognise it in someone else's install script and object.</p>
+<h5>Lab</h5>
+<ol>
+<li>Confirm the sysctl and read the profile Ubuntu ships. Seeing the source is what makes the rest of this lesson stop being folklore.
+<pre class="cmd">sysctl kernel.apparmor_restrict_unprivileged_userns
+sed -n '1,12p' /etc/apparmor.d/unprivileged_userns</pre>
+<pre class="out">kernel.apparmor_restrict_unprivileged_userns = <b>1</b>
+# Special profile transitioned to by unconfined when creating an unprivileged
+# user namespace.
+abi &lt;abi/4.0&gt;,
+include &lt;tunables/global&gt;
+
+profile unprivileged_userns {
+     <b>audit deny capability,</b>
+     audit deny change_profile,</pre></li>
+<li>Watch the denial happen in the audit log, which is the only place it is named. Run the failing command, then read the kernel ring buffer.
+<pre class="cmd">unshare --user --map-root-user bash -c id
+sudo dmesg | tail -2</pre>
+<pre class="out">unshare: write failed /proc/self/uid_map: Operation not permitted
+apparmor="AUDIT" operation="<b>userns_create</b>" class="namespace" info="Userns create -
+  transitioning profile" profile="unconfined" pid=20943 comm="unshare"
+  requested="userns_create" target="<b>unprivileged_userns</b>"
+apparmor="<b>DENIED</b>" operation="capable" class="cap" profile="unprivileged_userns"
+  pid=20943 comm="unshare" capability=21  capname="<b>sys_admin</b>"</pre>
+<p>Two lines: the transition, then the denial. If you remember one diagnostic from this lesson, make it "<code>dmesg | grep apparmor</code> after a permission error that makes no sense".</p></li>
+<li>Response A — the good one. Write a profile for a single wrapper script, so exactly one path is exempt.
+<pre class="cmd">mkdir -p ~/bin
+printf '#!/bin/bash\nexec unshare --user --map-root-user "$@"\n' &gt; ~/bin/rootless-lab
+chmod +x ~/bin/rootless-lab
+sudo tee /etc/apparmor.d/rootless-lab &gt;/dev/null &lt;&lt;'AA'
+abi &lt;abi/4.0&gt;,
+include &lt;tunables/global&gt;
+
+profile rootless-lab /home/ubuntu/bin/rootless-lab flags=(unconfined) {
+  userns,
+  include if exists &lt;local/rootless-lab&gt;
+}
+AA
+sudo apparmor_parser -r /etc/apparmor.d/rootless-lab</pre>
+<p>The profile is <code>flags=(unconfined)</code> — it confines nothing — and grants exactly one permission, <code>userns</code>. That is the minimum that undoes the restriction for this binary and nothing else.</p></li>
+<li>Prove it works, and prove it is narrow.
+<pre class="cmd">~/bin/rootless-lab bash -c \
+  'id; grep CapEff /proc/self/status; echo "profile: $(cat /proc/self/attr/current)"'
+echo '--- the same command by any other path ---'
+unshare --user --map-root-user id</pre>
+<pre class="out">uid=<b>0(root)</b> gid=0(root) groups=0(root),65534(nogroup)
+CapEff:	<b>000001ffffffffff</b>
+profile: <b>rootless-lab (unconfined)</b>
+--- the same command by any other path ---
+unshare: write failed /proc/self/uid_map: <b>Operation not permitted</b></pre>
+<p>One binary exempted, the machine-wide mitigation untouched. Confirm that last part:</p>
+<pre class="cmd">sysctl -n kernel.apparmor_restrict_unprivileged_userns</pre>
+<pre class="out"><b>1</b></pre></li>
+<li>Response B, for comparison only — and put it back immediately. This is what the internet tells you to do.
+<pre class="cmd">sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+unshare --user --map-root-user bash -c 'id; grep CapEff /proc/self/status'
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1</pre>
+<pre class="out">uid=0(root) gid=0(root) groups=0(root),65534(nogroup)
+CapEff:	000001ffffffffff</pre>
+<p>Identical result to the profile — for <em>every process on the machine</em>, including anything that has just been downloaded and run. That is the difference, and it does not show up in the output.</p></li>
+</ol>
+<h5 class="verify">Verify</h5>
+<p><code>~/bin/rootless-lab id</code> prints <code>uid=0(root)</code> with a full <code>CapEff</code>, while a bare <code>unshare --user --map-root-user</code> still fails, and <code>sysctl -n kernel.apparmor_restrict_unprivileged_userns</code> still prints <code>1</code>. All three at once is the state you want for <a href="#cp-i1-13">I1.13</a>.</p>
+<h5 class="gotcha">Gotchas</h5>
+<p>The profile matches by <strong>absolute path</strong>, so it must name the real location of the binary, and moving or reinstalling the file silently un-exempts it. That is a feature — a path-based rule cannot be inherited by an attacker's copy — but it means "it worked yesterday" after a package upgrade is a real failure mode. <code>aa-status | grep rootless</code> tells you whether the profile is loaded; <code>cat /proc/self/attr/current</code> from inside tells you whether it applied.</p>
+<p>Do not carry the sysctl to a Kubernetes node. Nodes run arbitrary workloads by definition, which is precisely the population the mitigation exists for; turning it off there is a straightforward reduction in the node's defence against container escapes, made globally, to fix one program's problem.</p>
+<p>Other distributions differ, and the difference is not cosmetic. Debian and Fedora do not ship this restriction, so the same lab needs no profile there; older Ubuntu used <code>kernel.unprivileged_userns_clone</code>, a <em>different</em> sysctl that blocks namespace creation outright rather than gating capabilities. Reading advice for one and applying it to the other produces a fix that does nothing.</p>
+<div class="k8s-link">
+<p>Kubernetes has the same argument at a different altitude: whether a workload may do privileged things, and how narrowly you can grant it. The kubelet does not use AppArmor to gate user namespaces — it allocates ID ranges itself and asks the runtime — but a node running rootless-capable workloads has to make exactly this decision about which processes may create namespaces with real capabilities.</p>
+<p>The advanced track has no <code>securityContext</code>, Pod Security Standards or AppArmor-annotation coverage, because none of it is on the CKA. Do not go looking for an anchor. What is there is the node-level view: <a href="w1.html#cp-1-2">W1.2 — what runs privileged on a node</a> and <a href="w6.html#cp-6-12">W6.12 — node Conditions</a>, which is where a node whose security posture you have just changed starts telling you about it.</p>
+</div>
+<h5>Docs</h5>
+<p class="docs-links"><code>man 5 apparmor.d</code> for the profile syntax, particularly the <em>Rules</em> section covering <code>userns</code>; <code>man 8 apparmor_parser</code> for <code>-r</code>. Ubuntu's own write-up lives at <a href="https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces">ubuntu.com — restricted unprivileged user namespaces</a> and is worth reading once for the threat model. Then <code>man 7 user_namespaces</code>, <em>Security</em> section, for why anyone thought this was necessary.</p>
+</article>
+</div>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
