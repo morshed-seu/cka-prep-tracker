@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Intermediate module I3: runc internals — the three-stage nsexec dance that creates a container, the _LIBCONTAINER handshake, why runc exits, detached mode and pid files, console sockets, state on disk, hooks, and checkpoint/restore.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔧</text></svg>">
+<title>I3 · runc internals — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I3 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Intermediate tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · Missing primitives</a></li>
+    <li><a href="i2.html">I2 · The runtime spec</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i3">← Back to the intermediate tracker</a></p>
+<header class="hero">
+  <h1>I3 — runc internals</h1>
+  <p><a href="i2.html">I2</a> told you what a container <em>is</em>: a directory with a <code>config.json</code> in it, and a specification saying what any runtime must do when handed one. This module is about the runtime doing it. Not the abstract "a runtime applies the config" of the last module — the actual sequence of system calls, in order, with the reasons each one has to come where it does.</p>
+  <p>The centre of the module is a surprise that catches nearly everyone. <strong><code>runc</code> does not stay running.</strong> It builds the container and then exits, leaving your workload re-parented to PID&nbsp;1 with nobody watching it. That is not a bug and it is not laziness; it is a deliberate design choice, and it is the reason an entire category of software — <em>shims</em> — exists at all. By the end of this module you will have written one, in about sixty lines of Python, and you will understand exactly what job you were filling.</p>
+  <p>Along the way you will trace the three-process dance that makes a container, read the private environment-variable handshake the two halves of runc use to talk to each other, find the file that a daemonless runtime uses as its memory, and hand-build the exact invocation pattern that <a href="../beginner.html#b9">CNI</a> will standardise in I9.</p>
+  <div class="weights">
+    <span>Checkpoints<b>14</b></span>
+    <span>Hours<b>~5</b></span>
+    <span>Prerequisites<b>I2, B2, B6, B9</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Trace <code>runc create</code> to the moment it re-executes itself, and explain why a runtime must run a second copy of itself rather than just calling <code>unshare</code>.</li>
+<li>Read the <code>_LIBCONTAINER_*</code> handshake and name what each file descriptor it passes is for.</li>
+<li>State the order of operations a container is built in, verify each step in <code>/proc</code>, and explain why the order is forced rather than arbitrary.</li>
+<li>Explain what <code>create</code> leaves behind that <code>start</code> completes, and prove it is the same process either side of the line.</li>
+<li>Compare foreground and detached runtimes, and find who a detached container's parent has become.</li>
+<li>Use <code>--pid-file</code>, and demonstrate the race a supervisor loses without it.</li>
+<li>Attach a real terminal to a detached container with a console socket, receiving the pty master over a unix socket.</li>
+<li>Work <code>runc exec</code>, <code>ps</code>, <code>events</code> and <code>update</code>, and say which namespaces <code>exec</code> re-enters.</li>
+<li>Read <code>/run/runc/&lt;id&gt;/state.json</code> and answer what a container is when nothing is running.</li>
+<li>Manufacture and correctly repair <code>container with given ID already exists</code>.</li>
+<li>Write a <code>createRuntime</code> hook that configures networking from outside the container — CNI's pattern, by hand.</li>
+<li>Describe checkpoint/restore's shape, its requirements, and the one Kubernetes feature built on it.</li>
+<li>Write a working shim, and state precisely what it does that <code>runc</code> refuses to.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><a href="i2.html">I2</a> is not optional here — every lab below starts from a bundle you know how to read. From the beginner track you want <a href="b2.html">B2</a> (processes, re-parenting, signals), <a href="b6.html">B6</a> (namespaces, <code>pivot_root</code>) and <a href="b9.html">B9</a> (unix-domain sockets and file-descriptor passing, which the console socket is a direct application of). None of it is re-taught.</p>
+<p><strong>Which machine.</strong> The same throwaway Ubuntu 24.04 VM you used for I2 — no registry access is needed on this page, so nothing here justifies a new box. Output below was captured on kernel <b>6.8.0</b> with <b>runc 1.5.1</b>. Everything runs as root.</p>
+<p><strong>Build the module's bundle first.</strong> One long-lived container is enough for most of the page; lessons that need a different one say so.</p>
+<pre class="cmd">mkdir -p ~/i3/box/rootfs &amp;&amp; cd ~/i3/box
+sudo tar -C rootfs -xzf ~/i2/alpine-minirootfs-3.22.5-x86_64.tar.gz
+sudo runc spec
+sudo jq '.process.args = ["sleep","1000"] | .process.terminal = false' \
+  config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json config.json</pre>
+</div>
+
+<!-- ---------------- Creation, step by step ---------------- -->
+<div class="grp" id="g-create"><h3>Creation, step by step</h3>
+
+<article class="lesson" id="cp-i3-1" data-id="i3-1">
+<div class="lesson-head"><span class="cp-id">I3.1</span><h4>The runtime runs a second copy of itself</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>There is a puzzle hidden in every container runtime, and it is worth stating before you see the answer. A runtime has to put your program inside a set of brand-new namespaces. But <code>unshare()</code> changes the namespaces of <em>the process that calls it</em> — so if <code>runc</code> called <code>unshare</code> directly, <code>runc</code> itself would end up inside the container it was building. It would be trapped in the thing it made. Every runtime has to solve this, and watching runc solve it explains a process tree that otherwise looks bizarre.</p>
+
+<h5>The concept</h5>
+<p>The answer is that <code>runc</code> splits itself in two. The copy you invoked stays outside and stays in charge; it spawns a second copy of the runc binary, told to run as <code>runc init</code>, and <em>that</em> copy is the one that gets buried under namespaces, mounts and capability drops until nothing of it is left but your program. In the track's analogy: the contractor does not move into the building. They send an apprentice in, brick up the door behind them, and the apprentice becomes the tenant.</p>
+<p>Even that is a simplification. runc actually uses <strong>three</strong> processes, and they have names in runc's own debug output — <em>stage&nbsp;0</em>, <em>stage&nbsp;1</em> and <em>stage&nbsp;2</em> — belonging to a C routine called <code>nsexec</code> that runs before Go's runtime even starts. The reason for the third one is precise and worth internalising, because it is a property of the kernel and not of runc: <strong><code>unshare(CLONE_NEWPID)</code> does not move the caller into the new PID namespace.</strong> It only arranges that the caller's <em>next children</em> are born in it. So stage&nbsp;1 unshares, and then must <code>clone()</code> once more to produce stage&nbsp;2 — the process that is actually PID&nbsp;1 inside. There is no way to skip that step.</p>
+<div class="flow"><span>stage 0<br><em>runc init</em></span><em>→</em><span>stage 1<br><em>unshares</em></span><em>→</em><span>stage 2<br><em>PID 1 inside</em></span><em>→</em><span>your program</span></div>
+<p>One more detail hides in the <code>execve</code> you are about to see, and it is a security fix with a CVE behind it. runc does not re-execute itself by <em>path</em> — it re-executes a <strong>file descriptor</strong>. If it ran <code>/usr/local/sbin/runc</code> by name, a malicious container image could arrange for that path to resolve to something else by the time it was used, and get its own code run with the host's privileges. Instead runc makes a sealed, read-only clone of its own binary and execs the fd; the container never gets a path it could tamper with.</p>
+
+<div class="specref">
+<p>Notice what the specification has to say about any of this:</p>
+<blockquote>This operation MUST create a new container. All of the properties configured in <code>config.json</code> except for <code>process</code> MUST be applied.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "Create"</cite>
+<p>That is the whole requirement. Three processes, <code>nsexec</code>, stage numbering, sealed binaries — <strong>none of it is specified</strong>, and none of it has to be. The spec constrains the observable result; everything on this page is runc's private business, which is exactly why <code>crun</code> can reach the same result with completely different code. Remember that when something here surprises you: you are reading an implementation, not a standard.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Trace the creation with <code>strace</code>, restricted to the handful of calls that actually build a container. One warning first, because it will bite you: <code>strace -f</code> waits for every process it follows, and <code>runc create</code> deliberately <em>leaves one alive</em>. So strace will not return on its own — wrap it in <code>timeout</code>.
+<pre class="cmd">cd ~/i3/box
+sudo timeout -s KILL 25 strace -f -o /tmp/s1.trace \
+  -e trace=clone,clone3,unshare,setns,mount,pivot_root,execve \
+  runc create s1 &lt; /dev/null
+sudo runc list</pre>
+<pre class="out">Killed
+ID   PID     STATUS     BUNDLE                CREATED
+s1   31593   <b>created</b>    /home/ubuntu/i3/box   2026-07-27T14:02:45Z</pre>
+<p><code>Killed</code> is strace being timed out, not a failure — the container was created successfully, which is what <code>runc list</code> confirms.</p></li>
+
+<li>Find the re-execution. This is the single most important line in the trace.
+<pre class="cmd">sudo grep -E 'execve|unshare' /tmp/s1.trace</pre>
+<pre class="out">31583 execve("/usr/local/sbin/runc", ["runc", "create", "s1"], … ) = 0
+31591 execve(<b>"/proc/self/fd/6"</b>, [<b>"runc", "init"</b>], 0xc0000a80c0 /* 7 vars */) = 0
+31592 <b>unshare(CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWPID|CLONE_NEWNET)</b> = 0</pre>
+<p>Three things at once. The binary re-executed itself as <code>runc init</code>; it did so from <code>/proc/self/fd/6</code> rather than from a path; and <em>all six namespaces are unshared in a single call</em> by a different process from the one that exec'd.</p></li>
+
+<li>Read the process tree out of the trace. Follow the PIDs, not the order of lines.
+<pre class="cmd">sudo grep -E 'clone\(child_stack|unshare' /tmp/s1.trace</pre>
+<pre class="out">31583 clone(…, flags=CLONE_VM|CLONE_PIDFD|CLONE_VFORK|SIGCHLD)   = <b>31591</b>
+31591 clone(child_stack=…, flags=<b>CLONE_PARENT</b>|SIGCHLD)          = <b>31592</b>
+31592 unshare(CLONE_NEWNS|…|CLONE_NEWPID|CLONE_NEWNET)           = 0
+31592 clone(child_stack=…, flags=<b>CLONE_PARENT</b>|SIGCHLD)          = <b>31593</b></pre>
+<p><code>31583</code> is the <code>runc create</code> you typed. <code>31591</code> is stage&nbsp;0, the re-exec'd <code>runc init</code>. <code>31592</code> is stage&nbsp;1, which does the unsharing. <code>31593</code> is stage&nbsp;2 — the container's PID&nbsp;1, and the number <code>runc list</code> reported. Note <code>CLONE_PARENT</code> on both clones: each new stage is made a sibling rather than a child, so that when the intermediate stages exit, stage&nbsp;2 is left parented to the original <code>runc</code> rather than orphaned mid-setup.</p></li>
+
+<li>Now get runc to narrate the same thing in its own words. This is far easier to read than the trace, and it is the tool to reach for when something goes wrong.
+<pre class="cmd">sudo runc delete --force s1
+sudo setsid runc --debug create s1 &lt; /dev/null &gt; /tmp/dbg.out 2&gt;&amp;1
+sudo grep -E 'exeseal|nsexec-[012]' /tmp/dbg.out | head -14</pre>
+<pre class="out">msg="runc exeseal: <b>using overlayfs for sealed /proc/self/exe</b>"
+msg="runc exeseal: using /proc/self/exe clone"
+msg="nsexec-0[33659]: ~&gt; nsexec stage-0"
+msg="nsexec-0[33659]: spawn stage-1"
+msg="nsexec-1[33660]: ~&gt; nsexec stage-1"
+msg="nsexec-1[33660]: <b>unshare remaining namespaces</b>"
+msg="nsexec-1[33660]: spawn stage-2"
+msg="nsexec-1[33660]: request stage-0 to forward stage-2 pid (33661)"
+msg="nsexec-2[<b>1</b>]: ~&gt; nsexec stage-2"</pre>
+<p>Two payoffs. <code>exeseal</code> is the sealed-binary machinery from the concept above, telling you which of its three methods it managed to use. And look at stage&nbsp;2's bracketed PID: <b>1</b>. It is already reporting its own PID from inside the new namespace, so you can see the exact line at which the container's inside and outside stop agreeing about numbers.</p></li>
+
+<li>Confirm the sealed binary is a real, unnameable copy rather than the file on disk.
+<pre class="cmd">P=$(sudo runc state s1 | jq -r .pid)
+sudo readlink /proc/$P/fd/6
+sudo stat -Lc 'dev=%d ino=%i size=%s' /proc/$P/fd/6
+sudo stat -c  'dev=%d ino=%i size=%s' /usr/local/sbin/runc</pre>
+<pre class="out">/runc
+dev=<b>53</b>    ino=8443 size=11437312
+dev=<b>2049</b>  ino=8443 size=11437312</pre>
+<p>Same inode and same size — it is unmistakably runc — but on a <em>different device</em>, because it is being served from an overlay mount that exists only for this purpose. The name <code>/runc</code> resolves to nothing the container can reach.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can point at the exact <code>execve</code> line where one process became two, name all three stages by PID from the trace, and say — without looking it up — why stage&nbsp;1 could not simply have become the container itself.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>strace -f</code> on <code>runc create</code> hangs, and it is not a mistake.</strong> The whole point of <code>create</code> is that it leaves a process alive and waiting. strace has nothing to report and will not exit; always use <code>timeout</code>. This trips people up badly the first time, because "the trace hung" reads like "the runtime hung".</li>
+<li><strong>You will not see the container's own program exec'd in this trace</strong> — no <code>/bin/sleep</code>, nothing from <code>process.args</code>. That is not strace losing it. <code>create</code> genuinely stops before that point, which is I3.5's subject.</li>
+<li><strong><code>runc init</code> is not a command you run.</strong> If you find it in a process list it is a container mid-setup, or one parked between <code>create</code> and <code>start</code>. Typing it yourself gets you an error about a missing init pipe, because it is only meaningful with the handshake I3.2 covers.</li>
+<li><strong>The exeseal method varies by machine.</strong> Overlayfs is preferred, <code>memfd_create</code> is next, and a temporary file is the last resort — the debug log names which one it took. If you are on a box with <code>vm.memfd_noexec=2</code> or no overlayfs, expect a different line there and do not read it as a fault.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The three-stage dance is invisible from Kubernetes, but its consequence is not. When a pod is stuck and <code>crictl inspect</code> shows a container created but not running, the process you would find on the node is exactly the stage-2 <code>runc init</code> above, waiting. And the sealed-binary machinery is the fix for <strong>CVE-2019-5736</strong>, a container-escape that worked precisely by overwriting the runtime binary through <code>/proc/self/exe</code> — worth knowing when a scanner flags a node's runc version. Where the runtime sits in the stack is <a href="w1.html#cp-1-20">W1.20, kubelet → containerd → shim → runc</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <a href="https://github.com/opencontainers/runc/blob/main/libcontainer/nsexec.c">runc's <code>nsexec.c</code></a> — the C source for all three stages, unusually well commented; <code>man 2 unshare</code> for the <code>CLONE_NEWPID</code> caveat, which the man page states explicitly and almost everyone misses.</p>
+</article>
+
+<article class="lesson" id="cp-i3-2" data-id="i3-2">
+<div class="lesson-head"><span class="cp-id">I3.2</span><h4>The private handshake between the two halves</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Once you know a runtime splits itself in two, an obvious question follows: how does the half that stays outside tell the half that is being buried what to do? It cannot use command-line arguments — you saw the exec, and the arguments were just <code>runc init</code>, nothing more. It cannot use a config file, because the inside half is about to lose access to the filesystem the config lives on. The answer is a small, private, entirely undocumented protocol, and reading it turns the runtime from a black box into a program.</p>
+
+<h5>The concept</h5>
+<p>The channel is set up before the exec, using the two things that survive it: <strong>open file descriptors</strong> and <strong>environment variables</strong>. File descriptors stay open across <code>execve</code> unless explicitly marked close-on-exec, so the outer half opens the pipes it needs, and then uses environment variables to tell the inner half <em>which numbers they landed on</em>. That is all the <code>_LIBCONTAINER_*</code> variables are: a directory of fd numbers.</p>
+<p>The leading underscore is a convention meaning "internal, do not depend on this". These names are not in any specification, they are not in runc's man pages, and they can change between releases. They are still worth knowing, because they appear in every strace of every container start on earth.</p>
+<table class="langpair"><thead><tr><th>variable</th><th>what is on the other end</th></tr></thead><tbody>
+<tr><td><code>_LIBCONTAINER_INITPIPE</code></td><td>The main channel — a <strong>socketpair</strong>, not a pipe, because the protocol needs to pass file descriptors as well as bytes. The outer half writes the <em>bootstrap message</em> down it.</td></tr>
+<tr><td><code>_LIBCONTAINER_SYNCPIPE</code></td><td>The step-by-step synchronisation channel used after bootstrap, so each side can block until the other has finished a stage.</td></tr>
+<tr><td><code>_LIBCONTAINER_LOGPIPE</code></td><td>How the inner half gets log lines out. Without it, errors raised after the mount namespace is swapped would have nowhere to go.</td></tr>
+<tr><td><code>_LIBCONTAINER_FIFOFD</code></td><td>An open fd on <code>exec.fifo</code> — the thing that makes <code>create</code> stop before running your program. I3.5's subject, and the single most load-bearing fd here.</td></tr>
+<tr><td><code>_LIBCONTAINER_INITTYPE</code></td><td><code>standard</code> for a new container, <code>setns</code> for <code>runc exec</code> joining an existing one. One binary, two jobs.</td></tr>
+</tbody></table>
+<p>The bootstrap message itself is <strong>netlink-formatted</strong> — the same length-type-value encoding the kernel uses for <code>ip</code> commands, reused here purely as a convenient binary format between two userspace processes. It carries the namespaces to create or join, the UID/GID mappings, and the OOM score. It has to be a binary message rather than JSON because it is parsed by <code>nsexec</code>'s C code, which runs before Go exists in the process.</p>
+
+<div class="specref">
+<p>The specification describes exactly one thing a runtime must communicate, and it is not any of this:</p>
+<blockquote><code>pid</code> (int, REQUIRED when <code>status</code> is <code>created</code> or <code>running</code> on Linux) is the ID of the container process.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "State"</cite>
+<p>Everything in this lesson is beneath that line. The spec cares that a PID comes out; how the runtime's halves negotiated it is left entirely alone. This is a good habit to build now: when you meet a runtime behaviour, ask first whether it is <em>required</em>, <em>permitted</em>, or <em>merely what this one does</em> — the three have very different implications when you are debugging a mixed cluster.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>strace does not print environments by default. Add <code>-v</code> and you get the whole handshake in one line.
+<pre class="cmd">sudo runc delete --force s2 2&gt;/dev/null
+sudo timeout -s KILL 25 strace -f -v -s 200 -o /tmp/s2.trace \
+  -e trace=execve runc create s2 &lt; /dev/null
+sudo grep 'runc", "init' /tmp/s2.trace</pre>
+<pre class="out">31851 execve("/proc/self/fd/6", ["runc", "init"], ["GOMAXPROCS=",
+  <b>"_LIBCONTAINER_INITPIPE=3"</b>, <b>"_LIBCONTAINER_SYNCPIPE=4"</b>,
+  <b>"_LIBCONTAINER_LOGPIPE=5"</b>,  "_LIBCONTAINER_LOGLEVEL=4",
+  <b>"_LIBCONTAINER_FIFOFD=7"</b>,   <b>"_LIBCONTAINER_INITTYPE=standard"</b>]) = 0</pre>
+<p>Seven variables, and the container's own environment is <em>not</em> among them — <code>process.env</code> from the config is delivered later, over the init pipe, not through this exec.</p></li>
+
+<li>Verify the numbers are real by looking at the surviving process's open files. Every variable above should point at something you can identify.
+<pre class="cmd">P=$(sudo runc state s2 | jq -r .pid)
+sudo ls -l /proc/$P/fd</pre>
+<pre class="out">0 -&gt; /dev/null
+1 -&gt; /tmp/s2.out
+2 -&gt; /tmp/s2.out
+3 -&gt; <b>socket:[114982]</b>
+4 -&gt; <b>/run/runc/s2/exec.fifo</b>
+6 -&gt; /runc
+7 -&gt; <b>/run/runc/s2/exec.fifo</b>
+9 -&gt; anon_inode:[eventpoll]</pre>
+<p>fd&nbsp;3 is a <code>socket:</code>, confirming the init pipe is a socketpair rather than an ordinary pipe — which is what lets it carry file descriptors. And there is <code>exec.fifo</code>, on the fd number the handshake announced. Hold that thought until I3.5.</p></li>
+
+<li>Confirm the claim about <code>INITTYPE</code> by watching what a <em>second</em> kind of init looks like. Leave the container running and exec into it.
+<pre class="cmd">sudo runc start s2
+sudo timeout -s KILL 15 strace -f -v -s 120 -o /tmp/s3.trace \
+  -e trace=execve runc exec s2 /bin/true
+sudo grep -o '_LIBCONTAINER_INITTYPE=[a-z]*' /tmp/s3.trace | sort -u</pre>
+<pre class="out">_LIBCONTAINER_INITTYPE=<b>setns</b></pre>
+<p>The same binary, re-exec'd the same way, told by one environment variable to join namespaces instead of creating them. That is the whole difference between starting a container and <code>kubectl exec</code>-ing into one.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name what is on the other end of every <code>_LIBCONTAINER_*</code> fd, explain from evidence why the init pipe must be a socket rather than a pipe, and say what changes between <code>INITTYPE=standard</code> and <code>INITTYPE=setns</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Without <code>-v</code>, strace hides all of this.</strong> The default output shows <code>0xc0000a80c0 /* 7 vars */</code> and moves on. People conclude the exec carries no information and go looking for a config file that does not exist.</li>
+<li><strong>Do not build anything on these variable names.</strong> They are private, they have changed before, and the older write-ups you will find describe a slightly different set (<code>_LIBCONTAINER_STATEDIR</code> and <code>_LIBCONTAINER_CONSOLE</code> appear in material written against runc 1.0 and are simply absent in 1.5.1). Read them as diagnostics, never as an interface.</li>
+<li><strong>An fd number in the environment is meaningless outside that process.</strong> <code>_LIBCONTAINER_INITPIPE=3</code> is only true for the one child it was exported to. Reading it from anywhere else and opening fd 3 gets you something unrelated.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You will see these variables again the first time you strace a stuck pod on a node, and their presence is diagnostic: a <code>runc init</code> process holding <code>_LIBCONTAINER_FIFOFD</code> is a container that was created and never started, which usually means the thing that should have called <code>start</code> — the shim, or the CNI plugin ahead of it — is what is actually wedged. That is a very different investigation from "the application won't boot", and it is the practical payoff for reading a handshake nobody documents. Pod-startup failure modes are catalogued in <a href="w6.html#cp-6-16">W6.16</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 execve</code> on which file descriptors survive an exec (the <code>FD_CLOEXEC</code> rule this whole design rests on); <code>man 7 netlink</code> for the message format the bootstrap data borrows; and <a href="https://github.com/opencontainers/runc/blob/main/libcontainer/message_linux.go">runc's <code>message_linux.go</code></a> for the bootstrap message's actual fields.</p>
+</article>
+
+<article class="lesson" id="cp-i3-3" data-id="i3-3">
+<div class="lesson-head"><span class="cp-id">I3.3</span><h4>The order of operations, verified in <code>/proc</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A container is not created by one action but by a sequence of them, and the sequence is fixed. Knowing it converts a large class of mysterious failures into obvious ones: if you know that mounts happen after the namespaces and before the capability drop, then "my mount failed with EPERM" and "my mount succeeded but the file isn't there" become questions with different answers. This lesson establishes the sequence and — more usefully — teaches you to confirm it yourself rather than trusting a list.</p>
+
+<h5>The concept</h5>
+<p>The order, as runc performs it:</p>
+<div class="flow"><span>namespaces</span><em>→</em><span>cgroup</span><em>→</em><span>mounts</span><em>→</em><span>pivot_root</span><em>→</em><span>capabilities</span><em>→</em><span>seccomp</span><em>→</em><span>execve</span></div>
+<p>Each of these leaves a trace somewhere in <code>/proc/&lt;pid&gt;/</code> that you can read from outside, which is what makes the sequence checkable rather than folklore:</p>
+<table class="langpair"><thead><tr><th>step</th><th>where it becomes visible</th></tr></thead><tbody>
+<tr><td>namespaces</td><td><code>/proc/&lt;pid&gt;/ns/*</code> — inode numbers differing from the host's</td></tr>
+<tr><td>cgroup</td><td><code>/proc/&lt;pid&gt;/cgroup</code>, and the pid appearing in that cgroup's <code>cgroup.procs</code></td></tr>
+<tr><td>mounts + <code>pivot_root</code></td><td><code>/proc/&lt;pid&gt;/mountinfo</code> — the entry whose mount point is <code>/</code></td></tr>
+<tr><td>capabilities</td><td><code>CapBnd</code>, <code>CapEff</code> and <code>CapPrm</code> in <code>/proc/&lt;pid&gt;/status</code></td></tr>
+<tr><td>seccomp</td><td><code>Seccomp</code> and <code>Seccomp_filters</code> in the same file</td></tr>
+<tr><td><code>execve</code></td><td><code>/proc/&lt;pid&gt;/cmdline</code> — your program's name replacing <code>runc init</code></td></tr>
+</tbody></table>
+<p>There is one very convenient property of <code>runc create</code> that makes this easy to check: it performs <em>every step except the last</em>, and then stops. So a created-but-not-started container is a container frozen one instruction before your program begins — you can walk down the table above at your leisure and find all six earlier steps already done.</p>
+
+<div class="specref">
+<p>The stopping point is not runc being helpful; it is required:</p>
+<blockquote>All of the properties configured in <code>config.json</code> except for <code>process</code> MUST be applied. <code>process.args</code> MUST NOT be applied until triggered by the <code>start</code> operation. The remaining <code>process</code> properties MAY be applied by this operation.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a>, "Create"</cite>
+<p>Read the last sentence carefully, because it is the source of a real portability trap. <code>process.args</code> is pinned to <code>start</code>, but everything else under <code>process</code> — capabilities, rlimits, the user — is <code>MAY</code>. runc applies them at <code>create</code>, as the lab below shows. A different runtime is entitled to defer them, and any tool that inspects a created container to see what it will be allowed to do is depending on behaviour the spec does not promise.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create without starting, and walk the table. Every line below reads a different piece of evidence for a different step.
+<pre class="cmd">cd ~/i3/box
+sudo runc delete --force s5 2&gt;/dev/null
+sudo setsid runc create s5 &lt; /dev/null &gt; /tmp/s5.out 2&gt;&amp;1
+P=$(sudo runc state s5 | jq -r .pid)
+
+printf 'namespaces : '; sudo readlink /proc/$P/ns/pid
+printf 'cgroup     : '; sudo cat /proc/$P/cgroup
+printf 'rootfs     : '; sudo awk '$5=="/" {print $4}' /proc/$P/mountinfo
+printf 'caps       : '; sudo awk '/^CapBnd/{print $2}' /proc/$P/status
+printf 'seccomp    : '; sudo awk '/^Seccomp:/{print $2}' /proc/$P/status
+printf 'program    : '; sudo tr '\0' ' ' &lt; /proc/$P/cmdline; echo</pre>
+<pre class="out">namespaces : pid:[4026532406]
+cgroup     : 0::/user.slice/user-1000.slice/s5
+rootfs     : /home/ubuntu/i3/box/rootfs
+caps       : 0000000020000420
+seccomp    : 0
+program    : <b>runc init</b></pre>
+<p>Five of six steps are already visible. A private PID namespace exists, a cgroup has been made and joined, the bundle's <code>rootfs</code> is mounted as this process's <code>/</code>, and the capability set has already been cut down. <code>Seccomp: 0</code> only because the default <code>runc spec</code> config has no seccomp section — add one and this reads <code>2</code>. The last line is the giveaway: the program is still <code>runc init</code>.</p></li>
+
+<li>Decode that capability mask rather than squinting at hex.
+<pre class="cmd">capsh --decode=0000000020000420</pre>
+<pre class="out">0x0000000020000420=<b>cap_kill,cap_net_bind_service,cap_audit_write</b></pre>
+<p>Three capabilities — the default <code>runc spec</code> set from <a href="i2.html#cp-i2-4">I2.4</a>. Crucially <code>CAP_SYS_ADMIN</code> is gone, and it is <code>CAP_SYS_ADMIN</code> that <code>mount</code> and <code>pivot_root</code> require. The mounts you just confirmed in <code>mountinfo</code> could not have been made by a process holding only this set, which is direct evidence that the drop came <em>after</em> the mounting.</p></li>
+
+<li>Now trigger the last step and watch exactly one thing change.
+<pre class="cmd">sudo runc start s5
+sleep 0.3
+printf 'program    : '; sudo tr '\0' ' ' &lt; /proc/$P/cmdline; echo
+printf 'namespaces : '; sudo readlink /proc/$P/ns/pid
+sudo runc list</pre>
+<pre class="out">program    : <b>sleep 1000</b>
+namespaces : pid:[4026532406]     <i># unchanged</i>
+ID   PID     STATUS     BUNDLE                CREATED
+s5   33759   <b>running</b>    /home/ubuntu/i3/box   2026-07-27T…</pre>
+<p><strong>Same PID, same namespace inode, different program.</strong> That is <code>execve</code> doing what <code>execve</code> does — replacing the program inside an existing process, keeping everything the process already held. It is the cleanest possible demonstration that all the container's isolation was built <em>around</em> a process before your code ever ran in it.</p></li>
+
+<li>Prove the capability claim from the other direction: ask the running container to mount something.
+<pre class="cmd">sudo runc exec s5 /bin/sh -c 'mount -t tmpfs none /mnt; echo rc=$?'</pre>
+<pre class="out">mount: <b>permission denied</b> (are you root?)
+rc=1</pre>
+<p>It is uid 0 and it still cannot mount, because the bounding set has no <code>CAP_SYS_ADMIN</code>. Root inside a container is exactly the capabilities it was left holding and nothing more — the point <a href="b4.html">B4</a> made with <code>capsh</code>, now enforced by a runtime.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can recite the seven steps, name the file in <code>/proc</code> that proves each one, and demonstrate on a live container that <code>create</code> completes six of them.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>Seccomp: 0</code> does not mean seccomp failed.</strong> The stock <code>runc spec</code> output has no <code>linux.seccomp</code> section at all, so there is nothing to install. Container runtimes higher up the stack add one — which is why a container run through <code>ctr</code> or a kubelet shows <code>Seccomp: 2</code> here and a hand-built bundle does not.</li>
+<li><strong>The cgroup path depends on who invoked runc.</strong> Run as a normal user's <code>sudo</code>, the container landed under <code>/user.slice/user-1000.slice/</code>; run from a system service it lands elsewhere. Do not memorise the path, read it.</li>
+<li><strong><code>/proc/&lt;pid&gt;/mountinfo</code> shows the host's view of the paths</strong>, so the root entry names the bundle directory rather than <code>/</code>. That is correct and often confusing — you are reading a container's mounts through a host process's eyes.</li>
+<li><strong>Do not infer ordering from a single snapshot.</strong> Everything above was already true when you looked. The evidence for the <em>order</em> is the capability argument in step 2 — a step that cannot have happened after the drop must have happened before it — not the fact that all six are visible at once.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This sequence is why <code>securityContext</code> settings that look equivalent behave differently. A volume mounted into a pod is applied during the mount phase, by the runtime, holding full privilege — so it succeeds regardless of how thoroughly you strip the container's capabilities. But anything the <em>application</em> tries to mount at runtime, including the surprisingly common case of a process wanting to remount <code>/proc</code>, runs after the drop and fails. The advanced track has no dedicated <code>securityContext</code> lesson; the closest material is <a href="w7.html#cp-7-1">W7.1</a> on the authorisation model and <a href="w3.html#cp-3-16">W3.16</a> on how pod-level settings reach the runtime.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 5 proc</code> for <code>status</code>, <code>mountinfo</code> and <code>ns/</code> — the three files this lesson lives in; <code>man 7 capabilities</code> for what <code>CAP_SYS_ADMIN</code> actually gates, which is a longer list than anyone expects.</p>
+</article>
+
+<article class="lesson" id="cp-i3-4" data-id="i3-4">
+<div class="lesson-head"><span class="cp-id">I3.4</span><h4>Why the order is forced, not chosen</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>I3.3 gave you a sequence. A sequence you have merely memorised is fragile — you will misremember it under pressure, and you will have no way to check. This lesson gives you the <em>rule</em> the sequence follows, and a rule can be re-derived. It is one sentence long, and once you have it you can work out the correct position of a step you have never seen before, including steps in runtimes that do not exist yet.</p>
+
+<h5>The concept</h5>
+<p>Here is the rule:</p>
+<blockquote><strong>Every step in container setup removes a power. So each step must run <em>after</em> everything that still needs the power it removes.</strong></blockquote>
+<p>Container creation is a one-way descent. It begins with a process holding everything — full root, all capabilities, unrestricted syscalls, the host's whole filesystem — and it ends with a process holding almost nothing. Each step is a door closing behind you. Which means the sequence is not a design decision at all; it is forced by a dependency graph, and there is essentially only one valid ordering.</p>
+<p>Work the two swaps the checkpoint asks for and you will see the rule bite twice.</p>
+<p><strong>Swap one: seccomp before mounts.</strong> A seccomp profile is a filter on system calls. Container profiles routinely block <code>mount</code>, <code>umount2</code>, <code>pivot_root</code> and the whole family of namespace calls — those are exactly the syscalls you do not want a compromised container making. But the setup process needs every one of them; it has a dozen mounts to perform and a root to pivot into. Install the filter first and the runtime immediately blocks itself. The failure is spectacular and completely self-inflicted: the container fails to create, with an <code>EPERM</code> from a syscall the runtime made against a filter the runtime installed on itself.</p>
+<p><strong>Swap two: capabilities before <code>pivot_root</code>.</strong> <code>pivot_root(2)</code> requires <code>CAP_SYS_ADMIN</code> in the mount namespace's owning user namespace. You verified in I3.3 that the container's bounding set is three capabilities and <code>CAP_SYS_ADMIN</code> is not one of them. Drop first and the pivot returns <code>EPERM</code> — the container would be left running your program on the <em>host's</em> root filesystem, if the runtime were careless enough to continue. Which is why the ordering matters as a security property and not merely a functional one: get it wrong and the failure mode is not "container does not start", it is "container starts, unisolated".</p>
+<p>The same rule places <code>execve</code> unarguably last. Your program is the one participant that must never hold any of the powers being removed, so everything happens before it and nothing after. And it places <code>seccomp</code> immediately before <code>execve</code>, second-to-last, for the same reason capabilities come late: it is the most aggressive restriction, so it goes on at the last possible moment.</p>
+<p>One genuine subtlety, and the exception that proves the rule: seccomp is installed <em>after</em> capabilities rather than before, even though both are "restrictions". The reason is <code>NoNewPrivs</code>. Installing a seccomp filter as an unprivileged process requires the <code>no_new_privs</code> bit, and setting that bit is itself irreversible — so it has to come after any step that might have needed to gain privilege. The ordering rule still holds; you just have to count <code>no_new_privs</code> as a power being removed too.</p>
+
+<div class="specref">
+<p>The specification is deliberately silent about ordering — with exactly one exception, and it is instructive:</p>
+<blockquote>The <code>createRuntime</code> hooks MUST be called as part of the <code>create</code> operation after the runtime environment has been created (according to the configuration in config.json) but before the <code>pivot_root</code> or any equivalent operation has been executed. […] The <code>createContainer</code> hooks MUST be called after the <code>createRuntime</code> hooks.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md">config.md</a>, "POSIX-platform Hooks"</cite>
+<p>The spec pins the ordering only where a <em>third party</em> can observe it. Hooks are other people's code, so the spec must promise them a position — and note it does so by naming the one landmark that matters, <code>pivot_root</code>, rather than by describing the sequence. The rest of the order is unmentioned because nobody outside the runtime can tell, and, as the argument above shows, because there is only one way to do it anyway. I3.11 puts a hook in that window and makes it do real work.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>This lesson is reasoning, not a patch to runc — but the premises are checkable, and you should check them rather than take them on faith. Start with the capability requirement for <code>pivot_root</code>, using a bare shell and no runtime at all.
+<pre class="cmd">sudo capsh --drop=cap_sys_admin -- -c \
+  'unshare --mount --propagation private true; echo rc=$?'</pre>
+<pre class="out">unshare: unshare failed: <b>Operation not permitted</b>
+rc=1</pre>
+<p>Without <code>CAP_SYS_ADMIN</code> you cannot even create the mount namespace, never mind pivot inside it. That is swap two's failure, reproduced in one line.</p></li>
+
+<li>Now the seccomp premise: confirm that a typical container profile really does block the setup syscalls. The profile shipped with containerd is the one to look at.
+<pre class="cmd">grep -o '"mount"\|"pivot_root"\|"umount2"\|"unshare"' \
+  /etc/containerd/seccomp.json 2&gt;/dev/null | sort -u \
+  || echo 'no local profile — see the moby profile linked in Docs'</pre>
+<p>If your box has no profile on disk, read the linked source instead: <code>mount</code>, <code>pivot_root</code>, <code>umount2</code>, <code>setns</code> and <code>unshare</code> are all outside the default allow-list, gated behind <code>CAP_SYS_ADMIN</code>. A runtime that installed that filter on itself before mounting would be dead on the next syscall.</p></li>
+
+<li>Demonstrate the irreversibility that makes the whole descent one-way. Drop a capability from the bounding set and try to get it back.
+<pre class="cmd">sudo capsh --drop=cap_net_bind_service -- -c \
+  'capsh --print | grep -i bounding | head -1'
+sudo capsh --drop=cap_net_bind_service -- -c \
+  'capsh --addamb=cap_net_bind_service -- -c true; echo rc=$?'</pre>
+<pre class="out">Bounding set =cap_chown,cap_dac_override,cap_dac_read_search,cap_fowner,…
+                                              <i># net_bind_service absent</i>
+<b>failed to raise ambient [cap_net_bind_service=10]</b>
+rc=1</pre>
+<p>Nothing can put it back — not even root, not in this process nor any descendant. Every step in the sequence has this property, and that is precisely why order is destiny.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>State the rule in one sentence without looking. Then, given a hypothetical new setup step — say, "apply a Landlock filesystem policy" — place it correctly in the sequence and justify the placement from the rule alone.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Restrictions last" is a good heuristic, not the rule.</strong> It fails on <code>pivot_root</code>, which is not a restriction at all yet must precede the capability drop. Use the dependency form — <em>after everything that needs what it removes</em> — and it never fails.</li>
+<li><strong>Cgroup placement is the one step with genuine flexibility.</strong> Joining a cgroup does not remove a power the later steps need, so runtimes differ on exactly when they do it, and both <code>CLONE_INTO_CGROUP</code> and a post-hoc write to <code>cgroup.procs</code> are legitimate. If a memory limit appears to be enforced slightly later than you expected, this is why.</li>
+<li><strong>Do not reason about ordering from an <code>strace</code> of a multithreaded runtime.</strong> Go's scheduler interleaves threads and the trace lines will not be in causal order. The <code>--debug</code> narration from I3.1 is sequenced correctly; the raw trace is not.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the rule behind a Kubernetes behaviour that reads as inconsistent until you know it. <code>allowPrivilegeEscalation: false</code> sets <code>no_new_privs</code>, and because that bit is irreversible and set before <code>execve</code>, a setuid binary in the image simply stops working — with no error mentioning Kubernetes, the pod spec, or privileges. Likewise an init container that needs to mount something must be <code>privileged</code>, not merely capability-granted, because it runs as a normal container after the runtime has already descended. The general shape — configuration applied by the runtime at creation, invisible afterwards — is <a href="w3.html#cp-3-16">W3.16</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 pivot_root</code> for its exact capability requirement; <code>man 2 prctl</code> under <code>PR_SET_NO_NEW_PRIVS</code> for the irreversibility argument; and <a href="https://github.com/moby/profiles/blob/main/seccomp/default.json">the moby default seccomp profile</a>, which is the one containerd ships and the one to search when a syscall is mysteriously blocked.</p>
+</article>
+
+</div><!-- /g-create -->
+
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
