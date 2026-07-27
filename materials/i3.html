@@ -1193,6 +1193,255 @@ file not found in $PATH</b>"</pre>
 
 </div><!-- /g-beyond -->
 
+<!-- ---------------- Project & drill ---------------- -->
+<div class="grp" id="g-project"><h3>Project &amp; drill</h3>
+
+<article class="lesson project" id="cp-i3-13" data-id="i3-13">
+<div class="lesson-head"><span class="cp-id">I3.13</span><h4>Mini project — <code>microshim.py</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>I3.5 left you with a problem: runc exits, your container is orphaned, and its exit code is thrown away by PID 1. This project fixes that in about sixty lines. When you are done you will have written a shim — a real one, doing the real job — and in I7 you will put it beside <code>containerd-shim-runc-v2</code> and ask what is missing. That comparison is far more useful when the thing on your side of it is yours.</p>
+
+<h5>The concept</h5>
+<p>The shim's job is to <strong>be the parent runc refuses to be</strong>. Four responsibilities:</p>
+<ol>
+<li><strong>Claim the container as a child</strong>, so its exit status comes to you.</li>
+<li><strong>Create and start it</strong>, taking the PID from a pid file rather than a query (I3.6).</li>
+<li><strong>Forward termination signals</strong> to the container's PID 1, so <code>SIGTERM</code> to the shim means "shut the container down".</li>
+<li><strong>Wait, report the exit code, and clean up</strong> with <code>runc delete</code> — cgroup included (I3.10).</li>
+</ol>
+<p>The first one is the interesting one, because there is a trap in it. runc creates the container as <em>its</em> child, then exits — so the container is never your child at all, and <code>os.wait()</code> would return immediately with "no children". You cannot wait for a process that is not yours.</p>
+<p>The kernel's answer is <code>prctl(PR_SET_CHILD_SUBREAPER, 1)</code>. A process that sets this flag becomes the collection point for orphans in its subtree: when an intermediate process dies, its children re-parent to the nearest marked ancestor instead of to PID&nbsp;1. So the shim sets the flag, runs runc, runc exits — and the container lands on the shim rather than on init. This is exactly what the real shim does, and it is the single most important line in the file.</p>
+<div class="flow"><span>shim: subreaper=1</span><em>→</em><span>runc create+start</span><em>→</em><span>runc exits</span><em>→</em><span>container re-parents<br><em>to the shim</em></span><em>→</em><span>shim waits</span></div>
+<p>One design decision worth stating: the shim uses <code>create</code> and <code>start</code> as two calls rather than <code>run --detach</code>. It costs nothing here, and it leaves the window open where a CNI plugin would go — which is precisely why the real shim does the same.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write it. The comments mark the four responsibilities.
+<pre class="cmd">cat &gt; ~/i3/microshim.py &lt;&lt;'PY'
+#!/usr/bin/env python3
+"""microshim.py — be the parent runc refuses to be.
+
+Usage: microshim.py &lt;container-id&gt; &lt;bundle-dir&gt;
+"""
+import ctypes, os, signal, subprocess, sys
+
+PR_SET_CHILD_SUBREAPER = 36
+cid, bundle = sys.argv[1], sys.argv[2]
+pidfile = f"/run/{cid}.pid"
+
+# 1. Claim orphans. Without this the container re-parents to PID 1 when runc
+#    exits, and PID 1 reaps it -- taking the exit code with it.
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER failed")
+
+# 2. Create and start the container detached. runc exits; we inherit it.
+subprocess.run(["runc", "create", "--pid-file", pidfile, "--bundle", bundle, cid],
+               check=True)
+pid = int(open(pidfile).read().strip())
+print(f"[shim] container init pid={pid}", flush=True)
+subprocess.run(["runc", "start", cid], check=True)
+
+# 3. Forward termination signals to the container's PID 1.
+def forward(signum, _frame):
+    print(f"[shim] forwarding {signal.Signals(signum).name} to {pid}", flush=True)
+    try:
+        os.kill(pid, signum)
+    except ProcessLookupError:
+        pass
+signal.signal(signal.SIGTERM, forward)
+signal.signal(signal.SIGINT, forward)
+
+# 4. Wait for it. As subreaper we get the real wait status, not a guess.
+status = 0
+while True:
+    try:
+        reaped, status = os.wait()
+    except ChildProcessError:
+        break
+    except InterruptedError:
+        continue
+    if reaped == pid:
+        break
+
+if os.WIFSIGNALED(status):
+    sig = os.WTERMSIG(status)
+    code = 128 + sig
+    print(f"[shim] container killed by {signal.Signals(sig).name}, exit={code}", flush=True)
+else:
+    code = os.WEXITSTATUS(status)
+    print(f"[shim] container exited, exit={code}", flush=True)
+
+# 5. Clean up the way runc delete does -- cgroup included.
+subprocess.run(["runc", "delete", cid], check=False)
+os.unlink(pidfile)
+sys.exit(code)
+PY
+chmod +x ~/i3/microshim.py
+python3 -c 'import ast;ast.parse(open("/home/ubuntu/i3/microshim.py").read())' &amp;&amp; echo 'syntax ok'</pre></li>
+
+<li>Give it a container that proves the signal path works — one that traps <code>SIGTERM</code> and exits with a number you would never see by accident.
+<pre class="cmd">cd ~/i3
+sudo cp -a box shimbox
+sudo jq '.process.args = ["/bin/sh","-c",
+  "trap \"echo caught SIGTERM; exit 42\" TERM; echo container up; while true; do sleep 1; done"]' \
+  shimbox/config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json shimbox/config.json</pre></li>
+
+<li>Run the shim and check the ancestry. This is the moment the project either worked or did not.
+<pre class="cmd">sudo runc delete --force m1 2&gt;/dev/null
+sudo setsid python3 ~/i3/microshim.py m1 ~/i3/shimbox &gt; /tmp/shim.out 2&gt;&amp;1 &amp;
+sleep 2
+P=$(sudo runc state m1 | jq -r .pid)
+sudo ps -o pid,ppid,comm -p $P
+sudo ps -o pid,ppid,comm -p $(sudo ps -o ppid= -p $P | tr -d ' ')</pre>
+<pre class="out">    PID    PPID COMMAND
+  36595   36583 sh
+    PID    PPID COMMAND
+  36583   36581 <b>python3</b></pre>
+<p>Compare with I3.5, where the same detached container's parent was <code>systemd</code>. It is <code>python3</code> now — your shim — because of one <code>prctl</code> call.</p></li>
+
+<li>Send the shim a <code>SIGTERM</code> and watch the whole chain work.
+<pre class="cmd">sudo kill -TERM 36583
+sleep 2
+cat /tmp/shim.out</pre>
+<pre class="out">[shim] container init pid=36595
+container up
+[shim] <b>forwarding SIGTERM to 36595</b>
+caught SIGTERM
+[shim] <b>container exited, exit=42</b></pre>
+<p>Read that as four separate achievements. The signal reached the shim; the shim forwarded it to the container's PID&nbsp;1; the container's trap ran; and <strong>the exit code came back</strong> — the number that plain <code>runc run --detach</code> discards entirely.</p></li>
+
+<li>Confirm the cleanup, which is the fourth responsibility and the one people forget.
+<pre class="cmd">sudo runc list | grep m1 || echo '(no m1 in runc list)'
+ls -d /sys/fs/cgroup/user.slice/user-1000.slice/m1</pre>
+<pre class="out">(no m1 in runc list)
+ls: cannot access '…/m1': <b>No such file or directory</b></pre>
+<p>State directory gone, cgroup gone. Your shim does the correct repair from I3.10 automatically, every time, which is exactly why leaked cgroups are rare on healthy nodes and common after crashes.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Your container's parent is your shim rather than PID&nbsp;1; a <code>SIGTERM</code> to the shim produces a graceful shutdown and the exit code <code>42</code>; and nothing is left in <code>runc list</code> or <code>/sys/fs/cgroup</code> afterwards.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Without the <code>prctl</code> call the shim silently does nothing useful.</strong> <code>os.wait()</code> raises <code>ChildProcessError</code> immediately, the loop breaks, and the shim exits reporting <code>0</code> while the container runs on happily. Comment out that line once and watch it happen — it is a much better lesson than reading about it.</li>
+<li><strong>A subreaper collects <em>all</em> orphans below it, not just yours.</strong> The wait loop must check which PID it reaped, which is what <code>if reaped == pid</code> is for. Drop the check and the shim exits when any unrelated grandchild dies.</li>
+<li><strong><code>SIGKILL</code> cannot be forwarded.</strong> <code>signal.signal(signal.SIGKILL, …)</code> raises, and a <code>SIGKILL</code>ed shim runs no cleanup at all. That is I3.14's second fault, and it is why real shims are designed to be restartable rather than assumed reliable.</li>
+<li><strong>Signals to PID 1 of a namespace need a handler.</strong> The container traps <code>TERM</code> deliberately — without the trap, the kernel drops the signal and the container ignores your shutdown entirely. That is I2's lesson and the most common cause of a pod burning its full termination grace period.</li>
+<li><strong>This shim holds no stdio.</strong> The container inherited the shim's, so its output lands wherever the shim's went. A real shim owns a pty or a fifo pair and serves logs on request — one of several gaps I7 catalogues.</li>
+</ul>
+
+<div class="k8s-link">
+<p>What you wrote is a recognisable subset of <code>containerd-shim-runc-v2</code>, the process you will find one of per pod on every node. The real one adds: a ttRPC API so containerd can drive it after a restart, log handling, an exit-event stream, the ability to host several containers in one pod sandbox, and — crucially — <strong>it survives containerd restarting</strong>, which is why upgrading containerd does not kill running pods. That last property is the reason the shim is a separate process rather than a goroutine inside containerd, and it is worth carrying into I7. The stack is <a href="w1.html#cp-1-20">W1.20</a>; graceful termination, which is your signal-forwarding path seen from Kubernetes, is <a href="w3.html#cp-3-5">W3.5</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 prctl</code> under <code>PR_SET_CHILD_SUBREAPER</code> — read the whole paragraph, it is short and it is the project; <code>man 2 wait</code> for the <code>WIFSIGNALED</code>/<code>WEXITSTATUS</code> macros and the 128+signal convention.</p>
+</article>
+
+<article class="lesson drill" id="cp-i3-14" data-id="i3-14">
+<div class="lesson-head"><span class="cp-id">I3.14</span><h4>Debugging drill — two faults</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Both faults below are the runtime-level ancestors of Kubernetes symptoms you will meet, and both are the kind that produce <em>no error message</em>. Nothing crashes, nothing logs, and the system reports success. Learning to recognise them here — where there are four moving parts instead of forty — is what makes them recognisable later.</p>
+
+<h5>Fault 1 — "it starts and immediately exits 0"</h5>
+<p><strong>Plant it.</strong> A bundle whose <code>args</code> point at a shell, with no terminal and no stdin.</p>
+<pre class="cmd">cd ~/i3
+sudo cp -a box drill1
+sudo jq '.process.args = ["/bin/sh"] | .process.terminal = false' \
+  drill1/config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json drill1/config.json
+sudo runc delete --force d1 2&gt;/dev/null
+sudo runc run --detach --pid-file /tmp/d1.pid d1 &lt; /dev/null &gt; /dev/null 2&gt;&amp;1
+echo "rc=$?  pid-file=$(sudo cat /tmp/d1.pid)"
+sudo runc list | grep d1</pre>
+<pre class="out">rc=<b>0</b>  pid-file=37049
+d1   <b>0</b>   <b>stopped</b>   /home/ubuntu/i3/drill1   2026-07-27T14:36:33Z   root</pre>
+<p><strong>The symptom.</strong> Everything reports success. runc exits 0, the pid file has a real PID, and the container is already stopped. There is no error anywhere — because nothing went wrong.</p>
+<p>Run it under your shim and you get the one extra fact that solves it:</p>
+<pre class="cmd">sudo runc delete --force d1; sudo rm -f /run/d1.pid
+sudo python3 ~/i3/microshim.py d1 ~/i3/drill1 &lt; /dev/null</pre>
+<pre class="out">[shim] container init pid=37189
+[shim] container exited, <b>exit=0</b></pre>
+
+<details class="reveal"><summary>Hint 1 — what is <em>not</em> wrong</summary><p>Exit code 0 means the program ran and chose to finish. This is not a crash, not a missing binary (that gives <code>executable file not found</code>), not a permissions problem, and not the runtime. Something inside completed its work in microseconds and had nothing further to do. Ask what <code>/bin/sh</code> does when it is started with nothing to run.</p></details>
+
+<details class="reveal"><summary>Hint 2 — what is on stdin</summary><p>An interactive shell reads commands from stdin. With <code>terminal: false</code> there is no pty, and the lab redirected stdin from <code>/dev/null</code>, so the very first read returns end-of-file. A shell that reaches EOF exits — successfully, because reaching the end of its input is a normal way to finish. Confirm it outside any container: <code>/bin/sh &lt; /dev/null; echo $?</code>.</p></details>
+
+<details class="reveal"><summary>Solution</summary>
+<p>The container is doing exactly what it was told. <code>args: ["/bin/sh"]</code> asks for an interactive shell; it gets no terminal and an empty stdin, reads EOF, and exits 0.</p>
+<p>Two fixes, and the right one depends on intent:</p>
+<pre class="cmd"># If you meant it to do work: give it work.
+sudo jq '.process.args = ["/bin/sh","-c","echo I-AM-ALIVE; sleep 2"]' \
+  drill1/config.json &gt; /tmp/c.json &amp;&amp; sudo cp /tmp/c.json drill1/config.json
+sudo runc delete --force d1; sudo rm -f /run/d1.pid
+sudo python3 ~/i3/microshim.py d1 ~/i3/drill1 &lt; /dev/null</pre>
+<pre class="out">[shim] container init pid=37231
+<b>I-AM-ALIVE</b>
+[shim] container exited, exit=0</pre>
+<p>If you meant it to be interactive, the fix is a terminal — <code>process.terminal: true</code> and a console socket (I3.7). Either way, the diagnosis is the same: <strong>exit 0 with no output means the process finished normally, so ask what "finished" meant to it.</strong></p>
+</details>
+
+<div class="k8s-link">
+<p>This is <code>CrashLoopBackOff</code> on a container that never crashed. A pod whose <code>command</code> is a shell, or an image whose <code>ENTRYPOINT</code> expects arguments it did not get, exits 0 immediately; the default <code>restartPolicy: Always</code> restarts it; it exits again; and the backoff timer climbs. The tell is <code>Last State: Terminated, Exit Code: 0</code> — a crash loop with a successful exit code in it is always this fault, never a crash. See <a href="w6.html#cp-6-16">W6.16</a>.</p>
+</div>
+
+<h5 class="gotcha">Fault 2 — a shim that was <code>SIGKILL</code>ed</h5>
+<p><strong>Plant it.</strong> Start a container under the shim, then kill the shim in the one way it cannot defend against.</p>
+<pre class="cmd">sudo runc delete --force d2 2&gt;/dev/null; sudo rm -f /run/d2.pid
+sudo setsid python3 ~/i3/microshim.py d2 ~/i3/shimbox &gt; /tmp/d2.out 2&gt;&amp;1 &amp;
+sleep 2
+SHIM=$(sudo ps -o ppid= -p $(sudo runc state d2 | jq -r .pid) | tr -d ' ')
+sudo kill -9 $SHIM
+sleep 1
+cat /tmp/d2.out
+sudo runc list | grep d2</pre>
+<pre class="out">[shim] container init pid=37332
+container up                          <i># note: no exit line</i>
+d2   37332   <b>running</b>   /home/ubuntu/i3/shimbox   2026-07-27T14:38:31Z   root</pre>
+<p><strong>The symptom.</strong> Now try to start it again by the same ID — which is what any supervisor would do.</p>
+<pre class="cmd">sudo runc create --bundle ~/i3/shimbox d2</pre>
+<pre class="out">level=error msg="runc create failed: <b>container with given ID already exists</b>"</pre>
+
+<details class="reveal"><summary>Hint 1 — is it stale, or is it real?</summary><p>Do not assume "already exists" means a leftover record. Check first: <code>sudo runc state d2 | jq -c '{status,pid}'</code>. If the status is <code>running</code> and that PID exists, the container is genuinely alive and the message is telling the truth. Something else died.</p></details>
+
+<details class="reveal"><summary>Hint 2 — who is the orphan's parent?</summary><p><code>sudo ps -o pid,ppid,comm -p &lt;pid&gt;</code>. The parent is PID&nbsp;1. The shim set itself as a subreaper, but a subreaper that dies stops collecting — so the container re-parented a second time, to init. Nothing is supervising it, and nothing will ever report its exit code.</p></details>
+
+<details class="reveal"><summary>Solution</summary>
+<p><code>SIGKILL</code> cannot be caught, so the shim never reached step 5 and never ran <code>runc delete</code>. The container outlived its supervisor. This is different from I3.10's fault, where the <em>container</em> died and the record survived — here the <strong>record and the container are both real, and the supervisor is the thing that is gone</strong>. That distinction decides the repair:</p>
+<pre class="cmd">sudo runc state d2 | jq -c '{status,pid}'     # is it actually alive?
+sudo ps -o pid,ppid,comm -p 37332              # who parents it now?
+sudo runc delete d2                            # will refuse — and should
+sudo runc delete --force d2                    # the correct repair</pre>
+<pre class="out">{"status":"running","pid":37332}
+    PID    PPID COMMAND
+  37332       <b>1</b> sh
+level=error msg="<b>cannot delete container d2 that is not stopped: running</b>"
+<i># --force: succeeds, kills the orphan, removes the cgroup</i></pre>
+<p>Note that plain <code>runc delete</code> refusing is <em>correct behaviour and useful information</em> — it is the runtime telling you your diagnosis was wrong. Reaching straight for <code>--force</code> would have killed a running workload without ever learning that it was running.</p>
+<p>Verify the repair reached everything:</p>
+<pre class="cmd">sudo runc list | grep d2 || echo '(gone)'
+ls -d /sys/fs/cgroup/user.slice/user-1000.slice/d2
+sudo ps -o pid,comm -p 37332</pre>
+<pre class="out">(gone)
+ls: cannot access '…/d2': No such file or directory
+    PID COMMAND                        <i># empty: the orphan is gone too</i></pre>
+</details>
+
+<div class="k8s-link">
+<p>This is why a real shim is built to be <em>reconnected to</em> rather than assumed alive. <code>containerd-shim-runc-v2</code> writes its socket address into the container's bundle directory, so a containerd that restarts — or one whose shim was killed — can find and re-attach to what is still running instead of concluding the container is gone. The failure you just produced is the one that machinery exists to prevent, and its Kubernetes symptom is a pod the API server believes is running on a node where the kubelet has lost track of it. Node-level triage is <a href="w6.html#cp-6-4">W6.4</a>; the shim's reattach protocol is I7.</p>
+</div>
+
+<h5 class="verify">Verify</h5>
+<p>You can produce both faults from a clean bundle, distinguish "the container died and the record survived" from "the container lives and the supervisor died" using <code>runc state</code> alone, and name the Kubernetes symptom each one becomes.</p>
+
+<p class="docs-links"><b>Docs:</b> <code>man 7 signal</code> for why <code>SIGKILL</code> and <code>SIGSTOP</code> cannot be caught; <code>man 1 dash</code> on an interactive shell's EOF behaviour, which is fault 1 in one sentence.</p>
+</article>
+
+</div><!-- /g-project -->
+
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
