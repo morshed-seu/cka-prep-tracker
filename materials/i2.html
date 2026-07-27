@@ -345,6 +345,207 @@ demo   26604   running   /run/containerd/io.containerd.runtime.v2.task/default/d
 <p class="docs-links"><a href="https://github.com/containerd/containerd/blob/main/docs/PLUGINS.md">containerd <code>docs/PLUGINS.md</code></a> for what a snapshotter is and which one is in use; <code>ctr --help</code> and <code>ctr snapshots --help</code>. The runtime specification is silent here by design, which is itself the thing to remember.</p>
 </article>
 </div>
+
+<!-- ---------------- config.json, field by field ---------------- -->
+<div class="grp" id="g-fields"><h3><code>config.json</code>, field by field</h3>
+
+<article class="lesson" id="cp-i2-4" data-id="i2-4">
+<div class="lesson-head"><span class="cp-id">I2.4</span><h4><code>process</code> — and the five capability sets</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>process</code> is the part of the document that decides what the container can <em>do</em>, and it is where the majority of real-world container security failures are configured. It also contains the single most misunderstood structure in the whole specification — the five capability sets — which people routinely copy from a blog post without knowing that setting one of them silently overrides another. This lesson changes one field at a time and checks each one in <code>/proc</code>, because that is the only way the relationships become visible.</p>
+
+<h5>The concept</h5>
+<p>The straightforward fields first. <code>args</code> is the argv the runtime will <code>exec</code> — element zero is the program, and it is resolved <em>inside the container's root filesystem</em> using the container's <code>PATH</code>. <code>env</code> is the complete environment; nothing from your shell leaks in. <code>cwd</code> must exist inside the rootfs or creation fails. <code>terminal</code> asks the runtime for a pseudo-terminal. <code>rlimits</code> are the same per-process limits <code>ulimit</code> sets. <code>oomScoreAdj</code> tunes which process the kernel kills first when the machine runs out of memory.</p>
+<p><code>user</code> carries <code>uid</code>, <code>gid</code> and <code>additionalGids</code>, all numeric. There is no username field anywhere in the specification — resolving <code>appuser</code> to a number by reading <code>/etc/passwd</code> inside the rootfs is a job for the layer above, and I2.16 shows you exactly the error it produces when it fails.</p>
+<p><code>noNewPrivileges</code> sets the <code>no_new_privs</code> bit from <a href="i1.html#cp-i1-10">I1.10</a>: a one-way promise that no <code>exec</code> from here can ever gain privilege, which is what makes setuid binaries inside the container inert.</p>
+<p>Then <strong>capabilities</strong>, with all five sets from <a href="b4.html#cp-b4-12">B4.12</a>, each an explicit list of <code>CAP_</code> names:</p>
+<ul>
+<li><code>bounding</code> — the ceiling. Nothing in this process or any of its descendants can ever hold a capability outside this set. This is the one that matters.</li>
+<li><code>permitted</code> — what this process may raise into effective.</li>
+<li><code>effective</code> — what is being checked right now, for this process.</li>
+<li><code>inheritable</code> — what survives <code>exec</code> into a file that has the matching inheritable bits. Nearly always useless and nearly always wrong to set.</li>
+<li><code>ambient</code> — what survives <code>exec</code> into an ordinary unprivileged binary. This is the one that makes non-root containers able to bind port 80.</li>
+</ul>
+<p>They are not five independent lists. The kernel enforces relationships between them at <code>exec</code>, and the important one is: <strong>a capability in <code>ambient</code> is forced into <code>permitted</code> and <code>effective</code></strong>. So a configuration that lists a capability as ambient but omits it from effective does not get what it asked for — it gets the capability anyway. You are about to watch that happen.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a fresh bundle whose workload sticks around long enough to inspect.
+<pre class="cmd">cd ~/i2
+sudo rm -rf caps &amp;&amp; sudo mkdir -p caps/rootfs
+sudo tar -C caps/rootfs -xzf alpine-minirootfs-3.22.5-x86_64.tar.gz
+cd caps &amp;&amp; sudo runc spec</pre></li>
+
+<li>Set every field in one edit, so each can be checked independently afterwards. Note the deliberately inconsistent capability sets — <code>CAP_CHOWN</code> is ambient and inheritable but <em>not</em> effective.
+<pre class="cmd">sudo jq '
+   .process.terminal = false
+ | .process.args = ["/bin/sleep","600"]
+ | .process.cwd = "/tmp"
+ | .process.env += ["GREETING=from the spec"]
+ | .process.user = {uid:0, gid:0, additionalGids:[10,20]}
+ | .process.oomScoreAdj = -500
+ | .process.rlimits = [{type:"RLIMIT_NOFILE", hard:4096, soft:2048}]
+ | .process.capabilities = {
+     bounding:    ["CAP_NET_RAW","CAP_CHOWN"],
+     permitted:   ["CAP_NET_RAW","CAP_CHOWN"],
+     effective:   ["CAP_NET_RAW"],
+     inheritable: ["CAP_CHOWN"],
+     ambient:     ["CAP_CHOWN"] }
+' config.json &gt; /tmp/x &amp;&amp; sudo cp /tmp/x config.json
+sudo runc run -d --pid-file /tmp/caps.pid caps
+P=$(cat /tmp/caps.pid); echo "pid=$P"</pre>
+<pre class="out">pid=26838</pre>
+<p><code>--pid-file</code> writes the host-side PID of the container's first process, which is how you inspect a container from outside without guessing.</p></li>
+
+<li>Check the capability sets, which is the whole reason for the lesson.
+<pre class="cmd">sudo grep -E '^(Name|Groups|NoNewPrivs|Cap(Inh|Prm|Eff|Bnd|Amb))' /proc/$P/status</pre>
+<pre class="out">Name:	sleep
+Groups:	10 20
+CapInh:	0000000000000001
+CapPrm:	0000000000002001
+<b>CapEff:	0000000000002001</b>
+CapBnd:	0000000000002001
+CapAmb:	0000000000000001
+NoNewPrivs:	1</pre>
+<p>Decode them rather than reading hex:</p>
+<pre class="cmd">for f in CapInh CapPrm CapEff CapBnd CapAmb; do
+  printf '%s ' $f
+  capsh --decode=$(sudo awk -v k=$f: '$1==k{print $2}' /proc/$P/status)
+done</pre>
+<pre class="out">CapInh 0x0000000000000001=cap_chown
+CapPrm 0x0000000000002001=cap_chown,cap_net_raw
+<b>CapEff 0x0000000000002001=cap_chown,cap_net_raw</b>
+CapBnd 0x0000000000002001=cap_chown,cap_net_raw
+CapAmb 0x0000000000000001=cap_chown</pre>
+<p>The configuration said <code>effective: ["CAP_NET_RAW"]</code>. The process has <code>cap_chown</code> effective as well. Nothing is broken and runc did not ignore you — the kernel raises every ambient capability into permitted and effective at <code>exec</code>, because that is what "ambient" means. The document you wrote is a request; the kernel's rules are applied afterwards, and where they disagree the kernel wins.</p></li>
+
+<li>Confirm the rest, each in its own file under <code>/proc</code>.
+<pre class="cmd">sudo readlink /proc/$P/cwd
+sudo cat /proc/$P/environ | tr '\0' '\n'
+sudo grep 'Max open files' /proc/$P/limits
+sudo cat /proc/$P/oom_score_adj</pre>
+<pre class="out">/tmp
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+TERM=xterm
+<b>GREETING=from the spec</b>
+HOME=/root
+Max open files            <b>2048</b>                 <b>4096</b>                 files
+<b>-500</b></pre>
+<p>Two things the specification did not say. <code>HOME</code> appeared from nowhere — runc synthesises it from <code>process.user.uid</code> when the environment does not set it. And <code>soft</code> and <code>hard</code> map onto the two columns in exactly the order you would hope.</p></li>
+
+<li>Clean up.
+<pre class="cmd">sudo runc delete -f caps</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Re-run with <code>ambient</code> removed and nothing else changed. <code>CapEff</code> becomes <code>0000000000002000</code> — <code>cap_net_raw</code> alone, exactly as configured. That single difference is the proof that ambient was the cause and not a runc quirk.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An absent capabilities object is not an empty one.</strong> Omit <code>process.capabilities</code> entirely and runc gives the container the caps it inherited, which as root is everything. Write <code>{}</code> and the container gets none. This is the difference between a container that is fine and a container that owns the node, expressed as two characters.</li>
+<li><strong><code>bounding</code> is the only set with teeth.</strong> Trimming <code>effective</code> while leaving <code>bounding</code> wide open buys nothing: the process can raise anything permitted at any time, and permitted is capped by bounding. If you are auditing a configuration, read <code>bounding</code> first and treat the rest as commentary.</li>
+<li><strong>Misspelled capability names are a warning, not an error.</strong> runc prints <code>ignoring unknown or unavailable capabilities: [...]</code> and carries on. Get every name wrong and you get an empty set and a container that fails in some unrelated-looking way ten minutes later. I2.15 has this bug on purpose so you meet it once, deliberately.</li>
+<li><strong><code>cwd</code> must exist.</strong> There is no "create it if missing" — a non-existent <code>cwd</code> fails at create with a message about <code>chdir</code>, which is easy to misread as a permissions problem.</li>
+</ul>
+
+<div class="specref">
+<p>On the five sets, and on the fact that they are lists of names rather than a bitmask:</p>
+<blockquote><code>capabilities</code> (object, OPTIONAL) is an object containing arrays that specifies the sets of capabilities for the process. Valid values are defined in the man page. […] Any value which cannot be mapped to a relevant kernel interface MUST cause an error.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#linux-process">config.md § Linux Process</a></cite>
+<p>Worth reading twice: the specification says an unmappable value <strong>MUST</strong> cause an error, and runc 1.5.1 emits a warning and continues. That is a real conformance gap, and it is the mechanism behind the gotcha above. Where a spec and an implementation disagree, the implementation is what runs your production workload.</p>
+</div>
+
+<div class="k8s-link">
+<p>A pod's <code>securityContext.capabilities.add</code>/<code>drop</code> compiles down to exactly these arrays; <code>runAsUser</code>/<code>runAsGroup</code>/<code>fsGroup</code> become <code>process.user</code>; <code>allowPrivilegeEscalation: false</code> becomes <code>noNewPrivileges: true</code>. The advanced track has no dedicated <code>securityContext</code> lesson, so the nearest anchor is <a href="w3.html#cp-3-16">W3.16</a> on the pod spec fields that reach the runtime — and this lesson is the honest description of what happens after they get there.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><code>man 7 capabilities</code> — specifically the "Transformation of capabilities during execve()" section, which is the rulebook the kernel applied above. <code>man 1 capsh</code> for <code>--decode</code>. <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#posix-process">config.md § POSIX Process</a> for <code>rlimits</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i2-5" data-id="i2-5">
+<div class="lesson-head"><span class="cp-id">I2.5</span><h4><code>root</code> — path, and the read-only container</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>root</code> is two fields and both of them cause outages. <code>path</code> is resolved relative to the bundle directory, which is not where anybody expects, and gets a whole third of the debugging drill to itself. <code>readonly</code> is the single highest-value security setting in the document — and turning it on breaks almost every real image in a way that people then "fix" by turning it off again. This lesson breaks it and repairs it properly.</p>
+
+<h5>The concept</h5>
+<p><code>root.path</code> names the directory that becomes <code>/</code>. A relative path is relative to <strong>the bundle directory</strong> — not the current directory, not the runtime's directory. An absolute path is also legal and works, and is what a snapshotter-driven stack does not use, because it wants the bundle to be relocatable.</p>
+<p><code>root.readonly: true</code> makes the root mount read-only. This is not the same as making the container's whole filesystem read-only: any <code>mounts</code> entry can still be writable, and that is the intended design. The container's <em>image</em> is immutable; the container's <em>working data</em> lives on mounts you chose deliberately. A container that cannot write to its own image cannot be persistently backdoored by anything that gets in, and it cannot slowly fill the node's disk with logs nobody reads.</p>
+<p>The two things that break, in every image, are always the same: <strong>somewhere to write temporary files</strong>, and <strong>a package manager's lock file</strong>. The wrong fix is <code>readonly: false</code>. The right fix is a writable <code>tmpfs</code> mounted where writes belong, which is one line and which also puts a size limit on them.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start from the read-only default and try three ordinary things.
+<pre class="cmd">cd ~/i2/hello
+sudo jq '.root.readonly = true | .process.terminal = false
+ | .process.args = ["/bin/sh","-c","echo hi &gt; /tmp/x || true; touch /etc/probe || true"]' \
+  config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run ro</pre>
+<pre class="out"><b>/bin/sh: can't create /tmp/x: Read-only file system</b>
+<b>touch: /etc/probe: Read-only file system</b></pre></li>
+
+<li>Now try what a real program does, which is where the failure stops being obvious.
+<pre class="cmd">sudo jq '.process.args = ["/sbin/apk","add","--no-cache","curl"]' config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run ro</pre>
+<pre class="out"><b>ERROR: Unable to lock database: Read-only file system</b>
+ERROR: Failed to open apk database: Read-only file system</pre>
+<p>Note what this looks like in a log aggregator with no context: a database error. Reported by a user, it becomes "the container can't reach the database", and half an hour disappears. The signature to memorise is the phrase <strong>Read-only file system</strong> appearing anywhere in an error whose subject is something else entirely.</p></li>
+
+<li>Fix it the right way — add a writable mount, keep the root read-only.
+<pre class="cmd">sudo jq '.process.args = ["/bin/sh","-c","echo hi &gt; /tmp/x &amp;&amp; cat /tmp/x &amp;&amp; mount | grep \" /tmp \""]
+ | .mounts += [{destination:"/tmp", type:"tmpfs", source:"tmpfs",
+                options:["nosuid","nodev","mode=1777","size=16m"]}]' \
+  config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run ro</pre>
+<pre class="out">hi
+<b>tmpfs on /tmp type tmpfs (rw,nosuid,nodev,relatime,size=16384k,inode64)</b></pre>
+<p>The root is still read-only. <code>/tmp</code> is writable, capped at 16 MB, and vanishes with the container. That combination is strictly better than a writable root: the blast radius is bounded in both space and time.</p></li>
+
+<li>Now the path. An absolute <code>root.path</code> works:
+<pre class="cmd">sudo jq '.root.path = "/home/ubuntu/i2/hello/rootfs"' config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run ro</pre>
+<pre class="out">hi
+tmpfs on /tmp type tmpfs (rw,nosuid,nodev,relatime,size=16384k,inode64)</pre>
+<p>And a relative one is resolved against the bundle, which the error message tells you exactly if you read it:</p>
+<pre class="cmd">sudo jq '.root.path = "nope"' config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json
+sudo runc run ro</pre>
+<pre class="out">level=error msg="runc run failed: invalid rootfs: stat <b>/home/ubuntu/i2/hello/nope</b>: no such file or directory"</pre>
+<p>The path in the message is <em>bundle</em> + <em>root.path</em>. Whenever this error appears, read the path it prints rather than the path you wrote — the difference between them is the bug.</p></li>
+
+<li>Put it back before moving on.
+<pre class="cmd">sudo jq '.root.path = "rootfs"' config.json &gt; /tmp/c &amp;&amp; sudo cp /tmp/c config.json</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>With the tmpfs mount in place and <code>readonly: true</code>, <code>mount</code> inside the container shows <code>/</code> as <code>ro</code> and <code>/tmp</code> as <code>rw</code> simultaneously. Writing 20 MB into <code>/tmp</code> fails with <code>No space left on device</code> rather than filling the host — that is the size limit doing its job.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A read-only root does not mean an immutable container.</strong> Every writable mount you add is writable, and a <code>hostPath</code> mount is writable on the <em>node</em>. Read-only root removes one attack surface; it is not a containment boundary on its own.</li>
+<li><strong>The rootfs must be a directory on the same machine.</strong> A symlink for <code>root.path</code> is resolved, an NFS mount works but will hang the container if the server goes away, and a path that crosses a mount point behaves differently under different <code>rootfsPropagation</code> settings (I2.8).</li>
+<li><strong>Images that log to their own directory fail late.</strong> Everything starts, traffic is served, and forty minutes later the first log rotation fails. Test with the root read-only from the start rather than switching it on before a release.</li>
+</ul>
+
+<div class="specref">
+<blockquote><code>path</code> (string, REQUIRED) Specifies the path to the root filesystem for the container. […] The value SHOULD be the conventional <code>rootfs</code>. A directory MUST exist at the path declared by the field.</blockquote>
+<blockquote><code>readonly</code> (bool, OPTIONAL) If true then the root filesystem MUST be read-only inside the container, defaults to false.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#root">config.md § Root</a></cite>
+<p><em>SHOULD</em> be <code>rootfs</code>: a convention with the force of a strong recommendation, which is why every bundle you will ever meet uses that exact name, and why a bundle that does not is worth a second look.</p>
+</div>
+
+<div class="k8s-link">
+<p><code>securityContext.readOnlyRootFilesystem: true</code> is this field, and the standard companion pattern — an <code>emptyDir</code> volume mounted at <code>/tmp</code> — is the writable-mount fix you just performed by hand. <a href="w5.html#cp-5-2">W5.2</a> covers <code>emptyDir</code>; it is a tmpfs or a node directory depending on its <code>medium</code>, and either way it becomes an entry in the <code>mounts</code> array.</p>
+</div>
+
+<h5>Docs</h5>
+<p class="docs-links"><a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#root">config.md § Root</a>, and <code>man 8 mount</code> for the <code>tmpfs</code> options used above (<code>mode=1777</code> is the sticky world-writable mode <code>/tmp</code> must have).</p>
+</article>
+
+</div>
 </main>
 </div>
 <script src="../assets/lesson.js"></script>
