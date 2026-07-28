@@ -328,6 +328,387 @@ docker.io/library/alpine</pre>
 <p class="docs-links"><b>Docs:</b> search the Kubernetes docs for <em>"image pull policy"</em> and read the whole table — the defaulting rule (a tag of <code>latest</code> silently changes the default) is the part people get wrong. On the OCI side, tags are a registry concern, so the detail is in the distribution spec you meet in I5.</p>
 </article>
 </div><!-- /g-the-model -->
+<!-- ---------------- Walking a real image ---------------- --><div class="grp" id="g-walking-a-real-image"><h3>Walking a real image</h3>
+<article class="lesson" id="cp-i4-5" data-id="i4-5">
+<div class="lesson-head"><span class="cp-id">I4.5</span><h4>An image on disk, in the spec's own layout</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Every tool you have used so far hides images inside a daemon's private storage, where you cannot look at them. The spec defines a plain directory format instead — no daemon, no database, no privileged process. Once an image is sitting in a directory you can <code>ls</code>, the rest of this module is just reading files.</p>
+
+<h5>The concept</h5>
+<p>The <strong>OCI image layout</strong> is the on-disk twin of the registry API, and it is deliberately boring. Three things, and that is the entire specification:</p>
+<ul>
+<li><code>oci-layout</code> — a marker file containing one JSON object naming the layout version. Its presence is how you know the directory is a layout at all.</li>
+<li><code>index.json</code> — the single entry point, an image index listing what this layout contains.</li>
+<li><code>blobs/&lt;algorithm&gt;/&lt;hex&gt;</code> — a flat content store where <strong>every file is named by its own digest</strong>.</li>
+</ul>
+<p>Being boring is the value. A layout is a directory you can <code>tar</code> up, copy to a USB stick and carry into an air-gapped datacentre, and it is exactly how most disconnected deployments really move images — not by any clever mechanism, just by copying a folder. It is also why <code>skopeo</code> can move an image between a registry and your disk without either end running a container engine.</p>
+<p>Notice what is <em>not</em> there. No filenames from inside the image, no directory tree, nothing human-readable below <code>index.json</code>. You cannot tell by looking whether <code>blobs/sha256/2607caa…</code> is a config or a layer — the only thing that tells you is the <code>mediaType</code> on the descriptor that pointed at it. This is I4.2's claim made concrete: the pointer carries the type, because the content deliberately does not.</p>
+<p>The tool for this is <strong><code>skopeo</code></strong>, which copies images between "transports" — <code>docker://</code> for a registry, <code>oci:</code> for this layout, <code>dir:</code> for a looser dump, <code>docker-archive:</code> for a <code>docker save</code> tarball. It never starts a container and never talks to a daemon; it is a pure format converter, which makes it the right instrument for a module about formats.</p>
+
+<div class="specref">
+<p>The spec's own summary of the layout, and the two files it insists on. Note the phrase from I4.4 recurring — <em>content-addressable blobs</em> on one side, <em>location-addressable references</em> on the other.</p>
+<blockquote>The OCI Image Layout is the directory structure for OCI content-addressable blobs and location-addressable references (refs).<br><br>[<code>oci-layout</code>] This JSON object serves as a marker for the base of an Open Container Image Layout and to provide the version of the image-layout in use.<br><br>[<code>index.json</code>] This REQUIRED file is the entry point for references and descriptors of the image-layout.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/image-layout.md">image-layout.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Copy a real image out of a registry and into the spec's layout. Nothing is running: no daemon starts, no container is created, and you do not need root.
+<pre class="cmd">mkdir -p ~/i4 &amp;&amp; cd ~/i4
+skopeo copy docker://alpine:3.21 oci:./alpine-oci:3.21</pre>
+<pre class="out">Getting image source signatures
+Copying blob sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+Copying config sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+Writing manifest to image destination</pre>
+<p>Two blobs and a manifest. That is a whole Linux distribution.</p></li>
+
+<li>Look at what landed. Three blobs, one index, one marker — and the blob filenames are the digests you saw scroll past during the copy.
+<pre class="cmd">tree ./alpine-oci</pre>
+<pre class="out">./alpine-oci
+├── blobs
+│   └── sha256
+│       ├── <b>2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</b>
+│       ├── <b>897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81</b>
+│       └── f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+├── index.json
+└── oci-layout
+
+3 directories, 5 files</pre>
+<p>Three blobs, but the copy only mentioned two. The third — <code>f27cad9…</code> — is the manifest itself, which is a blob like everything else. That is the hop I4.6 follows.</p></li>
+
+<li>Read the two JSON files. The marker is one line; the index is the entry point, and it is a descriptor with a tag hung on it as an annotation.
+<pre class="cmd">cat ./alpine-oci/oci-layout
+jq . ./alpine-oci/index.json</pre>
+<pre class="out">{"imageLayoutVersion":"<b>1.0.0</b>"}
+
+{
+  "schemaVersion": 2,
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:<b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>",
+      "size": 1022,
+      "annotations": {
+        "<b>org.opencontainers.image.ref.name</b>": "3.21"
+      }
+    }
+  ]
+}</pre>
+<p>This is where a tag lives in a layout: as an <em>annotation on a descriptor</em>, not as a directory or a symlink. Exactly I4.4's point — a mutable label attached to immutable content.</p></li>
+
+<li>Verify the content store really is content-addressed. Recompute a blob's hash and compare it with its own filename.
+<pre class="cmd">cd alpine-oci
+sha256sum blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</pre>
+<pre class="out"><b>2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</b>  blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</pre>
+<p>The name and the hash are the same string. Every blob in every layout everywhere has this property, and checking it is the whole of I4.15's verification pass.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have an <code>~/i4/alpine-oci</code> directory containing <code>oci-layout</code>, <code>index.json</code> and three blobs, and you can name which blob is the manifest without opening any of them — because <code>index.json</code> told you.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>skopeo copy</code> takes one platform by default.</strong> The layout you just built holds only <code>linux/amd64</code>, even though the registry offers eight architectures. Its <code>index.json</code> is therefore <em>not</em> the index the registry served — a distinction that catches people out in I4.8, and the reason <code>--all</code> exists.</li>
+<li><strong>The tag lives in an annotation, so two layouts can disagree.</strong> Copy the same image twice under different tags into one directory and you get two entries in <code>index.json</code> pointing at one manifest blob. That is correct and is what sharing looks like.</li>
+<li><strong><code>dir:</code> is not <code>oci:</code>.</strong> <code>skopeo</code>'s <code>dir:</code> transport writes a flat dump with a <code>manifest.json</code> and no <code>oci-layout</code>; it is convenient but is not the spec's layout, and tools that expect a layout will reject it. Use <code>oci:</code> whenever the format matters.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Air-gapped clusters move images exactly this way — a layout on removable media, loaded into a registry on the far side. When <a href="w6.html#cp-6-17">W6.17</a>'s <code>ErrImagePull</code> turns out to be "the mirror does not have that blob", this directory is the level at which you check, because a missing leaf is visibly a missing file.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>image-layout.md</code> is the shortest file in the spec — read all of it. For <code>skopeo</code>, <code>man skopeo-copy</code> lists the transports; the ones worth knowing are <code>docker://</code>, <code>oci:</code>, <code>docker-archive:</code> and <code>containers-storage:</code>.</p>
+</article>
+<article class="lesson" id="cp-i4-6" data-id="i4-6">
+<div class="lesson-head"><span class="cp-id">I4.6</span><h4>Walking the graph with jq, one hop at a time</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Getting fluent with these two commands is worth more than any tool that pretty-prints images for you, for a blunt reason: on a broken node, the pretty-printer is very often the thing that is failing. <code>cat</code> and <code>jq</code> keep working when <code>crictl</code> does not.</p>
+
+<h5>The concept</h5>
+<p>You drew this graph in I4.3. Now walk it. There are three hops, and each one is the same move: read a descriptor, take its <code>digest</code>, strip the <code>sha256:</code> prefix, open that file under <code>blobs/sha256/</code>.</p>
+<div class="flow"><span>index.json</span><em>→</em><span>manifest</span><em>→</em><span>config</span><em>+</em><span>layers</span></div>
+<p>The hop that surprises people is the second one. <strong>The config is a blob like any other</strong> — it lives in the same content store as the layer tarballs, is addressed the same way, and is fetched the same way. There is nothing special about it except its media type.</p>
+<p>That fact explains a long-standing confusion. The registry indexes an image by its <em>manifest</em> digest — that is what a tag resolves to and what <code>image@sha256:…</code> pins. But local tooling has historically shown you the <em>config</em> digest and called it the image ID. Both are real digests of real blobs in the same graph; they are just different nodes. So when <code>nerdctl images</code> shows an ID that appears nowhere in the registry, nothing is wrong — you are looking at a different vertex.</p>
+<p>Write down the digest at every hop as you go. You are doing this by hand now with files; in I5 you will do the identical walk over HTTP, where each hop is a <code>GET</code> and the digests are what you put in the URL.</p>
+
+<div class="specref">
+<p>The manifest's job is stated in one sentence, and the ordering requirement in the layers array is the part to hold on to — it is load-bearing for I4.12 and for the drill's third fault.</p>
+<blockquote>[<code>rootfs.diff_ids</code>] An array of layer content hashes (<code>DiffIDs</code>), in order from first to last.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Hop one. Read the entry point, take the manifest's digest, and confirm the blob really is named by its own content before you trust a byte of it.
+<pre class="cmd">cd ~/i4/alpine-oci
+MAN=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+echo "manifest digest: sha256:$MAN"
+sha256sum blobs/sha256/$MAN</pre>
+<pre class="out">manifest digest: sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+<b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>  blobs/sha256/f27cad91…</pre></li>
+
+<li>Hop two. Open the manifest. It is 1,022 bytes and holds exactly what I4.3 promised: one config descriptor, one ordered layer list, plus annotations.
+<pre class="cmd">jq . blobs/sha256/$MAN</pre>
+<pre class="out">{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:<b>2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</b>",
+    "size": 611
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81",
+      "size": 3646875
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.base.name": "scratch",
+    "org.opencontainers.image.created": "2026-04-16T23:53:12Z",
+    "org.opencontainers.image.revision": "52e3f9384ecbfe80a2d36bb344e464c0cf7c7507",
+    "org.opencontainers.image.source": "https://github.com/alpinelinux/docker-alpine.git#52e3f938…:x86_64",
+    "org.opencontainers.image.version": "3.21.7"
+  }
+}</pre>
+<p>The annotations already tell you this is Alpine <b>3.21.7</b>, built from a named commit — I4.8 comes back to who is expected to read those.</p></li>
+
+<li>Hop three. Follow the config descriptor. Same move, same content store, and it verifies the same way.
+<pre class="cmd">CFG=$(jq -r '.config.digest' blobs/sha256/$MAN | cut -d: -f2)
+sha256sum blobs/sha256/$CFG
+jq '{architecture, os, config, rootfs}' blobs/sha256/$CFG</pre>
+<pre class="out"><b>2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</b>  blobs/sha256/2607caa9…
+
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "Cmd": [
+      "/bin/sh"
+    ],
+    "WorkingDir": "/"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b>"
+    ]
+  }
+}</pre>
+<p>Note the <code>diff_ids</code> hash is <em>not</em> the layer digest from the manifest. Two different hashes of the same layer — I4.10 is entirely about why.</p></li>
+
+<li>Record the walk. Three digests, one per hop; you will follow this exact chain over HTTP in I5.
+<pre class="cmd">printf 'index -&gt; %s\nmanifest -&gt; %s\nconfig -&gt; %s\n' \
+  "$(jq -r '.manifests[0].digest' index.json)" \
+  "sha256:$MAN" "sha256:$CFG" | tee ~/i4/walk.txt</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can go from a layout directory to the image's <code>Cmd</code> using only <code>jq</code>, <code>cut</code> and <code>cat</code> — and you can say which digest a registry would call "the image" and which one <code>nerdctl images</code> would show.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Strip <code>sha256:</code> before using a digest as a path.</strong> The blob lives at <code>blobs/sha256/&lt;hex&gt;</code>, so the algorithm appears as a directory, not in the filename. Forgetting the <code>cut -d: -f2</code> is the single most common typo in this module.</li>
+<li><strong>Never <code>jq</code> a manifest and re-save it.</strong> Pretty-printing changes the bytes and therefore the digest; the blob would no longer match its own name and every verifier downstream would reject it. Read with <code>jq</code>, but keep the original file.</li>
+<li><strong>Two names for the image, both legitimate.</strong> Manifest digest is what registries and <code>image@sha256:…</code> mean; config digest is what local tooling calls the image ID. Neither is wrong — but comparing one against the other produces a mismatch that looks alarming and means nothing.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the walk containerd performs on every pull, and the reason <a href="w1.html#cp-1-20">W1.20</a>'s kubelet → containerd → shim → runc chain can report a failure at four different depths. "Manifest unknown" is hop one, "blob unknown" is hop three, and telling them apart tells you whether the tag or the storage is at fault.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>manifest.md</code> in the image spec. For the tooling side, <code>man jq</code>'s section on <code>-r</code> (raw output) is what makes these one-liners composable.</p>
+</article>
+<article class="lesson" id="cp-i4-7" data-id="i4-7">
+<div class="lesson-head"><span class="cp-id">I4.7</span><h4>OCI or Docker: telling the media types apart</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two nearly-identical formats are alive in the wild at the same time, and the difference between them is a handful of strings. That is exactly the kind of difference that produces a confident wrong diagnosis: an image that "plainly exists" returns 404, or a registry rejects a push for reasons the error message does not explain.</p>
+
+<h5>The concept</h5>
+<p>The OCI image spec was <em>adopted from</em> Docker's v2 schema 2 rather than designed to replace it, so the structures are near-identical and most field names match exactly. What differs is the vocabulary — the <code>mediaType</code> strings from I4.2:</p>
+<table class="langpair">
+<thead><tr><th>Role</th><th>OCI</th><th>Docker v2 schema 2</th></tr></thead>
+<tbody>
+<tr><td>one image, one platform</td><td><code>application/vnd.oci.image.manifest.v1+json</code></td><td><code>application/vnd.docker.distribution.manifest.v2+json</code></td></tr>
+<tr><td>a list of those</td><td><code>application/vnd.oci.image.index.v1+json</code></td><td><code>application/vnd.docker.distribution.manifest.list.v2+json</code></td></tr>
+<tr><td>the config blob</td><td><code>application/vnd.oci.image.config.v1+json</code></td><td><code>application/vnd.docker.container.image.v1+json</code></td></tr>
+<tr><td>a gzipped layer</td><td><code>application/vnd.oci.image.layer.v1.tar+gzip</code></td><td><code>application/vnd.docker.image.rootfs.diff.tar.gzip</code></td></tr>
+</tbody>
+</table>
+<p>The two families use different words for the same idea — OCI says <em>index</em> where Docker says <em>manifest list</em> — but they describe the same graph.</p>
+<p>How does a registry decide which to serve? <strong>The client asks.</strong> An HTTP <code>Accept</code> header lists the media types the client can handle, and the registry returns whichever form it has that matches. Registries store what was pushed and will convert only within limits, so ask for the wrong set and you can get a manifest you did not expect — or a 404 for an image that is definitely there. That is one of the four failures in I5's drill, and it is much less mysterious once you have seen how small the actual difference is.</p>
+
+<div class="specref">
+<p>The spec's own framing: the format is a <em>Merkle DAG</em> whose references are descriptors, and the media type is the field on the descriptor that selects the parser. Nothing about the graph changes between the two families — only the strings naming the node types.</p>
+<blockquote>This REQUIRED property contains the media type of the referenced content.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md">descriptor.md § <code>mediaType</code></a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Fetch the very same image a second time, but ask for the Docker form. <code>skopeo</code>'s <code>--format v2s2</code> sets the <code>Accept</code> header for you.
+<pre class="cmd">cd ~/i4
+skopeo copy --format v2s2 docker://alpine:3.21 dir:./alpine-v2s2
+jq . ./alpine-v2s2/manifest.json</pre>
+<pre class="out">{
+  "schemaVersion": 2,
+  "mediaType": "<b>application/vnd.docker.distribution.manifest.v2+json</b>",
+  "config": {
+    "mediaType": "<b>application/vnd.docker.container.image.v1+json</b>",
+    "size": 611,
+    "digest": "sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577"
+  },
+  "layers": [
+    {
+      "mediaType": "<b>application/vnd.docker.image.rootfs.diff.tar.gzip</b>",
+      "size": 3646875,
+      "digest": "sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81"
+    }
+  ]
+}</pre>
+<p>Look at the digests before reading on: <code>2607caa9…</code> and <code>897d797d…</code>. They are the <em>same blobs</em> you walked in I4.6.</p></li>
+
+<li>Now diff the two documents and see exactly how little differs.
+<pre class="cmd">MAN=$(jq -r '.manifests[0].digest' alpine-oci/index.json | cut -d: -f2)
+diff &lt;(jq -S . alpine-oci/blobs/sha256/$MAN) &lt;(jq -S . alpine-v2s2/manifest.json)</pre>
+<pre class="out">2,10d1
+&lt;   "annotations": {
+&lt;     "org.opencontainers.image.base.name": "scratch",
+&lt;     "org.opencontainers.image.created": "2026-04-16T23:53:12Z",
+&lt;     "org.opencontainers.image.revision": "52e3f9384ecbfe80a2d36bb344e464c0cf7c7507",
+&lt;     "org.opencontainers.image.version": "3.21.7"
+&lt;   },
+13c4
+&lt;     "mediaType": "<b>application/vnd.oci.image.config.v1+json</b>"
+---
+&gt;     "mediaType": "<b>application/vnd.docker.container.image.v1+json</b>"
+19c10
+&lt;       "mediaType": "<b>application/vnd.oci.image.layer.v1.tar+gzip</b>"
+---
+&gt;       "mediaType": "<b>application/vnd.docker.image.rootfs.diff.tar.gzip</b>"
+23c14
+&lt;   "mediaType": "<b>application/vnd.oci.image.manifest.v1+json</b>"
+---
+&gt;   "mediaType": "<b>application/vnd.docker.distribution.manifest.v2+json</b>"</pre>
+<p>That is the whole difference: <strong>three media-type strings and an annotations block</strong>. The config digest, the layer digest and every size are byte-identical — the same blobs serve both formats, and only the labels on the pointers changed.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown a manifest with no context, you can say within a second which family it belongs to, and you can explain why converting between them does not require re-uploading a single layer.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Converting the manifest changes the image's digest, even though no blob moved.</strong> Different bytes, different hash — so an image pushed as OCI and as v2s2 has two manifest digests for identical content. Anything that pinned <code>@sha256:…</code> to one form will not match the other, which is a genuinely nasty surprise during a registry migration.</li>
+<li><strong>Annotations are OCI-only.</strong> They have no home in a v2s2 manifest, so converting to Docker format silently discards them — including <code>org.opencontainers.image.source</code> and <code>.revision</code>, the two fields I11's supply-chain story depends on.</li>
+<li><strong>"schemaVersion 2" is not the distinguisher.</strong> Both families use it. The <code>mediaType</code> is the only reliable signal, and older Docker manifests omitted it entirely — in which case you must fall back on the <code>Content-Type</code> header the registry sent.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes never sees a media type; containerd negotiates it. But when a pull fails against an older or unusual registry with a message about an unsupported manifest type, this is the layer where it happened — and <a href="w6.html#cp-6-17">W6.17</a>'s classification of image failures is easier to apply when you know the negotiation exists at all.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>media-types.md</code> in the image spec lists every registered type and, usefully, which ones convert to which. The Docker-side strings are documented in the distribution project's manifest reference.</p>
+</article>
+<article class="lesson" id="cp-i4-8" data-id="i4-8">
+<div class="lesson-head"><span class="cp-id">I4.8</span><h4>Multi-platform images, and the entries that are not images</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>exec format error</code> is one of the most persistent incidents in container platforms, and it is peculiarly annoying because the pull succeeds. Nothing fails until a binary runs and the kernel refuses it. The cause lives here, in a selection step that happens on the client and can quietly select nothing at all.</p>
+
+<h5>The concept</h5>
+<p>An <strong>image index</strong> is a list of manifests, each tagged with the platform it was built for. Its entries carry a <code>platform</code> object with <code>architecture</code>, <code>os</code>, and sometimes <code>variant</code> — the last distinguishing, say, 32-bit ARM v6 from v7.</p>
+<p>The critical fact: <strong>platform selection is performed by the client, not the registry.</strong> You fetch the index, look through the list for an entry matching the machine you are on, and then fetch that manifest. The registry does not know or care what you are running.</p>
+<p>Which is why the failure is so slippery. If nothing matches — you deployed a single-platform image built on an ARM laptop to amd64 nodes — the honest outcome is "no image found for platform". But the pull may still appear to succeed against a single-platform image whose architecture nobody checked, and then the kernel meets an ARM binary and produces <code>exec format error</code> at container start. Same root cause, two very different-looking symptoms, several hours apart.</p>
+<p>There is a second thing in a real index that the specification does not prepare you for, and this module's live run found it: <strong>on a modern Docker Hub image, half the entries are not images.</strong> BuildKit publishes <em>attestation manifests</em> — SBOMs and provenance records — into the same index, marking them with the platform <code>unknown/unknown</code> and an annotation <code>vnd.docker.reference.type: attestation-manifest</code> pointing back at the manifest they describe. They are legitimate and useful, but a naive selector that just scans for a match can pick one, and then fail confusingly when it turns out not to be a runnable image. Your I4.15 project skips them explicitly.</p>
+<p>The other thing to read off a real index is its <strong>annotations</strong>. <code>org.opencontainers.image.source</code> names the repository, <code>.revision</code> the exact commit, <code>.created</code> the build time. Nothing enforces them and no runtime consumes them — they exist so that a running container can be traced back to the code that produced it, which is the other half of I11's supply-chain story.</p>
+
+<div class="specref">
+<p>Note that <code>platform</code> is <em>OPTIONAL</em> on a manifest descriptor while <code>architecture</code> and <code>os</code> are REQUIRED inside it — so an entry may have no platform at all, and a selector must cope with that rather than assuming the field exists.</p>
+<blockquote>The image index is a higher-level manifest which points to specific image manifests, ideal for one or more platforms.<br><br>[<code>platform</code>] This OPTIONAL property describes the minimum runtime requirements of the image.<br><br>[<code>platform.architecture</code>] This REQUIRED property specifies the CPU architecture. Image indexes SHOULD use, and implementations SHOULD understand, values listed in the Go Language document for GOARCH.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/image-index.md">image-index.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Fetch the index the registry actually serves — not the single-platform one <code>skopeo copy</code> wrote in I4.5 — and count what is in it.
+<pre class="cmd">cd ~/i4
+skopeo inspect --raw docker://alpine:3.21 &gt; raw-index.json
+jq -r '.mediaType, (.manifests | length)' raw-index.json</pre>
+<pre class="out">application/vnd.oci.image.index.v1+json
+<b>16</b></pre>
+<p>Sixteen entries for an image that supports eight architectures. That is the first clue.</p></li>
+
+<li>Do the selection by hand. Print the real platforms, keeping <code>architecture</code> and <code>variant</code> in separate columns — they are separate fields, and joining them produces plausible nonsense like "arm64v8".
+<pre class="cmd">jq -r '.manifests[]
+       | select(.platform.architecture != "unknown")
+       | [.platform.os, .platform.architecture, (.platform.variant // "-"), .size]
+       | @tsv' raw-index.json</pre>
+<pre class="out">linux	<b>amd64</b>	-	1022
+linux	arm	v6	1023
+linux	arm	v7	1023
+linux	<b>arm64</b>	v8	1025
+linux	386	-	1018
+linux	ppc64le	-	1025
+linux	riscv64	-	1025
+linux	s390x	-	1021</pre>
+<p>Eight real platforms. To select <code>linux/amd64</code> you match those two fields and take that entry's digest — which is <code>f27cad91…</code>, precisely the manifest I4.6 walked.</p></li>
+
+<li>Now look at the other eight. This is the part the spec will not warn you about.
+<pre class="cmd">jq -r '.manifests[]
+       | select(.platform.architecture == "unknown")
+       | .annotations' raw-index.json | head -6</pre>
+<pre class="out">{
+  "com.docker.official-images.bashbrew.arch": "amd64",
+  "vnd.docker.reference.digest": "sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339",
+  "<b>vnd.docker.reference.type</b>": "<b>attestation-manifest</b>"
+}</pre>
+<p>An <em>attestation</em> — build provenance for the amd64 manifest, whose digest it names. It is not a runnable image, and its <code>platform</code> is deliberately <code>unknown/unknown</code> so that older clients skip it. One per architecture: eight images, eight attestations, sixteen entries.</p></li>
+
+<li>Read the annotations that are meant for humans and for supply-chain tooling.
+<pre class="cmd">MAN=$(jq -r '.manifests[0].digest' alpine-oci/index.json | cut -d: -f2)
+jq -r '.annotations | to_entries[] | "\(.key)\t\(.value)"' alpine-oci/blobs/sha256/$MAN</pre>
+<pre class="out">org.opencontainers.image.base.name	scratch
+org.opencontainers.image.created	2026-04-16T23:53:12Z
+<b>org.opencontainers.image.revision</b>	52e3f9384ecbfe80a2d36bb344e464c0cf7c7507
+<b>org.opencontainers.image.source</b>	https://github.com/alpinelinux/docker-alpine.git#52e3f938…:x86_64
+org.opencontainers.image.version	3.21.7</pre>
+<p>Source repository and exact commit. No runtime reads these — they exist so a container in production can be traced back to a line of code.</p></li>
+
+<li>Get the whole index onto disk, so I4.15 has something real to select from. <code>--all</code> is the flag I4.5's gotcha promised.
+<pre class="cmd">skopeo copy --all docker://alpine:3.21 oci:./alpine-all:3.21
+jq -r '.manifests[0].mediaType' alpine-all/index.json</pre>
+<pre class="out"><b>application/vnd.oci.image.index.v1+json</b></pre>
+<p>Now the layout's top-level entry is an <em>index</em>, not a manifest — so a tool reading it has to descend one extra level. That is the branch your project handles in I4.15.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name the digest <code>alpine:3.21</code> would resolve to on an arm64 machine, and you can explain why an index with sixteen entries describes eight images.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Half a modern index is not images.</strong> A selector that matches only on <code>os</code>/<code>architecture</code> and does not skip <code>unknown/unknown</code> can pick an attestation manifest. Filter on the platform <em>and</em> on the <code>vnd.docker.reference.type</code> annotation.</li>
+<li><strong><code>architecture</code> and <code>variant</code> are separate fields.</strong> There is no <code>arm64v8</code> architecture; there is <code>arm64</code> with variant <code>v8</code>. Concatenating them for display is fine, matching on the concatenation is not — and 32-bit ARM images differ only by variant, so getting it wrong picks a binary the CPU cannot run.</li>
+<li><strong>A single-platform image has no index to check.</strong> Selection cannot detect a mismatch that no index describes, so the failure moves from pull time to exec time. That is the second half of I4.16's platform fault, and it is why the project checks the config's own <code>architecture</code> as a backstop.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is what <a href="w3.html#cp-3-12">W3.12</a>'s <code>nodeSelector</code> and node affinity are for on a mixed-architecture cluster: <code>kubernetes.io/arch</code> is a node label, and constraining a single-platform workload to matching nodes is the scheduling-level fix for a problem that is really an image-format problem. On a uniform cluster you will never see it, which is exactly why it surprises people the first time an arm64 node joins.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>image-index.md</code> for the structure; the GOARCH/GOOS value lists it defers to are in the Go documentation. In the Kubernetes docs, search <em>"well-known labels"</em> for <code>kubernetes.io/arch</code>.</p>
+</article>
+</div><!-- /g-walking-a-real-image -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
