@@ -197,6 +197,187 @@ status: 404</pre>
 
 <p class="docs-links"><b>Docs:</b> <code>spec.md § Definitions</code> and <code>§ Pulling manifests</code> for the grammar of <code>&lt;name&gt;</code> and <code>&lt;reference&gt;</code>. On the Kubernetes side, search for <em>"image pull policy"</em> — the tag/digest distinction drives its whole behaviour.</p>
 </article>
+<article class="lesson" id="cp-i5-3" data-id="i5-3">
+<div class="lesson-head"><span class="cp-id">I5.3</span><h4>HEAD: how a node asks "has this tag moved?"</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>imagePullPolicy: Always</code> has a reputation for being expensive, and the reputation is wrong. Understanding the one HTTP request behind it fixes that misconception, explains why the policy nonetheless breaks disconnected clusters, and — as a bonus you can measure — shows you which registry requests cost you rate-limit budget and which are free.</p>
+
+<h5>The concept</h5>
+<p>A <code>HEAD</code> request returns a response's headers with no body. On a manifest URL, the header that matters is <code>Docker-Content-Digest</code>: the digest the reference currently resolves to. So a node holding a cached image can ask the only question it actually has — <em>has this tag moved since I pulled it?</em> — by comparing one string, having transferred nothing.</p>
+<p>That reframes the policy. <strong><code>Always</code> does not mean "always re-download". It means "always re-<em>resolve</em>".</strong> The kubelet HEADs the manifest, compares the returned digest against what its content store already holds, and if they match it pulls not one byte. The cost of the policy is one cheap round trip per container start, not a transfer.</p>
+<p>Which also explains the failure that makes it painful in the wrong environment. If the registry is unreachable, the <em>resolve</em> fails — and the pod fails with it, even though a perfectly good image is sitting on local disk. Nothing was needed from the network except a string comparison, and the pod dies anyway. That is why disconnected and air-gapped clusters run <code>IfNotPresent</code>, and it is the single most common reason a cluster that survived a Docker Hub outage sat next to one that did not.</p>
+
+<div class="specref">
+<p>The spec gives <code>HEAD</code> its own section, and — importantly — makes the digest header a SHOULD, not a MUST. A client cannot assume it is there.</p>
+<blockquote>In order to verify that a repository contains a given manifest or blob, make a <code>HEAD</code> request to a URL in the following form: […]<br><br>A HEAD request to an existing blob or manifest URL MUST return <code>200 OK</code>.<br>A successful response SHOULD contain the digest of the uploaded blob in the header <code>Docker-Content-Digest</code>.<br>A successful response SHOULD contain the size in bytes of the uploaded blob in the header <code>Content-Length</code>.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#checking-if-content-exists-in-the-registry">spec.md § Checking if content exists in the registry</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>HEAD a manifest and read what came back without the body. <code>content-length</code> tells you what you <em>would</em> have downloaded; <code>etag</code> carries the digest a second time.
+<pre class="cmd">curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+     $REG/v2/$REPO/manifests/3.21 | tr -d '\r' | grep -iv '^date\|^strict'</pre>
+<pre class="out">HTTP/2 200
+content-type: application/vnd.oci.image.index.v1+json
+<b>content-length: 9218</b>
+<b>docker-content-digest: sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>
+docker-distribution-api-version: registry/2.0
+etag: "sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
+docker-ratelimit-source: 203.0.113.50
+x-ratelimit-limit: 100;w=3600
+x-ratelimit-remaining: 99;w=3600</pre>
+<p>(The IP is redacted; I5.6 is about what it means.)</p></li>
+
+<li>Measure the difference. Same URL, same headers, one letter of difference in the method.
+<pre class="cmd">for M in HEAD GET; do
+  curl -s -X $M -o /dev/null -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+    -w "$M  status=%{http_code}  body_bytes=%{size_download}\n" $REG/v2/$REPO/manifests/3.21
+done</pre>
+<pre class="out">HEAD  status=200  <b>body_bytes=0</b>
+GET  status=200  <b>body_bytes=9218</b></pre></li>
+
+<li>Now do what the kubelet does: compare the digest the registry reports against the one already on this machine. They match, so a pull would move nothing.
+<pre class="cmd">sudo nerdctl images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep '^alpine:3.21'
+curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 \
+  | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print "remote:", $2}'</pre>
+<pre class="out">local:  alpine:3.21 <b>48b0309ca019</b>
+remote: sha256:<b>48b0309ca019</b>d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain <code>imagePullPolicy: Always</code> in terms of one HTTP request, say what it costs, and say exactly which environment it breaks and why.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>Docker-Content-Digest</code> is a SHOULD, and its name is a historical accident.</strong> The spec calls the Docker-era headers OPTIONAL. A client that cannot get the header falls back to a <code>GET</code> and hashes the body itself — which is why "HEAD is free" is a property of Docker Hub's implementation, not a guarantee of the protocol.</li>
+<li><strong>The digest depends on your <code>Accept</code> header.</strong> HEAD the same tag asking for different media types and you can get different digests back, because you are asking about different documents. I5.4 is entirely about this.</li>
+<li><strong>"Re-resolve" still needs the registry.</strong> The cheapness of <code>Always</code> is about bytes, not about availability. One unreachable registry and every <code>Always</code> pod on the node stops starting.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism under <a href="w1.html#cp-1-20">W1.20</a>'s account of who does the pulling on a node, and the reason <a href="w6.html#cp-6-17">W6.17</a> recommends <code>IfNotPresent</code> for clusters that must survive a registry outage. Note the Kubernetes default that catches people: a pod whose image has no tag, or the tag <code>:latest</code>, gets <code>Always</code> whether you asked for it or not.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the Kubernetes docs for <em>"image pull policy"</em> — the defaulting rule for <code>:latest</code> is the exam-relevant part. Spec side: <code>spec.md § Checking if content exists</code>.</p>
+</article>
+<article class="lesson" id="cp-i5-4" data-id="i5-4">
+<div class="lesson-head"><span class="cp-id">I5.4</span><h4>Content negotiation, and the 404 that is really a wrong header</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>One tag can be several different documents depending on what you say you accept, and a registry is entitled to answer "I have nothing that matches" with a <code>404</code>. That is how you get <code>MANIFEST_UNKNOWN</code> for an image you are looking at in the web UI — the fourth fault in this module's drill, and a genuinely nasty half-hour if you have never met it.</p>
+
+<h5>The concept</h5>
+<p>The <code>Accept</code> header lists the media types your client can parse. Four matter here, in two matched pairs: the OCI image index and the Docker manifest list (multi-platform, a list of manifests); and the OCI image manifest and the Docker v2 schema 2 manifest (one platform, config plus layers). I4.6 established that OCI and Docker forms differ in three media-type strings and an annotations block, and in nothing else that moves bytes.</p>
+<p>What a registry does with your <code>Accept</code> header, however, is <strong>not uniform</strong>, and this is where the lesson has to be careful. The spec says the client SHOULD send one and the server indicates what it returned in <code>Content-Type</code>. It does not require conversion, and it does not require an error. Measured on the two registries in front of us in 2026, the behaviours are strikingly different:</p>
+<ul>
+<li><strong>Docker Hub ignores it.</strong> Ask for the single-platform Docker v2s2 type and you still get the OCI index back. It returns what is stored, and lets your client cope.</li>
+<li><strong><code>registry:2</code> honours it strictly.</strong> Ask for a type it does not hold and you get <code>404 MANIFEST_UNKNOWN</code> — for an image that is definitely there. Send no <code>Accept</code> at all and you get the same 404, because the default is the ancient schema 1 type and modern images are not stored that way.</li>
+</ul>
+<p>There is a third behaviour, and it is the strangest: asked for a type it does not hold, <code>registry:2</code> may <em>down-convert</em> to Docker schema 1 — a signed legacy format — and hand you a document with a completely different digest from the image you asked about. You did not get an error, you got a different image identity. If anything downstream compares that digest against a pinned one, it will disagree, and nothing in the exchange says why.</p>
+<p>The practical upshot is a rule: <strong>always send an explicit <code>Accept</code> listing all four types.</strong> Never rely on a server default. Every <code>curl</code> in the rest of this module does exactly that.</p>
+
+<div class="specref">
+<p>Note how much room the spec leaves here — SHOULD throughout, and no requirement to convert or to refuse.</p>
+<blockquote>The client SHOULD include an <code>Accept</code> header indicating which manifest content types it supports.<br>In a successful response, the <code>Content-Type</code> header will indicate the type of the returned manifest.<br>[…]<br>If the manifest has a <code>mediaType</code> field, clients SHOULD reject unless the <code>mediaType</code> field's value matches the type specified by the <code>Content-Type</code> header.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-manifests">spec.md § Pulling manifests</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask Docker Hub for the same tag five different ways and watch it not care. The last two requests ask for <em>single-platform</em> types and still receive an index.
+<pre class="cmd">probe(){ printf '%-58s -&gt; ' "$1"
+  curl -s -o /tmp/m.json -w '%{http_code} ' -H "Authorization: Bearer $TOKEN" \
+       ${1:+-H "Accept: $1"} $REG/v2/$REPO/manifests/3.21
+  jq -r 'if .errors then "ERROR "+.errors[0].code else (.mediaType // "no mediaType") end' /tmp/m.json; }
+
+probe ""
+probe "application/vnd.oci.image.index.v1+json"
+probe "application/vnd.docker.distribution.manifest.list.v2+json"
+probe "application/vnd.docker.distribution.manifest.v2+json"
+probe "application/vnd.oci.image.manifest.v1+json"</pre>
+<pre class="out">                                                           -&gt; 200 application/vnd.oci.image.index.v1+json
+application/vnd.oci.image.index.v1+json                    -&gt; 200 application/vnd.oci.image.index.v1+json
+application/vnd.docker.distribution.manifest.list.v2+json  -&gt; 200 application/vnd.oci.image.index.v1+json
+application/vnd.docker.distribution.manifest.v2+json       -&gt; <b>200 application/vnd.oci.image.index.v1+json</b>
+application/vnd.oci.image.manifest.v1+json                 -&gt; <b>200 application/vnd.oci.image.index.v1+json</b></pre></li>
+
+<li>Now the same experiment against a registry that does care. Push one image twice, in the two formats, then ask for each the right way and the wrong way. (<code>skopeo</code> arrives properly in I5.12; here it is just a way to plant two known documents.)
+<pre class="cmd">sudo skopeo copy --dest-tls-verify=false --format oci \
+  docker://docker.io/library/alpine:3.21 docker://localhost:5000/oci/alpine:3.21
+sudo skopeo copy --dest-tls-verify=false --format v2s2 \
+  docker://docker.io/library/alpine:3.21 docker://localhost:5000/v2s2/alpine:3.21
+
+OCI=application/vnd.oci.image.manifest.v1+json
+V2S2=application/vnd.docker.distribution.manifest.v2+json
+probe2(){ printf '%-12s %-58s -&gt; ' "$1" "$2"
+  curl -s -o /tmp/m.json -w '%{http_code} ' ${2:+-H "Accept: $2"} \
+       http://localhost:5000/v2/$1/manifests/3.21
+  jq -r 'if .errors then "ERROR "+.errors[0].code else (.mediaType // "no mediaType") end' /tmp/m.json; }
+
+probe2 oci/alpine  "";      probe2 oci/alpine  "$OCI";  probe2 oci/alpine  "$V2S2"
+probe2 v2s2/alpine "";      probe2 v2s2/alpine "$V2S2"; probe2 v2s2/alpine "$OCI"</pre>
+<pre class="out">oci/alpine                                                              -&gt; <b>404 ERROR MANIFEST_UNKNOWN</b>
+oci/alpine   application/vnd.oci.image.manifest.v1+json                 -&gt; 200 application/vnd.oci.image.manifest.v1+json
+oci/alpine   application/vnd.docker.distribution.manifest.v2+json       -&gt; <b>404 ERROR MANIFEST_UNKNOWN</b>
+
+v2s2/alpine                                                             -&gt; 200 no mediaType
+v2s2/alpine  application/vnd.docker.distribution.manifest.v2+json       -&gt; 200 application/vnd.docker.distribution.manifest.v2+json
+v2s2/alpine  application/vnd.oci.image.manifest.v1+json                 -&gt; <b>200 no mediaType</b></pre>
+<p>Two things to sit with. The image stored as OCI is <em>invisible</em> to a client that asks only for the Docker type — a 404 for content that is present. And the two "no mediaType" answers are not the manifest you asked for at all.</p></li>
+
+<li>Find out what those actually were. Compare the digest you get when you ask correctly with the one you get when you ask wrongly.
+<pre class="cmd">curl -sI -H "Accept: $V2S2" http://localhost:5000/v2/v2s2/alpine/manifests/3.21 \
+  | tr -d '\r' | grep -i 'content-type\|docker-content-digest'
+curl -sI -H "Accept: $OCI"  http://localhost:5000/v2/v2s2/alpine/manifests/3.21 \
+  | tr -d '\r' | grep -i 'content-type\|docker-content-digest'
+curl -s  -H "Accept: $OCI"  http://localhost:5000/v2/v2s2/alpine/manifests/3.21 \
+  | jq '{schemaVersion, name, tag, fsLayers: (.fsLayers|length), signatures: (.signatures|length)}'</pre>
+<pre class="out">Content-Type: application/vnd.docker.distribution.manifest.v2+json
+Docker-Content-Digest: sha256:<b>9420d98bbeb9</b>ca70c69fd1e2bffd85c9a98c06e75e80b23411819398633df8f3
+
+Content-Type: <b>application/vnd.docker.distribution.manifest.v1+prettyjws</b>
+Docker-Content-Digest: sha256:<b>2c6b25fd6670</b>a410c873867ef15f33016bc0d7e6138bc35095d99b35ef68d143
+
+{
+  "schemaVersion": <b>1</b>,
+  "name": "v2s2/alpine",
+  "tag": "3.21",
+  "fsLayers": 2,
+  "signatures": 1
+}</pre>
+<p>A <code>200</code>, a schema-1 document, and a <em>different digest for the same tag</em> — obtained by changing nothing but a request header.</p></li>
+
+<li>Build the header you will use for the rest of the module, and confirm it gets you the index with all its entries.
+<pre class="cmd">ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,\
+application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 \
+  | jq '{mediaType, manifests: (.manifests|length)}'</pre>
+<pre class="out">{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": <b>16</b>
+}</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have an <code>Accept</code> header you trust, and you can explain how a <code>404 MANIFEST_UNKNOWN</code> can be raised for an image that is demonstrably present. You can also name a way to get a <code>200</code> that is worse than an error.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Registries genuinely differ here, so do not generalise from one.</strong> Docker Hub ignored every <code>Accept</code> we sent; <code>registry:2</code> enforced it strictly. Both are conformant — the spec says SHOULD. Test against the registry you actually use.</li>
+<li><strong>A schema-1 fallback is a silent identity change.</strong> You asked about a tag and got a different digest, with a <code>200</code> and no warning. Any pinning or signature check downstream will now disagree with you and will not say why.</li>
+<li><strong>The 16 entries are not 16 images.</strong> Eight are attestation manifests, as I4.5 found. Any platform selection must skip them — I5.7 does it explicitly.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes never exposes this layer: whatever the negotiation did, the kubelet reports <code>ErrImagePull</code> with the registry's message flattened into an event (<a href="w6.html#cp-6-17">W6.17</a>). When the message is <code>manifest unknown</code> for an image you can see in the registry UI, the wrong-<code>Accept</code> path is the explanation people take longest to find — and the fastest test is one <code>curl</code> from the node with an explicit four-type header.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Pulling manifests</code>, plus the spec's own <code>content-negotiation.md</code>. On the Kubernetes side there is nothing to read — that is rather the point of this checkpoint.</p>
+</article>
 
 </div>
 
