@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="The OCI distribution spec: pull an image with nothing but curl, push one by hand, and read ImagePullBackOff as the HTTP status code it always was.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I5 — Registries — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I5 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4 · The OCI image spec</a></li>
+    <li><a href="i5.html">I5 · Registries</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i5">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I5 — Registries</h1>
+  <p>A registry is an HTTP server with two namespaces — blobs by digest, manifests by tag or digest — and once you have pulled an image using nothing but <code>curl</code>, <code>ImagePullBackOff</code> stops being a Kubernetes mystery and becomes a status code you can read.</p>
+  <p>I4 gave you an image sitting in a directory. This module is about the four hours of its life before that — how it travelled. The answer is smaller than you expect: a registry is an HTTP server with two kinds of URL, and by the end of the second group you will have pulled a complete image using <code>curl</code>, <code>jq</code> and <code>sha256sum</code>, with no container tooling anywhere in the path.</p>
+  <div class="weights">
+    <span>Checkpoints<b>15</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>I4</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Read the two endpoint families off any registry URL, and say which one is mutable and why that asymmetry is the whole design.</li>
+<li>Complete the token dance by hand and pull a full image — index, manifest, config, every layer — with <code>curl</code> alone, verifying each digest as it lands.</li>
+<li>Push blobs monolithically and in chunks, explain why the manifest goes last, and make a 30 MB "upload" take no bytes at all.</li>
+<li>Point containerd at a mirror with <code>hosts.toml</code>, and diagnose the four common pull failures from their status codes rather than from Kubernetes' summary of them.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I4</strong> — you must already be able to walk an image graph and verify a digest. Authored against <strong>OCI distribution-spec v1.1.1</strong>. This module needs working internet.</p>
+<p><strong>Which machine.</strong> Every capture below is from the <code>sandbox</code> VM (Ubuntu 24.04, kernel 6.8.0) running <strong>curl 8.5.0</strong>, <strong>jq 1.7</strong>, <strong>skopeo 1.13.3</strong>, <strong>containerd 2.3.3</strong>, <strong>nerdctl 2.3.5</strong> and <strong>registry:2</strong>, against Docker Hub and against a local registry on <code>localhost:5000</code>. Public IP addresses in the output are redacted; everything else is verbatim.</p>
+</div>
+
+<!-- ---------------- The API ---------------- --><div class="grp" id="g-the-api"><h3>The API</h3>
+<article class="lesson" id="cp-i5-1" data-id="i5-1">
+<div class="lesson-head"><span class="cp-id">I5.1</span><h4>The handshake: one URL that answers "are you a registry?"</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Before you can debug a registry you have to be sure you are talking to one. That sounds trivial until the day a pull fails against an internal host and the question "is the registry broken, or is something in front of it?" costs an hour. There is exactly one request that answers it, and the answer arrives in the status code alone.</p>
+
+<h5>The concept</h5>
+<p>Every registry that implements the distribution spec serves its entire API under the path prefix <code>/v2/</code>, and the bare endpoint <code>/v2/</code> is the version handshake. The version lives in the <em>path</em> rather than in a header, which is a small decision with a pleasant consequence: a client discovers whether a server speaks the protocol with one request and nothing to negotiate.</p>
+<p>The part that surprises people is what a healthy Docker Hub returns: <strong><code>401 Unauthorized</code></strong>, not <code>200</code>. That is not a failure. The endpoint exists, the server answered, and the <code>WWW-Authenticate</code> header it sent back is the server telling you exactly where to go and get a token. On this API, <strong>401 is frequently the first line of a successful conversation</strong> — internalise that now and half of the confusion in this module never arises.</p>
+<p>The genuinely bad answer is <code>404</code>. A 404 at <code>/v2/</code> means whatever answered does not know it is supposed to be a registry — usually a reverse proxy, ingress rule or load balancer that is routing your request somewhere else entirely. Distinguishing "needs auth" from "is not a registry" is the entire job of this one request, and it takes a second.</p>
+
+<div class="specref">
+<p>The spec defines this endpoint for exactly one purpose, and is careful to say that authentication is somebody else's business.</p>
+<blockquote>To check whether or not the registry implements this specification, perform a <code>GET</code> request to the following endpoint: <code>/v2/</code>.<br><br>If the response is <code>200 OK</code>, then the registry implements this specification.<br><br>This endpoint MAY be used for authentication/authorization purposes, but this is out of the purview of this specification.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#determining-support">spec.md § Determining Support</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask Docker Hub the question. Read the status line first and the headers second — everything you need for the next three checkpoints is in this one response.
+<pre class="cmd">curl -si https://registry-1.docker.io/v2/ | head -9</pre>
+<pre class="out"><b>HTTP/2 401</b>
+date: Tue, 28 Jul 2026 11:31:58 GMT
+content-type: application/json
+content-length: 87
+docker-distribution-api-version: registry/2.0
+<b>www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io"</b>
+strict-transport-security: max-age=31536000
+
+{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":null}]}</pre></li>
+
+<li>Now the same question to a registry that requires no authentication at all — the local <code>registry:2</code> you will run in I5.9. This is what a <code>200</code> looks like, and the body is a literal empty object.
+<pre class="cmd">curl -si http://localhost:5000/v2/ | head -6</pre>
+<pre class="out"><b>HTTP/1.1 200 OK</b>
+Content-Length: 2
+Content-Type: application/json; charset=utf-8
+Docker-Distribution-Api-Version: registry/2.0
+X-Content-Type-Options: nosniff
+
+<b>{}</b></pre></li>
+
+<li>And the answer that means "you are not talking to a registry". Note the give-away: <code>content-type: text/html</code> and a <code>server</code> header that belongs to something else.
+<pre class="cmd">curl -si https://example.com/v2/ | head -4</pre>
+<pre class="out"><b>HTTP/2 404</b>
+date: Tue, 28 Jul 2026 11:31:58 GMT
+<b>content-type: text/html</b>
+server: cloudflare</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a hostname, you can say in one request whether it is a registry, and if so whether it wants a token. You can also explain to a colleague why the 401 they screenshotted is not the bug they think it is.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The trailing slash is required.</strong> <code>/v2</code> and <code>/v2/</code> are different paths, and some registries answer only the second. When a handshake mysteriously 404s, check that first.</li>
+<li><strong>A JSON error body means the registry answered; a plain-text one means something else did.</strong> The <code>{"errors":[...]}</code> envelope is part of the spec, so its presence tells you the request reached a registry handler. A bare <code>404 page not found</code> in plain text — you will see one in I5.2 — means the request was rejected before any registry code ran.</li>
+<li><strong><code>docker-distribution-api-version</code> is not a reliable signal.</strong> The spec calls the Docker-era headers OPTIONAL and says clients SHOULD NOT depend on them. Read the status code.</li>
+</ul>
+
+<div class="k8s-link">
+<p>When a node reports <code>ErrImagePull</code> against an internal registry (<a href="w6.html#cp-6-17">W6.17</a>), this is the first command to run <em>from that node</em> — not from your laptop. It separates "the registry is unreachable or misrouted" from "the credentials in the <code>imagePullSecret</code> are wrong", and those two have completely different fixes. Kubernetes never shows you this layer; you have to go and look.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the exam will not ask you to <code>curl</code> a registry, but it will ask you to fix a pod that cannot pull. Search the Kubernetes docs for <em>"images"</em> and read the private-registry section; the spec side is <code>spec.md § Determining Support</code>.</p>
+</article>
+<article class="lesson" id="cp-i5-2" data-id="i5-2">
+<div class="lesson-head"><span class="cp-id">I5.2</span><h4>Two endpoint families, one of them mutable</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The distribution API is small enough to hold in your head — but only once you notice that every URL in it belongs to one of two families, and that the difference between them explains why registry mirrors are easy, why caching is safe, and where every interesting attack is aimed.</p>
+
+<h5>The concept</h5>
+<p>There are two:</p>
+<ul>
+<li><code>/v2/&lt;name&gt;/blobs/&lt;digest&gt;</code> — <strong>content</strong>, addressed by its own hash. The reference here <em>must</em> be a digest. Because of I4.1, this URL is immutable by construction: the name is computed from the bytes, so the same URL can never legitimately return different content.</li>
+<li><code>/v2/&lt;name&gt;/manifests/&lt;reference&gt;</code> — <strong>metadata</strong>, where the reference may be a digest <em>or a tag</em>. And that is the whole difference. A tag is a name somebody assigned, so it can be moved.</li>
+</ul>
+<p>So the entire mutable surface of a registry is one mapping: <strong>tag → digest</strong>. Everything else is content-addressed and therefore frozen.</p>
+<p>Follow the consequences, because they are not obvious and they matter. Blobs can be cached forever with no invalidation logic — there is nothing to invalidate. They can be served by any mirror, any CDN, any USB stick, because the client verifies them itself and never has to trust the source (I4.1 again, now doing real work). Registry caching, normally a subtle problem, becomes almost trivially correct.</p>
+<p>And all the difficulty concentrates in one place. The tag endpoint is the only thing that needs consistency guarantees, the only thing worth protecting with authorisation, and the only thing an attacker gains anything by tampering with — because moving <code>:latest</code> to point at their digest is the whole attack, and no amount of digest verification downstream will notice, since the bytes really do match the digest they were promised. That is precisely the gap I11's signing story is built to close.</p>
+
+<div class="specref">
+<p>The spec's own definitions draw the line in one sentence each. Note that "blob" is defined by <em>how it is addressed</em>, and "manifest" by <em>what it points at</em>.</p>
+<blockquote><strong>Blob</strong>: the binary form of content that is stored by a registry, addressable by a digest<br><br><strong>Manifest</strong>: a JSON document uploaded via the manifests endpoint. A manifest may reference other manifests and blobs in a repository via descriptors.<br><br><strong>Tag</strong>: a custom, human-readable pointer to a manifest. A manifest digest may have zero, one, or many tags referencing it.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#definitions">spec.md § Definitions</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Fetch one manifest twice — once by tag, once by the digest that tag resolves to. Same document, two names, and only one of them can ever change. (The token dance on line 2 is I5.5; take it on trust for now.)
+<pre class="cmd">REG=https://registry-1.docker.io; REPO=library/alpine
+TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:$REPO:pull" | jq -r .token)
+ACC="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+
+curl -s -o /dev/null -w "by tag    -&gt; %{http_code}\n" -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+     $REG/v2/$REPO/manifests/3.21
+D=$(curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+echo "resolved  -&gt; $D"
+curl -s -o /dev/null -w "by digest -&gt; %{http_code}\n" -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+     $REG/v2/$REPO/manifests/$D</pre>
+<pre class="out">by tag    -&gt; 200
+resolved  -&gt; <b>sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>
+by digest -&gt; 200</pre></li>
+
+<li>Now try to use a tag where the spec demands a digest. The blob endpoint has no tags to offer.
+<pre class="cmd">curl -s -w "\nstatus: %{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+     $REG/v2/$REPO/blobs/3.21</pre>
+<pre class="out"><b>404 page not found</b>
+
+status: 404</pre>
+<p>Look closely at that body: plain text, no <code>{"errors":[...]}</code> envelope. The request never reached a registry handler at all, because <code>3.21</code> failed to parse as a digest. That distinction — JSON error versus bare text — is a diagnostic you will reuse.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown any registry URL, you can say instantly whether what it names can change, and therefore whether it is safe to cache forever. You can also say where in this API an attacker would aim.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Immutable" is a property of the naming, not a promise from the server.</strong> A hostile registry can absolutely return the wrong bytes for a blob URL. What content addressing gives you is the ability to <em>detect</em> that in one line of code — which is why every client in this module recomputes the digest, and why I5.7's step 4 is not ceremony.</li>
+<li><strong>A digest may carry many tags, or none.</strong> Deleting a tag does not delete an image, and an image referenced only by digest is perfectly normal — that is exactly what a pinned pod spec produces.</li>
+<li><strong>The repository name has a strict grammar.</strong> Lowercase only, and the spec's regex forbids the uppercase letters people reach for first. An unexpected 400 on push is often a capital letter in a repository name.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This asymmetry is the real argument for <code>image: app@sha256:…</code> over <code>image: app:v2</code> in a deployment. A tag is a mutable pointer that someone else controls; a digest is not. It is the same distinction <a href="w3.html#cp-3-6">W3.6</a> makes when a rollout's identity has to be pinned to something that cannot shift underneath it, and it is why <a href="w6.html#cp-6-17">W6.17</a>'s "but it worked yesterday" pulls are so often a moved tag rather than a broken registry.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Definitions</code> and <code>§ Pulling manifests</code> for the grammar of <code>&lt;name&gt;</code> and <code>&lt;reference&gt;</code>. On the Kubernetes side, search for <em>"image pull policy"</em> — the tag/digest distinction drives its whole behaviour.</p>
+</article>
+
+</div>
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i4.html">← I4</a><a href="../intermediate.html#i6">I6 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
