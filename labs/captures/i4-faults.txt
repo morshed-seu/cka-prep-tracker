@@ -1,0 +1,57 @@
+# captured 2026-07-28T10:36:22Z on sandbox
+# --- snippet ---
+# 
+# cd ~/i4
+# echo "############ FAULT 1: a layer blob whose bytes were altered ############"
+# sudo rm -rf tampered && cp -r derived-oci tampered
+# DMAN=$(jq -r ".manifests[0].digest" tampered/index.json | cut -d: -f2)
+# LAY=$(jq -r ".layers[1].digest" tampered/blobs/sha256/$DMAN | cut -d: -f2)
+# printf "\\x00" | dd of=tampered/blobs/sha256/$LAY bs=1 seek=200 conv=notrunc status=none
+# echo "flipped one byte at offset 200 of the second layer blob"
+# python3 oci-inspect.py tampered 1 2>&1 | tail -8
+# echo "(exit $?)"
+# echo
+# echo "############ FAULT 2: no manifest for the requested platform ############"
+# python3 oci-inspect.py alpine-oci 3.21 --platform linux/s390x 2>&1 | tail -3
+# echo
+# echo "############ FAULT 3: layers applied in the WRONG ORDER ############"
+# ln -sf oci-inspect.py oci_inspect.py
+# sudo rm -rf rootfs-bad
+# sudo python3 -c "
+# import importlib.util, os, json
+# spec = importlib.util.spec_from_file_location(\"oi\", \"oci_inspect.py\")
+# oi = importlib.util.module_from_spec(spec); spec.loader.exec_module(oi)
+# layout=\"derived-oci\"
+# man=json.load(open(\"derived-oci/blobs/sha256/\"+\"$DMAN\"))
+# paths=[oi.blob_path(layout,l[\"digest\"]) for l in man[\"layers\"]]
+# os.makedirs(\"rootfs-bad\", exist_ok=True)
+# for p in reversed(paths):
+#     oi.apply_layer(p, \"rootfs-bad\")
+# print(\"applied layer[1] then layer[0] - reverse order\")
+# "
+# echo -n "/etc/motd resurrected? : "; sudo test -e rootfs-bad/etc/motd && echo "YES - the deleted file is BACK" || echo "no"
+# echo -n "stray whiteout files left in the rootfs: "; sudo find rootfs-bad -name ".wh.*" | wc -l
+# sudo find rootfs-bad -name ".wh.*" | head -3
+# 
+# --- output ---
+############ FAULT 1: a layer blob whose bytes were altered ############
+flipped one byte at offset 200 of the second layer blob
+
+resolving tag '1' for platform linux/amd64
+
+verifying every digest by recomputing it:
+  [OK] manifest                     sha256:3754800d226dfe8df1f...       559 bytes
+  [OK] config                       sha256:46f0b63bfdfd6112c97...       765 bytes
+  [OK] layer[0]                     sha256:55cfd63653c76188760...   3772079 bytes
+  [MISMATCH] layer[1]                     sha256:bac3e37179e0ca21c83...       394 bytes
+(exit 0)
+
+############ FAULT 2: no manifest for the requested platform ############
+      chainID  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb   <- what the snapshotter caches on
+
+history: 2 entries, 1 of them empty_layer (so 1 produced a layer, matching 1)
+
+############ FAULT 3: layers applied in the WRONG ORDER ############
+applied layer[1] then layer[0] - reverse order
+/etc/motd resurrected? : YES - the deleted file is BACK
+stray whiteout files left in the rootfs: 0
