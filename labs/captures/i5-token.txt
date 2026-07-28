@@ -1,0 +1,64 @@
+# captured 2026-07-28T11:34:27Z on sandbox
+# --- snippet ---
+# set +e
+# REPO=library/alpine; REG=https://registry-1.docker.io
+# echo "### 1. the challenge"
+# CH=$(curl -sI $REG/v2/$REPO/manifests/3.21 | tr -d "\r" | grep -i "^www-authenticate")
+# echo "$CH"
+# echo
+# echo "### 2. parse realm, service, scope out of it"
+# REALM=$(echo "$CH"  | sed -n "s/.*realm=\"\([^\"]*\)\".*/\1/p")
+# SVC=$(echo "$CH"    | sed -n "s/.*service=\"\([^\"]*\)\".*/\1/p")
+# SCOPE=$(echo "$CH"  | sed -n "s/.*scope=\"\([^\"]*\)\".*/\1/p")
+# echo "realm=$REALM"; echo "service=$SVC"; echo "scope=$SCOPE"
+# echo
+# echo "### 3. ask the authorization service — note: no credentials sent"
+# TOKEN=$(curl -s "$REALM?service=$SVC&scope=$SCOPE" | jq -r .token)
+# curl -s "$REALM?service=$SVC&scope=$SCOPE" | jq "{expires_in, issued_at, token: (.token[0:24]+\"...\")}"
+# echo
+# echo "### 4. what the token actually grants (payload, base64url-decoded)"
+# echo "$TOKEN" | cut -d. -f2 | tr "_-" "/+" | base64 -d 2>/dev/null | jq "{iss, aud, sub, exp, access}"
+# echo
+# echo "### 5. use it"
+# curl -s -o /dev/null -w "with token    -> %{http_code}\n" -H "Authorization: Bearer $TOKEN" $REG/v2/$REPO/manifests/3.21
+# curl -s -o /dev/null -w "without token -> %{http_code}\n" $REG/v2/$REPO/manifests/3.21
+# --- output ---
+### 1. the challenge
+www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+
+### 2. parse realm, service, scope out of it
+realm=https://auth.docker.io/token
+service=registry.docker.io
+scope=repository:library/alpine:pull
+
+### 3. ask the authorization service — note: no credentials sent
+{
+  "expires_in": 300,
+  "issued_at": "2026-07-28T11:34:29.056058747Z",
+  "token": "eyJhbGciOiJSUzI1NiIsInR5..."
+}
+
+### 4. what the token actually grants (payload, base64url-decoded)
+{
+  "iss": "auth.docker.io",
+  "aud": "registry.docker.io",
+  "sub": "",
+  "exp": 1785238768,
+  "access": [
+    {
+      "actions": [
+        "pull"
+      ],
+      "name": "library/alpine",
+      "parameters": {
+        "pull_limit": "100",
+        "pull_limit_interval": "21600"
+      },
+      "type": "repository"
+    }
+  ]
+}
+
+### 5. use it
+with token    -> 200
+without token -> 401

@@ -1,0 +1,38 @@
+# captured 2026-07-28T11:40:24Z on sandbox
+# --- snippet ---
+# set +e
+# echo "### the ctr flag is a crutch — the kubelet pulls through CRI, which needs config_path"
+# sudo ctr version >/dev/null
+# grep -n "config_path" /etc/containerd/config.toml || echo "(config_path not set in /etc/containerd/config.toml)"
+# echo
+# echo "### what containerd 2.3.3 expects, in the images plugin"
+# sudo containerd config default | grep -n -A2 "config_path" | head -12
+# echo
+# echo "### second pull of the same image — served from the cache, no upstream fetch"
+# sudo nerdctl rm -f mirror2 >/dev/null 2>&1
+# sudo ctr -n i5 images rm docker.io/library/busybox:1.37 >/dev/null 2>&1
+# time sudo ctr -n i5 images pull --hosts-dir /etc/containerd/certs.d docker.io/library/busybox:1.37 2>&1 | tail -1
+# --- output ---
+### the ctr flag is a crutch — the kubelet pulls through CRI, which needs config_path
+grep: /etc/containerd/config.toml: No such file or directory
+(config_path not set in /etc/containerd/config.toml)
+
+### what containerd 2.3.3 expects, in the images plugin
+31:      config_path = ''
+32-
+33-    [plugins.'io.containerd.cri.v1.images'.image_decryption]
+--
+152:    plugin_config_path = '/etc/nri/conf.d'
+153-    plugin_registration_timeout = '5s'
+154-    plugin_request_timeout = '2s'
+--
+259:    config_path = ''
+260-    max_concurrent_unpacks = 1
+261-
+
+### second pull of the same image — served from the cache, no upstream fetch
+Completed pull from OCI Registry (docker.io/library/busybox:1.37)	elapsed: 1.3 s	total:  2.1 Mi	(1.6 MiB/s)	
+
+real	0m1.362s
+user	0m0.011s
+sys	0m0.016s

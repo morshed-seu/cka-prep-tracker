@@ -1,0 +1,27 @@
+# captured 2026-07-28T11:41:00Z on sandbox
+# --- snippet ---
+# set +e
+# REG=https://registry-1.docker.io
+# echo "### A. 401 WITH a challenge — you simply have not got a token yet"
+# curl -si $REG/v2/library/alpine/manifests/3.21 | tr -d "\r" | grep -i "^HTTP/\|^www-authenticate"
+# curl -s  $REG/v2/library/alpine/manifests/3.21 | jq -c ".errors[0]|{code,message}"
+# echo
+# echo "### B. 401 WITHOUT a challenge — the token endpoint rejected your credentials"
+# curl -si -u "notauser:notapassword" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull" | tr -d "\r" | grep -i "^HTTP/\|^www-authenticate"
+# curl -s  -u "notauser:notapassword" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull" | jq -c "{details, errors: (.errors[0]?|{code,message})}"
+# echo
+# echo "### C. and what a real client says when it hits B"
+# sudo ctr -n i5 images pull --user notauser:notapassword docker.io/library/alpine:3.21 2>&1 | tail -2
+# --- output ---
+### A. 401 WITH a challenge — you simply have not got a token yet
+HTTP/2 401 
+www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+{"code":"UNAUTHORIZED","message":"authentication required"}
+
+### B. 401 WITHOUT a challenge — the token endpoint rejected your credentials
+HTTP/2 401 
+www-authenticate: Basic realm="auth.docker.io"
+{"details":"incorrect username or password","errors":{"code":null,"message":null}}
+
+### C. and what a real client says when it hits B
+ctr: failed to resolve image: failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://auth.docker.io/token?scope=repository%3Alibrary%2Falpine%3Apull&service=registry.docker.io: 401 Unauthorized

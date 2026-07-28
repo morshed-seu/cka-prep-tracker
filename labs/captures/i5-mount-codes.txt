@@ -1,0 +1,41 @@
+# captured 2026-07-28T11:38:46Z on sandbox
+# --- snippet ---
+# set +e
+# echo "### the two POSTs to big/two, with their status codes"
+# sudo nerdctl logs registry 2>&1 | grep "POST /v2/big/two" | python3 -c "
+# import sys,re,json
+# for line in sys.stdin:
+#     m=re.search(r\"\\\"(POST [^\\\"]+)\\\" (\\d+)\", line)
+#     if m:
+#         u=re.sub(r\"_state=[^&\\\"]*\",\"_state=...\",m.group(1))
+#         print(f\"{m.group(2)}  {u[:110]}\")
+# "
+# echo
+# echo "### and by hand, per the spec — mount a blob into a third repository"
+# D=$(curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json" http://localhost:5000/v2/big/one/manifests/24.04 | jq -r ".layers[0].digest")
+# echo "blob to mount: $D"
+# curl -si -X POST "http://localhost:5000/v2/big/three/blobs/uploads/?mount=$D&from=big/one" | tr -d "\r" | grep -i "^HTTP/\|^location\|^docker-content-digest\|^content-length"
+# echo
+# echo "### bytes transferred: none. it is now readable in big/three"
+# curl -sI http://localhost:5000/v2/big/three/blobs/$D | tr -d "\r" | grep -i "^HTTP/\|content-length"
+# echo
+# echo "### mounting a blob the registry does not have -> a normal upload session instead"
+# curl -si -X POST "http://localhost:5000/v2/big/three/blobs/uploads/?mount=sha256:$(printf %064d 0)&from=big/one" | tr -d "\r" | head -1
+# --- output ---
+### the two POSTs to big/two, with their status codes
+201  POST /v2/big/two/blobs/uploads/?from=big%2Fone&mount=sha256%3Aca2678b20700c15185707964d9211b1a6406196114bf675f
+202  POST /v2/big/two/blobs/uploads/ HTTP/1.1
+
+### and by hand, per the spec — mount a blob into a third repository
+blob to mount: sha256:ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888
+HTTP/1.1 201 Created
+Content-Length: 0
+Docker-Content-Digest: sha256:ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888
+Location: http://localhost:5000/v2/big/three/blobs/sha256:ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888
+
+### bytes transferred: none. it is now readable in big/three
+HTTP/1.1 200 OK
+Content-Length: 29735601
+
+### mounting a blob the registry does not have -> a normal upload session instead
+HTTP/1.1 202 Accepted

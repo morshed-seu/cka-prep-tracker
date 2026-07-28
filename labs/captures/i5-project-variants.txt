@@ -1,0 +1,43 @@
+# captured 2026-07-28T11:48:10Z on sandbox
+# --- snippet ---
+# set +e
+# P="$HOME/.venv-intermediate/bin/python -u"
+# echo "### A. a registry that needs no token at all"
+# rm -rf ~/l1; $P ~/pull.py localhost:5000/demo/alpine:3.21 ~/l1 2>&1 | grep "^registry\|^token\|^resolved\|^note"
+# echo
+# echo "### B. a platform the index does not carry"
+# rm -rf ~/l2; $P ~/pull.py docker.io/library/alpine:3.21 ~/l2 --platform linux/mips64 2>&1 | tail -1
+# echo
+# echo "### C. a tag that resolves to one manifest, with no index to select from"
+# rm -rf ~/l3; $P ~/pull.py localhost:5000/sneaky/alpine:3.21 ~/l3 --platform linux/amd64 2>&1 | grep "^note\|WARNING"
+# echo
+# echo "### D. a repository that is not there"
+# rm -rf ~/l4; $P ~/pull.py localhost:5000/nope/nothing:1 ~/l4 2>&1 | tail -4
+# echo
+# echo "### E. and the fault from the drill: a manifest whose layer is gone"
+# rm -rf ~/l5; $P ~/pull.py localhost:5000/broken/hw:1 ~/l5 2>&1 | tail -4
+# --- output ---
+### A. a registry that needs no token at all
+registry   http://localhost:5000
+token      none needed
+resolved   3.21 -> sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+note       no index; 3.21 is a single manifest
+
+### B. a platform the index does not carry
+error: no image found for platform linux/mips64; the index offers ['linux/386', 'linux/amd64', 'linux/arm/v6', 'linux/arm/v7', 'linux/arm64/v8', 'linux/ppc64le', 'linux/riscv64', 'linux/s390x']
+
+### C. a tag that resolves to one manifest, with no index to select from
+note       no index; 3.21 is a single manifest
+  WARNING: asked for linux/amd64, but the config says linux/arm64
+
+### D. a repository that is not there
+token      none needed
+error: 404 Not Found on http://localhost:5000/v2/nope/nothing/manifests/1
+  registry says: MANIFEST_UNKNOWN
+  meaning:       the reference does not exist here. A 404 on a manifest is a wrong name, tag or Accept header; a 404 on a blob after the manifest resolved is a registry missing content it promised
+
+### E. and the fault from the drill: a manifest whose layer is gone
+  [verified] config       sha256:e2ac70e7319a02c5a47...       577 bytes
+error: 404 Not Found on http://localhost:5000/v2/broken/hw/blobs/sha256:4f55086f7dd096d48b0e49be066971a8ed996521c2e190aa21b2435a847198b4
+  registry says: BLOB_UNKNOWN
+  meaning:       the reference does not exist here. A 404 on a manifest is a wrong name, tag or Accept header; a 404 on a blob after the manifest resolved is a registry missing content it promised

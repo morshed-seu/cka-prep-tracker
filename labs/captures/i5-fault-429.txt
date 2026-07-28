@@ -1,0 +1,35 @@
+# captured 2026-07-28T11:43:06Z on sandbox
+# --- snippet ---
+# set +e
+# setsid nohup python3 ~/limiter.py >/dev/null 2>&1 < /dev/null &
+# sleep 2
+# echo "### it answers the handshake — so the registry is reachable and healthy"
+# curl -s -o /dev/null -w "GET /v2/  -> %{http_code}\n" http://127.0.0.1:5002/v2/
+# echo
+# echo "### and refuses the manifest"
+# curl -si http://127.0.0.1:5002/v2/library/alpine/manifests/3.21 | tr -d "\r" | grep -i "^HTTP/\|retry-after\|ratelimit"
+# curl -s http://127.0.0.1:5002/v2/library/alpine/manifests/3.21 | jq -c ".errors[0].code"
+# echo
+# echo "### what containerd reports — note the status code survives"
+# sudo ctr -n i5z images pull --plain-http 127.0.0.1:5002/library/alpine:3.21 2>&1 | tail -2
+# echo
+# echo "### and what nerdctl reports"
+# sudo nerdctl pull --insecure-registry 127.0.0.1:5002/library/alpine:3.21 2>&1 | tail -2
+# pkill -f "[l]imiter\.py"
+# --- output ---
+### it answers the handshake — so the registry is reachable and healthy
+GET /v2/  -> 200
+
+### and refuses the manifest
+HTTP/1.0 429 Too Many Requests
+Retry-After: 3600
+RateLimit-Limit: 100;w=21600
+RateLimit-Remaining: 0;w=21600
+"TOOMANYREQUESTS"
+
+### what containerd reports — note the status code survives
+ctr: failed to resolve image: unexpected status from HEAD request to http://127.0.0.1:5002/v2/library/alpine/manifests/3.21: 429 Too Many Requests
+
+### and what nerdctl reports
+time="2026-07-28T17:43:08+06:00" level=warning msg="server \"127.0.0.1:5002\" does not seem to support HTTPS, falling back to plain HTTP" error="failed to resolve image: failed to do request: Head \"https://127.0.0.1:5002/v2/library/alpine/manifests/3.21\": tls: first record does not look like a TLS handshake"
+time="2026-07-28T17:43:08+06:00" level=fatal msg="failed to resolve image: failed to do request: Head \"https://127.0.0.1:5002/v2/library/alpine/manifests/3.21\": tls: first record does not look like a TLS handshake"

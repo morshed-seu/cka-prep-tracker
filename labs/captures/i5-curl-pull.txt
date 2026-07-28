@@ -1,0 +1,90 @@
+# captured 2026-07-28T11:35:48Z on sandbox
+# --- snippet ---
+# set +e
+# REG=https://registry-1.docker.io; REPO=library/alpine; TAG=3.21
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# rm -rf ~/pull && mkdir -p ~/pull/blobs && cd ~/pull
+# T=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)
+# H="Authorization: Bearer $T"
+# 
+# echo "### 1. index -> pick linux/amd64, skipping attestations"
+# curl -s -H "$H" -H "Accept: $ACC" $REG/v2/$REPO/manifests/$TAG > index.json
+# jq -r ".manifests[] | \"\(.platform.os)/\(.platform.architecture)\(.platform.variant // \"\")  \(.digest[0:19])  \(.annotations.\"vnd.docker.reference.type\" // \"-\")\"" index.json
+# MD=$(jq -r ".manifests[] | select(.platform.os==\"linux\" and .platform.architecture==\"amd64\" and (.annotations.\"vnd.docker.reference.type\"|not)) | .digest" index.json)
+# echo "chosen: $MD"
+# 
+# echo
+# echo "### 2. manifest"
+# curl -s -H "$H" -H "Accept: $ACC" $REG/v2/$REPO/manifests/$MD > manifest.json
+# echo "digest verifies: $(sha256sum manifest.json | cut -c1-64)  vs  ${MD#sha256:}"
+# jq "{mediaType, config: .config.digest, layers: [.layers[].digest]}" manifest.json
+# 
+# echo
+# echo "### 3. config blob"
+# CD=$(jq -r .config.digest manifest.json)
+# curl -sL -H "$H" -o blobs/${CD#sha256:} $REG/v2/$REPO/blobs/$CD
+# echo "config verifies: $(sha256sum blobs/${CD#sha256:} | cut -c1-16)... vs ${CD:7:16}..."
+# jq "{architecture, os, Cmd: .config.Cmd, diff_ids: .rootfs.diff_ids}" blobs/${CD#sha256:}
+# 
+# echo
+# echo "### 4. layer blobs — and where the bytes come from"
+# for LD in $(jq -r ".layers[].digest" manifest.json); do
+#   echo "-- $LD"
+#   curl -s -o /dev/null -H "$H" -w "   no-follow: %{http_code}  redirect_url=%{redirect_url}\n" $REG/v2/$REPO/blobs/$LD
+#   curl -sL -H "$H" -o blobs/${LD#sha256:} -w "   follow:    %{http_code}  bytes=%{size_download}  host=%{url_effective}\n" $REG/v2/$REPO/blobs/$LD
+#   echo "   sha256sum: $(sha256sum blobs/${LD#sha256:} | cut -c1-24)"
+# done
+# echo
+# ls -l blobs/
+# --- output ---
+### 1. index -> pick linux/amd64, skipping attestations
+linux/amd64  sha256:f27cad911749  -
+unknown/unknown  sha256:1459b643bb61  attestation-manifest
+linux/armv6  sha256:b100acfd1266  -
+unknown/unknown  sha256:66658e3f9564  attestation-manifest
+linux/armv7  sha256:e2d6b24023cc  -
+unknown/unknown  sha256:f74819955928  attestation-manifest
+linux/arm64v8  sha256:1832327faf04  -
+unknown/unknown  sha256:2c404686b414  attestation-manifest
+linux/386  sha256:1634a6b20a82  -
+unknown/unknown  sha256:cc0d65cc7353  attestation-manifest
+linux/ppc64le  sha256:5eeafa69a2d7  -
+unknown/unknown  sha256:c9a05a0cdacb  attestation-manifest
+linux/riscv64  sha256:eae9b783e97a  -
+unknown/unknown  sha256:f4e20467400d  attestation-manifest
+linux/s390x  sha256:9333f5f4545f  -
+unknown/unknown  sha256:1355e62c4191  attestation-manifest
+chosen: sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+
+### 2. manifest
+digest verifies: f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339  vs  f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+{
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": "sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577",
+  "layers": [
+    "sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81"
+  ]
+}
+
+### 3. config blob
+config verifies: 2607caa9805847fa... vs 2607caa9805847fa...
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "Cmd": [
+    "/bin/sh"
+  ],
+  "diff_ids": [
+    "sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb"
+  ]
+}
+
+### 4. layer blobs — and where the bytes come from
+-- sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+   no-follow: 307  redirect_url=https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/89/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81/data?Expires=1785241553&Signature=N7B35QvMVLR8ErbRzXCGWKg9nkkrQuDMAHNLUxPLI5CNFU-GJYJGZzQNtThQ-RDgQj-QMsAGXHW-FCx7EVGdBTIneA2EXRddCsHTwP7duad83qLUn7UKDCvOsM5XcgQSzkyIxKNU6Dh0yrYib8eyqbyWscY4dgATZXPCfhHOjtwDtFviWiGR52EFBnqOkbkFRRmjpSkwRiVSBFSYYdtV2I60ti3HT1KZ3bjKVUso2g599yHQFgMgadB~UdHJsHjxneXweZy7cEDw8EJ-y08~765AMSPX-UYzucRsqJeqHpURsKKMjjHqkBaJFClsn7CGQ64qdLvUzXpErkveDkpwZw__&Key-Pair-Id=K2C9XPB6FLAKUF
+   follow:    200  bytes=3646875  host=https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/89/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81/data?Expires=1785241554&Signature=f6fEe1iNRNElAIbXzh-dk~w-Eq0ghx7LRcxR8p5zov~WXnxAAJzEzTuSGPCRQCkwxohADRobTSSRoiEt1SWTA464SBX0lIuMsVuesDAHixzggvGtJdbxq8YLqx1ihsfbQt1Ffq08wmGSU~E2dUeBqow3ZyF9U8tEEzDmNsI6j3mN-QX97EgNXIqPLgwAoA6RdYXsHUHN2JxusK1dsGwX-5DWFCADpiYiHFmS~-AtGf5Tkl5L0FVp55aHNbSiEsYbVGLlb~p8lKw6awYobRIfYi8YZoRk8CInSzEQMefvuN1ni3Z4pFDL7aYVGzzHU09sB9sfU9yzieBbLdg1oVTraA__&Key-Pair-Id=K2C9XPB6FLAKUF
+   sha256sum: 897d797d2723cf0e318402f4
+
+total 3568
+-rw-rw-r-- 1 ubuntu ubuntu     611 Jul 28 17:35 2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+-rw-rw-r-- 1 ubuntu ubuntu 3646875 Jul 28 17:35 897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81

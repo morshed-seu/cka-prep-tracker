@@ -1,0 +1,43 @@
+# captured 2026-07-28T11:34:50Z on sandbox
+# --- snippet ---
+# set +e
+# REPO=library/alpine; REG=https://registry-1.docker.io
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+# TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)
+# echo "### the budget, as the response headers report it"
+# curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 | tr -d "\r" | grep -i ratelimit
+# echo
+# echo "### the budget, as the token itself declares it"
+# echo "$TOKEN" | cut -d. -f2 | tr "_-" "/+" | base64 -d 2>/dev/null | jq ".access[0].parameters"
+# echo
+# echo "### spend three and watch it count down"
+# for i in 1 2 3; do
+#   curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 \
+#     | tr -d "\r" | awk -F": " "tolower(\$1)~/ratelimit-remaining|ratelimit-source/{printf \"%s=%s  \", \$1, \$2} END{print \"\"}"
+# done
+# echo
+# echo "### who the budget is charged to"
+# curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 | tr -d "\r" | grep -i "ratelimit-source"
+# curl -s https://api.ipify.org; echo "   <- this machine as the internet sees it"
+# --- output ---
+### the budget, as the response headers report it
+docker-ratelimit-source: 203.0.113.50
+x-ratelimit-limit: 100;w=3600
+ratelimit-limit: 100;w=3600
+x-ratelimit-remaining: 91;w=3600
+ratelimit-remaining: 91;w=3600
+
+### the budget, as the token itself declares it
+{
+  "pull_limit": "100",
+  "pull_limit_interval": "21600"
+}
+
+### spend three and watch it count down
+docker-ratelimit-source=203.0.113.50  x-ratelimit-remaining=91;w=3600  ratelimit-remaining=91;w=3600  
+docker-ratelimit-source=203.0.113.50  x-ratelimit-remaining=91;w=3600  ratelimit-remaining=91;w=3600  
+docker-ratelimit-source=203.0.113.50  x-ratelimit-remaining=91;w=3600  ratelimit-remaining=91;w=3600  
+
+### who the budget is charged to
+docker-ratelimit-source: 203.0.113.50
+203.0.113.50   <- this machine as the internet sees it

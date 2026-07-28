@@ -1,0 +1,32 @@
+# captured 2026-07-28T11:32:14Z on sandbox
+# --- snippet ---
+# set +e
+# REG=https://registry-1.docker.io
+# REPO=library/alpine
+# TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)
+# A="-H \"Authorization: Bearer $TOKEN\""
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# 
+# echo "### manifests: reference = a TAG"
+# curl -s -o /dev/null -w "GET /v2/$REPO/manifests/3.21 -> %{http_code}\n" -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21
+# 
+# D=$(curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 | tr -d "\r" | awk -F": " "tolower(\$1)==\"docker-content-digest\"{print \$2}")
+# echo "resolved digest: $D"
+# echo
+# echo "### manifests: reference = a DIGEST (same document, immutable name)"
+# curl -s -o /dev/null -w "GET /v2/$REPO/manifests/\$D -> %{http_code}\n" -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/$D
+# echo
+# echo "### blobs: reference MUST be a digest — a tag is not a legal blob reference"
+# curl -s -H "Authorization: Bearer $TOKEN" -w "\nGET /v2/$REPO/blobs/3.21 -> %{http_code}\n" $REG/v2/$REPO/blobs/3.21 | tail -3
+# --- output ---
+### manifests: reference = a TAG
+GET /v2/library/alpine/manifests/3.21 -> 200
+resolved digest: sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+
+### manifests: reference = a DIGEST (same document, immutable name)
+GET /v2/library/alpine/manifests/$D -> 200
+
+### blobs: reference MUST be a digest — a tag is not a legal blob reference
+404 page not found
+
+GET /v2/library/alpine/blobs/3.21 -> 404

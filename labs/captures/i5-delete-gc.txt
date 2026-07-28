@@ -1,0 +1,44 @@
+# captured 2026-07-28T11:39:28Z on sandbox
+# --- snippet ---
+# set +e
+# echo "### registry:2 disables delete by default — turn it on"
+# sudo nerdctl rm -f registry >/dev/null 2>&1
+# sudo nerdctl run -d --name registry -p 5000:5000 -e REGISTRY_STORAGE_DELETE_ENABLED=true docker.io/library/registry:2 >/dev/null 2>&1
+# sleep 3
+# sudo skopeo copy --dest-tls-verify=false docker://docker.io/library/ubuntu:24.04 docker://localhost:5000/gc/demo:24.04 2>&1 | tail -1
+# echo
+# echo "### disk used by the registry, before"
+# sudo nerdctl exec registry du -sh /var/lib/registry
+# echo
+# echo "### delete the tag, then look for the image"
+# sudo skopeo delete --tls-verify=false docker://localhost:5000/gc/demo:24.04 && echo "delete: ok"
+# curl -s -o /dev/null -w "GET manifest by tag -> %{http_code}\n" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" http://localhost:5000/v2/gc/demo/manifests/24.04
+# echo
+# echo "### disk used by the registry, after"
+# sudo nerdctl exec registry du -sh /var/lib/registry
+# echo
+# echo "### the blobs are still there — reclaiming them is a separate pass"
+# sudo nerdctl exec registry /bin/registry garbage-collect /etc/docker/registry/config.yml 2>&1 | tail -6
+# sudo nerdctl exec registry du -sh /var/lib/registry
+# --- output ---
+### registry:2 disables delete by default — turn it on
+Writing manifest to image destination
+
+### disk used by the registry, before
+28.5M	/var/lib/registry
+
+### delete the tag, then look for the image
+delete: ok
+GET manifest by tag -> 404
+
+### disk used by the registry, after
+28.5M	/var/lib/registry
+
+### the blobs are still there — reclaiming them is a separate pass
+blob eligible for deletion: sha256:52df9b1ee71626e0088f7d400d5c6b5f7bb916f8f0c82b474289a4ece6cf3faf
+time="2026-07-28T11:39:37.810190072Z" level=info msg="Deleting blob: /docker/registry/v2/blobs/sha256/52/52df9b1ee71626e0088f7d400d5c6b5f7bb916f8f0c82b474289a4ece6cf3faf" go.version=go1.20.8 instance.id=32a81f80-115e-4b31-b391-e54248ff7787 service=registry 
+time="2026-07-28T11:39:37.810355512Z" level=info msg="Deleting blob: /docker/registry/v2/blobs/sha256/ca/ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888" go.version=go1.20.8 instance.id=32a81f80-115e-4b31-b391-e54248ff7787 service=registry 
+blob eligible for deletion: sha256:ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888
+blob eligible for deletion: sha256:ef91e4b15da8323a1523adb2b371998dcd3063dae8553cc2744c178ccc065bc4
+time="2026-07-28T11:39:37.814343587Z" level=info msg="Deleting blob: /docker/registry/v2/blobs/sha256/ef/ef91e4b15da8323a1523adb2b371998dcd3063dae8553cc2744c178ccc065bc4" go.version=go1.20.8 instance.id=32a81f80-115e-4b31-b391-e54248ff7787 service=registry 
+96.0K	/var/lib/registry

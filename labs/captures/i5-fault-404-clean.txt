@@ -1,0 +1,35 @@
+# captured 2026-07-28T11:42:16Z on sandbox
+# --- snippet ---
+# set +e
+# R=http://localhost:5000
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# echo "### an image this machine has never pulled"
+# sudo skopeo copy --dest-tls-verify=false docker://docker.io/library/hello-world:linux docker://localhost:5000/broken/hw:1 2>&1 | tail -1
+# MD=$(curl -sI -H "Accept: $ACC" $R/v2/broken/hw/manifests/1 | tr -d "\r" | awk -F": " "tolower(\$1)==\"docker-content-digest\"{print \$2}")
+# LD=$(curl -s -H "Accept: $ACC" $R/v2/broken/hw/manifests/$MD | jq -r ".layers[0].digest")
+# echo "layer: $LD"
+# echo "already in the local content store? $(sudo ctr -n default content ls -q 2>/dev/null | grep -c ${LD#sha256:})"
+# echo
+# echo "### delete only the layer blob"
+# curl -s -o /dev/null -w "DELETE blob   -> %{http_code}\n" -X DELETE $R/v2/broken/hw/blobs/$LD
+# curl -s -o /dev/null -w "GET manifest  -> %{http_code}\n" -H "Accept: $ACC" $R/v2/broken/hw/manifests/1
+# curl -s -o /dev/null -w "GET blob      -> %{http_code}\n" $R/v2/broken/hw/blobs/$LD
+# echo
+# echo "### now pull it"
+# sudo ctr namespace rm i5y >/dev/null 2>&1
+# sudo ctr -n i5y images pull --plain-http localhost:5000/broken/hw:1 2>&1 | grep -v "|" | tail -3
+# --- output ---
+### an image this machine has never pulled
+Writing manifest to image destination
+layer: sha256:4f55086f7dd096d48b0e49be066971a8ed996521c2e190aa21b2435a847198b4
+already in the local content store? 0
+
+### delete only the layer blob
+DELETE blob   -> 202
+GET manifest  -> 200
+GET blob      -> 404
+
+### now pull it
+application/vnd.oci.image.manifest.v1+json sha256:d1a8d0a4eeb63aff09f5f34d4d80505e0ba81905f36158cc3970d8e07179e59e
+Pulling from OCI Registry (localhost:5000/broken/hw:1)	elapsed: 0.1 s	total:  1.6 Ki	(18.8 KiB/s)	
+ctr: failed to copy: httpReadSeeker: failed open: could not fetch content descriptor sha256:4f55086f7dd096d48b0e49be066971a8ed996521c2e190aa21b2435a847198b4 (application/vnd.oci.image.layer.v1.tar+gzip) from remote: not found

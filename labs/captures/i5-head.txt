@@ -1,0 +1,43 @@
+# captured 2026-07-28T11:32:39Z on sandbox
+# --- snippet ---
+# set +e
+# REPO=library/alpine
+# REG=https://registry-1.docker.io
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)
+# 
+# echo "### HEAD a manifest — headers only, no body"
+# curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 | tr -d "\r" | grep -iv "^date\|^strict\|^ratelimit"
+# echo
+# echo "### bytes actually transferred, HEAD vs GET"
+# for M in HEAD GET; do
+#   curl -s -X $M -o /dev/null -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+#     -w "$M  status=%{http_code}  body_bytes=%{size_download}\n" $REG/v2/$REPO/manifests/3.21
+# done
+# echo
+# echo "### the question a node with a cached image asks"
+# CACHED=$(sudo ctr -n default images ls -q 2>/dev/null | head -1)
+# LOCAL=$(sudo nerdctl images --format "{{.Repository}}:{{.Tag}} {{.ID}}" 2>/dev/null | grep "^alpine:3.21" | head -1)
+# echo "local:  $LOCAL"
+# REMOTE=$(curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 | tr -d "\r" | awk -F": " "tolower(\$1)==\"docker-content-digest\"{print \$2}")
+# echo "remote: $REMOTE"
+# --- output ---
+### HEAD a manifest — headers only, no body
+HTTP/2 200 
+content-type: application/vnd.oci.image.index.v1+json
+content-length: 9218
+docker-content-digest: sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+docker-distribution-api-version: registry/2.0
+etag: "sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
+docker-ratelimit-source: 203.0.113.50
+x-ratelimit-limit: 100;w=3600
+x-ratelimit-remaining: 99;w=3600
+
+
+### bytes actually transferred, HEAD vs GET
+HEAD  status=200  body_bytes=0
+GET  status=200  body_bytes=9218
+
+### the question a node with a cached image asks
+local:  alpine:3.21 48b0309ca019
+remote: sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d

@@ -1,0 +1,43 @@
+# captured 2026-07-28T11:33:07Z on sandbox
+# --- snippet ---
+# set +e
+# REPO=library/alpine; REG=https://registry-1.docker.io
+# TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)
+# probe(){ printf "%-58s -> " "$2"
+#   curl -s -o /tmp/m.json -w "%{http_code} " -H "Authorization: Bearer $TOKEN" ${2:+-H "Accept: $2"} $REG/v2/$REPO/manifests/3.21
+#   jq -r "if .errors then \"ERROR \"+.errors[0].code else (.mediaType // \"no mediaType field\") end" /tmp/m.json; }
+# 
+# echo "### one tag, four different Accept headers"
+# probe x ""
+# probe x "application/vnd.oci.image.index.v1+json"
+# probe x "application/vnd.docker.distribution.manifest.list.v2+json"
+# probe x "application/vnd.docker.distribution.manifest.v2+json"
+# probe x "application/vnd.oci.image.manifest.v1+json"
+# echo
+# echo "### the header to use for the rest of the module"
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 | jq "{mediaType, manifests: (.manifests|length)}"
+# echo
+# echo "### what the default (no Accept) actually returned, in full"
+# curl -s -H "Authorization: Bearer $TOKEN" $REG/v2/$REPO/manifests/3.21 | jq "{schemaVersion, mediaType, config: .config.mediaType, layers: (.layers|length)}"
+# --- output ---
+### one tag, four different Accept headers
+                                                           -> 200 application/vnd.oci.image.index.v1+json
+application/vnd.oci.image.index.v1+json                    -> 200 application/vnd.oci.image.index.v1+json
+application/vnd.docker.distribution.manifest.list.v2+json  -> 200 application/vnd.oci.image.index.v1+json
+application/vnd.docker.distribution.manifest.v2+json       -> 200 application/vnd.oci.image.index.v1+json
+application/vnd.oci.image.manifest.v1+json                 -> 200 application/vnd.oci.image.index.v1+json
+
+### the header to use for the rest of the module
+{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": 16
+}
+
+### what the default (no Accept) actually returned, in full
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "config": null,
+  "layers": 0
+}

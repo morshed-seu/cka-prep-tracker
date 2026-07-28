@@ -1,0 +1,42 @@
+# captured 2026-07-28T11:41:24Z on sandbox
+# --- snippet ---
+# set +e
+# R=http://localhost:5000
+# echo "### a healthy image on the local registry"
+# sudo skopeo copy --dest-tls-verify=false docker://docker.io/library/busybox:1.37 docker://localhost:5000/broken/busybox:1.37 2>&1 | tail -1
+# ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# MD=$(curl -sI -H "Accept: $ACC" $R/v2/broken/busybox/manifests/1.37 | tr -d "\r" | awk -F": " "tolower(\$1)==\"docker-content-digest\"{print \$2}")
+# M=$(curl -s -H "Accept: $ACC" $R/v2/broken/busybox/manifests/$MD)
+# LD=$(echo "$M" | jq -r ".layers[0].digest")
+# echo "manifest: $MD"
+# echo "layer:    $LD"
+# echo
+# echo "### plant the fault: delete just the layer blob, leave the manifest"
+# curl -s -o /dev/null -w "DELETE blob -> %{http_code}\n" -X DELETE $R/v2/broken/busybox/blobs/$LD
+# echo
+# echo "### the symptom: the manifest still resolves..."
+# curl -s -o /dev/null -w "GET manifest -> %{http_code}\n" -H "Accept: $ACC" $R/v2/broken/busybox/manifests/1.37
+# echo "### ...and then the blob is gone"
+# curl -s -w "\nGET blob     -> %{http_code}\n" $R/v2/broken/busybox/blobs/$LD | tail -2
+# echo
+# echo "### what a real client does with that"
+# sudo ctr -n i5 images rm localhost:5000/broken/busybox:1.37 >/dev/null 2>&1
+# sudo ctr -n i5 images pull --plain-http localhost:5000/broken/busybox:1.37 2>&1 | tail -2
+# --- output ---
+### a healthy image on the local registry
+Writing manifest to image destination
+manifest: sha256:7a3ebe5bfd1a4a19797d20b0c0bb39d44393e9a03fd852c0865b0f540d868df0
+layer:    sha256:436a1b1fd078ee8e117111472724c2827077657189af7a781829d0825d48d2ab
+
+### plant the fault: delete just the layer blob, leave the manifest
+DELETE blob -> 202
+
+### the symptom: the manifest still resolves...
+GET manifest -> 200
+### ...and then the blob is gone
+
+GET blob     -> 404
+
+### what a real client does with that
+application/vnd.oci.image.manifest.v1+json sha256:7a3ebe5bfd1a4a19797d20b0c0bb39d44393e9a03fd852c0865b0f540d868df0
+Pulling from OCI Registry (localhost:5000/broken/busybox:1.37)	elapsed: 0.0 s	total:  1.0 Ki	(46.2 KiB/s)	

@@ -1,0 +1,51 @@
+# captured 2026-07-28T11:39:54Z on sandbox
+# --- snippet ---
+# set +e
+# echo "### a pull-through cache: a registry:2 that fetches from upstream on a miss"
+# sudo nerdctl rm -f mirror >/dev/null 2>&1
+# sudo nerdctl run -d --name mirror -p 5001:5000 -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io docker.io/library/registry:2 >/dev/null 2>&1
+# sleep 3
+# curl -s -o /dev/null -w "mirror /v2/ -> %{http_code}\n" http://localhost:5001/v2/
+# echo
+# echo "### tell containerd to use it for docker.io"
+# sudo mkdir -p /etc/containerd/certs.d/docker.io
+# sudo tee /etc/containerd/certs.d/docker.io/hosts.toml >/dev/null <<EOF
+# server = "https://registry-1.docker.io"
+# 
+# [host."http://localhost:5001"]
+#   capabilities = ["pull", "resolve"]
+#   skip_verify = true
+# EOF
+# cat /etc/containerd/certs.d/docker.io/hosts.toml
+# echo
+# echo "### pull something not yet cached anywhere"
+# sudo ctr -n i5 images rm docker.io/library/busybox:1.37 >/dev/null 2>&1
+# sudo ctr -n i5 images pull --hosts-dir /etc/containerd/certs.d docker.io/library/busybox:1.37 2>&1 | tail -3
+# echo
+# echo "### prove it went to the mirror"
+# sudo nerdctl logs mirror 2>&1 | grep -o "\"[A-Z]* /v2/library/busybox[^\"]*\" [0-9]*" | head -8
+# --- output ---
+### a pull-through cache: a registry:2 that fetches from upstream on a miss
+mirror /v2/ -> 200
+
+### tell containerd to use it for docker.io
+server = "https://registry-1.docker.io"
+
+[host."http://localhost:5001"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true
+
+### pull something not yet cached anywhere
+      └──config (a9774febc922)          	complete   	|[32m++++++++++++++++++++++++++++++++++++++[0m|	
+application/vnd.oci.image.index.v1+json sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028
+Completed pull from OCI Registry (docker.io/library/busybox:1.37)	elapsed: 11.2s	total:  2.1 Mi	(194.2 KiB/s)	
+
+### prove it went to the mirror
+"HEAD /v2/library/busybox/manifests/1.37?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:7a3ebe5bfd1a4a19797d20b0c0bb39d44393e9a03fd852c0865b0f540d868df0?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:a59442b711b17cc485ef22b5168df03773563bfb6aefaaf63eb08d195517ba1e?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:52b7a0c31f13dad50855287d4826afe46ac3f41c2133186a2e32d1429538f733?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:fd2054cd2a1a0f6163c528456f3b6ed01155d0d105707e8f93086f5c26cc1131?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:5d2325ea84c2a87f0a2b458bdd0b00e0c92f943e43da3a0a67a8747d849afcf4?ns=docker.io HTTP/1.1" 200
+"GET /v2/library/busybox/manifests/sha256:7c4327a753654d97cfc121d53d0f55d68dcb673bed672ae21e190e0f0266943d?ns=docker.io HTTP/1.1" 200

@@ -1,0 +1,61 @@
+# captured 2026-07-28T11:38:05Z on sandbox
+# --- snippet ---
+# set +e
+# cd ~ && R=http://localhost:5000
+# echo "hello from a hand-rolled blob" > blob.bin
+# D=sha256:$(sha256sum blob.bin | cut -d" " -f1)
+# echo "blob digest: $D  ($(stat -c%s blob.bin) bytes)"
+# echo
+# echo "### A. monolithic — POST opens a session, PUT sends everything and names the digest"
+# H=$(curl -si -X POST $R/v2/hand/mono/blobs/uploads/ | tr -d "\r")
+# echo "$H" | head -1
+# LOC=$(echo "$H" | awk -F": " "tolower(\$1)==\"location\"{print \$2}")
+# echo "Location (note: absolute, and carries the session state):"
+# echo "  ${LOC%%\?*}?_state=..."
+# curl -si -X PUT --data-binary @blob.bin -H "Content-Type: application/octet-stream" "$LOC&digest=$D" | tr -d "\r" | grep -i "^HTTP/\|^location\|^docker-content-digest"
+# echo
+# echo "### B. chunked — POST, one PATCH per chunk, PUT to finalise"
+# split -b 10 blob.bin chunk.
+# LOC=$(curl -si -X POST $R/v2/hand/chunked/blobs/uploads/ | tr -d "\r" | awk -F": " "tolower(\$1)==\"location\"{print \$2}")
+# OFF=0
+# for c in chunk.*; do
+#   N=$(stat -c%s $c); END=$((OFF+N-1))
+#   RESP=$(curl -si -X PATCH --data-binary @$c -H "Content-Type: application/octet-stream" -H "Content-Range: $OFF-$END" "$LOC" | tr -d "\r")
+#   printf "PATCH %-8s -> %s  Range: %s\n" "$OFF-$END" "$(echo "$RESP"|head -1)" "$(echo "$RESP"|awk -F": " "tolower(\$1)==\"range\"{print \$2}")"
+#   LOC=$(echo "$RESP" | awk -F": " "tolower(\$1)==\"location\"{print \$2}")
+#   OFF=$((END+1))
+# done
+# curl -si -X PUT "$LOC&digest=$D" | tr -d "\r" | grep -i "^HTTP/\|^docker-content-digest"
+# rm -f chunk.*
+# echo
+# echo "### C. finalise with a digest that does not match the bytes"
+# LOC=$(curl -si -X POST $R/v2/hand/bad/blobs/uploads/ | tr -d "\r" | awk -F": " "tolower(\$1)==\"location\"{print \$2}")
+# curl -s -X PUT --data-binary @blob.bin "$LOC&digest=sha256:0000000000000000000000000000000000000000000000000000000000000000" | jq -c ".errors[0]|{code,message}"
+# echo
+# echo "### both uploads are now retrievable by digest; the bad one is not"
+# for repo in mono chunked bad; do curl -s -o /dev/null -w "hand/$repo -> %{http_code}\n" $R/v2/hand/$repo/blobs/$D; done
+# --- output ---
+blob digest: sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d  (30 bytes)
+
+### A. monolithic — POST opens a session, PUT sends everything and names the digest
+HTTP/1.1 202 Accepted
+Location (note: absolute, and carries the session state):
+  http://localhost:5000/v2/hand/mono/blobs/uploads/f497c507-680a-4637-b910-b4728f9f4166?_state=...
+HTTP/1.1 201 Created
+Docker-Content-Digest: sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d
+Location: http://localhost:5000/v2/hand/mono/blobs/sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d
+
+### B. chunked — POST, one PATCH per chunk, PUT to finalise
+PATCH 0-9      -> HTTP/1.1 202 Accepted  Range: 0-9
+PATCH 10-19    -> HTTP/1.1 202 Accepted  Range: 0-19
+PATCH 20-29    -> HTTP/1.1 202 Accepted  Range: 0-29
+HTTP/1.1 201 Created
+Docker-Content-Digest: sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d
+
+### C. finalise with a digest that does not match the bytes
+{"code":"DIGEST_INVALID","message":"provided digest did not match uploaded content"}
+
+### both uploads are now retrievable by digest; the bad one is not
+hand/mono -> 200
+hand/chunked -> 200
+hand/bad -> 404

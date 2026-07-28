@@ -1,0 +1,61 @@
+# captured 2026-07-28T11:39:07Z on sandbox
+# --- snippet ---
+# set +e
+# echo "### inspect — the cooked view"
+# sudo skopeo inspect --tls-verify=false docker://localhost:5000/demo/alpine:3.21 | jq "{Name, Digest, Architecture, Os, Layers: (.Layers|length), Env}"
+# echo
+# echo "### inspect --raw — the manifest exactly as stored, no interpretation"
+# sudo skopeo inspect --tls-verify=false --raw docker://localhost:5000/demo/alpine:3.21 | jq -c "{mediaType, config: .config.mediaType, layers: [.layers[].mediaType]}"
+# echo
+# echo "### list-tags"
+# sudo skopeo list-tags --tls-verify=false docker://localhost:5000/big/one
+# echo
+# echo "### copy between transports — registry to an OCI layout on disk, no runtime involved"
+# rm -rf ~/oci-out
+# sudo skopeo copy --src-tls-verify=false docker://localhost:5000/demo/alpine:3.21 oci:$HOME/oci-out:3.21 2>&1 | tail -2
+# sudo find ~/oci-out -type f | sort
+# echo
+# echo "### registry to registry, streaming — nothing is unpacked"
+# sudo skopeo copy --dest-tls-verify=false docker://docker.io/library/busybox:1.37 docker://localhost:5000/mirror/busybox:1.37 2>&1 | tail -2
+# echo
+# echo "### delete"
+# sudo skopeo delete --tls-verify=false docker://localhost:5000/mirror/busybox:1.37 2>&1 | tail -2
+# --- output ---
+### inspect — the cooked view
+{
+  "Name": "localhost:5000/demo/alpine",
+  "Digest": "sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339",
+  "Architecture": "amd64",
+  "Os": "linux",
+  "Layers": 1,
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ]
+}
+
+### inspect --raw — the manifest exactly as stored, no interpretation
+{"mediaType":"application/vnd.oci.image.manifest.v1+json","config":"application/vnd.oci.image.config.v1+json","layers":["application/vnd.oci.image.layer.v1.tar+gzip"]}
+
+### list-tags
+{
+    "Repository": "localhost:5000/big/one",
+    "Tags": [
+        "24.04"
+    ]
+}
+
+### copy between transports — registry to an OCI layout on disk, no runtime involved
+Copying config sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+Writing manifest to image destination
+/home/ubuntu/oci-out/blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+/home/ubuntu/oci-out/blobs/sha256/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+/home/ubuntu/oci-out/blobs/sha256/f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+/home/ubuntu/oci-out/index.json
+/home/ubuntu/oci-out/oci-layout
+
+### registry to registry, streaming — nothing is unpacked
+Copying config sha256:db287cb6be81219cd18c1d82b70908f5d33eb028568b456f78eedff2ff2930e4
+Writing manifest to image destination
+
+### delete
+time="2026-07-28T17:39:12+06:00" level=fatal msg="deleting localhost:5000/mirror/busybox:1.37: unsupported"
