@@ -378,6 +378,186 @@ curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manife
 
 <p class="docs-links"><b>Docs:</b> <code>spec.md § Pulling manifests</code>, plus the spec's own <code>content-negotiation.md</code>. On the Kubernetes side there is nothing to read — that is rather the point of this checkpoint.</p>
 </article>
+</div><!-- /g-the-api -->
+
+<!-- ---------------- Pulling by hand ---------------- --><div class="grp" id="g-pulling-by-hand"><h3>Pulling by hand</h3>
+<article class="lesson" id="cp-i5-5" data-id="i5-5">
+<div class="lesson-head"><span class="cp-id">I5.5</span><h4>The token dance: the registry does not authenticate you</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A public image needs a token. That single fact confuses more people than anything else in this API, and it explains a whole class of failure — including why an <code>imagePullSecret</code> holding perfectly valid credentials can still fail, and why a long pull can die of a <code>401</code> halfway through.</p>
+
+<h5>The concept</h5>
+<p>The registry does not check your identity. It delegates that to a separate <strong>authorization service</strong>, and the <code>WWW-Authenticate</code> header from I5.1 is the registry telling you where that service lives and precisely what to ask it for. Three fields matter:</p>
+<ul>
+<li><code>realm</code> — the URL of the token endpoint.</li>
+<li><code>service</code> — which registry the token should be valid for.</li>
+<li><code>scope</code> — what you want to do, as <code>repository:&lt;name&gt;:&lt;actions&gt;</code>, e.g. <code>repository:library/alpine:pull</code>.</li>
+</ul>
+<p>You request a token from the realm with that scope, and use it as an <code>Authorization: Bearer</code> header on the real request. For a public image you send <strong>no credentials at all</strong> and get an <em>anonymous</em> token — which is why the answer to "why does a public pull need a token?" is that the token is not about who you are, it is about what you asked to do. The auth service is quite happy to grant "pull from library/alpine" to nobody in particular.</p>
+<p>Four consequences, all practical:</p>
+<ul>
+<li><strong>Tokens are per-scope.</strong> A client pulling from two repositories does two dances. A pod with images from three repositories triggers three.</li>
+<li><strong>Tokens expire, and quickly</strong> — Docker Hub's live in five minutes. A large pull can outlast its token and take a sudden <code>401</code> partway through; well-behaved clients simply re-fetch and continue, which is why you rarely see it and why a client that does <em>not</em> handle it fails only on big images.</li>
+<li><strong><code>docker login</code> stores credentials, not tokens.</strong> The token is re-fetched per operation. So a Kubernetes <code>imagePullSecret</code> containing entirely valid credentials still fails if the <em>auth service</em> is unreachable, even when the registry itself is fine — two hostnames, two failure modes, one error message.</li>
+<li><strong>The token is a JWT, and you can read it.</strong> Its payload states the access it grants, in the clear.</li>
+</ul>
+
+<div class="specref">
+<p>The distribution spec deliberately says almost nothing about authentication — it defines the endpoint and steps back. That silence is why registries differ so much here, and why the challenge header is the only thing you can rely on.</p>
+<blockquote>This endpoint MAY be used for authentication/authorization purposes, but this is out of the purview of this specification.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#determining-support">spec.md § Determining Support</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the challenge from the resource you actually want. Note it is more specific than the one on <code>/v2/</code>: it names the scope for you.
+<pre class="cmd">REG=https://registry-1.docker.io; REPO=library/alpine
+CH=$(curl -sI $REG/v2/$REPO/manifests/3.21 | tr -d '\r' | grep -i '^www-authenticate')
+echo "$CH"</pre>
+<pre class="out">www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",<b>scope="repository:library/alpine:pull"</b></pre></li>
+
+<li>Pull the three fields out and ask the authorization service. There are no credentials anywhere in this request.
+<pre class="cmd">REALM=$(echo "$CH" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+SVC=$(echo   "$CH" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+SCOPE=$(echo "$CH" | sed -n 's/.*scope="\([^"]*\)".*/\1/p')
+printf 'realm=%s\nservice=%s\nscope=%s\n' "$REALM" "$SVC" "$SCOPE"
+
+curl -s "$REALM?service=$SVC&amp;scope=$SCOPE" | jq '{expires_in, issued_at, token: (.token[0:24]+"...")}'</pre>
+<pre class="out">realm=https://auth.docker.io/token
+service=registry.docker.io
+scope=repository:library/alpine:pull
+
+{
+  <b>"expires_in": 300,</b>
+  "issued_at": "2026-07-28T11:34:29.056058747Z",
+  "token": "eyJhbGciOiJSUzI1NiIsInR5..."
+}</pre>
+<p>Five minutes. Remember that number when a 4 GB image takes longer than that to transfer.</p></li>
+
+<li>Decode the middle segment of the JWT and read what you were actually granted. A JWT is three base64url-encoded parts separated by dots; the payload is the second.
+<pre class="cmd">TOKEN=$(curl -s "$REALM?service=$SVC&amp;scope=$SCOPE" | jq -r .token)
+echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{iss, aud, sub, access}'</pre>
+<pre class="out">{
+  "iss": "auth.docker.io",
+  "aud": "registry.docker.io",
+  <b>"sub": "",</b>
+  "access": [
+    {
+      "actions": [ "pull" ],
+      "name": "library/alpine",
+      "parameters": {
+        <b>"pull_limit": "100",</b>
+        <b>"pull_limit_interval": "21600"</b>
+      },
+      "type": "repository"
+    }
+  ]
+}</pre>
+<p><code>"sub": ""</code> — nobody. The grant is entirely about the scope. The two <code>parameters</code> are your rate-limit budget, stated by the token itself; I5.6 takes that apart.</p></li>
+
+<li>Use it, then prove it was the token that mattered.
+<pre class="cmd">curl -s -o /dev/null -w "with token    -&gt; %{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+     $REG/v2/$REPO/manifests/3.21
+curl -s -o /dev/null -w "without token -&gt; %{http_code}\n" $REG/v2/$REPO/manifests/3.21</pre>
+<pre class="out">with token    -&gt; <b>200</b>
+without token -&gt; <b>401</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can complete the dance by hand for any registry that challenges you, and you can explain why a public image needs a token at all. You can also name the two different hosts a pull depends on, and say what breaks when each one is down.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Two hostnames, one error message.</strong> A pull needs both the registry and its auth service. Firewall rules that allow only the registry produce failures that look like bad credentials. When you allowlist a registry, allowlist its <code>realm</code> too — and I5.7 adds a third host to that list.</li>
+<li><strong>The scope must match what you are about to do.</strong> A token scoped <code>:pull</code> will not push, and the resulting <code>401</code> on a <code>PUT</code> looks exactly like a credentials problem. Pushing needs <code>repository:&lt;name&gt;:pull,push</code>.</li>
+<li><strong>A JWT is signed, not encrypted.</strong> Anyone holding it can read its claims — that is why decoding it above needed no key. It is also a bearer credential: whoever has it can use it until it expires, so treat one you have captured in a debug log as a live secret.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is what a <code>kubernetes.io/dockerconfigjson</code> Secret ultimately feeds: the kubelet reads the credentials, does this dance per repository, and never shows you any of it. <a href="w3.html#cp-3-23">W3.23</a>'s point that a Secret is base64-encoded rather than encrypted applies with force here — the registry password sits in etcd in a form anyone with read access can decode. When <a href="w6.html#cp-6-17">W6.17</a>'s <code>ErrImagePull</code> says "unauthorized", the question this checkpoint lets you ask is <em>which</em> of the two servers said so.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the Kubernetes docs for <em>"pull an image from a private registry"</em> — the <code>imagePullSecrets</code> and service-account paths are both exam-relevant. The token protocol itself is not in the OCI spec; the Docker registry token specification is the reference.</p>
+</article>
+<article class="lesson" id="cp-i5-6" data-id="i5-6">
+<div class="lesson-head"><span class="cp-id">I5.6</span><h4>Rate limits, and the twenty nodes behind one address</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the failure that wastes the most time in real clusters, because it is intermittent, it strikes under load, and by the time it reaches a human it has been rewritten into a message that mentions neither rate limits nor HTTP. Ten minutes here saves an afternoon later.</p>
+
+<h5>The concept</h5>
+<p>Docker Hub meters anonymous pulls, and for anonymous requests the meter is attached to your <strong>source IP address</strong>. The registry tells you where you stand in the response headers of every request, so the budget is never a mystery — if you look.</p>
+<p>Now apply that to a cluster. Twenty nodes behind one NAT gateway present one address to Docker Hub, so they share one budget. The result is a failure with an unpleasant shape: pods start fine all morning, then a deploy at 14:00 half-succeeds, with a different subset of pods affected each time you retry. Nothing is broken, nothing has changed, and the pods that fail move around — which is exactly the signature people misread as a flaky network.</p>
+<p>The status code is <code>429</code>. What reaches the person looking at <code>kubectl get pods</code> is <code>ImagePullBackOff</code>, with the real reason buried in the pod's events and often truncated. This is why "go and check the actual HTTP status" is such a high-value first move: the answer is unambiguous the moment you see the number, and unrecoverable guesswork until you do.</p>
+<p>The fixes are all in I5.13, and there are three: authenticate (a bigger budget), mirror (fetch from somewhere else), or run a pull-through cache (fetch once, serve many).</p>
+
+<div class="specref">
+<p>Rate limiting is not in the distribution spec at all — it is registry policy, and the spec's only hook for it is the general error mechanism. The <code>TOOMANYREQUESTS</code> code is defined in the error-code table.</p>
+<blockquote>The client MAY encounter error codes targeting Docker schema1 manifests […] These error codes are OPTIONAL and clients SHOULD NOT depend on them.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#error-codes">spec.md § Error Codes</a> (and § Legacy Docker support error codes, quoted, for why the code strings are not a contract)</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read your budget off any response. Both spellings of the header are sent — the standard-track one and Docker's <code>x-</code> prefixed original.
+<pre class="cmd">curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+     $REG/v2/$REPO/manifests/3.21 | tr -d '\r' | grep -i ratelimit</pre>
+<pre class="out"><b>docker-ratelimit-source: 203.0.113.50</b>
+x-ratelimit-limit: 100;w=3600
+ratelimit-limit: 100;w=3600
+<b>x-ratelimit-remaining: 91;w=3600</b>
+ratelimit-remaining: 91;w=3600</pre>
+<p>(The address is redacted here. The <code>w=3600</code> is the window in seconds.)</p></li>
+
+<li>Now prove what <code>docker-ratelimit-source</code> is. This is the whole NAT argument in two commands.
+<pre class="cmd">curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 \
+  | tr -d '\r' | grep -i 'ratelimit-source'
+curl -s https://api.ipify.org; echo '   &lt;- this machine, as the internet sees it'</pre>
+<pre class="out">docker-ratelimit-source: <b>203.0.113.50</b>
+<b>203.0.113.50</b>   &lt;- this machine, as the internet sees it</pre>
+<p>The budget is charged to the address, not to the machine. Every node sharing that egress address shares that number.</p></li>
+
+<li>Find out what actually costs you. Take a reading, spend three HEADs, take another, spend three GETs, take a third.
+<pre class="cmd">rem(){ curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21 \
+       | tr -d '\r' | awk -F': ' 'tolower($1)=="ratelimit-remaining"{print $2}'; }
+echo "start:         $(rem)"
+for i in 1 2 3; do curl -sI -o /dev/null -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21; done
+echo "after 3x HEAD: $(rem)"
+for i in 1 2 3; do curl -s  -o /dev/null -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" $REG/v2/$REPO/manifests/3.21; done
+echo "after 3x GET:  $(rem)"</pre>
+<pre class="out">start:         91;w=3600
+after 3x HEAD: <b>91;w=3600</b>
+after 3x GET:  <b>90;w=3600</b></pre>
+<p>Two findings, and only one of them is the one you expected. <strong>HEAD is free</strong> — which is the measurement behind I5.3's claim that <code>imagePullPolicy: Always</code> is cheap. And three GETs cost <em>one</em>, so the meter is counting something coarser than HTTP requests: a "pull", however Docker Hub chooses to define it. Report what you measured, not what you assumed.</p></li>
+
+<li>Note the disagreement between the two places the budget is stated. The header says 100 per 3600 seconds; the token from I5.5 says 100 per 21600.
+<pre class="cmd">echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '.access[0].parameters'</pre>
+<pre class="out">{
+  "pull_limit": "100",
+  <b>"pull_limit_interval": "21600"</b>
+}</pre>
+<p>Six hours versus one. Both were returned by Docker Hub in the same minute. Treat neither as documentation — treat <code>ratelimit-remaining</code> as the only number that is telling you about right now.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state your remaining budget from any response, explain to an infrastructure team why twenty nodes have the pull quota of one laptop, and predict the shape of the failure that follows — intermittent, load-triggered, and moving between pods.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Anonymous limits are per source IP; authenticated limits are per account.</strong> Authenticating changes both the size of the budget and what it is attached to. That is why "just log in on the nodes" is a real fix and not a workaround.</li>
+<li><strong>The published numbers change and the headers disagree with each other.</strong> Do not commit a limit to memory — read <code>ratelimit-remaining</code> at the moment you care.</li>
+<li><strong>A 429 does not always mention rate limiting by the time you see it.</strong> The kubelet reports <code>ImagePullBackOff</code>; the underlying message may be truncated in events. <code>crictl pull</code> from the node, or a <code>curl</code>, gives you the number directly.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the most common non-obvious cause of <a href="w6.html#cp-6-17">W6.17</a>'s <code>ImagePullBackOff</code>, and the one least visible from inside the cluster. The diagnostic path is: <code>kubectl describe pod</code> for the event, then — because the event will not say "429" — <code>crictl pull</code> or <code>curl</code> from the affected node. A backoff that resolves itself after an hour with no change is this, and nothing else.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> nothing in the Kubernetes docs covers registry rate limits; the registry operator's own documentation is the reference. For the exam, the useful search is <em>"ImagePullBackOff"</em> in the debugging pages — know that the reason lives in the events, not in the pod status.</p>
+</article>
 
 </div>
 
