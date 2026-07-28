@@ -940,6 +940,192 @@ hand/bad -&gt; <b>404</b></pre></li>
 
 <p class="docs-links"><b>Docs:</b> <code>spec.md § Pushing blobs</code> covers monolithic, chunked and the POST-then-PUT variant. Nothing exam-relevant on the Kubernetes side.</p>
 </article>
+<article class="lesson" id="cp-i5-11" data-id="i5-11">
+<div class="lesson-head"><span class="cp-id">I5.11</span><h4>Cross-repository mount: the 30 MB upload that moves no bytes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Promoting an image from <code>staging/app</code> to <code>prod/app</code> ought to be free — the bytes are already on the registry. There is an endpoint that makes it free, a permission subtlety that silently disables it, and a symptom so mild that nobody investigates: the pipeline just got slower.</p>
+
+<h5>The concept</h5>
+<p>Blobs are content-addressed, so a registry stores each one <em>once</em> and lets repositories reference it. "Uploading" a blob the registry already holds is therefore not a transfer at all — it is a permission check and a new reference. The spec gives it a dedicated form: instead of the usual <code>POST</code> to open an upload session, you <code>POST</code> with two query parameters naming the blob and the repository to take it from.</p>
+<p>A successful mount answers <strong><code>201 Created</code></strong> — note, not <code>202 Accepted</code>, which is what opening an upload session returns. That difference is the whole protocol: <code>201</code> means "done, it is yours", and <code>202</code> means "I could not do that, here is an upload session instead". A client does not need to ask whether the registry supports mounting; it tries, and reads the status code.</p>
+<p>The subtlety is the permission check, and it is where the bug lives. You must be able to <em>pull</em> from the source repository. A CI account scoped narrowly to the repository it publishes to cannot mount from anywhere, so every mount degrades to a full upload — correctly, silently, and with no error anywhere. The only symptom is that pushes take minutes instead of seconds, which is exactly the kind of regression that gets absorbed into "CI is slow lately".</p>
+
+<div class="specref">
+<p>The spec spells out the fallback explicitly, which is why the try-and-read-the-code approach is safe.</p>
+<blockquote>If a necessary blob exists already in another repository within the same registry, it can be mounted into a different repository via a <code>POST</code> request in the following format:<br><code>/v2/&lt;name&gt;/blobs/uploads/?mount=&lt;digest&gt;&amp;from=&lt;other_name&gt;</code><br><br>The response to a successful mount MUST be <code>201 Created</code> […]<br><br>Alternatively, if a registry does not support cross-repository mounting or is unable to mount the requested blob, it SHOULD return a <code>202</code>. This indicates that the upload session has begun and that the client MAY proceed with the upload.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#mounting-a-blob-from-another-repository">spec.md § Mounting a blob from another repository</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Push something big enough to time — Ubuntu's base image is about 30 MB, which is plenty.
+<pre class="cmd">time sudo skopeo copy --dest-tls-verify=false \
+  docker://docker.io/library/ubuntu:24.04 docker://localhost:5000/big/one:24.04</pre>
+<pre class="out">Copying config sha256:ef91e4b15da8323a1523adb2b371998dcd3063dae8553cc2744c178ccc065bc4
+Writing manifest to image destination
+
+real	<b>0m5.552s</b></pre></li>
+
+<li>Now the same image into a second repository on the same registry. Nothing is cached on the client — the source is the registry itself.
+<pre class="cmd">time sudo skopeo copy --src-tls-verify=false --dest-tls-verify=false \
+  docker://localhost:5000/big/one:24.04 docker://localhost:5000/big/two:24.04</pre>
+<pre class="out">Copying config sha256:ef91e4b15da8323a1523adb2b371998dcd3063dae8553cc2744c178ccc065bc4
+Writing manifest to image destination
+
+real	<b>0m0.092s</b></pre>
+<p>Sixty times faster. Find out why rather than assuming.</p></li>
+
+<li>Read the two upload requests skopeo made, with their status codes. One mounted, one did not.
+<pre class="cmd">sudo nerdctl logs registry 2>&amp;1 | grep 'POST /v2/big/two' \
+  | grep -o '"POST [^"]*" [0-9]*' | cut -c1-118</pre>
+<pre class="out"><b>201</b>  POST /v2/big/two/blobs/uploads/?from=big%2Fone&amp;<b>mount=</b>sha256%3Aca2678b20700c15185707964d9211b1a6406196114bf675f
+<b>202</b>  POST /v2/big/two/blobs/uploads/ HTTP/1.1</pre>
+<p>The 30 MB layer was mounted (<code>201</code>). The 2 KB config was uploaded normally (<code>202</code>) — not worth the round trip.</p></li>
+
+<li>Do it yourself, per the spec, into a third repository that has never seen this image. Watch the <code>Content-Length: 0</code> on the request that "uploads" 30 MB.
+<pre class="cmd">D=$(curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json" \
+    http://localhost:5000/v2/big/one/manifests/24.04 | jq -r '.layers[0].digest')
+curl -si -X POST "http://localhost:5000/v2/big/three/blobs/uploads/?mount=$D&amp;from=big/one" \
+  | tr -d '\r' | grep -i '^HTTP/\|^content-length\|^docker-content-digest'</pre>
+<pre class="out"><b>HTTP/1.1 201 Created</b>
+<b>Content-Length: 0</b>
+Docker-Content-Digest: sha256:ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888</pre></li>
+
+<li>Confirm it is genuinely there, and then trigger the fallback by asking for a blob the registry does not have.
+<pre class="cmd">curl -sI http://localhost:5000/v2/big/three/blobs/$D | tr -d '\r' | grep -i '^HTTP/\|content-length'
+curl -si -X POST "http://localhost:5000/v2/big/three/blobs/uploads/?mount=sha256:$(printf %064d 0)&amp;from=big/one" \
+  | head -1</pre>
+<pre class="out">HTTP/1.1 200 OK
+Content-Length: <b>29735601</b>
+
+<b>HTTP/1.1 202 Accepted</b></pre>
+<p>29.7 MB readable in a repository that received zero bytes — and a clean <code>202</code> when the mount cannot be satisfied, which is the client's signal to upload normally.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain why the second push of a 900 MB image takes two seconds, and you can name the one permission that turns that back into a 900 MB upload with no error message. You can also tell <code>201</code> from <code>202</code> without looking it up.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Mounting needs pull rights on the <em>source</em> repository.</strong> A CI token scoped to only its destination degrades to a full upload, correctly and silently. If pushes suddenly got slower after a permissions tidy-up, this is the first thing to check — the registry log will show <code>202</code> where it used to show <code>201</code>.</li>
+<li><strong>It only works within one registry.</strong> Content addressing does not make blobs teleport between hosts; a copy to a different registry is a real transfer, however identical the digests.</li>
+<li><strong>The registry MAY treat <code>from</code> as optional.</strong> Some will find the blob anywhere they have it. Do not depend on that — always send <code>from</code>, and read the status code rather than assuming success.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is why image promotion between environments is cheap, and therefore why <em>"build once, promote by digest"</em> is practical advice rather than an ideal. A pipeline that rebuilds per environment produces a different digest each time, so the pod running in production is not the artifact that was tested — which is what makes <a href="w3.html#cp-3-8">W3.8</a>'s <code>kubectl rollout undo</code> a weaker promise than it looks: rolling back to a previous revision only returns you to a previously tested artifact if that artifact was identified by something stable. Cross-repo mount is the mechanism that makes doing it properly free.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Mounting a blob from another repository</code>, and endpoint <code>end-11</code> in the endpoint table — the table's Success column (<code>201</code>/<code>202</code>) is the fastest way to remember which is which.</p>
+</article>
+</div><!-- /g-pushing -->
+
+<!-- ---------------- In practice ---------------- --><div class="grp" id="g-in-practice"><h3>In practice</h3>
+<article class="lesson" id="cp-i5-12" data-id="i5-12">
+<div class="lesson-head"><span class="cp-id">I5.12</span><h4>skopeo: the everyday tool, now that you know what it does</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You have spent four checkpoints doing by hand what one command does. That was not wasted: you can now read <code>skopeo</code>'s output knowing exactly which HTTP requests produced it, and — more usefully — you know which of its conveniences are hiding something you might need to see.</p>
+
+<h5>The concept</h5>
+<p><code>skopeo</code> works on images <em>where they live</em>. No daemon, no root, no local runtime, and nothing is unpacked unless you ask for it. That is why it earns a place in a runtime-internals track: it belongs in CI, in an air-gapped transfer, and — most valuably — in the middle of an incident when the local runtime is exactly what you suspect.</p>
+<p>Four verbs carry the load:</p>
+<ul>
+<li><code>inspect</code> — the cooked view: platform, layers, environment. With <code>--raw</code>, the manifest byte for byte as stored, with no interpretation at all. Reach for <code>--raw</code> the moment you care <em>which</em> manifest a registry is handing you, because that is where I5.4's negotiation surprises become visible.</li>
+<li><code>copy</code> — between any two transports: <code>docker://</code> (a registry), <code>oci:</code> (a layout on disk, exactly what I4 read), <code>dir:</code> (a flat directory) and <code>containers-storage:</code>. Registry-to-registry is a streaming operation — nothing is unpacked, so it is fast and needs no disk for a rootfs.</li>
+<li><code>list-tags</code> — the tag listing endpoint, which is the only way to discover what is in a repository.</li>
+<li><code>delete</code> — and here is the honest caveat, which matters more than the verb does.</li>
+</ul>
+<p>Deleting is where expectations break. On most registries <code>delete</code> removes the <em>manifest</em>, not the blobs. The tag stops resolving immediately; the disk does not move at all. Reclaiming the space needs a separate garbage-collection pass, which for <code>registry:2</code> means running the registry read-only while it walks the store. And on a default <code>registry:2</code>, deletion is disabled outright — the verb returns <code>unsupported</code> until you enable it.</p>
+<p>This is not a quirk. It follows from I5.9's ordering: blobs are shared between repositories and tags (that is the whole point of I5.11), so nothing can safely delete a blob without proving that nothing else references it. That proof <em>is</em> the garbage-collection pass. Deleting an image and watching disk usage not move is a normal Tuesday.</p>
+
+<div class="specref">
+<p>The spec allows a registry to refuse deletion entirely, which is why the default you meet is a refusal rather than an error you can fix in the client.</p>
+<blockquote>Content management refers to the deletion of blobs, tags, and manifests.<br>Registries MAY implement deletion or they MAY disable it.<br>Similarly, a registry MAY implement tag deletion, while others MAY allow deletion only by manifest.<br><br>[…] If tag deletion is disabled, the registry MUST respond with either a <code>400 Bad Request</code> or a <code>405 Method Not Allowed</code>.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#content-management">spec.md § Content Management</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>The two views of one image. The first is interpreted; the second is what the registry actually stores, and it is the one that answers "did I get the manifest I asked for?".
+<pre class="cmd">sudo skopeo inspect --tls-verify=false docker://localhost:5000/demo/alpine:3.21 \
+  | jq '{Name, Digest, Architecture, Os, Layers: (.Layers|length)}'
+sudo skopeo inspect --tls-verify=false --raw docker://localhost:5000/demo/alpine:3.21 \
+  | jq -c '{mediaType, config: .config.mediaType, layers: [.layers[].mediaType]}'</pre>
+<pre class="out">{
+  "Name": "localhost:5000/demo/alpine",
+  "Digest": "sha256:<b>f27cad9117495d32</b>d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339",
+  "Architecture": "amd64",
+  "Os": "linux",
+  "Layers": 1
+}
+{"mediaType":"application/vnd.oci.image.manifest.v1+json","config":"application/vnd.oci.image.config.v1+json","layers":["application/vnd.oci.image.layer.v1.tar+gzip"]}</pre>
+<p>That digest is the same one you computed by hand in I5.7, on an image that has since been copied between two registries. The bytes did not change, so the name did not either.</p></li>
+
+<li>Copy out of a registry into an OCI layout on disk. No runtime is involved, and the result is exactly the directory shape I4 taught you to read.
+<pre class="cmd">sudo skopeo copy --src-tls-verify=false docker://localhost:5000/demo/alpine:3.21 oci:$HOME/oci-out:3.21
+sudo find ~/oci-out -type f | sort</pre>
+<pre class="out">/home/ubuntu/oci-out/blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+/home/ubuntu/oci-out/blobs/sha256/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+/home/ubuntu/oci-out/blobs/sha256/f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+<b>/home/ubuntu/oci-out/index.json</b>
+<b>/home/ubuntu/oci-out/oci-layout</b></pre></li>
+
+<li>List what a repository holds, and try to delete something. This is the default answer.
+<pre class="cmd">sudo skopeo list-tags --tls-verify=false docker://localhost:5000/big/one
+sudo skopeo delete --tls-verify=false docker://localhost:5000/mirror/busybox:1.37</pre>
+<pre class="out">{
+    "Repository": "localhost:5000/big/one",
+    "Tags": [ "24.04" ]
+}
+level=fatal msg="deleting localhost:5000/mirror/busybox:1.37: <b>unsupported</b>"</pre></li>
+
+<li>Enable deletion and try again — this time watching the disk rather than the status code. Push a 30 MB image, delete it, and measure.
+<pre class="cmd">sudo nerdctl rm -f registry &amp;&amp; sudo nerdctl run -d --name registry -p 5000:5000 \
+  -e REGISTRY_STORAGE_DELETE_ENABLED=true docker.io/library/registry:2
+sleep 3
+sudo skopeo copy --dest-tls-verify=false docker://docker.io/library/ubuntu:24.04 \
+  docker://localhost:5000/gc/demo:24.04
+
+sudo nerdctl exec registry du -sh /var/lib/registry
+sudo skopeo delete --tls-verify=false docker://localhost:5000/gc/demo:24.04 &amp;&amp; echo 'delete: ok'
+curl -s -o /dev/null -w 'manifest by tag -&gt; %{http_code}\n' \
+  -H "Accept: application/vnd.oci.image.index.v1+json" http://localhost:5000/v2/gc/demo/manifests/24.04
+sudo nerdctl exec registry du -sh /var/lib/registry</pre>
+<pre class="out"><b>28.5M</b>	/var/lib/registry
+delete: ok
+manifest by tag -&gt; <b>404</b>
+<b>28.5M</b>	/var/lib/registry</pre>
+<p>The image is gone and the disk has not moved a byte. That is the whole caveat, measured.</p></li>
+
+<li>Now run the pass that actually reclaims it.
+<pre class="cmd">sudo nerdctl exec registry /bin/registry garbage-collect /etc/docker/registry/config.yml 2>&amp;1 | grep eligible
+sudo nerdctl exec registry du -sh /var/lib/registry</pre>
+<pre class="out">blob eligible for deletion: sha256:52df9b1ee71626e0088f7d400d5c6b5f7bb916f8f0c82b474289a4ece6cf3faf
+blob eligible for deletion: sha256:ca2678b20700c15185707964d9211b1a6406196114bf675f568b6025d37b3888
+blob eligible for deletion: sha256:ef91e4b15da8323a1523adb2b371998dcd3063dae8553cc2744c178ccc065bc4
+<b>96.0K</b>	/var/lib/registry</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can move an image between a registry, a disk layout and another registry without a runtime, and you can explain to somebody watching a disk fill up why deleting images did not help. Ask yourself what a garbage collector has to prove before it may remove one blob.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Deletion is off by default on <code>registry:2</code>, and the error says <code>unsupported</code>, not "disabled".</strong> It reads like a client limitation and is a server setting: <code>REGISTRY_STORAGE_DELETE_ENABLED=true</code>.</li>
+<li><strong>Garbage collection wants the registry read-only.</strong> A push racing the collector can have its freshly uploaded blob judged unreferenced — the manifest that would reference it has not been written yet, which is I5.9's ordering biting from the other side. Run it in a maintenance window, not on a whim.</li>
+<li><strong><code>skopeo copy</code> without <code>--all</code> copies one platform.</strong> I4's finding stands: the result is a layout reached by tag with no index behind it, so a later <code>--platform</code> selection is silently a lie. If you mean to copy a multi-platform image, say <code>--all</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the tool for the air-gapped-cluster question the exam likes: how do images get in? <code>skopeo copy</code> from Docker Hub to a layout on removable media, carry it across, <code>skopeo copy</code> from the layout into the internal registry — no runtime, no root, no daemon at either end. Combined with I5.13's <code>hosts.toml</code>, that is a complete air-gap story that never rewrites an image reference in a single manifest, which is what makes it survivable at scale (<a href="w6.html#cp-6-17">W6.17</a>).</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>skopeo(1)</code> and <code>skopeo-copy(1)</code> for the transport syntax — the transport prefixes are the part worth memorising. Spec side: <code>spec.md § Content Management</code>.</p>
+</article>
 
 </div>
 
