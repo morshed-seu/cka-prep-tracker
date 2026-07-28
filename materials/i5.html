@@ -1126,30 +1126,179 @@ blob eligible for deletion: sha256:ef91e4b15da8323a1523adb2b371998dcd3063dae8553
 
 <p class="docs-links"><b>Docs:</b> <code>skopeo(1)</code> and <code>skopeo-copy(1)</code> for the transport syntax — the transport prefixes are the part worth memorising. Spec side: <code>spec.md § Content Management</code>.</p>
 </article>
+<article class="lesson" id="cp-i5-13" data-id="i5-13">
+<div class="lesson-head"><span class="cp-id">I5.13</span><h4>hosts.toml: pointing containerd somewhere else</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the fix for I5.6, and it is one file. It is also the file that makes an air-gapped cluster work <em>without rewriting every image reference in every manifest</em> — which is the difference between a migration you can do and one you cannot.</p>
+
+<h5>The concept</h5>
+<p>containerd reads per-registry configuration from a directory tree — one subdirectory per registry host, each holding a <code>hosts.toml</code>. Because it lives outside the main config file, configuration management can drop it in without templating <code>config.toml</code>, and it is read per pull rather than only at start-up.</p>
+<p>Two things that get conflated and should not be:</p>
+<ul>
+<li>A <strong>mirror</strong> is a host consulted <em>first</em>, with fall-back to the upstream on a miss. It fixes rate limiting and reduces egress. It does not help when upstream is unreachable, because a miss still has to go somewhere.</li>
+<li>A <strong>pull-through cache</strong> is itself a registry that fetches from upstream on a miss and <em>stores</em> the result. It fixes rate limiting, reduces egress, <em>and</em> keeps serving what it has already cached when upstream is down.</li>
+</ul>
+<p>The <code>hosts.toml</code> looks identical for both; the difference is entirely in what you point it at. In the lab below it is a pull-through cache, because that is the configuration worth knowing.</p>
+<p>The last piece is the one that catches people, and it is a version-sensitive detail worth getting exactly right. <code>ctr</code> takes <code>--hosts-dir</code> on the command line, which is convenient for testing and proves nothing about your cluster — <strong>the kubelet does not use <code>ctr</code></strong>. It pulls through CRI, and CRI reads the directory only if <code>config_path</code> is set in containerd's configuration. On containerd 2.3.3 that setting lives in <code>[plugins.'io.containerd.cri.v1.images'.registry]</code>, and it is empty by default.</p>
+
+<div class="specref">
+<p>Mirroring is not in the distribution spec at all — it is a client concern, and the spec's content-agnostic framing is precisely what makes a mirror possible: a blob is a blob wherever it comes from, because the client verifies it.</p>
+<blockquote>The specification is designed to be agnostic of content types.<br><br><strong>Blob</strong>: the binary form of content that is stored by a registry, addressable by a digest</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#definitions">spec.md § Introduction and Definitions</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run a pull-through cache. It is the same <code>registry:2</code> image with one environment variable, which is what makes this cheap enough to do properly.
+<pre class="cmd">sudo nerdctl run -d --name mirror -p 5001:5000 \
+  -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io docker.io/library/registry:2
+sleep 3
+curl -s -o /dev/null -w 'mirror /v2/ -&gt; %{http_code}\n' http://localhost:5001/v2/</pre>
+<pre class="out">mirror /v2/ -&gt; <b>200</b></pre></li>
+
+<li>Write the <code>hosts.toml</code>. The directory name is the registry you are overriding; <code>server</code> is the upstream it stands in for; each <code>[host."…"]</code> block is a place to try, in order.
+<pre class="cmd">sudo mkdir -p /etc/containerd/certs.d/docker.io
+sudo tee /etc/containerd/certs.d/docker.io/hosts.toml &lt;&lt;'EOF'
+server = "https://registry-1.docker.io"
+
+[host."http://localhost:5001"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true
+EOF</pre>
+<pre class="out">server = "https://registry-1.docker.io"
+
+[host."http://localhost:5001"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true</pre></li>
+
+<li>Pull something through it, then prove from the mirror's own log that the traffic went there. Proving it is the point — a mirror that is silently not being used looks exactly like one that is.
+<pre class="cmd">sudo ctr -n i5 images pull --hosts-dir /etc/containerd/certs.d docker.io/library/busybox:1.37
+sudo nerdctl logs mirror 2>&amp;1 | grep -o '"[A-Z]* /v2/library/busybox[^"]*" [0-9]*' | head -3</pre>
+<pre class="out">Completed pull from OCI Registry (docker.io/library/busybox:1.37)	elapsed: <b>11.2s</b>	total:  2.1 Mi
+
+"<b>HEAD</b> /v2/library/busybox/manifests/1.37<b>?ns=docker.io</b>" 200
+"GET /v2/library/busybox/manifests/sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028?ns=docker.io" 200
+"GET /v2/library/busybox/manifests/sha256:7a3ebe5bfd1a4a19797d20b0c0bb39d44393e9a03fd852c0865b0f540d868df0?ns=docker.io" 200</pre>
+<p>Note <code>?ns=docker.io</code> on every request: containerd is telling the mirror <em>which upstream namespace</em> it is proxying for, so one cache can front several registries without ambiguity. And note the first request is a <code>HEAD</code> — I5.3, doing its job.</p></li>
+
+<li>Pull it again after removing the local copy. Upstream is not touched; the cache serves it.
+<pre class="cmd">sudo ctr -n i5 images rm docker.io/library/busybox:1.37
+time sudo ctr -n i5 images pull --hosts-dir /etc/containerd/certs.d docker.io/library/busybox:1.37</pre>
+<pre class="out">Completed pull from OCI Registry (docker.io/library/busybox:1.37)	elapsed: <b>1.3 s</b>	total:  2.1 Mi
+
+real	0m1.362s</pre></li>
+
+<li>Now the part that decides whether any of this works in a real cluster. <code>--hosts-dir</code> was a crutch; find the setting the kubelet's path actually needs.
+<pre class="cmd">sudo containerd config default | awk '/^ *\[plugins/ {s=$0} /config_path/ {print NR": "s"  ->  "$0}'</pre>
+<pre class="out">31:      [plugins.'io.containerd.cri.v1.images'.registry]  -&gt;        <b>config_path = ''</b>
+152:    [plugins.'io.containerd.nri.v1.nri']  -&gt;      plugin_config_path = '/etc/nri/conf.d'
+259:    [plugins.'io.containerd.transfer.v1.local']  -&gt;      <b>config_path = ''</b>
+</pre>
+<p>Two of these matter and they are not interchangeable. Line 31 is the CRI images plugin — this is the one the kubelet's pulls go through, and the one to set to <code>/etc/containerd/certs.d</code>. Line 259 is the transfer service, used by <code>ctr</code> and <code>nerdctl</code> in containerd 2.x. Setting only the second gives you a mirror that works perfectly when you test it by hand and is ignored by every pod on the node.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can configure a mirror, and — more importantly — you can prove it is being used rather than assuming it. You can also state the difference between a mirror and a pull-through cache in terms of what happens when upstream is down.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Testing with <code>ctr --hosts-dir</code> proves nothing about the kubelet.</strong> They take different paths through containerd. Set <code>config_path</code> in the CRI images plugin and test with <code>crictl pull</code>, which does go through CRI.</li>
+<li><strong>The plugin path changed in containerd 2.x.</strong> Guides written for 1.7 say <code>[plugins."io.containerd.grpc.v1.cri".registry]</code>. On 2.3.3 the CRI plugin is split, and the setting is under <code>io.containerd.cri.v1.images</code>. A config that looks right and does nothing is usually this.</li>
+<li><strong><code>capabilities</code> is not decoration.</strong> A host without <code>"resolve"</code> will not be asked to turn a tag into a digest, so a mirror configured with <code>["pull"]</code> alone is bypassed for exactly the request I5.3 showed you is the most frequent one.</li>
+<li><strong>Deprecated <code>mirrors</code> config still exists and still wins confusingly.</strong> The old <code>[plugins…registry.mirrors]</code> block in <code>config.toml</code> is superseded by <code>certs.d</code>. Having both is how you get a node that ignores the file you just wrote.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the concrete fix for the rate-limit failure in <a href="w6.html#cp-6-17">W6.17</a>, and it is deployed the way node-level configuration always is: a file on every node plus a containerd restart, which in practice means a DaemonSet or your machine-image build. Note what it does <em>not</em> require — no change to any pod spec, no rewritten image references, no registry prefix in a Deployment. That property is the reason it scales to an existing cluster: a thousand Deployments written against <code>docker.io</code> keep working, unedited, while every node quietly fetches from somewhere else.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>docs/hosts.md</code> is the reference for <code>hosts.toml</code> and is short. For the exam, search the Kubernetes docs for <em>"image registry"</em> and note that this is node configuration, not cluster API — nothing you do with <code>kubectl</code> will fix it.</p>
+</article>
 
 </div>
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>A registry answers <code>401</code> at <code>/v2/</code>. Is it healthy?
+<details class="reveal"><summary>Answer</summary><p>Almost certainly yes — that is the normal answer from any registry requiring a token, and the <code>WWW-Authenticate</code> header tells you where to get one. The answer that means trouble is <code>404</code>, which usually means a proxy is fronting the host and does not know it should be routing to a registry. A plain-text body rather than the spec's <code>{"errors":[…]}</code> envelope is the same signal.</p></details></li>
+
+<li>Why can a blob be cached forever with no invalidation logic, while a manifest cannot?
+<details class="reveal"><summary>Answer</summary><p>Because a blob is named by the hash of its own bytes, so the same URL can never legitimately return different content — there is nothing to invalidate. A manifest may be referenced by a <em>tag</em>, and a tag is a name someone assigned and can move. The tag→digest mapping is the only mutable surface in the entire API, which is why it is also the only thing worth attacking or worth protecting with authorisation.</p></details></li>
+
+<li><code>imagePullPolicy: Always</code> is often described as expensive. What does it actually cost, and when is it genuinely dangerous?
+<details class="reveal"><summary>Answer</summary><p>One <code>HEAD</code> per container start. The kubelet re-<em>resolves</em> rather than re-downloading: it compares the returned <code>Docker-Content-Digest</code> with what the content store holds and pulls nothing if they match. Measured against Docker Hub, HEADs did not decrement the rate-limit counter at all. It is dangerous in disconnected environments, because an unreachable registry fails the pod even though a perfectly good image is on local disk — which is why those clusters run <code>IfNotPresent</code>.</p></details></li>
+
+<li>A registry returns <code>404 MANIFEST_UNKNOWN</code> for an image you can see in its web UI. Give two causes.
+<details class="reveal"><summary>Answer</summary><p>An <code>Accept</code> header that does not list the media type the manifest is stored as — measured on <code>registry:2</code>, an OCI-stored image asked for as Docker v2s2 404s, and so does a request with no <code>Accept</code> at all. The other cause is a genuinely absent tag, so check by digest too. Note that Docker Hub behaves differently: it ignored every <code>Accept</code> header tested and returned the OCI index regardless. Both are conformant — the spec says SHOULD.</p></details></li>
+
+<li>You get a <code>200</code> back from a manifest request, but the digest does not match the one you pinned. What happened?
+<details class="reveal"><summary>Answer</summary><p>Most likely the registry down-converted to Docker schema 1 (<code>application/vnd.docker.distribution.manifest.v1+prettyjws</code>) because you asked for a type it does not hold. You did not get an error; you got a <em>different document</em> for the same tag, with its own digest. Anything comparing against a pinned digest will now disagree and nothing in the exchange explains why. Send an explicit four-type <code>Accept</code> and check <code>Content-Type</code> on the response.</p></details></li>
+
+<li>Why does a <em>public</em> image need a token?
+<details class="reveal"><summary>Answer</summary><p>Because the token is not about who you are, it is about what you asked to do. The registry delegates authorisation to a separate service and tells you the scope to request; you send no credentials and receive an anonymous token whose <code>sub</code> is empty. The practical consequence is that a pull depends on two hosts — the registry and its auth service — and a firewall allowing only the first produces failures that look exactly like bad credentials.</p></details></li>
+
+<li>Twenty nodes sit behind one NAT gateway. Predict the failure and its shape.
+<details class="reveal"><summary>Answer</summary><p>They share one anonymous rate-limit budget, because Docker Hub charges anonymous pulls to the source IP — provable by comparing <code>docker-ratelimit-source</code> with the machine's own public address. The failure is <code>429</code>, and its shape is what makes it hard: pods start fine until load rises, then a deploy half-fails with a different subset of pods affected each time. By the time it reaches a human it is <code>ImagePullBackOff</code> with the number nowhere in sight.</p></details></li>
+
+<li>A push is interrupted halfway. What state is the registry in?
+<details class="reveal"><summary>Answer</summary><p>It holds some orphaned blobs and no new manifest, so no client can see anything at all — the image simply does not exist yet. That is the point of uploading blobs first and the manifest last: the manifest is the only thing that makes content resolvable, so writing it last makes the whole push atomic without any transaction. The orphans are wasted space until garbage collection, and are never visible.</p></details></li>
+
+<li>A manifest resolves but one of its blobs <code>404</code>s. Whose bug is it, and why do only some nodes fail?
+<details class="reveal"><summary>Answer</summary><p>A replication path — a mirror or a sync job — that copied the manifest before its blobs, breaking the ordering invariant the push protocol maintains. The upstream registry is fine. Only some nodes fail because a node whose content store already holds that layer never asks for it: containerd found ours locally and the pull succeeded, while <code>skopeo</code> copying to a fresh destination reported <code>blob unknown to registry</code>. Test on a node that has never held the image.</p></details></li>
+
+<li>Pushing a 900 MB image to a second repository on the same registry takes two seconds. Then, after a permissions tidy-up, it takes nine minutes again. What changed?
+<details class="reveal"><summary>Answer</summary><p>Cross-repository blob mount stopped working. It requires <em>pull</em> rights on the source repository, so a CI account scoped narrowly to its destination silently degrades to a full upload — correctly, with no error anywhere. The tell is in the registry's access log: <code>202</code> where there used to be <code>201</code> on <code>POST …/blobs/uploads/?mount=…&amp;from=…</code>.</p></details></li>
+
+<li>You deleted several large images from a registry and the disk did not move. Why not, and what would a garbage collector have to prove before removing one blob?
+<details class="reveal"><summary>Answer</summary><p><code>delete</code> removes the manifest, not the blobs — measured: 28.5M before, 28.5M after, and 96K only once <code>garbage-collect</code> ran. A collector must prove no remaining manifest anywhere in the registry references that blob, because blobs are shared between tags and repositories. That is a whole-store walk, which is why it is a separate pass and why it wants the registry read-only.</p></details></li>
+
+<li>You configure a mirror in <code>hosts.toml</code>, test it with <code>ctr --hosts-dir</code>, and it works perfectly — but pods on the node still pull from Docker Hub. What did you miss?
+<details class="reveal"><summary>Answer</summary><p><code>config_path</code>. The kubelet pulls through CRI, which reads <code>certs.d</code> only if <code>config_path</code> is set — on containerd 2.3.3 that is <code>[plugins.'io.containerd.cri.v1.images'.registry]</code>, and it is empty by default. <code>ctr</code> takes a command-line flag and goes through the transfer service instead, so testing that way proves nothing about pods. Guides written for containerd 1.7 name <code>io.containerd.grpc.v1.cri</code>, which no longer applies.</p></details></li>
+
+<li>A pull of a single-platform image succeeds on an amd64 node and the container later dies with <code>exec format error</code>. Where should the pull have failed?
+<details class="reveal"><summary>Answer</summary><p>Nowhere, in the real pull path — which is the point. Resolving a tag is not selecting a platform: if the tag resolves straight to one manifest with no index, nothing has chosen anything, and <code>--platform</code> is silently ignored. The only place the truth is stated as a fact rather than a promise is the image config's own <code>architecture</code> field, and nothing in the standard path checks it. <code>pull.py</code> does.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>You can read any registry URL and say which of the two endpoint families it belongs to, whether what it names can change, and therefore whether it is safe to cache.</li>
+<li>You can complete the token dance by hand and pull a complete image with <code>curl</code>, <code>jq</code> and <code>sha256sum</code> — then unpack it and run it, with no container tooling in the path at any point.</li>
+<li>You can push blobs monolithically and in chunks, explain why the manifest is written last, and make a 30 MB upload transfer no bytes at all.</li>
+<li>You can point containerd at a mirror and prove it is being used, including the <code>config_path</code> setting that decides whether pods see it.</li>
+<li><strong><code>ImagePullBackOff</code> is now a diagnosable HTTP problem rather than a Kubernetes mystery</strong> — five failure modes, each identified by a status code you can reach in under a minute from the affected node.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="b12.html#cp-b12-4">Go deeper: B12.4 built hashing, encoding and encryption from scratch — the foundation every digest in this module stands on →</a></div>
 
-<nav class="pager"><a href="i4.html">← I4</a><a href="../intermediate.html#i6">I6 · TODO →</a></nav>
+<nav class="pager"><a href="i4.html">← I4 · The OCI image spec</a><a href="../intermediate.html#i6">I6 · Building images →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+Authored against <strong>OCI distribution-spec v1.1.1</strong> (2025-01-29, still current as of 2026-07-28)
+on Ubuntu 24.04 / kernel 6.8.0, with <strong>curl 8.5.0</strong>, <strong>jq 1.7</strong>,
+<strong>skopeo 1.13.3</strong>, <strong>containerd 2.3.3</strong>, <strong>runc 1.5.1</strong>,
+<strong>nerdctl 2.3.5</strong> and <strong>registry:2</strong>. Every command and every line of
+output on this page came from a live run on 2026-07-28.
+<br><br>
+Version-sensitive findings from that run, in case they age: Docker Hub returned
+<code>application/vnd.oci.image.index.v1+json</code> for <em>every</em> <code>Accept</code> header
+tested, including single-platform types, while <code>registry:2</code> enforced the header strictly
+and answered <code>404 MANIFEST_UNKNOWN</code> — or down-converted to
+<code>application/vnd.docker.distribution.manifest.v1+prettyjws</code> with a different digest.
+Docker Hub sends both <code>ratelimit-*</code> and <code>x-ratelimit-*</code> headers plus
+<code>docker-ratelimit-source</code>; its anonymous token declares
+<code>pull_limit_interval 21600</code> while the headers report <code>w=3600</code>, so the two
+disagree and only <code>ratelimit-remaining</code> is worth reading. Three <code>HEAD</code>s did not
+decrement that counter; three identical <code>GET</code>s decremented it once. Blob requests
+redirect (<code>307</code>) to <code>production.cloudfront.docker.com</code>. Deletion is disabled by
+default on <code>registry:2</code> and, once enabled, frees no disk until
+<code>garbage-collect</code> runs. On containerd 2.3.3 the registry <code>config_path</code> lives in
+<code>[plugins.'io.containerd.cri.v1.images'.registry]</code>, not the 1.7-era
+<code>io.containerd.grpc.v1.cri</code>.
 </footer>
 </main>
 </div>
