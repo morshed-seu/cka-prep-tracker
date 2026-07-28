@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="I4 — Images: the OCI image spec from the inside. Walk a real image from index.json to a layer tar, verify every digest by hand, and assemble a runnable rootfs with no container tooling.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I4 — Images — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I4 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4 · TODO short title</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i4">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I4 — Images</h1>
+  <p>An image is not a file and not a filesystem — it is a content-addressed graph of JSON documents and tar archives, held together by SHA-256. Walk one by hand from <code>index.json</code> down to a layer tar, then assemble a runnable rootfs out of it with no container tooling at all.</p>
+  <p>The thesis of this track is that the container ecosystem added contracts rather than mechanism, and images are the cleanest case of it. There is no new kernel feature here and nothing to install — an image is JSON documents pointing at tarballs, held together by SHA-256. By the end you will have taken one apart with <code>jq</code>, recomputed every hash in it, rebuilt its filesystem yourself, and handed the result to the <code>runc</code> bundle you built in I2.</p>
+  <div class="weights">
+    <span>Checkpoints<b>16</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>I2 · B5 · B12</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>The model</strong> — content addressing, the descriptor as the format's only pointer, the index → manifest → config + layers graph, and why a tag is the one mutable thing in it.</li>
+<li><strong>Walking a real image</strong> — get one onto disk in the spec's own layout with no daemon, follow it hop by hop with <code>jq</code>, tell OCI and Docker media types apart, and do multi-platform selection by hand.</li>
+<li><strong>Layers</strong> — a layer is a tar; <code>digest</code> versus <code>diff_id</code> and why both exist; whiteouts as tar entries rather than the device nodes B5 found on disk; and the chain ID a snapshotter actually caches on.</li>
+<li><strong>The config</strong> — the image config as the subset of a <code>config.json</code> an image may pre-declare, and the precedence rule that explains Kubernetes' <code>command</code>/<code>args</code>.</li>
+<li><strong>Project &amp; drill</strong> — <code>oci-inspect.py</code>: verify every digest, apply whiteouts correctly, produce a rootfs <code>runc</code> will run. Then three faults that each look like something else.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I2</strong> (you need somewhere to put the rootfs you build) and <strong>B5</strong> (overlayfs, copy-up, whiteouts on disk), plus <strong><a href="b12.html#cp-b12-4">B12.4</a></strong> for hashing. Authored against <strong>OCI image-spec v1.1.1</strong> (the current release; v1.1.0 was February 2025, v1.1.1 the March 2025 patch).</p>
+<p><strong>Which machine.</strong> Everything here ran on the <code>sandbox</code> VM — Ubuntu 24.04, kernel 6.8.0 — with <code>skopeo 1.13.3</code> (apt), <code>containerd 2.3.3</code>, <code>runc 1.5.1</code>, <code>nerdctl</code>, <code>jq</code> and stock <code>python3</code>. No image building and no local registry yet, so the larger <code>buildbox</code> is not needed until I6; internet access is, because we pull from Docker Hub. The image is <code>alpine:3.21</code>, which resolved to <code>sha256:48b0309c…abc07d</code> (Alpine 3.21.7, built 2026-04-16) on the day this was written — see I4.4 for why that sentence is phrased so carefully.</p>
+</div>
+
+<!-- ---------------- The model ---------------- --><div class="grp" id="g-the-model"><h3>The model</h3>
+<article class="lesson" id="cp-i4-1" data-id="i4-1">
+<div class="lesson-head"><span class="cp-id">I4.1</span><h4>Content addressing: a name you can check</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Almost everything people find confusing about images — why two images can "share" a layer without anyone arranging it, why a mirror in another country is trustworthy, why <code>:latest</code> ruins afternoons — comes from a single design decision made before any of the rest of the format existed. Everything is named by the hash of its own bytes. Get that one idea properly settled and the remaining fifteen checkpoints are consequences.</p>
+
+<h5>The concept</h5>
+<p>You already know how to hash a file: you did it in <a href="b12.html#cp-b12-4">B12.4</a>, where hashing, encoding and encryption were separated once and for all. A <strong>digest</strong> is just that — <abbr title="a hash function producing a 256-bit output; collision-resistant, meaning nobody can find two different inputs with the same output">SHA-256</abbr> run over some bytes, written as <code>sha256:</code> followed by 64 hex characters.</p>
+<p><strong>Content addressing</strong> is the decision to use that digest as the thing's <em>name</em>. Not a name you assign, and not a name that says where the thing lives — a name computed from what the thing <em>is</em>. Two consequences follow, and the whole format is built on them.</p>
+<p>The first: <strong>identical content always has the identical name</strong>, everywhere, forever, with no coordination. Two teams who have never spoken, building on the same Alpine base, produce byte-identical base layers and therefore the same digest. Storage deduplication is not a feature anyone implemented; it falls out of the naming.</p>
+<p>The second, and the one that matters more: <strong>a name can be verified rather than trusted.</strong> Normally a name is a promise — you ask for <code>/etc/passwd</code> and you trust the filesystem handed you the right file. A digest is different: you fetch the bytes from anywhere at all, hash them yourself, and compare. If it matches, the content is right, and it does not matter one bit whether it came from Docker Hub, a corporate mirror, a pull-through cache, or a USB stick carried into an air-gapped datacentre. This is why a digest is an <em>identity, not a location</em>.</p>
+<p>Hold on to that phrase, because it explains things that otherwise look arbitrary. A registry is only a convenient place to keep blobs, not an authority about them — which is why I5 can pull an image with nothing but <code>curl</code>, and why I11's supply-chain tooling can make meaningful guarantees at all. If content could only be identified by where it came from, none of that would work.</p>
+
+<div class="specref">
+<p>The spec states the property and, in the same breath, the reason for it — note that verification is framed as defending against an <em>insecure source</em>, not against a broken disk.</p>
+<blockquote>The <em>digest</em> property of a Descriptor acts as a content identifier, enabling content addressability. It uniquely identifies content by taking a collision-resistant hash of the bytes.<br><br>If the <em>digest</em> can be communicated in a secure manner, one can verify content from an insecure source by recalculating the digest independently, ensuring the content has not been modified.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md#digests">descriptor.md § Digests</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Prove the first consequence: the same bytes in two unrelated places get the same name. Nothing coordinates this — the name is computed, not assigned.
+<pre class="cmd">echo "the same bytes" &gt; a.txt
+cp a.txt /var/tmp/b.txt
+sha256sum a.txt /var/tmp/b.txt</pre>
+<pre class="out"><b>7ff5e82712857794abc1c3c4ddb867d2724efd5df0e0d3bd34b3115b186c3227</b>  a.txt
+<b>7ff5e82712857794abc1c3c4ddb867d2724efd5df0e0d3bd34b3115b186c3227</b>  /var/tmp/b.txt</pre></li>
+
+<li>Now change a single character — one lowercase <code>s</code> becomes <code>S</code> — and watch the name become unrecognisably different. There is no "close": digests do not degrade gracefully, which is exactly what makes comparison a yes/no test.
+<pre class="cmd">echo "the same byteS" &gt; c.txt
+sha256sum c.txt</pre>
+<pre class="out"><b>51bef788bff6b5c72dce1199e1cd09dcea66cc37e7d96f6f2b2a047301b72346</b>  c.txt</pre></li>
+
+<li>Look ahead at what you are about to spend the module on. This is a real image on disk (you will pull it yourself in I4.5); every file in its blob store is <em>named by its own digest</em>. Recomputing the hash reproduces the filename exactly.
+<pre class="cmd">cd alpine-oci &amp;&amp; ls blobs/sha256/
+sha256sum blobs/sha256/*</pre>
+<pre class="out">2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+
+<b>2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577</b>  blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+<b>897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81</b>  blobs/sha256/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+<b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>  blobs/sha256/f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state, without hedging, why an image pulled from an untrusted mirror is safe to run when you know its digest — and why knowing only its <em>tag</em> gives you no such assurance. If that distinction is still fuzzy, I4.4 is where it bites.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A digest proves integrity, not provenance.</strong> It tells you the bytes were not altered in transit. It says nothing about whether the person who built them should be trusted — that requires a signature over the digest, which is I11's subject. "It matched the digest" and "it is safe" are different claims.</li>
+<li><strong>The hash covers the exact bytes, not the meaning.</strong> Reformat a JSON manifest — same fields, different whitespace — and the digest changes completely. This is why manifests are stored and transferred verbatim and why tooling must never re-serialise one it intends to reference.</li>
+<li><strong><code>sha256:</code> is part of the name.</strong> The prefix names the algorithm, so the format can migrate later without ambiguity. Strip it when using the value as a path under <code>blobs/</code>, keep it everywhere else.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is why <code>image: app@sha256:…</code> exists as an alternative to <code>image: app:v2</code> in a pod spec, and it is the same reasoning as <a href="w3.html#cp-3-23">W3.23</a>'s point that base64 in a Secret is encoding, not encryption — a hash is not a secret and not a lock, it is a checkable name. When you meet <code>ErrImagePull</code> in <a href="w6.html#cp-6-17">W6.17</a>, one of the three root causes is a digest that no longer resolves.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the exam will not ask you to hash anything, but it will ask you to pin an image. Search the Kubernetes docs for <em>"images"</em> and read the section on image names and digests; the OCI side is <code>descriptor.md § Digests</code>.</p>
+</article>
+<article class="lesson" id="cp-i4-2" data-id="i4-2">
+<div class="lesson-head"><span class="cp-id">I4.2</span><h4>The descriptor: the only pointer in the format</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Most file formats accumulate half a dozen ways to refer to something — an offset here, a filename there, an ID somewhere else. The image spec has exactly one, used at every level without exception. Once you can recognise it, an image manifest stops being a wall of JSON and becomes a handful of pointers you can follow.</p>
+
+<h5>The concept</h5>
+<p>A <strong>descriptor</strong> is a small JSON object with three required fields:</p>
+<ul>
+<li><code>mediaType</code> — what the thing you are about to fetch <em>is</em>, as a MIME-style string.</li>
+<li><code>digest</code> — its content-addressed name, from I4.1.</li>
+<li><code>size</code> — its length in bytes.</li>
+</ul>
+<p>Optionally it may also carry <code>urls</code> (other places the blob can be fetched from), <code>annotations</code> (arbitrary metadata), <code>data</code> (the content inlined, for tiny blobs) and — in an index — <code>platform</code>.</p>
+<p>Each required field earns its place, and the third is the one people overlook. <code>digest</code> is the identity. <code>mediaType</code> tells a client how to parse the bytes <em>before</em> it fetches them, so nothing ever has to sniff content or guess from a file extension — the parser is chosen from the pointer, not from the payload. And <code>size</code> lets a client allocate exactly once and, more importantly, <strong>refuse</strong>: if a descriptor says 611 bytes and the server keeps sending, the client can cut the connection instead of streaming a decompression bomb into memory.</p>
+<p>So every pointer in the format is simultaneously self-describing (you know the type), self-verifying (you can check the digest) and self-limiting (you know when to stop). A format whose only reference type has all three properties is a large part of why this specification has aged as well as it has. It is also why the whole thing is walkable with <code>curl</code> and <code>jq</code> — there is nothing to decode, just pointers to follow.</p>
+
+<div class="specref">
+<p>The spec introduces descriptors as the mechanism for <em>all</em> references, and the word to notice in the first sentence is <strong>Merkle</strong> — a tree (here a graph) in which every node names its children by hash, so verifying the root transitively commits to everything beneath it.</p>
+<blockquote>An OCI image consists of several different components, arranged in a Merkle Directed Acyclic Graph (DAG). References between components in the graph are expressed through Content Descriptors.<br><br>A Content Descriptor (or simply Descriptor) describes the disposition of the targeted content. A Content Descriptor includes the type of the content, a content identifier (digest), and the byte-size of the raw content.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md">descriptor.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Pull out every reference in a real image and see that they are all the same shape. The first lives in <code>index.json</code> and points at a manifest; the other two live inside that manifest and point at a config and a layer.
+<pre class="cmd">cd ~/i4/alpine-oci
+MAN=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+jq -c '.manifests[] | {mediaType, digest, size}' index.json
+jq -c '.config | {mediaType, digest, size}' blobs/sha256/$MAN
+jq -c '.layers[] | {mediaType, digest, size}' blobs/sha256/$MAN</pre>
+<pre class="out">{"mediaType":"<b>application/vnd.oci.image.manifest.v1+json</b>","digest":"sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339","size":1022}
+{"mediaType":"<b>application/vnd.oci.image.config.v1+json</b>","digest":"sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577","size":611}
+{"mediaType":"<b>application/vnd.oci.image.layer.v1.tar+gzip</b>","digest":"sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81","size":3646875}</pre>
+<p>Three different kinds of thing — a JSON manifest, a JSON config, a gzipped tarball — and one pointer shape for all of them. The <code>mediaType</code> is what tells them apart, and it arrives <em>before</em> the content does.</p></li>
+
+<li>Count them mechanically, so it is not a claim you are taking on faith. This walks both JSON documents and picks out every object carrying the three required fields.
+<pre class="cmd">cat index.json blobs/sha256/$MAN \
+  | jq -c '[.. | objects | select(has("digest") and has("size") and has("mediaType"))] | length'</pre>
+<pre class="out">1
+2</pre>
+<p><code>jq</code> reports per document: <b>one</b> descriptor in <code>index.json</code>, <b>two</b> in the manifest. Three pointers, and that is the entire reference graph of this image. A multi-layer image differs only in the length of the <code>layers</code> array.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown any JSON document from this format, you can point at each descriptor and say what it targets without following it — because <code>mediaType</code> already told you.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>size</code> is a security control, not a hint.</strong> A client that ignores it and streams until EOF has no defence against a hostile registry returning an endless response. Your I4.15 project checks it for exactly this reason.</li>
+<li><strong>Annotations on a descriptor and annotations inside the target are different places.</strong> The manifest descriptor in an index can be annotated by whoever assembled the index; the manifest itself carries its own. They are not merged, and tooling that shows you "the annotations" rarely says which set it means.</li>
+<li><strong>A descriptor does not say where the blob is.</strong> Apart from the optional <code>urls</code>, there is no location anywhere — resolution is entirely the client's problem. That is deliberate, and it is what I4.1 meant by identity rather than location.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You will not type a descriptor into Kubernetes, but the kubelet's image handling is descriptors all the way down: when <a href="w1.html#cp-1-20">W1.20</a>'s kubelet → containerd → shim → runc chain pulls an image, every hop between containerd and the registry is a descriptor being resolved and verified. The <code>size</code> field is why a partially-transferred layer is detected rather than silently used.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>descriptor.md</code> in the image spec is two pages and worth reading start to finish — it is the only part of the format you must know by heart. The media-type registry is in <code>media-types.md</code>.</p>
+</article>
+<article class="lesson" id="cp-i4-3" data-id="i4-3">
+<div class="lesson-head"><span class="cp-id">I4.3</span><h4>The graph: index → manifest → config + layers</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>"An image" sounds like one object, and every tool encourages that impression by printing a single name and a single size. It is actually four kinds of node in a small graph, and nearly every confusing thing about images — why <code>docker images</code> shows an ID that appears nowhere in the registry, why an image has no honest single size — dissolves the moment you can draw the graph.</p>
+
+<h5>The concept</h5>
+<p>Draw it before you touch a real one. There are four node types, and only two of them are JSON you can read:</p>
+<ul>
+<li>An <strong>index</strong> (sometimes called a manifest list) — a list of manifests, normally one per platform. JSON. Optional: single-platform images may have none.</li>
+<li>A <strong>manifest</strong> — one image, for one platform. JSON. It holds exactly two things: a descriptor for the config, and an <em>ordered</em> list of descriptors for the layers.</li>
+<li>A <strong>config</strong> — JSON describing how to run the thing: environment, entrypoint, user, plus the layer bookkeeping of I4.13.</li>
+<li>The <strong>layers</strong> — opaque binary. Tarballs, usually compressed. These are the leaves, and they are all of the bytes that matter.</li>
+</ul>
+<svg viewBox="0 0 620 260" role="img" aria-label="The image graph: an index pointing at two manifests, each pointing at a config and shared layer blobs" style="max-width:100%;height:auto">
+  <defs><marker id="i4arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="var(--muted)"/></marker></defs>
+  <rect x="16" y="106" width="112" height="42" rx="5" fill="var(--code-bg)" stroke="var(--accent)"/>
+  <text x="72" y="124" text-anchor="middle" font-size="13" fill="var(--ink)">index</text>
+  <text x="72" y="139" text-anchor="middle" font-size="10" fill="var(--muted)">JSON</text>
+  <rect x="196" y="40" width="130" height="46" rx="5" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="261" y="59" text-anchor="middle" font-size="13" fill="var(--ink)">manifest</text>
+  <text x="261" y="75" text-anchor="middle" font-size="10" fill="var(--muted)">linux/amd64</text>
+  <rect x="196" y="168" width="130" height="46" rx="5" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="261" y="187" text-anchor="middle" font-size="13" fill="var(--ink)">manifest</text>
+  <text x="261" y="203" text-anchor="middle" font-size="10" fill="var(--muted)">linux/arm64</text>
+  <rect x="404" y="10" width="106" height="34" rx="5" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="457" y="32" text-anchor="middle" font-size="12" fill="var(--ink)">config</text>
+  <rect x="404" y="188" width="106" height="34" rx="5" fill="var(--code-bg)" stroke="var(--line)"/>
+  <text x="457" y="210" text-anchor="middle" font-size="12" fill="var(--ink)">config</text>
+  <rect x="404" y="98" width="106" height="34" rx="5" fill="var(--accent)" opacity="0.16" stroke="var(--accent)"/>
+  <text x="457" y="120" text-anchor="middle" font-size="12" fill="var(--ink)">layer blobs</text>
+  <text x="560" y="115" font-size="10" fill="var(--muted)">shared</text>
+  <text x="560" y="128" font-size="10" fill="var(--muted)">leaves</text>
+  <line x1="128" y1="118" x2="192" y2="66" stroke="var(--muted)" marker-end="url(#i4arrow)"/>
+  <line x1="128" y1="136" x2="192" y2="188" stroke="var(--muted)" marker-end="url(#i4arrow)"/>
+  <line x1="326" y1="54" x2="400" y2="28" stroke="var(--muted)" marker-end="url(#i4arrow)"/>
+  <line x1="326" y1="74" x2="400" y2="108" stroke="var(--muted)" marker-end="url(#i4arrow)"/>
+  <line x1="326" y1="200" x2="400" y2="206" stroke="var(--muted)" marker-end="url(#i4arrow)"/>
+  <line x1="326" y1="180" x2="400" y2="126" stroke="var(--muted)" marker-end="url(#i4arrow)"/>
+</svg>
+<p>Every arrow is a descriptor from I4.2. Everything above the layer blobs is small, readable JSON; the layers are the only opaque bytes — and, as the shared box shows, two images can point at the very same layer.</p>
+<p>Two properties of this shape matter more than the shape itself.</p>
+<p>First, <strong>everything above the layers is JSON small enough to read in a terminal.</strong> The manifest in your lab is 1,022 bytes. This is a format you can debug with <code>curl</code> and <code>jq</code>, which is precisely why I5 will be able to pull an image by hand over HTTP with no client library.</p>
+<p>Second, it is a <strong>graph, not a tree</strong>, and it is acyclic because references are digests — you cannot point at something whose content is not yet fixed, so a cycle is unconstructible. Because names are computed from content, two images built from the same base do not merely have <em>similar</em> layers, they point at <em>the same blob</em>. The sharing is automatic and needs no coordination between the people who built them.</p>
+<p>Which leads to a question worth retiring: <em>how big is this image?</em> There is no honest single answer. The sum of its layer sizes is one number; what a given node must actually download is usually far smaller, because it already has most of the leaves. The useful question is always "how much of this do I not already have?"</p>
+
+<div class="specref">
+<p>The spec is explicit that the arrangement is a Merkle DAG, which is what makes verifying the top descriptor meaningful: each node commits, by hash, to every node below it.</p>
+<blockquote>An OCI image consists of several different components, arranged in a Merkle Directed Acyclic Graph (DAG).</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md">descriptor.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Before walking a real one in I4.6, sketch this on paper: one index box, two manifest boxes beneath it, and a config plus a layer stack under each — then draw the layer arrows from <em>both</em> manifests to one shared blob. Label each arrow "descriptor". The drawing takes ninety seconds and is the thing you will actually recall under exam pressure.</li>
+<li>Confirm the node types are what you think by asking a real image what shape it is. This is the layout you build in I4.5; the point here is only that the top-level entry is a list.
+<pre class="cmd">cd ~/i4/alpine-oci
+jq '{schemaVersion, entries: (.manifests | length), type: .manifests[0].mediaType}' index.json</pre>
+<pre class="out">{
+  "schemaVersion": 2,
+  "entries": <b>1</b>,
+  "type": "<b>application/vnd.oci.image.manifest.v1+json</b>"
+}</pre>
+<p>One entry, and it is a <em>manifest</em> rather than an index — because this copy was fetched for a single platform. I4.8 fetches the whole thing and finds sixteen.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can draw the four node types from memory, say which are JSON and which are opaque, and explain to someone why two different images can share storage without either build knowing about the other.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Image ID" usually means the config digest, not the manifest digest.</strong> The registry indexes by manifest digest; local tooling has historically shown the config digest. That is why the ID in <code>docker images</code> or <code>nerdctl images</code> matches nothing you saw in the registry — they are two different nodes of the same graph, both legitimately called "the image".</li>
+<li><strong>An index is optional.</strong> Plenty of images are a bare manifest with no index above them. Code that assumes the top node is always an index breaks on them — your I4.15 project has to handle both, which is why it checks the <code>mediaType</code> before descending.</li>
+<li><strong>Layer order is significant and is carried only by the array.</strong> Nothing inside a layer says where it belongs in the stack. Lose the ordering and you get I4.16's third fault: a rootfs that looks fine and is quietly wrong.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This graph is why a node that already runs six images built on the same base pulls almost nothing for the seventh, and why <a href="w6.html#cp-6-17">W6.17</a>'s image failures are so often about one missing leaf rather than "the image" being broken. It is also the structure <a href="b5.html#cp-b5-16">B5.16</a> arrived at from the other direction — layers plus a thin writable one — except that here the layers have names you can verify.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>manifest.md</code> and <code>image-index.md</code> in the image spec; both are short. For the mental model, the phrase to search is <em>"Merkle DAG"</em>.</p>
+</article>
+<article class="lesson" id="cp-i4-4" data-id="i4-4">
+<div class="lesson-head"><span class="cp-id">I4.4</span><h4>Tags are mutable labels on immutable content</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the single most expensive misunderstanding in the whole format, and it produces incidents that are maddening precisely because nothing is broken: two nodes run different code, both pulled the same image name, both did exactly what they were told. Everyone blames caching. The actual cause is that a tag was never a name for content in the first place.</p>
+
+<h5>The concept</h5>
+<p>Everything in I4.1 through I4.3 is immutable: a digest names fixed bytes and always will. A <strong>tag</strong> is the one mutable thing in the system — a human-readable label the registry maps to a digest, and that mapping can be reassigned at any time by anyone with push access.</p>
+<p>So <code>alpine:3.21</code> is not the name of an image. It is a name for <em>whatever the registry currently says <code>3.21</code> means</em>. Resolve it today and you get one digest; resolve it next month and you may legitimately get another, because the maintainers rebuilt 3.21 with a patched OpenSSL. Nothing has gone wrong. The tag did its job.</p>
+<p>People file this under "the <code>:latest</code> problem", which badly understates it. <code>latest</code> is not special in any way — it is just a tag with a misleading name, and it has no defined meaning at all. <strong>Any</strong> tag can move, including ones that look like immutable version numbers. <code>v2.1.0</code> moves more often than you would like.</p>
+<p>Two nodes pulling <code>app:v2</code> a week apart can therefore run different code, and every layer of the system will report success. The fix is to pin by digest — <code>app@sha256:…</code> — which names content and cannot drift. The reason people resist is honest: digests are unreadable, and updating them is work that has to be automated. So the compromise most teams reach, and the habit this track enforces, is <strong>name a tag and record the digest it resolved to</strong>. That will not prevent drift, but it makes drift <em>detectable</em>, which is most of the battle.</p>
+<p>The lab below shows the mechanism plainly: the tag's digest is nothing more than the SHA-256 of the manifest bytes the registry hands you. Resolution is a lookup; verification is arithmetic you can do yourself.</p>
+
+<div class="specref">
+<p>The layout spec is careful to separate the two kinds of naming, and the phrasing is worth keeping: blobs are <em>content-addressable</em>, references are <em>location-addressable</em>. A tag is the second kind.</p>
+<blockquote>The OCI Image Layout is the directory structure for OCI content-addressable blobs and location-addressable references (refs).</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/image-layout.md">image-layout.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask the registry for the raw bytes it serves for a tag, and save them exactly as received. Do not re-format them — the whole point is that the digest is over these precise bytes.
+<pre class="cmd">cd ~/i4
+skopeo inspect --raw docker://alpine:3.21 &gt; raw-index.json</pre></li>
+
+<li>Now compute the tag's digest yourself, then ask the registry what it thinks the digest is. They are the same number, because "the digest of a tag" means nothing more than the hash of the document the tag resolves to.
+<pre class="cmd">sha256sum raw-index.json
+skopeo inspect docker://alpine:3.21 | jq -r '.Digest, .Name'</pre>
+<pre class="out"><b>48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>  raw-index.json
+
+sha256:<b>48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>
+docker.io/library/alpine</pre>
+<p>Nothing privileged happened. You independently derived the registry's own answer with a command that ships in coreutils — which is exactly the property I4.1 promised.</p></li>
+
+<li>Record the pair. From here on, every pull in this track names a tag <em>and</em> writes down what it resolved to, so that a reader running these commands on a different day can immediately tell "the tag moved" from "my command is wrong".
+<pre class="cmd">echo "alpine:3.21 -&gt; sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d  ($(date -I))" &gt;&gt; ~/i4/pinned.txt</pre>
+<p>The image this page was authored against is <code>alpine:3.21</code> at <code>sha256:48b0309c…abc07d</code>, which was Alpine <b>3.21.7</b>, built 2026-04-16. If your digest differs, 3.21 has been rebuilt since — that is the lesson working, not a mistake.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain why "we deployed the same image to both clusters" is not a claim anyone can make from a tag alone, and you can produce the digest a tag currently resolves to without trusting any tool's summary of it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>imagePullPolicy: IfNotPresent</code> plus a moving tag is a booby trap.</strong> A node that already has <em>something</em> cached under that tag never asks the registry again, so it never learns the tag moved — while a freshly-joined node pulls the new content. The cluster now runs two versions of "the same" image, and nothing reports an error.</li>
+<li><strong>Re-formatting a manifest changes its digest.</strong> If you pipe a manifest through <code>jq .</code> and hash the result, you will get a different number and conclude the registry is lying. Hash the raw bytes; that is why the lab uses <code>--raw</code> and redirects straight to a file.</li>
+<li><strong>Deleting and re-pushing a tag is invisible after the fact.</strong> There is no history: the registry has no record that the tag pointed anywhere else. Your recorded digest is the only evidence, which is the whole argument for recording it.</li>
+</ul>
+
+<div class="k8s-link">
+<p>In a pod spec, <code>image: app:v2</code> is a tag and <code>image: app@sha256:…</code> is a digest, and the difference is exactly this lesson. The tag-moved scenario is one of the three root causes behind <a href="w6.html#cp-6-17">W6.17</a>'s <code>ErrImagePull</code>/<code>ImagePullBackOff</code> — a tag that resolved fine yesterday now points at a manifest the node cannot fetch. This is also why a rollout that "did nothing" can change behaviour: same spec, same tag, different bytes.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the Kubernetes docs for <em>"image pull policy"</em> and read the whole table — the defaulting rule (a tag of <code>latest</code> silently changes the default) is the part people get wrong. On the OCI side, tags are a registry concern, so the detail is in the distribution spec you meet in I5.</p>
+</article>
+</div><!-- /g-the-model -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i3.html">← I3 · runc internals</a><a href="../intermediate.html#i5">I5 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
