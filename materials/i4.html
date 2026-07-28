@@ -709,6 +709,339 @@ jq -r '.manifests[0].mediaType' alpine-all/index.json</pre>
 <p class="docs-links"><b>Docs:</b> <code>image-index.md</code> for the structure; the GOARCH/GOOS value lists it defers to are in the Go documentation. In the Kubernetes docs, search <em>"well-known labels"</em> for <code>kubernetes.io/arch</code>.</p>
 </article>
 </div><!-- /g-walking-a-real-image -->
+<!-- ---------------- Layers ---------------- --><div class="grp" id="g-layers"><h3>Layers</h3>
+<article class="lesson" id="cp-i4-9" data-id="i4-9">
+<div class="lesson-head"><span class="cp-id">I4.9</span><h4>A layer is a tar file, and nothing more</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>"Layer" sounds like a filesystem concept, and people reasonably assume it is some special block-level format. It is a tarball. Once you have run <code>tar tzvf</code> on one and seen ordinary paths with ordinary permissions scroll past, a large amount of mystique evaporates and you can start reasoning about images with tools you already had.</p>
+
+<h5>The concept</h5>
+<p>A layer is a <strong>tar archive of a filesystem diff</strong> — the files that this step of the build added or changed, not a complete filesystem. Usually it is compressed, and the <code>mediaType</code> from I4.2 tells you how: <code>…layer.v1.tar+gzip</code> or <code>…layer.v1.tar+zstd</code>, or plain <code>…layer.v1.tar</code> for uncompressed.</p>
+<p>That is the entire representation, and it is what makes layers <em>stack</em>: extract them in order onto the same directory, and later entries overwrite earlier ones. Applying an image is a sequence of <code>tar -x</code> calls into one place. That is a slow, disk-hungry version of what overlayfs does instantly with mount options — you built exactly this by hand in <a href="b5.html#cp-b5-13">B5.13</a>, stacking <code>lowerdir</code>s and watching the merged view appear. The image format is the transfer encoding for those stacked sheets; overlayfs is the runtime realisation of them.</p>
+<p>The base layer is a special case worth noticing: it is a diff against nothing, so it contains a whole root filesystem. That is why the first layer of Alpine is 3.6 MB of <code>bin/</code>, <code>etc/</code>, <code>lib/</code> and the rest, while a layer that installs one package might be a few kilobytes.</p>
+<p>On compression: <strong>zstd</strong> is the newer option and decompresses several times faster than gzip for comparable ratios. That sounds like a micro-optimisation until a node cold-starts fifty pods at once and every one of them is waiting on decompression before anything can run.</p>
+
+<div class="specref">
+<p>The spec calls a layer a <em>changeset</em> and is precise about what belongs in it — additions and modifications in full, deletions as markers. The second half of that sentence is I4.11's subject.</p>
+<blockquote>A tar archive is then created which contains <em>only</em> this changeset: Added and modified files and directories in their entirety; Deleted files or directories marked with a whiteout file.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md">layer.md § Representing Changes</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask the operating system what the blob actually is. No image tooling involved — <code>file</code> reads magic bytes.
+<pre class="cmd">cd ~/i4/alpine-oci
+MAN=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+LAY=$(jq -r '.layers[0].digest' blobs/sha256/$MAN | cut -d: -f2)
+file blobs/sha256/$LAY</pre>
+<pre class="out">blobs/sha256/897d797d…: <b>gzip compressed data</b>, original size modulo 2^32 <b>8120320</b></pre>
+<p>3.6 MB on disk, 8.1 MB uncompressed. A gzip file, which means every tool you own already understands it.</p></li>
+
+<li>List its contents. These are ordinary paths with ordinary modes — and a great many symlinks into <code>busybox</code>, which is what makes Alpine small.
+<pre class="cmd">tar tzvf blobs/sha256/$LAY | head -12
+tar tzf blobs/sha256/$LAY | wc -l</pre>
+<pre class="out">drwxr-xr-x 0/0               0 2026-04-15 22:10 <b>bin/</b>
+lrwxrwxrwx 0/0               0 2026-04-15 22:10 bin/arch -&gt; /bin/busybox
+lrwxrwxrwx 0/0               0 2026-04-15 22:10 bin/ash -&gt; /bin/busybox
+lrwxrwxrwx 0/0               0 2026-04-15 22:10 bin/base64 -&gt; /bin/busybox
+lrwxrwxrwx 0/0               0 2026-04-15 22:10 bin/bbconfig -&gt; /bin/busybox
+-rwxr-xr-x 0/0          808712 2025-11-23 19:10 <b>bin/busybox</b>
+lrwxrwxrwx 0/0               0 2026-04-15 22:10 bin/cat -&gt; /bin/busybox
+lrwxrwxrwx 0/0               0 2026-04-15 22:10 bin/chattr -&gt; /bin/busybox
+
+<b>520</b></pre>
+<p>520 entries, owned by <code>0/0</code>, with paths relative to the root of the image — no leading slash, which is what lets them be extracted anywhere.</p></li>
+
+<li>Extract it somewhere harmless and look around. This is a whole distribution, produced by one <code>tar</code> command.
+<pre class="cmd">mkdir -p /tmp/peek &amp;&amp; tar xzf blobs/sha256/$LAY -C /tmp/peek
+ls /tmp/peek
+cat /tmp/peek/etc/alpine-release</pre>
+<pre class="out">bin  dev  etc  home  lib  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+<b>3.21.7</b></pre>
+<p>You have just unpacked an image with no container tooling whatsoever. I4.15 does this properly — in order, with whiteouts handled — but the mechanism is exactly this.</p></li>
+
+<li>Confirm the media type agrees with what <code>file</code> told you. The pointer and the payload should never disagree; if they do, something upstream is wrong.
+<pre class="cmd">jq -r '.layers[0].mediaType' blobs/sha256/$MAN</pre>
+<pre class="out">application/vnd.oci.image.layer.v1.<b>tar+gzip</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can list the contents of any image layer with tools that predate containers by thirty years, and you can say why the first layer of an image is so much bigger than the rest.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Extracting layers with plain <code>tar</code> gives you a <em>wrong</em> rootfs.</strong> It works for one layer. Apply several and the deletions never happen — you get visible <code>.wh.</code> files instead of removed ones, which is precisely I4.11's subject and the reason the project cannot just shell out to <code>tar</code>.</li>
+<li><strong>Layer entries have no leading slash, and that is load-bearing.</strong> A tar with absolute paths would extract over the host filesystem. If you ever build a layer by hand, <code>tar</code> from inside the directory so paths stay relative.</li>
+<li><strong>Don't judge an image by its compressed size.</strong> The manifest's <code>size</code> is the transfer cost; the uncompressed content is what fills the node's disk, and here it is more than double. Node disk-pressure evictions are driven by the latter.</li>
+</ul>
+
+<div class="k8s-link">
+<p>These tarballs are what the kubelet's image garbage collection is reclaiming when a node hits its disk-usage thresholds, and their unpacked size is what actually counts against it. <a href="b5.html#cp-b5-16">B5.16</a> reached the same conclusion from the kernel side — an image is layers, a container is layers plus a thin writable one — and this is the wire format for the first half of that sentence.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>layer.md</code> in the image spec covers the tar requirements, including which fields must be normalised for reproducible builds. <code>man tar</code> for <code>t</code>/<code>x</code>/<code>z</code>; the exam will not test tar, but a broken node might.</p>
+</article>
+<article class="lesson" id="cp-i4-10" data-id="i4-10">
+<div class="lesson-head"><span class="cp-id">I4.10</span><h4>digest and diff_id: two hashes of one layer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You met both in I4.6 and they were different numbers for what is obviously the same layer. That is not redundancy or a versioning accident — the two hashes answer two different questions, and knowing which is which is what lets you diagnose why a rebuild that changed nothing still transferred megabytes.</p>
+
+<h5>The concept</h5>
+<p>One layer, hashed twice:</p>
+<ul>
+<li><code>digest</code>, in the <strong>manifest</strong>, is the hash of the <em>compressed</em> blob — the exact bytes that travel over the network and sit in <code>blobs/sha256/</code>.</li>
+<li><code>diff_id</code>, in the <strong>config</strong>'s <code>rootfs.diff_ids</code>, is the hash of the <em>uncompressed</em> tar — the actual filesystem changeset.</li>
+</ul>
+<p>Put plainly: <strong>one identifies the transfer, the other identifies the content.</strong></p>
+<p>They must be separate, and the reason is that <strong>compression is not deterministic across implementations</strong>. Take one tar archive, compress it with two different gzip versions or at two different levels, and you get two different files — different bytes, different <code>digest</code> — for byte-identical content. If the only identity were the compressed digest, the system could never tell "the same filesystem, recompressed" from "a different filesystem".</p>
+<p>So the format keeps both, and each is used where it belongs. The registry, the download path and deduplication of stored blobs all work in terms of <code>digest</code>, because that is what is actually being moved and stored. Anything reasoning about what the filesystem <em>contains</em> — the snapshotter, the chain IDs of I4.12 — works in <code>diff_id</code>, because that is what survives recompression.</p>
+<p>This also explains a genuinely confusing behaviour: rebuild an image whose content did not change, and you can still find yourself pushing layers that were logically already in the registry. The <code>diff_id</code>s match, the <code>digest</code>s do not, and the registry only knows about digests.</p>
+
+<div class="specref">
+<p>The config spec names the second hash and, crucially, insists on the ordering — the array is positional, and I4.12 depends on that.</p>
+<blockquote>[<code>rootfs.diff_ids</code>] An array of layer content hashes (<code>DiffIDs</code>), in order from first to last.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md § rootfs</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set up the two digests so you can compare them side by side.
+<pre class="cmd">cd ~/i4/alpine-oci
+MAN=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+CFG=$(jq -r '.config.digest' blobs/sha256/$MAN | cut -d: -f2)
+LAY=$(jq -r '.layers[0].digest' blobs/sha256/$MAN | cut -d: -f2)</pre></li>
+
+<li>Verify the <code>digest</code>: hash the blob exactly as it sits on disk, compressed. This is the number in the manifest.
+<pre class="cmd">jq -r '.layers[0].digest' blobs/sha256/$MAN
+sha256sum blobs/sha256/$LAY</pre>
+<pre class="out">sha256:<b>897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81</b>
+<b>897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81</b>  blobs/sha256/897d797d…</pre></li>
+
+<li>Now verify the <code>diff_id</code>: decompress on the fly and hash the tar stream. Nothing is written to disk — the hash is over what the bytes <em>become</em>, not over what is stored.
+<pre class="cmd">jq -r '.rootfs.diff_ids[0]' blobs/sha256/$CFG
+gunzip -c blobs/sha256/$LAY | sha256sum</pre>
+<pre class="out">sha256:<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b>
+<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b>  -</pre>
+<p>Both match their declared values exactly. Same layer, two identities, and now you can produce either one on demand.</p></li>
+
+<li>Prove the non-determinism claim rather than taking it on faith: recompress the identical tar at a different level and watch the <code>digest</code> move while the <code>diff_id</code> stays put.
+<pre class="cmd">gunzip -c blobs/sha256/$LAY | gzip -1 &gt; /tmp/relayer.tgz
+echo "original digest: $(sha256sum blobs/sha256/$LAY | cut -d' ' -f1)"
+echo "new digest:      $(sha256sum /tmp/relayer.tgz | cut -d' ' -f1)"
+echo "original diff_id: $(gunzip -c blobs/sha256/$LAY | sha256sum | cut -d' ' -f1)"
+echo "new diff_id:      $(gunzip -c /tmp/relayer.tgz | sha256sum | cut -d' ' -f1)"</pre>
+<pre class="out">original digest: 897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+new digest:      <b>619e935806ff0a2498f2d427c0969be15e80fbc1dbf84c5e4f864da89a46b91e</b>
+original diff_id: <b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b>
+new diff_id:      <b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b></pre>
+<p>The <code>diff_id</code> is unchanged; the <code>digest</code> is a completely different number. Identical filesystem, different blob — exactly the case the two-hash design exists to handle. (The <code>gzip -1</code> file is also 3,792,903 bytes against the original's 3,646,875 — faster compression, slightly bigger result, and a third distinct blob had we used <code>-9</code>.)</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a manifest and a config, you can say which hash the registry uses for deduplication and which one the snapshotter uses for caching — and explain why using either for both jobs would break something.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An uncompressed layer has <code>digest == diff_id</code>.</strong> There is no compression step, so both hashes cover the same bytes. It is correct, and it briefly looks like a bug when you meet it.</li>
+<li><strong>The two arrays are in different documents but must correspond positionally.</strong> <code>manifest.layers[2]</code> and <code>config.rootfs.diff_ids[2]</code> are the same layer. Nothing links them except their index — there is no shared key — so any tool that filters or reorders one must do the same to the other.</li>
+<li><strong>Verifying the <code>digest</code> does not verify the content.</strong> It confirms you received the bytes the manifest named. Confirming those bytes decompress to the filesystem the config expects requires checking the <code>diff_id</code> too, and most tooling silently skips that step.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism behind a rebuild that "changed nothing" but still pulled megabytes onto every node — new compressed digests for identical content. On the cluster it shows up as unexpected pull time and disk churn during a rollout, and the diagnosis is invisible unless you know there are two hashes. It is also why <a href="w6.html#cp-6-17">W6.17</a>'s image failures occasionally point at a blob that "should" already be present.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>config.md § rootfs</code> and <code>layer.md</code> in the image spec. The phrase to search when reading other people's tooling is <em>"DiffID"</em>, which is spelled that way in Go code and <code>diff_id</code> in JSON.</p>
+</article>
+<article class="lesson" id="cp-i4-11" data-id="i4-11">
+<div class="lesson-head"><span class="cp-id">I4.11</span><h4>Whiteouts: how a tar archive deletes a file</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A layer can only <em>add</em> entries — that is what a tar archive is. So how does the layer that runs <code>rm /etc/motd</code> represent a deletion? The answer is a convention, not a mechanism, and it is the single most common place where hand-rolled image tooling goes quietly wrong: the files come out looking fine and the deletions simply never happened.</p>
+
+<h5>The concept</h5>
+<p>The convention is a specially-named entry. To delete <code>etc/motd</code>, a layer contains a zero-length file called <code>etc/.wh.motd</code> — the prefix <code>.wh.</code> plus the basename of the thing to remove. A consumer applying layers in order sees that entry and, instead of creating a file, <em>deletes</em> the sibling it names. There is a second form, <code>.wh..wh..opq</code>, which marks its own directory as <em>opaque</em>: every child inherited from lower layers is hidden.</p>
+<p>Now the part that matters, and the reason this checkpoint exists at all. <strong>You have seen deletions represented before, and they looked completely different.</strong> In <a href="b5.html#cp-b5-15">B5.15</a> you deleted a file from an overlayfs upper layer and found a <em>character device with major:minor 0:0</em> sitting where the file had been. Both are "a deletion", and they are not the same thing:</p>
+<table class="langpair">
+<thead><tr><th></th><th>On disk (overlayfs)</th><th>In the layer (OCI tar)</th></tr></thead>
+<tbody>
+<tr><td>a deleted file</td><td>character device, <code>0:0</code></td><td>zero-length entry <code>.wh.&lt;name&gt;</code></td></tr>
+<tr><td>a replaced directory</td><td><code>trusted.overlay.opaque=y</code> xattr</td><td><code>.wh..wh..opq</code> entry</td></tr>
+<tr><td>requires</td><td>root, and a filesystem with xattrs</td><td>nothing — it is an ordinary tar</td></tr>
+</tbody>
+</table>
+<p>The transfer format cannot use the kernel's trick, because a character device and an xattr are not things a plain tar can carry safely across arbitrary filesystems and unprivileged extraction. So the spec picks a naming convention that survives anywhere. <strong>Converting between the two representations is the snapshotter's job</strong> — which is I7's subject, and which is why unpacking layers with plain <code>tar</code> leaves you with visible <code>.wh.</code> files rather than actual deletions.</p>
+<p><strong>What the live run found.</strong> The lab below derives an image by deleting a file and replacing a whole directory, and the deletion appears exactly as promised. The opaque marker does <em>not</em>. Committing through containerd produces individual <code>.wh.</code> entries for each former child instead — even though the opaque xattr is plainly set on disk. The cause is that containerd's default <strong><code>walking</code> differ</strong> compares filesystem <em>trees</em> rather than reading the overlay upper directory, so it never sees the xattr and enumerates the missing children instead. Both encodings are legal and produce the same result; which one you get depends on the differ, not on the spec. Do not expect <code>.wh..wh..opq</code> just because a directory was replaced.</p>
+
+<div class="specref">
+<p>The spec defines both forms. Note that the opaque entry hides <em>all</em> children, including subdirectories and everything beneath them — it is not a per-file marker.</p>
+<blockquote>A whiteout filename consists of the prefix <code>.wh.</code> plus the basename of the path to be deleted.<br><br>An opaque whiteout entry is a file with the name <code>.wh..wh..opq</code> indicating that all siblings are hidden in the lower layer.<br><br>As files prefixed with <code>.wh.</code> are special whiteout markers, it is not possible to create a filesystem which has a file or directory with a name beginning with <code>.wh.</code>.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md#whiteouts">layer.md § Whiteouts</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Derive an image from the one you have been walking. Run a container, delete a file, replace an entire directory, and add a file — three different kinds of change.
+<pre class="cmd">cd ~/i4
+sudo nerdctl run -d --name box1 alpine:3.21 sleep 600
+sudo nerdctl exec box1 sh -c 'ls -l /etc/motd; rm /etc/motd'
+sudo nerdctl exec box1 sh -c 'rm -rf /etc/apk &amp;&amp; mkdir /etc/apk &amp;&amp; echo replaced &gt; /etc/apk/marker'
+sudo nerdctl exec box1 sh -c 'echo hello &gt; /root/added.txt'
+sudo nerdctl commit box1 alpine-derived:1</pre>
+<pre class="out">-rw-r--r--    1 root     root           284 Jan  4  2025 /etc/motd
+sha256:46f0b63bfdfd6112c976a22b4e5ffb1ecfbbdfa59f3bb70836c07efdfc94d957</pre>
+<p>The commit turned all three changes into <strong>one</strong> new layer. (<code>nerdctl</code> rejects a one-character container name — the identifier pattern needs at least two, which is why the box is <code>box1</code>.)</p></li>
+
+<li>Get the derived image into a layout so you can open its layers, then confirm it now has two.
+<pre class="cmd">sudo nerdctl save alpine-derived:1 -o derived.tar
+sudo chown $USER derived.tar
+skopeo copy docker-archive:derived.tar oci:./derived-oci:1
+DMAN=$(jq -r '.manifests[0].digest' derived-oci/index.json | cut -d: -f2)
+jq '{layers: [.layers[] | {digest, size}]}' derived-oci/blobs/sha256/$DMAN</pre>
+<pre class="out">{
+  "layers": [
+    { "digest": "sha256:55cfd63653c76188760d313211122850525467c0d3c469111f3ba8f64898d7f2", "size": 3772079 },
+    { "digest": "sha256:bac3e37179e0ca21c834515826c2b6f2822900233953c5af9edfeaca68f57450", "size": <b>394</b> }
+  ]
+}</pre>
+<p>The whole changeset is <b>394 bytes</b>. That is what a diff-based format buys you.</p></li>
+
+<li>Open the new layer. This is the payoff — every one of those changes, in a plain tar listing.
+<pre class="cmd">NEW=$(jq -r '.layers[1].digest' derived-oci/blobs/sha256/$DMAN | cut -d: -f2)
+tar tvf derived-oci/blobs/sha256/$NEW</pre>
+<pre class="out">drwxr-xr-x 0/0               0 2026-07-28 16:31 etc/
+drwxr-xr-x 0/0               0 2026-07-28 16:31 etc/apk/
+---------- 0/0               0 1970-01-01 06:00 <b>etc/apk/.wh.arch</b>
+---------- 0/0               0 1970-01-01 06:00 <b>etc/apk/.wh.keys</b>
+-rw-r--r-- 0/0               9 2026-07-28 16:31 etc/apk/marker
+---------- 0/0               0 1970-01-01 06:00 <b>etc/apk/.wh.protected_paths.d</b>
+---------- 0/0               0 1970-01-01 06:00 <b>etc/apk/.wh.repositories</b>
+---------- 0/0               0 1970-01-01 06:00 <b>etc/apk/.wh.world</b>
+---------- 0/0               0 1970-01-01 06:00 <b>etc/.wh.motd</b>
+-rw-r--r-- 0/0               0 2026-07-28 16:31 etc/resolv.conf
+drwx------ 0/0               0 2026-07-28 16:31 root/
+-rw-r--r-- 0/0               6 2026-07-28 16:31 root/added.txt</pre>
+<p>There it is: <code>etc/.wh.motd</code>, zero length, mode <code>0000</code>, epoch timestamp. And note what is <em>absent</em> — no <code>.wh..wh..opq</code> for the replaced <code>etc/apk</code>, just one whiteout per former child. (<code>etc/resolv.conf</code> is a runtime-injected file caught by the commit; a classic <code>commit</code> artefact, and a reason real builds do not use it.)</p></li>
+
+<li>Now look at how the very same deletion is stored on disk, and watch the two representations sit side by side. Snapshot 8 here is the container's writable upper directory.
+<pre class="cmd">sudo bash -c 'for d in /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/*/fs; do
+  n=$(basename $(dirname $d))
+  motd=$(stat -c "%F" "$d/etc/motd" 2>/dev/null || echo absent)
+  opq=$(getfattr -n trusted.overlay.opaque --only-values "$d/etc/apk" 2>/dev/null || echo -)
+  printf "snapshot %-3s etc/motd=%-24s etc/apk opaque=%s\n" "$n" "$motd" "$opq"
+done'</pre>
+<pre class="out">snapshot 1   etc/motd=regular file            etc/apk opaque=-
+snapshot 10  etc/motd=<b>character special file</b>  etc/apk opaque=-
+snapshot 5   etc/motd=regular file            etc/apk opaque=-
+snapshot 8   etc/motd=<b>character special file</b>  etc/apk opaque=<b>y</b></pre>
+<p>The kernel's version of both markers, exactly as <a href="b5.html#cp-b5-15">B5.15</a> showed them — and the opaque xattr <em>is</em> set. The differ simply chose not to use it.</p></li>
+
+<li>Confirm the character device is the <code>0:0</code> node B5 described, not merely "some device".
+<pre class="cmd">sudo ls -l /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/8/fs/etc/motd</pre>
+<pre class="out"><b>c</b>--------- 2 root root <b>0, 0</b> Jul 28 16:31 …/snapshots/8/fs/etc/motd</pre></li>
+
+<li>Ask containerd which differ produced that tar, since it explains the missing opaque marker.
+<pre class="cmd">sudo ctr plugins ls | grep -i diff</pre>
+<pre class="out">io.containerd.differ.v1    erofs      -             skip
+io.containerd.differ.v1    <b>walking</b>    linux/amd64   <b>ok</b>
+io.containerd.service.v1   diff-service  -          ok</pre>
+<p>The <code>walking</code> differ walks two filesystem trees and compares them; it never reads the overlay upper directory, so the xattr is invisible to it and it emits one whiteout per missing child instead.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can point at the exact tar entry that deletes a file, explain why it is not a character device, and say why extracting a multi-layer image with plain <code>tar xf</code> produces a rootfs that is subtly wrong rather than obviously broken.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Do not rely on <code>.wh..wh..opq</code> appearing.</strong> A replaced directory may be encoded either way depending on the differ — containerd's default emits per-child whiteouts. A correct consumer must handle both; a correct <em>producer</em> may emit either. Testing against images from one build tool will not exercise both paths.</li>
+<li><strong>Whiteouts are instructions, not files.</strong> If <code>.wh.</code> entries survive into your extracted rootfs, your extractor ignored them — which is exactly the bug the project's <code>apply_layer</code> exists to avoid. Grep for <code>.wh.</code> in a finished rootfs as a cheap self-check.</li>
+<li><strong>A whiteout only affects <em>lower</em> layers.</strong> It removes what earlier layers contributed; it says nothing about later ones. This is why order is everything, and why I4.16's third fault produces a resurrected file rather than an error.</li>
+<li><strong><code>nerdctl commit</code> captures runtime-injected files.</strong> <code>/etc/resolv.conf</code>, <code>/etc/hosts</code> and friends are bind-mounted in by the runtime and get swept into the layer. Harmless here, genuinely bad in a real image — another reason builds use a Dockerfile rather than <code>commit</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This conversion is what containerd's snapshotter does on every image pull, turning <code>.wh.</code> entries into real overlayfs deletions before the kubelet ever sees a rootfs — the unpack half of <a href="w1.html#cp-1-20">W1.20</a>'s kubelet → containerd → shim → runc chain. When a pod starts with a file present that the image "definitely deleted", this layer of the stack is where to look.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>layer.md § Whiteouts</code> in the image spec — short, and worth reading in full because the opaque semantics are easy to half-remember. For the kernel side, <code>Documentation/filesystems/overlayfs.rst</code> covers the character-device and xattr representations.</p>
+</article>
+<article class="lesson" id="cp-i4-12" data-id="i4-12">
+<div class="lesson-head"><span class="cp-id">I4.12</span><h4>Chain ID: the identity of a whole stack</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You now have two hashes per layer and might reasonably assume a snapshotter caches on one of them. It caches on a third thing, computed from both — and the reason why is the single best explanation of Dockerfile cache behaviour you will get: why changing one early line invalidates everything after it.</p>
+
+<h5>The concept</h5>
+<p>Start from the flaw. Suppose a snapshotter cached prepared filesystems by <code>diff_id</code>. Take the layer that installs your application — one tar, one <code>diff_id</code>. Apply it on top of Alpine and you get one filesystem; apply the identical layer on top of Ubuntu and you get a completely different one. Same <code>diff_id</code>, different result. A cache keyed on it would happily hand back a prepared rootfs that is silently, catastrophically wrong.</p>
+<p>The fix: <strong>a layer's content does not determine the filesystem it produces — its whole history does.</strong> So the identity has to cover the entire ordered prefix, not just the layer. That identity is the <strong>chain ID</strong>, defined recursively:</p>
+<div class="flow"><span>chainID[0] = diff_id[0]</span><em>→</em><span>chainID[n] = sha256("chainID[n-1] diff_id[n]")</span></div>
+<p>The first chain ID is just the first <code>diff_id</code> — with nothing beneath it, the layer and the stack are the same thing. Each subsequent one hashes the previous chain ID, a single space, and the next <code>diff_id</code>. The result folds an arbitrarily long history into one fixed-size name.</p>
+<p>That makes "have I already prepared exactly this stack?" a single lookup, and it gives sharing for free at every depth: two images whose first four layers are identical have identical chain IDs for those four, so they share four prepared snapshots on the node — regardless of what they do afterwards. Conversely, change anything early and every chain ID after it changes, because each one feeds the next. That is the whole of Dockerfile cache invalidation, and I6 meets the same arithmetic again from the build side.</p>
+
+<div class="specref">
+<p>Chain IDs are not in the image spec at all — the spec defines <code>diff_ids</code> and their order, and the chain-ID computation is specified by containerd and the wider ecosystem on top of it. The ordering guarantee is what makes the recursion well-defined.</p>
+<blockquote>[<code>rootfs.diff_ids</code>] An array of layer content hashes (<code>DiffIDs</code>), in order from first to last.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md § rootfs</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the two <code>diff_id</code>s out of the derived image you built in I4.11.
+<pre class="cmd">cd ~/i4
+DMAN=$(jq -r '.manifests[0].digest' derived-oci/index.json | cut -d: -f2)
+DCFG=$(jq -r '.config.digest' derived-oci/blobs/sha256/$DMAN | cut -d: -f2)
+jq -r '.rootfs.diff_ids[]' derived-oci/blobs/sha256/$DCFG</pre>
+<pre class="out">sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+sha256:aa1db80a1aa8d4b9d83d26e249a6a03354caaaa54951130e7f42ae0671e91e53</pre>
+<p>The first is Alpine's base layer — the same <code>7211d01a…</code> you have seen since I4.6. The second is the 394-byte changeset.</p></li>
+
+<li>Compute both chain IDs by hand. The whole algorithm is one <code>printf</code> and one <code>sha256sum</code>; note that both digests go in with their <code>sha256:</code> prefixes, joined by exactly one space.
+<pre class="cmd">D0=$(jq -r '.rootfs.diff_ids[0]' derived-oci/blobs/sha256/$DCFG)
+D1=$(jq -r '.rootfs.diff_ids[1]' derived-oci/blobs/sha256/$DCFG)
+echo "chainID[0] = $D0"
+echo "chainID[1] = sha256:$(printf '%s %s' "$D0" "$D1" | sha256sum | cut -d' ' -f1)"</pre>
+<pre class="out">chainID[0] = sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+chainID[1] = sha256:<b>968325f7dbe78e359a7039edf0187bc7a1da1da00076a3827ceb17f8f5d78d9c</b></pre></li>
+
+<li>Now ask containerd what it actually stored, and compare. This is the moment the arithmetic stops being a claim.
+<pre class="cmd">sudo ctr -n default snapshot ls</pre>
+<pre class="out">KEY                                                                     PARENT                                                                  KIND
+5bd747a1ddf251dff278436f2a55cf5510de403c4c6d241a20388350dcd1decf        sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb  Active
+sha256:6f09edfb3f6d7173733adc8eec8ea00626550dc6fc2dcf07d40e13f5c1e907c4                                                                         Committed
+sha256:<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b>                                                                         Committed
+sha256:<b>968325f7dbe78e359a7039edf0187bc7a1da1da00076a3827ceb17f8f5d78d9c</b> sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb  Committed</pre>
+<p>Both numbers you computed are there as snapshot keys, and the second's <code>PARENT</code> is the first — the chain made explicit. Nothing was looked up; you derived containerd's own cache keys from two hashes and a space.</p></li>
+
+<li>Read the other rows for what they tell you. The <code>Active</code> snapshot keyed by a container ID is the thin writable layer of the running container from I4.11 — its parent is the base chain ID, which is <a href="b5.html#cp-b5-16">B5.16</a>'s "layers plus a thin writable one", now with names you can compute.
+<pre class="cmd">sudo ctr -n default snapshot ls | awk 'NR==1 || /Active/'</pre>
+<pre class="out">KEY                                                               PARENT                          KIND
+5bd747a1ddf251dff278436f2a55cf5510de403c4c6d241a20388350dcd1decf  sha256:7211d01a…37759cb          <b>Active</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a config's <code>diff_ids</code>, you can produce every chain ID with <code>printf</code> and <code>sha256sum</code>, and you can say why two images sharing a base share snapshots on the node while an early change invalidates every later one.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The separator is a single space, and the operands keep their <code>sha256:</code> prefixes.</strong> Get either detail wrong and you produce a plausible 64-hex-character number that matches nothing. If your value does not appear in <code>ctr snapshot ls</code>, this is almost always why.</li>
+<li><strong>Chain IDs are computed from <code>diff_id</code>, never from the manifest's <code>digest</code>.</strong> Using the compressed digest would make the cache key depend on compression settings — I4.10's whole point — so a recompressed but identical image would miss the cache entirely.</li>
+<li><strong>A single-layer image's chain ID equals its <code>diff_id</code>.</strong> That is not a coincidence to explain away; it falls straight out of the base case, and it is why Alpine's snapshot key looks like its <code>diff_id</code>.</li>
+<li><strong>Chain IDs are not in the OCI spec.</strong> Do not go looking for them in <code>config.md</code>. They are a containerd/ecosystem construction layered on top of the spec's ordering guarantee — a good example of this track's thesis that the contracts, not the mechanisms, are what got added.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is why a node that already runs one image based on your company's standard base pulls and unpacks almost nothing for the next twenty: the shared prefix has the same chain IDs, so the snapshots already exist. It is also the disk-usage model behind image garbage collection — snapshots are shared, so deleting an image frees far less than its reported size, which surprises people the first time they try to reclaim space on a full node.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the OCI side is only <code>config.md § rootfs</code>. For chain IDs themselves, containerd's <code>identity</code> package and the snapshotter documentation in the containerd repository are the authority — and <code>ctr snapshot ls</code> is the fastest way to check your arithmetic.</p>
+</article>
+</div><!-- /g-layers -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
