@@ -1216,8 +1216,237 @@ real	0m1.362s</pre></li>
 
 <p class="docs-links"><b>Docs:</b> containerd's <code>docs/hosts.md</code> is the reference for <code>hosts.toml</code> and is short. For the exam, search the Kubernetes docs for <em>"image registry"</em> and note that this is node configuration, not cluster API — nothing you do with <code>kubectl</code> will fix it.</p>
 </article>
+</div><!-- /g-in-practice -->
 
+<!-- ---------------- Project & drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson project" id="cp-i5-14" data-id="i5-14">
+<div class="lesson-head"><span class="cp-id">I5.14</span><h4>Mini project — pull.py, a real registry client</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Doing the pull once with <code>curl</code> proves you understand the requests. Writing the client proves you understand the <em>decisions</em> — when to verify, when to cache, what to do when the answer is a status code instead of a manifest. And at the end, two programs you wrote a module apart meet at a standard format without either knowing about the other.</p>
+
+<h5>The concept</h5>
+<p><code>pull.py</code> is about 260 lines, half of them comment and diagnosis, and does four things:</p>
+<ul>
+<li><strong>Authenticates</strong> — try <code>/v2/</code>, and if the answer is a <code>401</code> with a Bearer challenge, parse <code>realm</code>, <code>service</code> and <code>scope</code> out of it and fetch a token. If the answer is <code>200</code>, use no token at all. Both paths are exercised in the lab below.</li>
+<li><strong>Resolves</strong> tag → index → manifest, selecting a platform and skipping attestation manifests.</li>
+<li><strong>Verifies and caches</strong> every blob by digest in a content store laid out the way containerd's is: <code>&lt;store&gt;/blobs/sha256/&lt;hex&gt;</code>. That path is not a coincidence — it is also where an OCI layout keeps its blobs, so the layout this writes is the store plus two small files.</li>
+<li><strong>Diagnoses</strong>. Every HTTP error is turned into a sentence naming the status, what the registry said, and what that combination usually means. This is the module's thesis in one function: every common pull failure is a status code that already says what went wrong, and the only reason it reaches people as <code>ImagePullBackOff</code> is that nothing along the way said it out loud.</li>
+</ul>
+<p>Two implementation details are worth arguing about, because both are places a naive client is wrong. Blobs are written to a <code>.partial</code> name and renamed only after the digest matches — so a half-written or altered blob can never be mistaken for a cached one. And the config's <code>architecture</code> is checked against what was requested, because <strong>resolving a tag is not selecting a platform</strong>: if the tag resolved straight to a single manifest with no index, nothing has chosen anything, and <code>--platform</code> is a lie you told yourself. I4 found that nothing in the real pull path makes that check. This client makes it.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read it first — it is short, and every part of it is a checkpoint you have already done. The file is <code>labs/intermediate/pull.py</code>.
+<pre class="cmd">wc -l ~/pull.py
+grep -n '^def ' ~/pull.py</pre>
+<pre class="out">266 /home/ubuntu/pull.py
+38:def die(msg):
+43:def parse_ref(ref):
+61:def get(url, token=None, accept=None, method="GET"):
+<b>70:def diagnose(e, url):</b>
+101:def authenticate(endpoint, name):
+121:def fetch_blob(endpoint, name, desc, store, what):
+151:def fetch_manifest(endpoint, name, reference, store):
+170:def select(index, want):
+198:def main():</pre></li>
+
+<li>Pull from Docker Hub into an OCI layout, with blobs cached in a separate content store.
+<pre class="cmd">~/.venv-intermediate/bin/python ~/pull.py docker.io/library/alpine:3.21 ~/layout --store ~/store</pre>
+<pre class="out">registry   https://registry-1.docker.io
+repository library/alpine
+reference  3.21
+
+token      anonymous bearer token
+
+resolved   3.21 -&gt; sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+           application/vnd.oci.image.index.v1+json
+selected   linux/amd64 -&gt; sha256:f27cad9117495d32d06...
+
+blobs:
+  <b>[verified] config</b>       sha256:2607caa9805847fac4d...       611 bytes
+  <b>[verified] layer[0]</b>     sha256:897d797d2723cf0e318...   3646875 bytes
+
+OCI layout ready: /home/ubuntu/layout  (tag '3.21')
+  next: oci-inspect.py /home/ubuntu/layout 3.21 --extract rootfs/</pre></li>
+
+<li>Look at the store. Four blobs: the index, the manifest, the config and the layer — every document fetched, named by its own digest, exactly as containerd would keep them.
+<pre class="cmd">find ~/store -type f | sed "s|$HOME|~|" | sort</pre>
+<pre class="out">~/store/blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+~/store/blobs/sha256/48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+~/store/blobs/sha256/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+~/store/blobs/sha256/f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</pre></li>
+
+<li>Pull it again into a different layout. Nothing is transferred — the cache is checked by digest, which needs no expiry logic because a digest cannot go stale.
+<pre class="cmd">~/.venv-intermediate/bin/python ~/pull.py docker.io/library/alpine:3.21 ~/layout2 --store ~/store | grep -A3 '^blobs:'</pre>
+<pre class="out">blobs:
+  <b>[cached]   config</b>       sha256:2607caa9805847fac4d...
+  <b>[cached]   layer[0]</b>     sha256:897d797d2723cf0e318...</pre></li>
+
+<li>Hand the layout to <code>oci-inspect.py</code> from I4.15 — a program written before <code>pull.py</code> existed, which has no idea any of this came from a network.
+<pre class="cmd">~/.venv-intermediate/bin/python ~/oci-inspect.py ~/layout 3.21 --extract ~/rootfs2 | tail -8</pre>
+<pre class="out">history: 2 entries, 1 of them empty_layer (so 1 produced a layer, matching 1)
+
+extracting 1 layer(s) into /home/ubuntu/rootfs2/ in order:
+  applied layer[0]
+
+<b>rootfs ready: /home/ubuntu/rootfs2</b></pre></li>
+
+<li>Now the interesting cases. First, a registry that needs no token at all — the same code path, taking the other branch.
+<pre class="cmd">~/.venv-intermediate/bin/python ~/pull.py localhost:5000/demo/alpine:3.21 ~/l1 \
+  | grep '^registry\|^token\|^resolved\|^note'</pre>
+<pre class="out">registry   http://localhost:5000
+<b>token      none needed</b>
+resolved   3.21 -&gt; sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+note       no index; 3.21 is a single manifest</pre></li>
+
+<li>A platform the index does not carry. Note the offered list keeps <code>architecture</code> and <code>variant</code> separate, per I4.
+<pre class="cmd">~/.venv-intermediate/bin/python ~/pull.py docker.io/library/alpine:3.21 ~/l2 --platform linux/mips64</pre>
+<pre class="out">error: no image found for platform linux/mips64; the index offers ['linux/386', 'linux/amd64', <b>'linux/arm/v6', 'linux/arm/v7', 'linux/arm64/v8'</b>, 'linux/ppc64le', 'linux/riscv64', 'linux/s390x']</pre></li>
+
+<li>And the one that matters most: an image whose tag resolves to a single arm64 manifest, requested as amd64. Nothing in the real pull path catches this. Yours does.
+<pre class="cmd">sudo skopeo copy --dest-tls-verify=false --override-arch arm64 \
+  docker://docker.io/library/alpine:3.21 docker://localhost:5000/sneaky/alpine:3.21
+~/.venv-intermediate/bin/python ~/pull.py localhost:5000/sneaky/alpine:3.21 ~/l3 --platform linux/amd64 \
+  | grep '^note\|WARNING'</pre>
+<pre class="out">note       no index; 3.21 is a single manifest
+  <b>WARNING: asked for linux/amd64, but the config says linux/arm64</b></pre>
+<p>Without that line, this pull succeeds, the image lands, the pod starts, and the container dies with <code>exec format error</code> some minutes later — with nothing in the pull output to suggest why.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Your client pulls from an authenticated and an unauthenticated registry, caches by digest, and refuses to be quiet about a platform mismatch. Extend it if you want the real exercise: add <code>Range</code>-based resumption for interrupted blob downloads, using what I5.10 showed you about ranges from the upload side.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Verify before rename, not after use.</strong> Writing straight to the final path and checking afterwards means a failed verification leaves a poisoned cache entry that the next run treats as valid. The <code>.partial</code> dance is the whole defence and costs one line.</li>
+<li><strong>The manifest is cached by its own digest, computed locally.</strong> Never trust <code>Docker-Content-Digest</code> for this: it is a SHOULD, it can be absent, and using the server's claim as a cache key would let a server poison your store. Hash the bytes you received.</li>
+<li><strong>Anonymous is a branch, not a default.</strong> Registries that answer <code>200</code> at <code>/v2/</code> want no <code>Authorization</code> header at all, and sending an empty Bearer token to one is a good way to get a confusing <code>401</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now written the part of containerd that the kubelet triggers through CRI (<a href="w1.html#cp-1-20">W1.20</a>). What the real implementation adds beyond this is concurrency, shared caching across namespaces, snapshot preparation (I7) and progress reporting — not a different algorithm. When <a href="w6.html#cp-6-17">W6.17</a>'s <code>ErrImagePull</code> appears, the useful question is now which of your own function calls the real client would have been sitting in.</p>
 </div>
+
+<p class="docs-links"><b>Docs:</b> nothing new to look up — this project is the whole module. If a step is unclear, the checkpoint it came from is the place to go back to.</p>
+</article>
+<article class="lesson drill" id="cp-i5-15" data-id="i5-15">
+<div class="lesson-head"><span class="cp-id">I5.15</span><h4>Debugging drill: four failures, four status codes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Every one of these is a real incident with a real signature, and every one arrives at a human as the same three words. The skill being drilled is not fixing them — the fixes are easy — but getting from <code>ImagePullBackOff</code> to the number, because once you have the number there is nothing left to guess.</p>
+
+<h5>The concept</h5>
+<p>Four faults. For each: plant it, observe how it presents, get to the status code, and fix it.</p>
+<table class="langpair">
+<thead><tr><th>Fault</th><th>Status</th><th>The tell</th></tr></thead>
+<tbody>
+<tr><td>No token</td><td><code>401</code></td><td><code>Bearer</code> challenge, <em>from the registry</em></td></tr>
+<tr><td>Bad credentials</td><td><code>401</code></td><td><code>Basic</code> challenge, <em>from the auth service</em></td></tr>
+<tr><td>Half-replicated mirror</td><td><code>404</code></td><td>manifest resolves, then a blob does not</td></tr>
+<tr><td>Rate limited</td><td><code>429</code></td><td><code>/v2/</code> is healthy; the manifest is refused</td></tr>
+<tr><td>Wrong <code>Accept</code></td><td><code>404</code></td><td><code>MANIFEST_UNKNOWN</code> for an image you can see</td></tr>
+</tbody>
+</table>
+<p>One correction before you start, because the obvious discriminator for the two <code>401</code>s is wrong. It is tempting to say "a challenge means no token; no challenge means bad credentials" — but a rejected credential comes back <em>with</em> a <code>WWW-Authenticate</code> header too. The difference is which kind, and which host sent it: a <code>Bearer</code> challenge from the registry means you never authenticated, while a <code>Basic</code> challenge from the auth service means your credentials were seen and refused. The response bodies differ too, and that is the fastest tell of all.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault 1a — no token.</strong> The normal, healthy start of every anonymous pull.
+<pre class="cmd">curl -si https://registry-1.docker.io/v2/library/alpine/manifests/3.21 \
+  | tr -d '\r' | grep -i '^HTTP/\|^www-authenticate'
+curl -s https://registry-1.docker.io/v2/library/alpine/manifests/3.21 | jq -c '.errors[0]|{code,message}'</pre>
+<pre class="out">HTTP/2 <b>401</b>
+www-authenticate: <b>Bearer</b> realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+{"code":"UNAUTHORIZED","message":"authentication required"}</pre></li>
+
+<li><strong>Fault 1b — wrong credentials.</strong> Same status code, different host, different challenge scheme, different body.
+<pre class="cmd">curl -si -u 'notauser:notapassword' \
+  'https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:library/alpine:pull' \
+  | tr -d '\r' | grep -i '^HTTP/\|^www-authenticate'
+curl -s -u 'notauser:notapassword' \
+  'https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:library/alpine:pull' | jq -c .</pre>
+<pre class="out">HTTP/2 <b>401</b>
+www-authenticate: <b>Basic</b> realm="auth.docker.io"
+{"details":"<b>incorrect username or password</b>"}</pre>
+<p>And what a runtime makes of it — note that it names the auth host, which is the clue that survives all the way up:</p>
+<pre class="cmd">sudo ctr images pull --user notauser:notapassword docker.io/library/alpine:3.21</pre>
+<pre class="out">ctr: failed to resolve image: failed to authorize: failed to fetch oauth token: unexpected status
+from GET request to <b>https://auth.docker.io/token</b>?scope=repository%3Alibrary%2Falpine%3Apull&amp;service=registry.docker.io: <b>401 Unauthorized</b></pre></li>
+
+<li><strong>Fault 2 — half-replicated mirror.</strong> Plant it by deleting one layer blob and leaving the manifest, which is exactly what a mirror that replicates in the wrong order produces.
+<pre class="cmd">R=http://localhost:5000
+ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json"
+sudo skopeo copy --dest-tls-verify=false docker://docker.io/library/hello-world:linux \
+  docker://localhost:5000/broken/hw:1
+MD=$(curl -sI -H "Accept: $ACC" $R/v2/broken/hw/manifests/1 | tr -d '\r' \
+     | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+LD=$(curl -s -H "Accept: $ACC" $R/v2/broken/hw/manifests/$MD | jq -r '.layers[0].digest')
+curl -s -o /dev/null -w 'DELETE blob  -&gt; %{http_code}\n' -X DELETE $R/v2/broken/hw/blobs/$LD
+
+curl -s -o /dev/null -w 'GET manifest -&gt; %{http_code}\n' -H "Accept: $ACC" $R/v2/broken/hw/manifests/1
+curl -s -o /dev/null -w 'GET blob     -&gt; %{http_code}\n' $R/v2/broken/hw/blobs/$LD</pre>
+<pre class="out">DELETE blob  -&gt; 202
+<b>GET manifest -&gt; 200</b>
+<b>GET blob     -&gt; 404</b></pre>
+<p>Now pull it, on a machine that has never held this layer:</p>
+<pre class="cmd">sudo ctr -n i5y images pull --plain-http localhost:5000/broken/hw:1</pre>
+<pre class="out">ctr: failed to copy: httpReadSeeker: failed open: could not fetch content descriptor
+sha256:4f55086f7dd096d48b0e49be066971a8ed996521c2e190aa21b2435a847198b4
+(application/vnd.oci.image.layer.v1.tar+gzip) from remote: <b>not found</b></pre></li>
+
+<li>Now the part that makes this fault genuinely nasty, and which you should run deliberately. Try the same pull for an image whose layer this machine <em>already has</em> in its content store.
+<pre class="cmd">sudo skopeo copy --src-tls-verify=false docker://localhost:5000/broken/busybox:1.37 oci:/tmp/x:1.37</pre>
+<pre class="out">Copying blob sha256:436a1b1fd078ee8e117111472724c2827077657189af7a781829d0825d48d2ab
+level=fatal msg="reading blob …: fetching blob: <b>blob unknown to registry</b>"</pre>
+<p>But <code>ctr</code>, on the same broken image, <strong>succeeded</strong> — because containerd found the layer in its local content store and never asked the registry for it. That asymmetry is the whole field signature of this fault: <em>some</em> nodes fail, the ones that happen to have pulled a sibling image already do not, and the set changes as nodes are replaced. Anyone who tests on a node that already has the layer concludes the registry is fine.</p></li>
+
+<li><strong>Fault 3 — rate limited.</strong> Rather than burning a real budget, stand up a server that speaks the handshake and then refuses everything, which is exactly what a rate-limited registry looks like from the outside. The script is <code>labs/intermediate/limiter.py</code>.
+<pre class="cmd">setsid nohup python3 ~/limiter.py &gt;/dev/null 2&gt;&amp;1 &lt; /dev/null &amp;
+sleep 2
+curl -s -o /dev/null -w 'GET /v2/  -&gt; %{http_code}\n' http://127.0.0.1:5002/v2/
+curl -si http://127.0.0.1:5002/v2/library/alpine/manifests/3.21 \
+  | tr -d '\r' | grep -i '^HTTP/\|retry-after\|ratelimit'</pre>
+<pre class="out">GET /v2/  -&gt; <b>200</b>
+HTTP/1.0 <b>429 Too Many Requests</b>
+Retry-After: 3600
+RateLimit-Limit: 100;w=21600
+<b>RateLimit-Remaining: 0;w=21600</b></pre>
+<p>The handshake is healthy. Every "is the registry up?" check passes. Only the thing you actually wanted is refused — which is why this one gets misdiagnosed as a network problem.</p>
+<pre class="cmd">sudo ctr -n i5z images pull --plain-http 127.0.0.1:5002/library/alpine:3.21
+pkill -f '[l]imiter\.py'</pre>
+<pre class="out">ctr: failed to resolve image: unexpected status from HEAD request to
+http://127.0.0.1:5002/v2/library/alpine/manifests/3.21: <b>429 Too Many Requests</b></pre>
+<p>The runtime reports the number faithfully. It is the layer above — the kubelet's summary into a pod event — that loses it.</p></li>
+
+<li><strong>Fault 4 — wrong <code>Accept</code>.</strong> You met this in I5.4; run it as a fault and notice how little there is to go on.
+<pre class="cmd">curl -s http://localhost:5000/v2/oci/alpine/manifests/3.21 | jq -c '.errors[0]|{code,message}'
+curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+     http://localhost:5000/v2/oci/alpine/manifests/3.21 | jq -c '{mediaType}'</pre>
+<pre class="out">{"code":"<b>MANIFEST_UNKNOWN</b>","message":"manifest unknown"}
+{"mediaType":"application/vnd.oci.image.manifest.v1+json"}</pre>
+<p>Same URL, same image, two lines apart: unknown, then found. The only difference is a request header.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a failing pull, you can reach the status code in under a minute from the affected node, and you can name the fix each number implies. Test yourself on the two <code>401</code>s in particular — the wrong answer there sends you to rotate credentials that were never the problem.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Reproduce on a node that has never held the image.</strong> Fault 2 is invisible on a machine with the layer cached, and containerd's content store is shared across namespaces, so switching namespace is not a fresh start. Use an image the machine has genuinely never seen.</li>
+<li><strong>The handshake passing proves almost nothing.</strong> Faults 3 and 4 both leave <code>/v2/</code> answering <code>200</code>. "The registry is up" is not a diagnosis.</li>
+<li><strong>Fix the mirror, not the image, for fault 2.</strong> The upstream registry is fine; the ordering guarantee was broken by the replication path. Re-replicating in the right order fixes it, and deleting the tag does not.</li>
+</ul>
+
+<div class="k8s-link">
+<p>All five rows of that table arrive as <code>ImagePullBackOff</code> (<a href="w6.html#cp-6-17">W6.17</a>). The path from there to a status code is: <code>kubectl describe pod</code> for the event text, then — because the event will usually not contain the number — <code>crictl pull</code> or <code>curl</code> <em>from the affected node</em>. Keep this table with your triage sheet from <a href="w6.html#cp-6-4">W6.4</a>; it turns the most-guessed-at failure in Kubernetes into a lookup.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Error Codes</code> for the code strings, and the Kubernetes debugging pages for <em>"ImagePullBackOff"</em>. The exam-relevant habit is checking the pod's <em>events</em> rather than its status.</p>
+</article>
+</div><!-- /g-project-drill -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
