@@ -558,6 +558,212 @@ after 3x GET:  <b>90;w=3600</b></pre>
 
 <p class="docs-links"><b>Docs:</b> nothing in the Kubernetes docs covers registry rate limits; the registry operator's own documentation is the reference. For the exam, the useful search is <em>"ImagePullBackOff"</em> in the debugging pages — know that the reason lives in the events, not in the pod status.</p>
 </article>
+<article class="lesson" id="cp-i5-7" data-id="i5-7">
+<div class="lesson-head"><span class="cp-id">I5.7</span><h4>A complete pull with curl, jq and sha256sum</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the checkpoint the module exists for. Once you have pulled an image by hand, "the registry is broken" stops being a sentence you can say — you can name which of six requests failed and what its status code was. It also surfaces a firewall trap that catches restricted networks every time.</p>
+
+<h5>The concept</h5>
+<p>A pull is six steps, and you have already done four of them separately:</p>
+<div class="flow"><span>token</span><em>→</em><span>index</span><em>→</em><span>manifest</span><em>→</em><span>config</span><em>→</em><span>layers</span><em>→</em><span>verify</span></div>
+<p>Resolve the tag to an index; pick the manifest for your platform; fetch the config blob and each layer blob; verify every digest as it lands. Nothing else happens. There is no session, no negotiation beyond the <code>Accept</code> header, and no state on the server between requests.</p>
+<p>One thing does happen that the diagram hides, and it matters more than anything else in this checkpoint. A blob request is almost never answered with bytes. It is answered with <strong><code>307 Temporary Redirect</code></strong> to a signed, time-limited URL on object storage — for Docker Hub, a CloudFront hostname that has nothing in common with <code>registry-1.docker.io</code>. The registry does the authorisation; a CDN does the transfer.</p>
+<p>So a pull touches <em>three</em> hosts: the registry, its auth service, and a content host you never configured and cannot guess. Allowlist only the registry hostname and manifests resolve perfectly while every layer download hangs or fails — which presents as "pulls work from my laptop but not from the cluster", the number one cause of that symptom in restricted networks.</p>
+<p>And this is where I4.1's insistence on verifying digests stops being pedantry. You are downloading bytes from a CDN that the registry does not control, over a URL signed hours ago. You verify the hash yourself, so the CDN never has to be trusted with integrity at all. The redirect is safe <em>because</em> the client checks.</p>
+
+<div class="specref">
+<p>The spec makes the client's verification duty explicit, and — note the wording — puts the requirement on the client rather than trusting the server to be honest.</p>
+<blockquote>A GET request to an existing blob URL MUST provide the expected blob, with a response code that MUST be <code>200 OK</code>.<br>[…]<br>Most clients MAY ignore the value, but if it is used, the client MUST verify the value matches the returned response body.<br>Clients SHOULD verify that the response body matches the requested digest.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-blobs">spec.md § Pulling blobs</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set up, get a token, and fetch the index. Then list what is in it — and skip the attestation manifests, as I4.5 taught: <code>architecture</code> and <code>variant</code> are separate fields, so never write "arm64v8".
+<pre class="cmd">REG=https://registry-1.docker.io; REPO=library/alpine; TAG=3.21
+ACC="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,\
+application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+mkdir -p ~/pull/blobs &amp;&amp; cd ~/pull
+T=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:$REPO:pull" | jq -r .token)
+H="Authorization: Bearer $T"
+
+curl -s -H "$H" -H "Accept: $ACC" $REG/v2/$REPO/manifests/$TAG &gt; index.json
+jq -r '.manifests[] | [.platform.os, .platform.architecture, (.platform.variant // "-"),
+       (.annotations."vnd.docker.reference.type" // "image")] | @tsv' index.json | column -t</pre>
+<pre class="out">linux    amd64    -   image
+unknown  unknown  -   <b>attestation-manifest</b>
+linux    arm      v6  image
+unknown  unknown  -   attestation-manifest
+linux    arm      v7  image
+unknown  unknown  -   attestation-manifest
+linux    <b>arm64    v8</b>  image
+unknown  unknown  -   attestation-manifest
+linux    386      -   image
+unknown  unknown  -   attestation-manifest
+linux    ppc64le  -   image
+unknown  unknown  -   attestation-manifest
+linux    riscv64  -   image
+unknown  unknown  -   attestation-manifest
+linux    s390x    -   image
+unknown  unknown  -   attestation-manifest</pre></li>
+
+<li>Select linux/amd64 — filtering on the annotation as well as the platform, because an attestation entry must be skipped twice over — then fetch that manifest and verify its digest by recomputing it.
+<pre class="cmd">MD=$(jq -r '.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64"
+            and (.annotations."vnd.docker.reference.type"|not)) | .digest' index.json)
+curl -s -H "$H" -H "Accept: $ACC" $REG/v2/$REPO/manifests/$MD &gt; manifest.json
+echo "computed: $(sha256sum manifest.json | cut -c1-64)"
+echo "claimed:  ${MD#sha256:}"
+jq '{mediaType, config: .config.digest, layers: [.layers[].digest]}' manifest.json</pre>
+<pre class="out">computed: <b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>
+claimed:  <b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>
+{
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": "sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577",
+  "layers": [
+    "sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81"
+  ]
+}</pre></li>
+
+<li>Fetch the config blob. It is a blob like any other — same endpoint, same verification.
+<pre class="cmd">CD=$(jq -r .config.digest manifest.json)
+curl -sL -H "$H" -o blobs/${CD#sha256:} $REG/v2/$REPO/blobs/$CD
+echo "computed: $(sha256sum blobs/${CD#sha256:} | cut -c1-16)..."
+jq '{architecture, os, Cmd: .config.Cmd, diff_ids: .rootfs.diff_ids}' blobs/${CD#sha256:}</pre>
+<pre class="out">computed: <b>2607caa9805847fa</b>...
+{
+  "architecture": "amd64",
+  "os": "linux",
+  "Cmd": [ "/bin/sh" ],
+  "diff_ids": [ "sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb" ]
+}</pre></li>
+
+<li>Now the layers — and find out where the bytes come from. The first request deliberately does <em>not</em> follow the redirect, so you can see it.
+<pre class="cmd">for LD in $(jq -r '.layers[].digest' manifest.json); do
+  curl -s -o /dev/null -H "$H" -w '   no-follow: %{http_code}  -&gt; %{redirect_url}\n' $REG/v2/$REPO/blobs/$LD
+  curl -sL -H "$H" -o blobs/${LD#sha256:} -w '   follow:    %{http_code}  bytes=%{size_download}\n' $REG/v2/$REPO/blobs/$LD
+  echo "   computed:  $(sha256sum blobs/${LD#sha256:} | cut -c1-24)"
+done</pre>
+<pre class="out">   no-follow: <b>307</b>  -&gt; <b>https://production.cloudfront.docker.com</b>/registry-v2/docker/registry/v2/blobs/sha256/89/897d…/data?Expires=1785241553&amp;Signature=N7B35QvMVLR8…&amp;Key-Pair-Id=K2C9XPB6FLAKUF
+   follow:    200  bytes=3646875
+   computed:  <b>897d797d2723cf0e318402f4</b></pre>
+<p>A different hostname, a signed URL, and an expiry timestamp. That host is the one your firewall does not know about.</p></li>
+
+<li>You now hold a complete image. Three files: a manifest, a config, and one layer.
+<pre class="cmd">ls -l blobs/</pre>
+<pre class="out">-rw-rw-r-- 1 ubuntu ubuntu     611 Jul 28 17:35 2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+-rw-rw-r-- 1 ubuntu ubuntu 3646875 Jul 28 17:35 897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can pull any public image with <code>curl</code> alone, and you can list the three hostnames a pull depends on. Ask yourself which of the six steps a given failure happened at — if you can answer that for an <code>ImagePullBackOff</code>, this checkpoint has done its job.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>curl -L</code> can drop your <code>Authorization</code> header across hosts, and that is correct behaviour.</strong> The redirect target is pre-signed and needs no bearer token; sending one to a CDN would leak it. If you meet a <code>403</code> on a blob after a clean <code>307</code>, suspect the signed URL's expiry, not your token.</li>
+<li><strong>Firewall the redirect target, not just the registry.</strong> Manifests resolving while layers fail is the signature. The content host is a CDN whose addresses change, so allowlisting by IP does not hold.</li>
+<li><strong>Verify before you use, not after.</strong> The point of hashing is to refuse the bytes; a client that extracts a layer and then checks it has already written attacker-controlled files to disk. I5.14's <code>pull.py</code> writes to a <code>.partial</code> name and renames only after the digest matches.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Every image on a node arrived exactly this way — containerd did these requests, with the kubelet asking through CRI (<a href="w1.html#cp-1-20">W1.20</a>). Nothing above this line adds capability; it adds caching, concurrency and lifecycle. That is why <a href="w6.html#cp-6-17">W6.17</a>'s registry failures are all diagnosable from a node with <code>curl</code>, and why an air-gapped cluster works at all: the six steps have no hidden dependency on anything but HTTP.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Pulling blobs</code> and <code>§ Pulling manifests</code> are short and worth reading end to end — together they are the whole pull path. Kubernetes side: search for <em>"images"</em> and read what the kubelet does with credentials.</p>
+</article>
+<article class="lesson" id="cp-i5-8" data-id="i5-8">
+<div class="lesson-head"><span class="cp-id">I5.8</span><h4>Closing the loop: URL to running container, no container tooling</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Worth pausing on, because this is the point the whole track has been building towards. Between I2, I4 and the last checkpoint you have implemented every step of "run an image" yourself. Seeing them join up changes what you believe the rest of the stack is for.</p>
+
+<h5>The concept</h5>
+<p>Six steps make an image run: <strong>resolve, download, verify, unpack, configure, execute.</strong> You have now done all six with tools that predate containers entirely — <code>curl</code>, <code>sha256sum</code>, a Python script that untars, and <code>runc</code>.</p>
+<p>So what does everything above this line actually add? Caching, concurrency, lifecycle management, and API surface — not new capability. containerd adds a content store so two pods sharing a base layer download it once, snapshots so a rootfs is prepared without copying (I7), and a lifecycle you can talk to over gRPC. CRI adds a stable interface so the kubelet does not need to know which runtime is installed (I8). The kubelet adds reconciliation, restart policy and reporting. Every one of those is valuable; none of them is a new mechanism.</p>
+<p>That is the intermediate track's thesis at its most concrete — <em>the container ecosystem added almost no mechanism, it added contracts</em> — and it is the mental model that makes node debugging tractable. When a pod will not start, you are no longer asking the unanswerable question "why is Kubernetes unhappy?". You are asking which of six steps failed, and every one of them has a command you can run by hand.</p>
+
+<div class="specref">
+<p>Nothing new is being claimed here, so there is no new spec text to quote. The point is that two independent specifications meet at a directory on disk: the image spec's layout, produced by the distribution spec's endpoints, consumed by the runtime spec's bundle.</p>
+<blockquote>The Open Container Initiative Distribution Specification (a.k.a. "OCI Distribution Spec") defines an API protocol to facilitate and standardize the distribution of content.<br><br>The specification is designed to be agnostic of content types.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#introduction">spec.md § Introduction</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Turn the blobs from I5.7 into an OCI image layout. A layout is just the blob store plus two files: <code>oci-layout</code> declaring the version, and <code>index.json</code> naming what is in it.
+<pre class="cmd">cd ~/pull
+mkdir -p layout/blobs/sha256 &amp;&amp; cp blobs/* layout/blobs/sha256/
+MD=$(sha256sum manifest.json | cut -d' ' -f1)
+cp manifest.json layout/blobs/sha256/$MD
+echo '{"imageLayoutVersion":"1.0.0"}' &gt; layout/oci-layout
+cat &gt; layout/index.json &lt;&lt;EOF
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+ "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json",
+ "digest":"sha256:$MD","size":$(stat -c%s manifest.json),
+ "platform":{"os":"linux","architecture":"amd64"},
+ "annotations":{"org.opencontainers.image.ref.name":"curl-pulled"}}]}
+EOF
+find layout -type f | sort</pre>
+<pre class="out">layout/blobs/sha256/2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+layout/blobs/sha256/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+layout/blobs/sha256/f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+<b>layout/index.json</b>
+<b>layout/oci-layout</b></pre></li>
+
+<li>Hand it to <code>oci-inspect.py</code> — the program you wrote in I4.15, unchanged, which has no idea any of this came from a network.
+<pre class="cmd">~/.venv-intermediate/bin/python ~/oci-inspect.py layout curl-pulled --extract ~/pull/rootfs</pre>
+<pre class="out">resolving tag 'curl-pulled' for platform linux/amd64
+
+verifying every digest by recomputing it:
+  <b>[OK] manifest</b>                     sha256:f27cad9117495d32d06...      1022 bytes
+  <b>[OK] config</b>                       sha256:2607caa9805847fac4d...       611 bytes
+  <b>[OK] layer[0]</b>                     sha256:897d797d2723cf0e318...   3646875 bytes
+
+image: linux/amd64  created 2026-04-16T23:53:15.704110414Z
+  Entrypoint : None
+  Cmd        : ['/bin/sh']
+  Env        : ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
+
+1 layer(s); diff_id -&gt; chain ID:
+  [0] diff_id  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+      chainID  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+
+extracting 1 layer(s) into /home/ubuntu/pull/rootfs/ in order:
+  applied layer[0]
+
+<b>rootfs ready: /home/ubuntu/pull/rootfs</b></pre></li>
+
+<li>Put that rootfs in a runtime bundle and run it. This is I2's bundle, with a rootfs that arrived over HTTP.
+<pre class="cmd">mkdir -p bundle &amp;&amp; cd bundle
+sudo runc spec
+sudo mv ~/pull/rootfs ./rootfs
+sudo jq '.process.terminal=false | .process.args=["/bin/sh","-c",
+  "cat /etc/alpine-release; echo -- fetched by curl, unpacked by python, run by runc"]' \
+  config.json &gt; /tmp/c.json &amp;&amp; sudo mv /tmp/c.json config.json
+sudo runc run curl-pulled; echo "runc exit: $?"</pre>
+<pre class="out"><b>3.21.7</b>
+<b>-- fetched by curl, unpacked by python, run by runc</b>
+runc exit: 0</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name the six steps of running an image and the command you would use to perform each by hand. Test yourself on the harder question: for each of containerd, CRI and the kubelet, name what it adds — and confirm that none of the answers is "a capability the layer below lacked".</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Rootless <code>runc</code> will not run this bundle.</strong> A bundle from <code>runc spec</code> (rather than <code>runc spec --rootless</code>) asks for namespaces an unprivileged user cannot get, and fails with <code>failed to unshare remaining namespaces: Operation not permitted</code> — the empty capability set from I1's user-namespace finding, not a bug in your rootfs.</li>
+<li><strong>An OCI layout's <code>index.json</code> is not the registry's index.</strong> Same media type, different job: the registry's lists platforms, the layout's lists what this directory contains and gives it a name to look up by. I4.5 drew the distinction; it is easy to blur when you are generating one by hand.</li>
+<li><strong>Doing it by hand is not a recommendation.</strong> No caching, no concurrency, no resumption, no garbage collection. The value is diagnostic: you can now bypass every layer to find out which one is lying.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the answer to "what does the kubelet actually do when it starts a container?" (<a href="w1.html#cp-1-20">W1.20</a>) — it asks a CRI runtime to do the six steps above, and reports on the result. When you next read <a href="w6.html#cp-6-6">W6.6</a>'s node-level triage, notice how many of its steps are really "find out which of these six failed". Nothing in the cluster can do something you cannot now do by hand and inspect.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> no new documentation for this one — it is a synthesis. If anything is shaky, the gap is upstream: re-read <code>image-spec § Image Layout</code> for the layout, and revisit I2 for the bundle.</p>
+</article>
 
 </div>
 
