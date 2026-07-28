@@ -764,6 +764,182 @@ runc exit: 0</pre></li>
 
 <p class="docs-links"><b>Docs:</b> no new documentation for this one — it is a synthesis. If anything is shaky, the gap is upstream: re-read <code>image-spec § Image Layout</code> for the layout, and revisit I2 for the bundle.</p>
 </article>
+</div><!-- /g-pulling-by-hand -->
+
+<!-- ---------------- Pushing ---------------- --><div class="grp" id="g-pushing"><h3>Pushing</h3>
+<article class="lesson" id="cp-i5-9" data-id="i5-9">
+<div class="lesson-head"><span class="cp-id">I5.9</span><h4>The push order is the consistency model</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A registry has no transactions. There is no "begin", no "commit", nothing that makes several uploads atomic — and yet an interrupted push never leaves a broken image. The mechanism that achieves that is one ordering rule, and understanding it tells you exactly what a half-replicated mirror will look like when you meet one.</p>
+
+<h5>The concept</h5>
+<p>A push is a pull run backwards: <strong>every blob first, the manifest last.</strong></p>
+<div class="flow"><span>each layer</span><em>→</em><span>config</span><em>→</em><span>manifest</span></div>
+<p>That ordering <em>is</em> the consistency model, and it needs no coordination to work. A manifest is the only thing that makes an image resolvable — nothing can be pulled until one exists. So as long as the manifest is written last, no client can ever fetch a manifest whose content is not already fully present. The failure modes are therefore asymmetric in a very convenient way:</p>
+<ul>
+<li>An <strong>interrupted push</strong> leaves orphaned blobs. Wasted space, cleaned up by garbage collection (I5.12), and invisible to every client, because nothing points at them.</li>
+<li>A <strong>broken image</strong> — a manifest resolving to content that is not there — cannot happen from an interrupted push at all. It requires something to write the manifest out of order, which is precisely what a mirror replicating naively does, and precisely I5.15's second fault.</li>
+</ul>
+<p>The other thing to notice in the trace below is that a well-behaved client <em>asks before it uploads</em>. Blobs are content-addressed, so "do you already have <code>sha256:…</code>?" is answerable with a <code>HEAD</code>, and the answer is usually yes. Most of a push is finding out how little needs pushing.</p>
+
+<div class="specref">
+<p>The spec states the ordering in one sentence, and then — in the paragraphs that follow — carves out the single exception, for the <code>subject</code> field used by attestations and signatures.</p>
+<blockquote>Pushing an object typically works in the opposite order as a pull: the blobs making up the object are uploaded first, and the manifest last.<br><br>A registry MUST initially accept an otherwise valid manifest with a <code>subject</code> field that references a manifest that does not exist in the repository, allowing clients to push a manifest and referrers to that manifest in either order.<br>A registry MAY reject a manifest uploaded to the manifest endpoint with descriptors in other fields that reference a manifest or blob that does not exist in the registry.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#push">spec.md § Push</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run your own registry. It is one container and needs no configuration; from here to the end of the module it is the thing you experiment on, because you can break it freely.
+<pre class="cmd">sudo nerdctl run -d --name registry -p 5000:5000 docker.io/library/registry:2
+sleep 3
+curl -s -o /dev/null -w 'handshake -&gt; %{http_code}\n' http://localhost:5000/v2/</pre>
+<pre class="out">handshake -&gt; <b>200</b></pre></li>
+
+<li>Push an image into it, then read the registry's own access log to see what the push actually was. This is the whole HTTP conversation, in order.
+<pre class="cmd">sudo skopeo copy --dest-tls-verify=false \
+  docker://docker.io/library/alpine:3.21 docker://localhost:5000/demo/alpine:3.21
+
+sudo nerdctl logs registry 2>&amp;1 | grep -o '"[A-Z]* /v2/[^ ]*' | sed 's/?_state=[^" ]*//' | nl</pre>
+<pre class="out">     1	"GET /v2/
+     2	"<b>HEAD</b> /v2/demo/alpine/blobs/sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+     3	"HEAD /v2/v2s2/alpine/blobs/sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+     4	"HEAD /v2/oci/alpine/blobs/sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+     5	"HEAD /v2/demo/alpine/blobs/sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+     6	"POST /v2/demo/alpine/blobs/uploads/
+     7	"PATCH /v2/demo/alpine/blobs/uploads/fdb9fe21-5040-49c8-916d-e35f1f4b86e6
+     8	"PUT /v2/demo/alpine/blobs/uploads/fdb9fe21-5040-49c8-916d-e35f1f4b86e6
+     9	"HEAD /v2/demo/alpine/blobs/sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+    10	"POST /v2/demo/alpine/blobs/uploads/
+    11	"PATCH /v2/demo/alpine/blobs/uploads/5eb0e42b-83dd-4fff-9db4-b4a4ee18d0d7
+    12	"PUT /v2/demo/alpine/blobs/uploads/5eb0e42b-83dd-4fff-9db4-b4a4ee18d0d7
+    13	"<b>PUT /v2/demo/alpine/manifests/3.21</b></pre>
+<p>Read it as four movements. Line 1 is the handshake. Lines 2–5 ask whether anybody already has this layer — including, on lines 3 and 4, <em>other repositories on the same registry</em>, which is I5.11 appearing unbidden. Lines 6–12 upload the layer and then the config, each as POST → PATCH → PUT. And line 13, alone at the end, is the manifest.</p></li>
+
+<li>Confirm what that ordering bought you: until line 13 ran, the image did not exist as far as any client was concerned, even though all its bytes were already on the server.
+<pre class="cmd">curl -s -o /dev/null -w 'blob by digest -&gt; %{http_code}\n' \
+  http://localhost:5000/v2/demo/alpine/blobs/sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+curl -s -o /dev/null -w 'manifest by tag -&gt; %{http_code}\n' \
+  -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+  http://localhost:5000/v2/demo/alpine/manifests/3.21</pre>
+<pre class="out">blob by digest -&gt; 200
+manifest by tag -&gt; 200</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain how a registry gets crash-consistency with no transactions, and predict what an interrupted push leaves behind. You can also say what a client does <em>before</em> uploading anything, and why that makes most pushes cheap.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Orphaned blobs are normal and are not errors.</strong> Every abandoned push leaves some. They occupy space until garbage collection runs, and no client will ever see them.</li>
+<li><strong>The ordering guarantee is per registry, not per replication path.</strong> A mirror that copies a manifest before its blobs breaks the invariant that the push order protects, which is why I5.15's second fault exists at all — and why it is a <em>mirror</em> fault, never an upstream one.</li>
+<li><strong><code>subject</code> is the one exception, and it is deliberate.</strong> A registry must accept a manifest whose <code>subject</code> points at something absent, so signatures and attestations can be pushed in either order. Do not read that as permission to push manifests early in general.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Nothing in Kubernetes pushes images, so this has no direct cluster analogue — but the reasoning does. It is the same trick as writing a file to a temporary name and renaming it into place: make the operation that publishes the result the last and only atomic step. You saw the same reasoning in <a href="b13.html#cp-b13-10">B13.10</a>, where idempotency is what makes a retry safe: here, the retry of an interrupted push is safe because the only publishing step either happened or did not.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Push</code>, which is shorter than you expect. The <code>registry:2</code> configuration reference is worth a skim for the storage and delete options you will meet in I5.12.</p>
+</article>
+<article class="lesson" id="cp-i5-10" data-id="i5-10">
+<div class="lesson-head"><span class="cp-id">I5.10</span><h4>Pushing a blob by hand: sessions, chunks and resumption</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The upload half of the API is the part people never look at, and it is where registries differ most in practice. It is also where the integrity guarantee gets its server-side half: you verified digests on the way down in I5.7, and the registry verifies them on the way up.</p>
+
+<h5>The concept</h5>
+<p>An upload is a <strong>session</strong>. You <code>POST</code> to <code>/v2/&lt;name&gt;/blobs/uploads/</code>, the registry answers <code>202 Accepted</code> with a <code>Location</code> header containing a URL with an upload identifier in it, and you send the bytes to that URL. Two ways to finish:</p>
+<ul>
+<li><strong>Monolithic</strong> — one <code>PUT</code> with the whole blob and <code>?digest=</code> appended.</li>
+<li><strong>Chunked</strong> — a <code>PATCH</code> per chunk, each with a <code>Content-Range</code>, then a <code>PUT</code> with <code>?digest=</code> and no body to finalise.</li>
+</ul>
+<p>The session exists so an upload can be <em>resumed</em> rather than restarted. That matters when the blob is 900 MB and the connection is a train's wifi; each <code>PATCH</code> response tells you the byte range the registry now holds, so a client that reconnects knows exactly where to continue.</p>
+<p>The subtle and rather elegant part is <em>when</em> you supply the digest: at <strong>finalisation</strong>, not at the start. The registry hashes the bytes as they arrive and compares at the end, so a mismatch is caught by the server without it ever having to trust the client's claim about what it was sending. Combined with I5.7's client-side check, the content is verified independently at both ends of the wire, and neither side has to trust the other.</p>
+
+<div class="specref">
+<p>Note the two-stage shape, and that the <code>Location</code> header is where the session identity lives — the spec never specifies its format, which is why clients must treat it as opaque.</p>
+<blockquote>Upon success, the response MUST have a code of <code>202 Accepted</code>, and MUST include the following header:<br><code>Location: &lt;location&gt;</code><br><br>[…] The Docker-Content-Digest header returns the canonical digest of the uploaded blob, and MUST be equal to the client provided digest.</blockquote>
+<cite>OCI distribution-spec v1.1.1 — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-blobs">spec.md § Pushing blobs</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make a blob and compute the name it will have. Any bytes will do — a registry stores blobs, not images.
+<pre class="cmd">cd ~ &amp;&amp; echo "hello from a hand-rolled blob" &gt; blob.bin
+D=sha256:$(sha256sum blob.bin | cut -d' ' -f1)
+echo "$D  ($(stat -c%s blob.bin) bytes)"</pre>
+<pre class="out">sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d  (30 bytes)</pre></li>
+
+<li>Monolithic upload. Open the session, read <code>Location</code>, and <code>PUT</code> everything at once. The <code>Location</code> is an <em>absolute</em> URL and carries opaque session state — append to it, never rebuild it.
+<pre class="cmd">R=http://localhost:5000
+LOC=$(curl -si -X POST $R/v2/hand/mono/blobs/uploads/ | tr -d '\r' \
+      | awk -F': ' 'tolower($1)=="location"{print $2}')
+echo "${LOC%%\?*}?_state=..."
+curl -si -X PUT --data-binary @blob.bin -H "Content-Type: application/octet-stream" \
+     "$LOC&amp;digest=$D" | tr -d '\r' | grep -i '^HTTP/\|^location\|^docker-content-digest'</pre>
+<pre class="out">http://localhost:5000/v2/hand/mono/blobs/uploads/f497c507-680a-4637-b910-b4728f9f4166?_state=...
+<b>HTTP/1.1 201 Created</b>
+Docker-Content-Digest: sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d
+Location: http://localhost:5000/v2/hand/mono/blobs/sha256:62c2218ceb79…</pre></li>
+
+<li>Chunked upload of the same 30 bytes in three 10-byte pieces — small enough to watch, identical in structure to a 900 MB transfer. Watch the <code>Range</code> header accumulate: that is the resumption point, told to you after every chunk.
+<pre class="cmd">split -b 10 blob.bin chunk.
+LOC=$(curl -si -X POST $R/v2/hand/chunked/blobs/uploads/ | tr -d '\r' \
+      | awk -F': ' 'tolower($1)=="location"{print $2}')
+OFF=0
+for c in chunk.*; do
+  N=$(stat -c%s $c); END=$((OFF+N-1))
+  RESP=$(curl -si -X PATCH --data-binary @$c -H "Content-Type: application/octet-stream" \
+              -H "Content-Range: $OFF-$END" "$LOC" | tr -d '\r')
+  printf 'PATCH %-8s -&gt; %s  Range: %s\n' "$OFF-$END" "$(echo "$RESP"|head -1)" \
+         "$(echo "$RESP"|awk -F': ' 'tolower($1)=="range"{print $2}')"
+  LOC=$(echo "$RESP" | awk -F': ' 'tolower($1)=="location"{print $2}')
+  OFF=$((END+1))
+done
+curl -si -X PUT "$LOC&amp;digest=$D" | tr -d '\r' | grep -i '^HTTP/\|^docker-content-digest'</pre>
+<pre class="out">PATCH 0-9      -&gt; HTTP/1.1 202 Accepted  <b>Range: 0-9</b>
+PATCH 10-19    -&gt; HTTP/1.1 202 Accepted  <b>Range: 0-19</b>
+PATCH 20-29    -&gt; HTTP/1.1 202 Accepted  <b>Range: 0-29</b>
+<b>HTTP/1.1 201 Created</b>
+Docker-Content-Digest: sha256:62c2218ceb792224490244125f7b2266e6db39aeabf001f4a4f17b7cd5fb3c7d</pre></li>
+
+<li>Now lie about the digest and watch the server catch it. This is the guarantee that means a registry never has to trust a client.
+<pre class="cmd">LOC=$(curl -si -X POST $R/v2/hand/bad/blobs/uploads/ | tr -d '\r' \
+      | awk -F': ' 'tolower($1)=="location"{print $2}')
+curl -s -X PUT --data-binary @blob.bin \
+     "$LOC&amp;digest=sha256:0000000000000000000000000000000000000000000000000000000000000000" \
+  | jq -c '.errors[0]|{code,message}'</pre>
+<pre class="out">{"code":"<b>DIGEST_INVALID</b>","message":"provided digest did not match uploaded content"}</pre></li>
+
+<li>Check the outcome of all three. Two blobs landed; the third never existed.
+<pre class="cmd">for repo in mono chunked bad; do
+  curl -s -o /dev/null -w "hand/$repo -&gt; %{http_code}\n" $R/v2/hand/$repo/blobs/$D
+done</pre>
+<pre class="out">hand/mono -&gt; <b>200</b>
+hand/chunked -&gt; <b>200</b>
+hand/bad -&gt; <b>404</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can push a blob with <code>curl</code> either way, and explain why the digest is supplied at the end rather than the beginning. You can also say what a client needs to keep in order to resume an interrupted upload — and it is less than you would guess: just the <code>Location</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The <code>Location</code> is absolute and opaque.</strong> Prefixing it with the registry host again produces a URL like <code>http://host…http://host…</code> and a baffling failure. Append your <code>&amp;digest=</code> to it; never parse or reconstruct it.</li>
+<li><strong>Chunked upload is where registries diverge most.</strong> The spec leaves much of it as SHOULD, and implementations differ on minimum chunk sizes and whether <code>Content-Range</code> is required. This is a good place to practise I0.7's habit of checking what was actually mandated before assuming portability.</li>
+<li><strong>Sessions expire and can be cancelled.</strong> An abandoned upload holds space until the registry cleans it up; a client that means to abandon one should <code>DELETE</code> the <code>Location</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Nothing in a cluster pushes blobs, so this checkpoint has no direct Kubernetes analogue — and saying so is more useful than inventing one. What does transfer is the shape of the guarantee: the receiver validates, so the sender's claim never has to be believed. That is the same reasoning that lets a node accept layers from a CDN it does not trust (<a href="w6.html#cp-6-17">W6.17</a>), and it is worth carrying into I11, where the thing being validated stops being integrity and starts being provenance.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>spec.md § Pushing blobs</code> covers monolithic, chunked and the POST-then-PUT variant. Nothing exam-relevant on the Kubernetes side.</p>
+</article>
 
 </div>
 
