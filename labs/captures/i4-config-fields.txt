@@ -1,0 +1,56 @@
+# captured 2026-07-28T10:55:21Z on sandbox
+# --- snippet ---
+# 
+# cd ~/i4/alpine-oci
+# MAN=$(jq -r ".manifests[0].digest" index.json | cut -d: -f2)
+# CFG=$(jq -r ".config.digest" blobs/sha256/$MAN | cut -d: -f2)
+# echo "=== step 1: the runtime half ==="
+# jq ".config" blobs/sha256/$CFG
+# echo "=== step 2: the absences ==="
+# jq "{User: (.config.User // \"(absent)\"), ExposedPorts: (.config.ExposedPorts // \"(absent)\")}" blobs/sha256/$CFG
+# echo "=== step 3: bookkeeping ==="
+# jq "{diff_ids: .rootfs.diff_ids, history: [.history[] | {created_by, empty_layer}]}" blobs/sha256/$CFG
+# echo "=== step 4: derived image arithmetic ==="
+# cd ~/i4
+# DMAN=$(jq -r ".manifests[0].digest" derived-oci/index.json | cut -d: -f2)
+# DCFG=$(jq -r ".config.digest" derived-oci/blobs/sha256/$DMAN | cut -d: -f2)
+# jq "{layers: (.rootfs.diff_ids | length), history: (.history | length), empty: ([.history[] | select(.empty_layer)] | length)}" derived-oci/blobs/sha256/$DCFG
+# 
+# --- output ---
+=== step 1: the runtime half ===
+{
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "Cmd": [
+    "/bin/sh"
+  ],
+  "WorkingDir": "/"
+}
+=== step 2: the absences ===
+{
+  "User": "(absent)",
+  "ExposedPorts": "(absent)"
+}
+=== step 3: bookkeeping ===
+{
+  "diff_ids": [
+    "sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb"
+  ],
+  "history": [
+    {
+      "created_by": "ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit",
+      "empty_layer": null
+    },
+    {
+      "created_by": "CMD [\"/bin/sh\"]",
+      "empty_layer": true
+    }
+  ]
+}
+=== step 4: derived image arithmetic ===
+{
+  "layers": 2,
+  "history": 3,
+  "empty": 1
+}

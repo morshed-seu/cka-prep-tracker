@@ -1042,6 +1042,202 @@ sha256:<b>968325f7dbe78e359a7039edf0187bc7a1da1da00076a3827ceb17f8f5d78d9c</b> s
 <p class="docs-links"><b>Docs:</b> the OCI side is only <code>config.md § rootfs</code>. For chain IDs themselves, containerd's <code>identity</code> package and the snapshotter documentation in the containerd repository are the authority — and <code>ctr snapshot ls</code> is the fastest way to check your arithmetic.</p>
 </article>
 </div><!-- /g-layers -->
+<!-- ---------------- The config ---------------- --><div class="grp" id="g-the-config"><h3>The config</h3>
+<article class="lesson" id="cp-i4-13" data-id="i4-13">
+<div class="lesson-head"><span class="cp-id">I4.13</span><h4>The image config: what an image may pre-declare</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The image config looks like an arbitrary grab-bag of fields until you ask one question of it: <em>why these and not others?</em> There is no memory limit in an image config, no namespace list, no mount. That is not an oversight, and once you see the principle behind the split, the boundary between "what the image knows" and "what the deployment knows" stops needing to be memorised.</p>
+
+<h5>The concept</h5>
+<p>You built a <code>config.json</code> by hand in I2 — the OCI <em>runtime</em> config, the complete work order handed to <code>runc</code>. The image config is best understood as <strong>the subset of that work order an image is allowed to fill in ahead of time</strong>.</p>
+<p>The principle governing the split is clean: <strong>the image knows things about the software; the caller knows things about the deployment.</strong> The image's author knows where the binary lives, what environment it expects, which user it should drop to. They cannot possibly know how much memory you will grant it, which network namespace it will join, or what you will mount into it. So the image config carries exactly the first category and has no place at all for the second.</p>
+<table class="langpair">
+<thead><tr><th>Image config field</th><th>Becomes, in the I2 runtime config</th></tr></thead>
+<tbody>
+<tr><td><code>Env</code></td><td><code>process.env</code> — merged with the caller's, per key</td></tr>
+<tr><td><code>Entrypoint</code> + <code>Cmd</code></td><td><code>process.args</code> — concatenated, see I4.14</td></tr>
+<tr><td><code>WorkingDir</code></td><td><code>process.cwd</code></td></tr>
+<tr><td><code>User</code></td><td><code>process.user.uid</code>/<code>gid</code> — after name resolution</td></tr>
+<tr><td><code>Volumes</code></td><td>a hint that the caller should mount something here; no mount is created</td></tr>
+<tr><td><code>ExposedPorts</code></td><td>nothing at all</td></tr>
+<tr><td><code>Labels</code></td><td>nothing at runtime; metadata for tooling</td></tr>
+</tbody>
+</table>
+<p>Two fields deserve cynicism. <strong><code>ExposedPorts</code> publishes nothing</strong> — it opens no port, changes no firewall rule and is ignored entirely by Kubernetes. It is documentation that happens to be machine-readable, exactly like <code>containerPort</code> in a pod spec, which is also purely informational. And <code>Volumes</code> merely marks a path as "expected to hold instance-specific data"; it creates nothing.</p>
+<p>Beyond the runtime fields, the config carries the bookkeeping you have already met: <code>rootfs.diff_ids</code> from I4.10, and <strong><code>history</code></strong> — one entry per build step, with <code>created_by</code> recording the instruction that produced it. Crucially, history entries and layers do <em>not</em> correspond one-to-one: a step that changes no files (setting <code>CMD</code>, for instance) is marked <code>empty_layer: true</code> and produces no layer at all. Alpine has two history entries and one layer.</p>
+
+<div class="specref">
+<p>Note the phrase that recurs in nearly every field description — <em>act as defaults</em>. The image is proposing, not dictating, which is exactly what I4.14 measures.</p>
+<blockquote>Each image has an associated JSON structure which describes some basic information about the image such as date created, author, as well as execution/runtime configuration like its entrypoint, default arguments, networking, and volumes.<br><br>[<code>Env</code>] Entries are in the format of <code>VARNAME=VARVALUE</code>. These values act as defaults and are merged with any specified when creating a container.<br><br>[<code>ExposedPorts</code>] A set of ports to expose from a container running this image.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the runtime half of a real image config — the part that becomes a <code>config.json</code>.
+<pre class="cmd">cd ~/i4/alpine-oci
+MAN=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+CFG=$(jq -r '.config.digest' blobs/sha256/$MAN | cut -d: -f2)
+jq '.config' blobs/sha256/$CFG</pre>
+<pre class="out">{
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "Cmd": [
+    "/bin/sh"
+  ],
+  "WorkingDir": "/"
+}</pre>
+<p>Three fields. No <code>Entrypoint</code>, no <code>User</code>, no limits, no mounts — and nothing that could not be known by whoever built Alpine.</p></li>
+
+<li>Notice what a <em>missing</em> <code>User</code> means, because it is the most consequential absence in the file.
+<pre class="cmd">jq '{User: (.config.User // "(absent)"), ExposedPorts: (.config.ExposedPorts // "(absent)")}' blobs/sha256/$CFG</pre>
+<pre class="out">{
+  "User": "<b>(absent)</b>",
+  "ExposedPorts": "(absent)"
+}</pre>
+<p>No <code>User</code> means uid 0. The overwhelming majority of public images declare none, which is why "containers run as root by default" is true and why it is a deployment-side problem to fix.</p></li>
+
+<li>Read the bookkeeping half, and check the history-versus-layers arithmetic yourself.
+<pre class="cmd">jq '{diff_ids: .rootfs.diff_ids, history: [.history[] | {created_by, empty_layer}]}' blobs/sha256/$CFG</pre>
+<pre class="out">{
+  "diff_ids": [
+    "sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb"
+  ],
+  "history": [
+    {
+      "created_by": "ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit",
+      "empty_layer": null
+    },
+    {
+      "created_by": "CMD [\"/bin/sh\"]",
+      "<b>empty_layer</b>": <b>true</b>
+    }
+  ]
+}</pre>
+<p><b>Two</b> history entries, <b>one</b> layer. The <code>CMD</code> step changed no files, so it is marked <code>empty_layer</code> and contributed nothing — which is why counting history entries is not a way to count layers. (The <code>null</code> on the first entry is <code>jq</code> reporting an absent key, not a value in the file: the field is simply omitted when a step <em>did</em> produce a layer.)</p></li>
+
+<li>Compare against the derived image from I4.11, where a real step added a real layer.
+<pre class="cmd">cd ~/i4
+DMAN=$(jq -r '.manifests[0].digest' derived-oci/index.json | cut -d: -f2)
+DCFG=$(jq -r '.config.digest' derived-oci/blobs/sha256/$DMAN | cut -d: -f2)
+jq '{layers: (.rootfs.diff_ids | length), history: (.history | length),
+     empty: ([.history[] | select(.empty_layer)] | length)}' derived-oci/blobs/sha256/$DCFG</pre>
+<pre class="out">{
+  "layers": <b>2</b>,
+  "history": <b>3</b>,
+  "empty": <b>1</b>
+}</pre>
+<p>Three steps, one of them empty, two layers. The arithmetic always closes: <code>history − empty_layer = layers</code>, and your project checks it as a consistency test.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can look at any image config and say which fields will end up in the runtime <code>config.json</code>, which are pure documentation, and how many layers the image has without reading its manifest.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ExposedPorts</code> does nothing.</strong> It publishes no port and is ignored by Kubernetes entirely. Treating it as a security boundary — "the image only exposes 8080" — is a category error; the container can listen on anything it likes.</li>
+<li><strong>A <code>User</code> that names a user rather than a uid is resolved against the image's own <code>/etc/passwd</code>.</strong> I2 found the failure this produces: a numeric uid missing from the rootfs starts fine and fails later on permissions, while an unresolvable <em>name</em> fails at container creation. Same intent, two different failure layers.</li>
+<li><strong><code>Env</code> merges, it does not replace.</strong> The caller wins per key, and keys the caller does not mention survive from the image. This is why a container can inherit a <code>PATH</code> nobody in your deployment configured.</li>
+<li><strong><code>history</code> is advisory and often stripped or squashed.</strong> Do not build tooling that depends on it, and be aware that <code>created_by</code> strings can leak build-time secrets passed as build arguments.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Every field here has a pod-spec counterpart that overrides it: <code>env</code>, <code>command</code>, <code>args</code>, <code>workingDir</code>, and the <code>runAsUser</code> that fixes the absent <code>User</code>. Note that the advanced track has no <code>securityContext</code> or Pod Security Standards lesson to link to — the nearest relevant material is <a href="w3.html#cp-3-21">W3.21</a> on injecting configuration into a pod, which is the same override mechanism applied to <code>Env</code>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>config.md</code> in the image spec, which is the definitive list of fields and is short enough to read once properly. On the Kubernetes side, search <em>"define a command and arguments for a container"</em> — that page is I4.14 in the exam's own words.</p>
+</article>
+<article class="lesson" id="cp-i4-14" data-id="i4-14">
+<div class="lesson-head"><span class="cp-id">I4.14</span><h4>Who wins: Entrypoint, Cmd, and Kubernetes' command/args</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>"My container ignores the command I gave it" is one of the most common support questions in the entire ecosystem, and roughly half the time the cause is this one rule — plus the fact that Kubernetes renames both fields to words that mean the opposite of what people expect. It is worth an exam question and it has caused real outages.</p>
+
+<h5>The concept</h5>
+<p>The final <code>process.args</code> handed to <code>runc</code> is built from two image fields:</p>
+<div class="flow"><span>Entrypoint</span><em>+</em><span>Cmd</span><em>=</em><span>process.args</span></div>
+<p><code>Entrypoint</code> is the head — the command itself. <code>Cmd</code> is the tail — its default arguments. Concatenate them and you have the argv the container starts with. Alpine declares only <code>Cmd: ["/bin/sh"]</code>, so its argv is just <code>/bin/sh</code>.</p>
+<p>The override rules follow from that split, with one asymmetry that catches everyone:</p>
+<ul>
+<li>Supplying <strong>arguments</strong> at run time replaces <code>Cmd</code>, leaving <code>Entrypoint</code> in place. The command stays; its arguments change.</li>
+<li>Supplying an <strong>entrypoint</strong> override replaces <code>Entrypoint</code> — and <strong>discards the image's <code>Cmd</code></strong> unless you also supply arguments.</li>
+</ul>
+<p>That second rule is the trap, and it is not symmetric with the first. The reasoning is defensible: the image's default arguments were written for the image's own entrypoint, so once you replace the command, its old arguments are probably nonsense. But the effect is that overriding the entrypoint alone silently produces a bare command with no arguments — which, in the lab below, prints an empty line rather than failing.</p>
+<p>Now the renaming, which is where Kubernetes does the damage:</p>
+<table class="langpair">
+<thead><tr><th>Image config (OCI)</th><th>Pod spec (Kubernetes)</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>Entrypoint</code></td><td><code>command</code></td><td>the executable — the head</td></tr>
+<tr><td><code>Cmd</code></td><td><code>args</code></td><td>its arguments — the tail</td></tr>
+</tbody>
+</table>
+<p>Read that table twice. Kubernetes' <code>command</code> overrides the image's <code>Entrypoint</code>, <em>not</em> its <code>Cmd</code> — despite <code>Cmd</code> being the field literally named "command". So a pod spec that sets <code>command:</code> and not <code>args:</code> replaces the entrypoint and throws away the image's default arguments, exactly as case 3 below shows. That is the whole bug, and it explains the symptom precisely: the container starts, exits immediately or does nothing useful, and the image "ignored" a perfectly reasonable instruction.</p>
+
+<div class="specref">
+<p>The spec describes both fields as <em>defaults</em> that <em>may be replaced</em>, and is deliberately silent on the discard-Cmd behaviour — that is a tooling convention rather than a spec requirement, which is why it must be measured rather than assumed.</p>
+<blockquote>[<code>Entrypoint</code>] A list of arguments to use as the command to execute when the container starts. These values act as defaults and may be replaced by an entrypoint specified when creating a container.<br><br>[<code>Cmd</code>] Default arguments to the entrypoint of the container. These values act as defaults and may be replaced by any specified when creating a container.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md § config</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build an image that declares both fields and whose entrypoint simply echoes its own argv, so every experiment prints exactly what the container was asked to run. <code>nerdctl commit -c</code> accepts only <code>CMD</code> and <code>ENTRYPOINT</code>, which is all this needs.
+<pre class="cmd">cd ~/i4
+sudo nerdctl commit -c 'ENTRYPOINT ["/bin/echo", "EP"]' -c 'CMD ["CMD-default"]' box1 ep-demo:1
+sudo nerdctl image inspect ep-demo:1 | jq '.[0].Config | {Entrypoint, Cmd}'</pre>
+<pre class="out">{
+  "Entrypoint": [ "/bin/echo", "EP" ],
+  "Cmd": [ "CMD-default" ]
+}</pre></li>
+
+<li>Case 1 — override nothing. The argv is <code>Entrypoint</code> followed by <code>Cmd</code>, concatenated.
+<pre class="cmd">sudo nerdctl run --rm ep-demo:1</pre>
+<pre class="out"><b>EP CMD-default</b></pre></li>
+
+<li>Case 2 — supply arguments. They replace <code>Cmd</code>; the entrypoint survives untouched.
+<pre class="cmd">sudo nerdctl run --rm ep-demo:1 ARGS-FROM-CLI</pre>
+<pre class="out"><b>EP ARGS-FROM-CLI</b></pre></li>
+
+<li>Case 3 — override the entrypoint and nothing else. This is the one that matters.
+<pre class="cmd">sudo nerdctl run --rm --entrypoint /bin/echo ep-demo:1</pre>
+<pre class="out"></pre>
+<p><strong>An empty line.</strong> <code>echo</code> ran with no arguments at all — the image's <code>Cmd</code> was discarded when the entrypoint was replaced. Nothing errored, nothing warned. In Kubernetes this is a pod spec with <code>command:</code> and no <code>args:</code>, and it is why a container can start successfully and do nothing.</p></li>
+
+<li>Case 4 — override both, and everything behaves as you would expect.
+<pre class="cmd">sudo nerdctl run --rm --entrypoint /bin/echo ep-demo:1 BOTH-OVERRIDDEN</pre>
+<pre class="out"><b>BOTH-OVERRIDDEN</b></pre></li>
+
+<li>Write the rule down in the form you will need under exam pressure.
+<pre class="cmd">cat &lt;&lt;'RULE' | tee ~/i4/precedence.txt
+argv = (runtime entrypoint OR image Entrypoint) + (runtime args OR image Cmd)
+  ...except: overriding the entrypoint DISCARDS the image Cmd.
+k8s: command -> Entrypoint (the head)
+     args    -> Cmd        (the tail)
+RULE</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given an image's <code>Entrypoint</code> and <code>Cmd</code> and a pod spec's <code>command</code> and <code>args</code>, you can write down the exact argv the container will run — including the case where the answer is "the command, with nothing after it".</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Kubernetes' <code>command</code> is the image's <code>Entrypoint</code>, not its <code>Cmd</code>.</strong> The names are actively misleading. If you remember one thing from this lesson, make it this — and remember that setting <code>command</code> without <code>args</code> throws the image's defaults away.</li>
+<li><strong>The failure is silent.</strong> Case 3 exits 0 with empty output. Nothing in the pod's events, logs or status says "your arguments were discarded" — you get a container that ran and did nothing, which reads like an application bug.</li>
+<li><strong>Shell form and exec form are not the same.</strong> <code>CMD /bin/sh -c "..."</code> and <code>CMD ["/bin/sh","-c","..."]</code> produce different argv, and only the second is what the image config actually stores as a list. A string in a JSON array field is a common and confusing build error.</li>
+<li><strong><code>Env</code> behaves differently from both.</strong> It merges per key rather than replacing wholesale, so reasoning "overrides replace" from <code>Cmd</code> to <code>Env</code> gives the wrong answer.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is <a href="w3.html#cp-3-21">W3.21</a>'s territory from the image side: the pod spec's <code>command</code>/<code>args</code> are overrides of fields the image already set, and the merge rules differ per field. On the exam, a task that says "run the container with these arguments" is testing whether you reach for <code>args</code> (usually right) or <code>command</code> (usually wrong, and it will silently drop the image's defaults).</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the Kubernetes docs for <em>"define a command and arguments for a container"</em> — it contains the exact <code>Entrypoint</code>/<code>Cmd</code> mapping table and is the fastest thing to open mid-exam. The OCI side is <code>config.md § config</code>.</p>
+</article>
+</div><!-- /g-the-config -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
