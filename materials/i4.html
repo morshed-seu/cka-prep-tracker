@@ -32,7 +32,7 @@
     <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
     <li><a href="i2.html">I2 · What a container is, formally</a></li>
     <li><a href="i3.html">I3 · runc internals</a></li>
-    <li><a href="i4.html">I4 · TODO short title</a></li>
+    <li><a href="i4.html">I4 · Images — the OCI image spec</a></li>
   </ul></div>
 </aside>
 
@@ -1238,28 +1238,315 @@ RULE</pre></li>
 <p class="docs-links"><b>Docs:</b> search the Kubernetes docs for <em>"define a command and arguments for a container"</em> — it contains the exact <code>Entrypoint</code>/<code>Cmd</code> mapping table and is the fastest thing to open mid-exam. The OCI side is <code>config.md § config</code>.</p>
 </article>
 </div><!-- /g-the-config -->
+<!-- ---------------- Project & drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson project" id="cp-i4-15" data-id="i4-15">
+<div class="lesson-head"><span class="cp-id">I4.15</span><h4>Mini project — <code>oci-inspect.py</code></h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Every checkpoint so far has been you doing one hop with <code>jq</code>. This puts the whole thing in one program: resolve a tag, pick a platform, verify every digest, apply the layers with whiteouts handled correctly, and hand the result to the <code>runc</code> bundle you built in I2. When it runs, a real Alpine boots out of a rootfs you assembled yourself with no container tooling anywhere in the pipeline — which is the point at which images stop being magic.</p>
+
+<h5>The concept</h5>
+<p>The program is about 190 lines of standard-library Python and every part of it is something you have already done by hand. The full file is in <code>labs/intermediate/oci-inspect.py</code>; what follows is the four pieces that carry the actual ideas.</p>
+<p><strong>Verification</strong> is the heart of it, and it is a dozen lines. Recompute the digest, recompute the size, and refuse to continue if either disagrees. Note that it checks <code>size</code> too — I4.2's point about a descriptor being self-limiting is only true if somebody actually enforces it.</p>
+<pre class="cmd">def verify(layout, desc, what):
+    """Recompute the digest of a blob and compare it with what the descriptor claims."""
+    path = blob_path(layout, desc["digest"])
+    h, size = hashlib.sha256(), 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 &lt;&lt; 20), b""):
+            h.update(chunk); size += len(chunk)
+    got = "sha256:" + h.hexdigest()
+    if got != desc["digest"]:
+        die("digest verification failed - the blob is not what the manifest says it is")
+    if size != desc.get("size", size):
+        die(f"size mismatch: manifest says {desc['size']}, blob is {size}")
+    return path</pre>
+
+<p><strong>Platform selection</strong> is where the real world intrudes. I4.8 found that half a modern Docker Hub index is attestation manifests, so the selector has to skip them twice over — once on the <code>unknown/unknown</code> platform and once on the annotation — before matching.</p>
+<pre class="cmd">for m in index["manifests"]:
+    p = m.get("platform") or {}
+    if p.get("architecture") == "unknown" or p.get("os") == "unknown":
+        continue                                    # attestation, not an image
+    if m.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest":
+        continue
+    if p.get("os") == want_os and p.get("architecture") == want_arch:
+        candidates.append(m)</pre>
+
+<p><strong>Chain IDs</strong> are I4.12's arithmetic, transcribed literally — the space and the <code>sha256:</code> prefixes are the whole trick.</p>
+<pre class="cmd">def chain_ids(diff_ids):
+    """chainID[0] = diff_id[0]; chainID[n] = sha256("&lt;chainID[n-1]&gt; &lt;diff_id[n]&gt;")."""
+    out = [diff_ids[0]]
+    for d in diff_ids[1:]:
+        out.append("sha256:" + hashlib.sha256(f"{out[-1]} {d}".encode()).hexdigest())
+    return out</pre>
+
+<p><strong>Applying a layer</strong> is the part that cannot be delegated to <code>tar</code>, and it is where I4.11 is cashed in. Three cases: an opaque marker clears every sibling, a <code>.wh.</code> entry deletes the one file it names, and anything else extracts normally over whatever is already there.</p>
+<pre class="cmd">for member in tf:
+    base, parent = os.path.basename(member.name), os.path.dirname(member.name)
+    if base == ".wh..wh..opq":                      # hide ALL children from lower layers
+        for child in os.listdir(os.path.join(root, parent)):
+            ...remove(child)
+        continue
+    if base.startswith(".wh."):                     # delete the single sibling it names
+        ...remove(os.path.join(root, parent, base[4:]))
+        continue
+    tf.extract(member, root, filter="tar")          # ordinary entry: overwrite</pre>
+<p>Notice that a whiteout is <em>consumed</em>, never written. If a <code>.wh.</code> file survives into the finished rootfs, the extractor ignored it — which is the check the Verify step below performs.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run it against the single-layer image first, where you can check every number against what you already derived by hand in I4.6 and I4.10.
+<pre class="cmd">cd ~/i4
+python3 oci-inspect.py alpine-oci 3.21</pre>
+<pre class="out">layout version: 1.0.0
+
+resolving tag '3.21' for platform linux/amd64
+
+verifying every digest by recomputing it:
+  [<b>OK</b>] manifest                     sha256:f27cad9117495d32d06...      1022 bytes
+  [<b>OK</b>] config                       sha256:2607caa9805847fac4d...       611 bytes
+  [<b>OK</b>] layer[0]                     sha256:897d797d2723cf0e318...   3646875 bytes
+
+image: linux/amd64  created 2026-04-16T23:53:15.704110414Z
+  Entrypoint : None
+  Cmd        : ['/bin/sh']
+  Env        : ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
+  WorkingDir : '/'
+  User       : (unset -&gt; uid 0)
+
+1 layer(s); diff_id -&gt; chain ID:
+  [0] diff_id  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+      chainID  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb   &lt;- what the snapshotter caches on
+
+history: 2 entries, 1 of them empty_layer (so 1 produced a layer, matching 1)</pre></li>
+
+<li>Now the two-layer derived image, and extract it. This is the run that exercises the whiteout logic.
+<pre class="cmd">sudo python3 oci-inspect.py derived-oci 1 --extract rootfs</pre>
+<pre class="out">2 layer(s); diff_id -&gt; chain ID:
+  [0] diff_id  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+      chainID  sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb   &lt;- what the snapshotter caches on
+  [1] diff_id  sha256:aa1db80a1aa8d4b9d83d26e249a6a03354caaaa54951130e7f42ae0671e91e53
+      chainID  sha256:<b>968325f7dbe78e359a7039edf0187bc7a1da1da00076a3827ceb17f8f5d78d9c</b>   &lt;- what the snapshotter caches on
+
+history: 3 entries, 1 of them empty_layer (so 2 produced a layer, matching 2)
+
+extracting 2 layer(s) into rootfs/ in order:
+  applied layer[0]
+  applied layer[1], <b>6 path(s) whited out</b>
+      deleted etc/apk/arch
+      deleted etc/apk/keys
+      deleted etc/apk/protected_paths.d
+      deleted etc/apk/repositories
+      deleted etc/apk/world
+      <b>deleted etc/motd</b>
+
+rootfs ready: rootfs</pre>
+<p>That chain ID — <code>968325f7…</code> — is the number you computed with <code>printf</code> in I4.12 and found in <code>ctr snapshot ls</code>. Three independent routes to the same value.</p></li>
+
+<li>Check the extraction actually did what it claimed, rather than trusting the log.
+<pre class="cmd">sudo test -e rootfs/etc/motd &amp;&amp; echo "STILL PRESENT (bug)" || echo "absent - deletion applied"
+sudo ls rootfs/etc/apk
+sudo cat rootfs/root/added.txt
+sudo find rootfs -name '.wh.*' | wc -l</pre>
+<pre class="out">absent - deletion applied
+<b>marker</b>
+hello
+<b>0</b></pre>
+<p>The deleted file is gone, the replaced directory holds only its new content, the added file is there, and <b>zero</b> whiteout markers leaked into the rootfs.</p></li>
+
+<li>Hand it to <code>runc</code>. Take the I2 bundle, point it at this rootfs, and run a real distro you unpacked yourself.
+<pre class="cmd">sudo mkdir -p bundle &amp;&amp; sudo mv rootfs bundle/rootfs &amp;&amp; cd bundle
+sudo runc spec
+sudo jq '.process.terminal=false
+  | .process.args=["/bin/sh","-c","echo I am running from a rootfs I unpacked myself; cat /etc/alpine-release; ls /etc/apk; test -e /etc/motd &amp;&amp; echo MOTD PRESENT || echo motd correctly absent"]' \
+  config.json &gt; /tmp/c.json &amp;&amp; sudo mv /tmp/c.json config.json
+sudo runc run i4demo</pre>
+<pre class="out"><b>I am running from a rootfs I unpacked myself</b>
+<b>3.21.7</b>
+marker
+motd correctly absent</pre>
+<p>A real Alpine 3.21.7, running under a real runtime, from a filesystem assembled by 190 lines of Python out of a tarball and some JSON. No daemon, no image tooling, nothing you have not read.</p></li>
+
+<li>Clean up so the drill starts from a known state.
+<pre class="cmd">sudo runc delete i4demo 2>/dev/null; cd ~/i4</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Your <code>oci-inspect.py</code> verifies every digest, reproduces the chain IDs you computed by hand, produces a rootfs containing no <code>.wh.</code> files, and that rootfs boots under <code>runc</code>. If any one of those four is false, the drill in I4.16 will tell you which.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Extract as root or the ownership is wrong.</strong> A rootfs unpacked as an unprivileged user has every file owned by you rather than by uid 0, and <code>runc</code> will start it but the container's own permission checks will behave oddly. The lab uses <code>sudo</code> for the extract for this reason.</li>
+<li><strong><code>tarfile.extract</code> needs an explicit filter on modern Python.</strong> Python 3.12 deprecates the old permissive behaviour; passing <code>filter="tar"</code> both silences the warning and is the safer semantics. Without it, a malicious layer with <code>../</code> paths is a real risk.</li>
+<li><strong>The tag lookup and the platform check are separate concerns.</strong> A layout written by <code>skopeo copy</code> without <code>--all</code> holds one platform reached by tag, with no index to select from — so selection alone cannot detect a mismatch. The program checks the resolved config's own <code>architecture</code> as a backstop, which is what makes I4.16's second fault fire.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now implemented, in miniature, the unpack half of what containerd does on every pull before the kubelet sees anything — the step between "blob downloaded" and "snapshot ready" in <a href="w1.html#cp-1-20">W1.20</a>'s chain. The real one differs mainly in that it writes overlayfs snapshots keyed by chain ID instead of one flat directory, and converts whiteouts to character devices on the way, which is I7's subject.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the whole program is implied by <code>image-layout.md</code>, <code>manifest.md</code>, <code>config.md</code> and <code>layer.md</code> — four short files. Python's <code>tarfile</code> documentation, section "Extraction filters", covers the <code>filter=</code> argument and why it exists.</p>
+</article>
+<article class="lesson drill" id="cp-i4-16" data-id="i4-16">
+<div class="lesson-head"><span class="cp-id">I4.16</span><h4>Debugging drill — three faults that each look like something else</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The three faults below are the three ways an image can be wrong, and each is chosen because its symptom points somewhere other than its cause. One looks like a network problem, one looks like an application crash, and the third looks like nothing at all — which is the one worth fearing.</p>
+
+<h5>The concept</h5>
+<p>Work each fault the same way: reproduce it, read the error at face value, then say which of the module's checkpoints explains it. All three are run against your own <code>oci-inspect.py</code>, so you can see the failure from inside the verifier rather than through a runtime's error message.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault 1 — a layer blob whose bytes were altered.</strong> Copy the layout, flip a single byte deep inside the second layer, and run the verifier. This is a supply-chain attack in one command.
+<pre class="cmd">cd ~/i4
+cp -r derived-oci tampered
+DMAN=$(jq -r '.manifests[0].digest' tampered/index.json | cut -d: -f2)
+LAY=$(jq -r '.layers[1].digest' tampered/blobs/sha256/$DMAN | cut -d: -f2)
+printf '\x00' | dd of=tampered/blobs/sha256/$LAY bs=1 seek=200 conv=notrunc status=none
+python3 -u oci-inspect.py tampered 1</pre>
+<pre class="out">verifying every digest by recomputing it:
+  [OK] manifest                     sha256:3754800d226dfe8df1f...       559 bytes
+  [OK] config                       sha256:46f0b63bfdfd6112c97...       765 bytes
+  [OK] layer[0]                     sha256:55cfd63653c76188760...   3772079 bytes
+  [<b>MISMATCH</b>] layer[1]                sha256:bac3e37179e0ca21c83...       394 bytes
+      claimed sha256:<b>bac3e37179e0ca21c834515826c2b6f2822900233953c5af9edfeaca68f57450</b>
+      actual  sha256:<b>71bec2fbed0c3214cdeb42a6a40ec1a0971e732138044687a7426d1ed735641d</b>
+error: digest verification failed - the blob is not what the manifest says it is</pre>
+<p>One byte in 394 and the digest is unrecognisable — I4.1's "no close" property doing its job. Note what was <em>not</em> needed: no signature, no key, no trusted third party. The manifest said what the bytes should hash to and they did not. This is what a supply-chain check actually is, seen from the inside, and it is why <strong>a client that skips verification to save CPU has given up its only defence.</strong></p></li>
+
+<li><strong>Fault 2a — an index with no matching platform.</strong> Ask a full multi-platform index for an architecture nobody built.
+<pre class="cmd">python3 -u oci-inspect.py alpine-all 3.21 --platform linux/mips64</pre>
+<pre class="out">resolving tag '3.21' for platform linux/mips64
+  [OK] index                        sha256:48b0309ca019d89d40f...      9218 bytes
+error: <b>no image found for platform linux/mips64</b>; the index offers linux/386, linux/amd64, linux/arm, linux/arm64, linux/ppc64le, linux/riscv64, linux/s390x, unknown/unknown</pre>
+<p>The good case: the index exists, selection ran, nothing matched, and you get a clear error naming what <em>is</em> available. Note <code>unknown/unknown</code> in that list — the attestation manifests from I4.8, correctly excluded from selection but still present in the index.</p></li>
+
+<li><strong>Fault 2b — the arm64/amd64 incident.</strong> Now the dangerous variant: a <em>single-platform</em> layout, where there is no index to select from at all.
+<pre class="cmd">python3 -u oci-inspect.py alpine-oci 3.21 --platform linux/arm64</pre>
+<pre class="out">verifying every digest by recomputing it:
+  [OK] manifest                     sha256:f27cad9117495d32d06...      1022 bytes
+  [OK] config                       sha256:2607caa9805847fac4d...       611 bytes
+error: <b>no image found for platform linux/arm64</b>; this layout's '3.21' is <b>linux/amd64</b></pre>
+<p>Selection could not catch this, because nothing was selected — the tag resolved directly to one manifest. Only checking the resolved config's own <code>architecture</code> caught it. <strong>In the real world nothing performs that check</strong>, which is why an image built on an ARM laptop and deployed to amd64 nodes pulls successfully and then dies at exec time with <code>exec format error</code>. Same root cause as 2a, discovered hours later and one layer further down.</p></li>
+
+<li><strong>Fault 3 — layers applied in the wrong order.</strong> Extract the same two layers back to front, using the identical whiteout-aware code, so the only variable is order.
+<pre class="cmd">ln -sf oci-inspect.py oci_inspect.py
+sudo python3 -c "
+import importlib.util, os, json
+spec = importlib.util.spec_from_file_location('oi', 'oci_inspect.py')
+oi = importlib.util.module_from_spec(spec); spec.loader.exec_module(oi)
+man = json.load(open('derived-oci/blobs/sha256/$DMAN'))
+paths = [oi.blob_path('derived-oci', l['digest']) for l in man['layers']]
+os.makedirs('rootfs-bad', exist_ok=True)
+for p in reversed(paths):
+    oi.apply_layer(p, 'rootfs-bad')
+print('applied layer[1] then layer[0] - reverse order')"</pre>
+<pre class="out">applied layer[1] then layer[0] - reverse order</pre></li>
+
+<li>Now inspect the damage — and notice how hard it is to see.
+<pre class="cmd">sudo test -e rootfs-bad/etc/motd &amp;&amp; echo "YES - the deleted file is BACK" || echo no
+sudo find rootfs-bad -name '.wh.*' | wc -l</pre>
+<pre class="out"><b>YES - the deleted file is BACK</b>
+<b>0</b></pre>
+<p>This is the fault to be frightened of. There is <strong>no error, no warning, and not a single stray file</strong> — the rootfs looks completely normal. The whiteouts were applied faithfully; they simply ran when the files they name did not exist yet, deleting nothing, and then layer 0 restored everything the deletion was meant to remove. A file the image explicitly deletes is present in the running container.</p>
+<p>Think about what that means for a deletion that mattered: a default config, a setuid binary, a bundled private key that a later layer was supposed to remove. The container runs perfectly and carries the thing that was meant to be gone.</p></li>
+
+<li>Confirm the correct order still behaves, so you know the extractor is not simply broken.
+<pre class="cmd">sudo rm -rf rootfs-bad rootfs
+sudo python3 oci-inspect.py derived-oci 1 --extract rootfs | tail -3
+sudo test -e rootfs/etc/motd &amp;&amp; echo "present (wrong)" || echo "absent - correct"</pre>
+<pre class="out">      deleted etc/motd
+
+rootfs ready: rootfs
+<b>absent - correct</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name, for each fault, the checkpoint that explains it — I4.1 for the digest mismatch, I4.8 for platform selection, I4.9 and I4.11 for ordering — and you can say which of the three would survive every test you would normally think to write.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Fault 3 is invisible to testing.</strong> The rootfs has correct permissions, correct contents, no stray files, and boots. Only comparing against the image's declared intent — or noticing a file you expected to be absent — reveals it. This is why layer order is not a detail.</li>
+<li><strong>A digest mismatch is not always an attack.</strong> Truncated downloads, a full disk during a pull, and flaky storage produce identical symptoms. The check tells you the bytes are wrong, not why — but "wrong" is the actionable part, and continuing anyway is never right.</li>
+<li><strong>Fault 2b has no error message in production.</strong> Nothing in the real pull path compares the config's architecture to the host's. The failure surfaces later as <code>exec format error</code> from the kernel, which names neither the image nor the architecture, and looks like a broken binary rather than a wrong image.</li>
+<li><strong>Verification costs CPU, and that is the trade being made.</strong> Hashing every layer on every pull is not free, which is exactly why implementations are tempted to skip it — and why knowing whether yours does is worth checking.</li>
+</ul>
+
+<div class="k8s-link">
+<p>These map directly onto <a href="w6.html#cp-6-17">W6.17</a>'s three root causes of <code>ErrImagePull</code>/<code>ImagePullBackOff</code>, with one addition this module can now make precisely: the platform fault does <em>not</em> produce an image-pull error at all. It pulls cleanly and fails at container start, so a pod stuck in <code>CrashLoopBackOff</code> with <code>exec format error</code> in its logs (<a href="w6.html#cp-6-16">W6.16</a>) is an image-selection bug wearing an application-crash costume. On a mixed-architecture cluster, <a href="w3.html#cp-3-12">W3.12</a>'s <code>nodeSelector</code> on <code>kubernetes.io/arch</code> is the scheduling-level fix.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> for the verification requirement, <code>descriptor.md § Verification</code> — the SHOULD in that sentence is doing a lot of work. For the ordering requirement, <code>layer.md § Applying Changesets</code>.</p>
+</article>
+</div><!-- /g-project-drill -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>A blob is fetched from an untrusted mirror and its digest matches the manifest. What have you proved, and what have you not?
+<details class="reveal"><summary>Answer</summary><p>You have proved <strong>integrity</strong>: the bytes are the ones the manifest named, so nothing was altered in transit or storage. You have proved nothing about <strong>provenance</strong> — whether whoever built them should be trusted. That needs a signature over the digest, which is I11's subject. "It matched" and "it is safe" are different claims.</p></details></li>
+
+<li>Name the three required fields of a descriptor, and say what each one lets a client do <em>before</em> it fetches the content.
+<details class="reveal"><summary>Answer</summary><p><code>mediaType</code> — choose a parser without sniffing the payload. <code>digest</code> — verify the bytes on arrival. <code>size</code> — allocate once and, more importantly, <strong>refuse</strong> an oversized response rather than streaming a decompression bomb. Self-describing, self-verifying, self-limiting.</p></details></li>
+
+<li><code>nerdctl images</code> shows an image ID that appears nowhere in the registry. Is something wrong?
+<details class="reveal"><summary>Answer</summary><p>No. The registry indexes by <strong>manifest</strong> digest — that is what a tag resolves to and what <code>image@sha256:…</code> pins. Local tooling has historically displayed the <strong>config</strong> digest. Both are real blobs in the same graph; they are just different nodes of it.</p></details></li>
+
+<li>Two nodes pull <code>app:v2</code> a week apart and run different code. Which component is broken?
+<details class="reveal"><summary>Answer</summary><p>None of them. A tag is a <em>mutable label</em> and someone repushed it; every component did exactly its job. The habit that makes this detectable is recording the digest a tag resolved to; the habit that prevents it is pinning by digest. <code>imagePullPolicy: IfNotPresent</code> makes it worse, because a node with a cached copy never learns the tag moved.</p></details></li>
+
+<li>A layer has two hashes. Which one does a registry deduplicate on, which does a snapshotter cache on, and why can neither do both jobs?
+<details class="reveal"><summary>Answer</summary><p>The registry uses <code>digest</code> (over the <em>compressed</em> blob) because that is what it stores and transfers. The snapshotter uses <code>diff_id</code> (over the <em>uncompressed</em> tar), by way of chain IDs, because that is what determines filesystem content. Compression is not deterministic across implementations, so the same filesystem recompressed yields a different <code>digest</code> — a cache keyed on it would miss constantly, and a registry keyed on <code>diff_id</code> could not name the bytes it actually holds.</p></details></li>
+
+<li>You replace a whole directory in a derived image. Will the layer contain <code>.wh..wh..opq</code>?
+<details class="reveal"><summary>Answer</summary><p><strong>Not necessarily</strong>, and on containerd it will not. The default <code>walking</code> differ compares filesystem trees rather than reading the overlay upper directory, so it never sees the <code>trusted.overlay.opaque</code> xattr and emits one <code>.wh.&lt;child&gt;</code> per former child instead. Both encodings are legal; a consumer must handle either, and you cannot infer the producer from the encoding.</p></details></li>
+
+<li>Why does a snapshotter cache on chain ID rather than on <code>diff_id</code>?
+<details class="reveal"><summary>Answer</summary><p>Because a layer's content does not determine the filesystem it produces — its whole history does. The identical "install our app" layer on top of Alpine and on top of Ubuntu gives two different rootfs states with one <code>diff_id</code>. A chain ID folds the entire ordered prefix into one name: <code>chainID[0] = diff_id[0]</code>, then <code>sha256("&lt;prev&gt; &lt;diff_id[n]&gt;")</code>. That is also why changing an early layer invalidates every later one.</p></details></li>
+
+<li>An index for a popular image has sixteen entries but supports eight architectures. Explain.
+<details class="reveal"><summary>Answer</summary><p>Eight are image manifests; the other eight are BuildKit <strong>attestation manifests</strong> — SBOM and provenance records — carrying platform <code>unknown/unknown</code> and the annotation <code>vnd.docker.reference.type: attestation-manifest</code>, pointing back at the manifest each describes. A platform selector must skip them or it can "select" something that is not a runnable image.</p></details></li>
+
+<li>A pod sets <code>command:</code> but not <code>args:</code>. The container starts and does nothing. Why?
+<details class="reveal"><summary>Answer</summary><p>Kubernetes' <code>command</code> overrides the image's <strong>Entrypoint</strong>, and overriding the entrypoint <strong>discards the image's <code>Cmd</code></strong>. So the container runs the new command with no arguments at all. It exits 0, logs nothing, and nothing warns you — measured in I4.14, where the equivalent run printed an empty line.</p></details></li>
+
+<li>Which does Kubernetes' <code>args</code> override — <code>Entrypoint</code> or <code>Cmd</code>?
+<details class="reveal"><summary>Answer</summary><p><code>Cmd</code>. The mapping is <code>command</code> → <code>Entrypoint</code> (the head) and <code>args</code> → <code>Cmd</code> (the tail), which is the opposite of what the field names suggest — <code>Cmd</code> is <em>not</em> what <code>command</code> overrides.</p></details></li>
+
+<li>Layers are extracted in the wrong order. What does the resulting rootfs look like?
+<details class="reveal"><summary>Answer</summary><p><strong>Entirely normal.</strong> No error, no warning, no stray <code>.wh.</code> files. The whiteouts were applied faithfully but ran before the files they name existed, deleting nothing; a later-applied earlier layer then restored everything the deletion was meant to remove. A file the image explicitly deletes is present in the running container — and it passes every test you would think to write.</p></details></li>
+
+<li>An image pulls cleanly and the container dies with <code>exec format error</code>. Where is the bug?
+<details class="reveal"><summary>Answer</summary><p>Platform selection. Either the index had no entry for this architecture, or — the nastier case — it was a single-platform image for the wrong architecture, where there is no index to select from and nothing in the real pull path compares the config's <code>architecture</code> to the host. The pull genuinely succeeded; the kernel refused the binary hours later. It presents as an application crash and is an image-selection bug.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>You can explain content addressing as identity-not-location, and say what a matching digest does and does not prove.</li>
+<li>You can walk any image from <code>index.json</code> to a layer tar with nothing but <code>cat</code>, <code>jq</code> and <code>sha256sum</code>, and verify every hash on the way.</li>
+<li>You can tell an OCI manifest from a Docker v2 schema-2 one at sight, and perform multi-platform selection by hand — including skipping the entries that are not images.</li>
+<li>You can produce both hashes of a layer, compute a chain ID that matches containerd's own snapshot key, and say why the snapshotter needs the third number.</li>
+<li>You can find a deletion inside a tar archive, and explain why it looks nothing like the deletion overlayfs stores on disk.</li>
+<li>You can predict the exact argv a container will run from an image config and a pod spec — including the case where overriding <code>command</code> silently drops the image's arguments.</li>
+<li>You have unpacked a real distribution image by hand, applied its whiteouts correctly, and booted it under <code>runc</code>.</li>
+<li>An image is no longer magic: it is JSON, tarballs, and SHA-256.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="b5.html#cp-b5-13">Go deeper: B5.13 — overlayfs by hand, where these layers become a mounted filesystem →</a></div>
 
-<nav class="pager"><a href="i3.html">← I3 · runc internals</a><a href="../intermediate.html#i5">I5 · TODO →</a></nav>
+<nav class="pager"><a href="i3.html">← I3 · runc internals</a><a href="../intermediate.html#i5">I5 · Registries →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+Authored against <b>OCI image-spec v1.1.1</b> (current release; v1.1.0 February 2025, v1.1.1 March 2025) on <b>Ubuntu 24.04 LTS</b>, kernel <b>6.8.0</b>, with <b>skopeo 1.13.3</b>, <b>containerd 2.3.3</b>, <b>runc 1.5.1</b>, <b>nerdctl</b>, <b>jq</b> and stock <b>python3</b>. Every command and every line of output on this page was run live on the <code>sandbox</code> VM and captured, on <b>2026-07-28</b>. The image is <code>alpine:3.21</code>, which resolved that day to <code>sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</code> — Alpine <b>3.21.7</b>, built 2026-04-16.
+<br><br>
+Three findings from that run correct assumptions this curriculum previously held. <b>(1)</b> Replacing a whole directory does <i>not</i> reliably produce a <code>.wh..wh..opq</code> entry: containerd's default <b><code>walking</code> differ</b> compares filesystem trees, never reads the overlay upper directory, and so emits one <code>.wh.</code> per former child even though <code>trusted.overlay.opaque=y</code> is plainly set on disk — verified with <code>getfattr</code>. Both encodings are legal, and a consumer must handle either. <b>(2)</b> A modern Docker Hub index carries <b>attestation manifests</b> alongside images — <code>alpine:3.21</code> has 16 entries for 8 architectures, the extra 8 marked <code>platform: unknown/unknown</code> with <code>vnd.docker.reference.type: attestation-manifest</code> — so a naive platform selector will pick one. <b>(3)</b> OCI and Docker v2s2 manifests differ in exactly <b>three media-type strings plus the annotations block</b>; the config and layer digests are byte-identical and the same blobs back both, measured with <code>diff</code> rather than asserted.
+<br><br>
+Also confirmed live: the chain-ID recursion <code>sha256("&lt;prev&gt; &lt;diff_id&gt;")</code> reproduces containerd's snapshot key exactly (<code>968325f7…</code>), with a single space and both operands keeping their <code>sha256:</code> prefixes; recompressing an identical tar at <code>gzip -1</code> changes the <code>digest</code> while leaving the <code>diff_id</code> untouched; and overriding an image's entrypoint without supplying arguments discards its <code>Cmd</code> silently, printing an empty line and exiting 0.
 </footer>
 </main>
 </div>
