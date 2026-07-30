@@ -1479,6 +1479,342 @@ lists every configuration key including <code>hairpinMode</code> and <code>promi
 of <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> is the paragraph
 that makes the leak conformant.</p>
 </article>
+<article class="lesson" id="cp-i9-10" data-id="i9-10">
+<div class="lesson-head"><span class="cp-id">I9.10</span><h4>host-local IPAM: a directory of files, and the node that has no addresses left</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>An entire genre of node incident lives in one directory. A node reports that it cannot start pods
+because there are no IP addresses available — and it has none running. The error message mentions no
+file, no directory and no plugin state. The evidence is a single <code>ls</code>, and after this lesson
+you will know which one.</p>
+
+<h5>The concept</h5>
+<p><abbr title="IP Address Management — the separate concern of deciding which address a container gets">IPAM</abbr>
+is a separate plugin, not a feature of the bridge. The <code>ipam</code> block in a configuration names
+its own <code>type</code>, and the interface plugin <em>delegates</em> to it: <code>bridge</code> execs
+<code>host-local</code>, passing the same environment parameters along, and uses whatever address comes
+back. That is why <code>CNI_PATH</code> matters even when your conflist names only one plugin, and why a
+missing IPAM binary produces an error from a plugin you did not configure.</p>
+
+<p>The split is a good design. It is also where the accounting lives, and <code>host-local</code>'s
+accounting is about as simple as accounting gets: <strong>one file per allocated address, in a directory
+named after the network, whose filename is the address and whose contents are the holder.</strong></p>
+
+<pre class="out">/var/lib/cni/networks/&lt;network-name&gt;/
+├── 10.90.0.2            "&lt;container-id&gt;\r\n&lt;ifname&gt;"
+├── 10.90.0.3
+├── 10.90.0.4
+├── last_reserved_ip.0   the highest address handed out so far
+└── lock                 flock target, so concurrent ADDs cannot collide</pre>
+
+<p>There is no TTL, no lease, no heartbeat, no reconciliation against reality, and no coordination beyond
+that lock file. <strong>A file is a reservation, whatever wrote it and whether or not its holder still
+exists.</strong> Every <code>DEL</code> that did not run leaves one behind permanently — and I9.9 just
+established several routine ways for a <code>DEL</code> not to run, or to run and not finish.</p>
+
+<p>Two behaviours of the allocator matter for diagnosis. It walks <em>forward</em> from
+<code>last_reserved_ip.0</code> and does not backfill released addresses, so the addresses in use are not
+a contiguous block and a gap does not mean a free address will be reused soon. And
+<code>last_reserved_ip.0</code> survives a <code>DEL</code>, so the pointer keeps climbing even as the
+store empties.</p>
+
+<div class="specref">
+<p>The spec treats IPAM as a delegated plugin with a defined obligation on teardown, which is exactly why
+the reservation is released even when the interface cleanup fails:</p>
+<blockquote>Plugins should generally complete a `DEL` action without error even if some resources are missing.  For example, an IPAM plugin should generally release an IP allocation and return success even if the container network namespace no longer exists, unless that network namespace is critical for IPAM management.</blockquote>
+<cite>CNI spec 1.1.0, § <code>DEL</code> — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>Note what the spec does <em>not</em> do: it never describes where reservations are stored, or in what
+format. That is entirely <code>host-local</code>'s invention, which is why a different IPAM plugin's
+exhaustion looks nothing like this one's.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Attach three namespaces and watch the tree fill.
+<pre class="cmd">for i in 1 2 3; do
+  sudo ip netns add i9pod$i
+  sudo -E cnitool add i9net /var/run/netns/i9pod$i | jq -r '.ips[0].address'
+done
+sudo ls -l /var/lib/cni/networks/i9net/</pre>
+<pre class="out">10.90.0.2/24
+10.90.0.3/24
+10.90.0.4/24
+total 16
+-rw------- 1 root root 34 Jul 30 15:13 <b>10.90.0.2</b>
+-rw------- 1 root root 34 Jul 30 15:13 <b>10.90.0.3</b>
+-rw------- 1 root root 34 Jul 30 15:13 <b>10.90.0.4</b>
+-rw------- 1 root root  9 Jul 30 15:13 last_reserved_ip.0
+-rwxr-x--- 1 root root  0 Jul 30 15:13 lock</pre></li>
+<li>Read the contents, and the pointer.
+<pre class="cmd">for f in /var/lib/cni/networks/i9net/10.90.0.*; do
+  echo "--- $f"; sudo cat "$f" | sed 's/^/    /'
+done
+sudo cat /var/lib/cni/networks/i9net/last_reserved_ip.0</pre>
+<pre class="out">--- /var/lib/cni/networks/i9net/10.90.0.2
+    cnitool-c3af9ea7303b56406479
+    eth0
+--- /var/lib/cni/networks/i9net/10.90.0.3
+    cnitool-6c80ef25d4a4145c2395
+    eth0
+--- /var/lib/cni/networks/i9net/10.90.0.4
+    cnitool-68353ca9f9dcdd34474f
+    eth0
+<b>10.90.0.4</b></pre>
+<p>Container ID and interface name — the attachment identity from I9.2. One detail that costs an hour if
+you write a compatible store: <strong>the line break is CRLF, not LF.</strong>
+<code>od -c</code> proves it, and <code>backend/disk/backend.go</code> says
+<code>LineBreak = "\r\n"</code>.</p>
+<pre class="cmd">sudo od -c /var/lib/cni/networks/i9net/10.90.0.2 | head -2</pre>
+<pre class="out">0000000   c   n   i   t   o   o   l   -   c   3   a   f   9   e   a   7
+0000020   3   0   3   b   5   6   4   0   6   4   7   9  <b>\r  \n</b></pre></li>
+<li>Release the middle one and see which address the next attachment gets.
+<pre class="cmd">sudo -E cnitool del i9net /var/run/netns/i9pod2
+sudo ls /var/lib/cni/networks/i9net/ | tr '\n' ' '; echo
+sudo ip netns add i9pod4
+sudo -E cnitool add i9net /var/run/netns/i9pod4 | jq -r '.ips[0].address'</pre>
+<pre class="out">10.90.0.2 10.90.0.4 last_reserved_ip.0 lock
+<b>10.90.0.5/24</b></pre>
+<p>Not <code>.3</code>. Allocation walks forward from the pointer and does not backfill, so the free
+address sits unused while the pointer climbs. On a <code>/24</code> churning pods, this is why addresses
+appear to run out long before the arithmetic says they should.</p></li>
+<li>Plant a reservation by hand for a container that does not exist, and confirm it is honoured.
+<pre class="cmd">sudo sh -c 'printf "a-pod-that-died-in-january\r\neth0\r\n" &gt; /var/lib/cni/networks/i9net/10.90.0.6'
+sudo ip netns add i9pod5
+sudo -E cnitool add i9net /var/run/netns/i9pod5 | jq -r '.ips[0].address'</pre>
+<pre class="out"><b>10.90.0.7/24</b></pre>
+<p><code>.6</code> was skipped. The plugin does not check whether the holder exists — it cannot; it has
+no way to ask. A file is a reservation.</p></li>
+<li>Now the incident. Give the network a <code>/29</code> — five usable addresses — fill it, and ask for
+a sixth.
+<pre class="cmd"># ipam.subnet is now 10.90.0.0/29
+for i in 1 2 3 4 5 6; do
+  sudo ip netns add i9pod$i
+  sudo -E cnitool add i9net /var/run/netns/i9pod$i 2&gt;&amp;1 | tail -1
+done</pre>
+<pre class="out">10.90.0.2/29
+10.90.0.3/29
+10.90.0.4/29
+10.90.0.5/29
+10.90.0.6/29
+<b>plugin type="bridge" failed (add): failed to allocate for range 0: no IP addresses available in range set: 10.90.0.1-10.90.0.6</b></pre></li>
+<li>Now make it the failure you will actually meet: destroy every pod <em>without</em> calling
+<code>DEL</code>, as a node reboot or a crashed kubelet does.
+<pre class="cmd">for i in 1 2 3 4 5 6; do sudo ip netns del i9pod$i 2&gt;/dev/null; done
+# and remove the host-side veths, as a reboot would
+ip netns list | wc -l
+sudo ls /var/lib/cni/networks/i9net/ | grep '^10\.'</pre>
+<pre class="out"><b>0</b>
+10.90.0.2
+10.90.0.3
+10.90.0.4
+10.90.0.5
+10.90.0.6</pre>
+<p>Zero network namespaces on the node. Five addresses reserved. Now schedule a pod:</p>
+<pre class="cmd">sudo ip netns add i9pod9
+sudo -E cnitool add i9net /var/run/netns/i9pod9 2&gt;&amp;1</pre>
+<pre class="out">plugin type="bridge" failed (add): failed to allocate for range 0: <b>no IP addresses available in range set: 10.90.0.1-10.90.0.6</b></pre>
+<p>Read that message as the operator who was paged. It names a range. It does not name a file, a
+directory, a plugin, or the fact that the node is running nothing at all. Everything you need is one
+<code>ls</code> away and nothing points you at it.</p></li>
+<li>The field repair, which is still what it was ten years ago: delete the reservations whose holders are
+gone.
+<pre class="cmd">sudo rm -f /var/lib/cni/networks/i9net/10.90.0.3 /var/lib/cni/networks/i9net/10.90.0.4
+sudo ip netns del i9pod9; sudo ip netns add i9pod9
+sudo -E cnitool add i9net /var/run/netns/i9pod9 | jq -r '.ips[0].address'</pre>
+<pre class="out"><b>10.90.0.3/29</b></pre>
+<p>I9.14 is about the verb that was added in 1.1.0 to make this unnecessary, and whether it does.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can find the reservation tree on any node, read a reservation's holder out of it, and explain why
+a file is authoritative regardless of what is running. Shown a node that cannot allocate, you go
+straight to <code>ls /var/lib/cni/networks/&lt;network&gt;/</code> and compare its contents against
+<code>crictl pods</code>. You know the store's format well enough to write a compatible one, CRLF
+included.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The exhaustion message names a range, not a cause.</strong> "No IP addresses available" on a
+node with three pods means leaked reservations roughly every time. The reflex is to count files and
+compare with <code>crictl pods -q | wc -l</code>.</li>
+<li><strong>Deleting the whole directory is not the safe fix.</strong> It releases live pods' addresses
+too, so the next scheduled pod can be handed an address already in use — which then presents as
+intermittent connectivity for two pods rather than a failure to start. Delete only the entries whose
+holders are gone.</li>
+<li><strong>Sizing has to account for churn, not just for concurrency.</strong> Forward-only allocation
+plus any leak rate means the usable pool shrinks over a node's lifetime. This is part of why the default
+pod CIDR per node is a <code>/24</code> for a node that will never run 250 pods.</li>
+<li><strong>The store is per network name, not per conflist file.</strong> Rename the network in your
+config and you get a brand-new empty store, while the old directory keeps every reservation it had — a
+tidy way to make a node's addresses vanish permanently.</li>
+<li><strong>Other IPAM plugins fail completely differently.</strong> A cloud provider's plugin allocating
+from a VPC subnet exhausts with an API error and a quota message. Do not carry
+<code>host-local</code>'s signature to a cluster that is not using it.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This directory is one of the things <a href="w4.html#cp-4-6">W4.6 — inspect your actual CNI</a> has you
+find on a real node, and address exhaustion is among the faults behind
+<a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose and read the signatures</a>. The three CIDRs
+whose sizing this constrains are <a href="w4.html#cp-4-4">W4.4 — know your three CIDRs and where each is
+configured</a>. Structurally this is the same failure as
+<a href="i7.html#cp-i7-12">I7.12</a>'s snapshotter: a store on disk with no upstream to rebuild from,
+where the accounting outlives the thing it accounts for.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b>
+<a href="https://www.cni.dev/plugins/current/ipam/host-local/">cni.dev/plugins/current/ipam/host-local</a>
+documents <code>ranges</code>, <code>dataDir</code> and the <code>rangeStart</code>/<code>rangeEnd</code>
+keys this lesson left alone. In the exam docs, search <em>cluster networking</em> for pod CIDR sizing and
+<em>node allocatable</em> for the pods-per-node limit that should bound it.</p>
+</article>
+<article class="lesson" id="cp-i9-11" data-id="i9-11">
+<div class="lesson-head"><span class="cp-id">I9.11</span><h4>loopback, static, macvlan and ipvlan — the rest of the set in one sitting</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>loopback</code> is the plugin nobody thinks about, and forgetting it produces failures that look
+like anything except networking — a health check that never passes, a sidecar that cannot reach the app
+next to it, a database client that cannot connect to its own machine. And <code>macvlan</code> versus
+<code>ipvlan</code> is a distinction people repeat vaguely; one command settles it permanently.</p>
+
+<h5>The concept</h5>
+<p>Four plugins, each answering a different question.</p>
+
+<p><strong><code>loopback</code></strong> brings <code>lo</code> up inside the namespace and gives it
+<code>127.0.0.1/8</code> and <code>::1/128</code>. It is mandatory, and the reason is that a fresh network
+namespace has a loopback interface that is <em>down</em> — you saw this in I9.2 and again after a
+successful <code>ADD</code>. An enormous amount of software assumes <code>127.0.0.1</code> works
+unconditionally, because on any real machine it does. Notice also that the runtime calls it as its own
+attachment with <code>CNI_IFNAME=lo</code>, not as part of the <code>eth0</code> chain.</p>
+
+<p><strong><code>static</code></strong> is an IPAM plugin that takes the address from the configuration
+instead of a store. No allocation, no reservation file, no state at all — which makes it perfect for a
+single fixed-address appliance and dangerous everywhere else, because it has no way to know an address is
+already in use.</p>
+
+<p><strong><code>macvlan</code></strong> gives the container its own MAC address on the parent interface's
+LAN. The container is a peer of the node on the physical network: no bridge, no veth, minimal overhead,
+and its traffic never traverses the host's IP stack. The catch is that the parent's switch port now sees
+several MAC addresses, and many switches (port security) and essentially all cloud providers refuse
+that.</p>
+
+<p><strong><code>ipvlan</code></strong> solves that by sharing the parent's MAC and splitting traffic by
+IP address at layer 3. It survives one-MAC-per-port restrictions, at the cost of L2 features — no
+broadcast/multicast to the container in L3 mode, and DHCP needs care since every container looks like the
+same MAC.</p>
+
+<p>Both put pods directly on the physical network with no encapsulation and no NAT, which is why they turn
+up in bare-metal, telco and NFV clusters, and almost nowhere else. The single distinguishing fact — own MAC
+versus shared MAC — is what the lab measures, and it takes one command.</p>
+
+<div class="specref">
+<p>The spec says nothing about which plugins exist; the plugin set is a separate repository with its own
+release cycle. What the spec does define is the delegation that makes IPAM a plugin in its own right:</p>
+<blockquote>- **Capability Arguments**: These are also key-value pairs. The key is a string, whereas the value is any JSON-serializable type. The keys and values are defined by [convention](CONVENTIONS.md).</blockquote>
+<cite>CNI spec 1.1.0, § Attachment Parameters — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>The practical consequence for this lesson: <code>ipam.type</code> naming another executable is a
+convention documented outside the spec, and swapping <code>host-local</code> for <code>static</code> or
+<code>dhcp</code> is a one-word config change precisely because of it.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask a fresh namespace to talk to itself, and read the error carefully.
+<pre class="cmd">sudo ip netns add i9pod1
+sudo ip netns exec i9pod1 ip -br addr
+sudo ip netns exec i9pod1 ping -c1 -W1 127.0.0.1</pre>
+<pre class="out">lo               <b>DOWN</b>
+ping: connect: <b>Network is unreachable</b></pre>
+<p>"Network is unreachable" — for <code>127.0.0.1</code>. Not "connection refused", not a timeout. If
+that surfaced from inside an application as a failed health check, networking is the last place most
+people would look.</p></li>
+<li>Run <code>loopback</code>, noting the interface name it is given.
+<pre class="cmd">echo '{"cniVersion":"1.1.0","name":"lo","type":"loopback"}' &gt; ~/i9/lo.json
+sudo env CNI_COMMAND=ADD CNI_CONTAINERID=lo-demo CNI_NETNS=/var/run/netns/i9pod1 \
+  <b>CNI_IFNAME=lo</b> CNI_PATH=/opt/cni/bin /opt/cni/bin/loopback &lt; ~/i9/lo.json | jq -c '.ips'
+sudo ip netns exec i9pod1 ip -br addr
+sudo ip netns exec i9pod1 ping -c1 -W1 127.0.0.1 | tail -2</pre>
+<pre class="out">[{"address":"127.0.0.1/8","interface":0},{"address":"::1/128","interface":0}]
+lo               <b>UNKNOWN        127.0.0.1/8 ::1/128</b>
+1 packets transmitted, <b>1 received, 0% packet loss</b>, time 0ms
+rtt min/avg/max/mdev = 0.049/0.049/0.049/0.000 ms</pre>
+<p><code>CNI_IFNAME=lo</code>, not <code>eth0</code>: this is a separate attachment for a separate
+interface, which is why it does not appear in your bridge chain's result. On a real node containerd
+handles it — the <code>useInternalLoopback</code> field you saw in <code>crictl info</code> at I9.5 is
+containerd deciding to do the job in-process rather than exec the binary.</p></li>
+<li>Swap the IPAM plugin for <code>static</code> and watch the store disappear.
+<pre class="cmd"># ipam: { "type": "static", "addresses": [ { "address": "10.90.0.77/24", "gateway": "10.90.0.1" } ] }
+sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -c '.ips'
+sudo ls /var/lib/cni/networks/</pre>
+<pre class="out">[{"address":"<b>10.90.0.77/24</b>","gateway":"10.90.0.1","interface":2}]
+bridge</pre>
+<p>No <code>i9net</code> directory at all — nothing was reserved, because nothing needs reserving when
+the answer is in the file.</p></li>
+<li>Now hand the same fixed address to a second namespace.
+<pre class="cmd">sudo ip netns add i9pod2
+sudo -E cnitool add i9net /var/run/netns/i9pod2 | jq -c '.ips'</pre>
+<pre class="out">[{"address":"<b>10.90.0.77/24</b>","gateway":"10.90.0.1","interface":2}]</pre>
+<p>Two namespaces, one address, no complaint. <code>static</code> has no idea and no mechanism for
+having one. Which is fine for the one appliance it was written for, and a duplicate-address incident
+anywhere else.</p></li>
+<li>Finally, the <code>macvlan</code>/<code>ipvlan</code> question, decided by looking at one field. Both
+attach to the real uplink.
+<pre class="cmd">cat /sys/class/net/ens3/address        # the parent's MAC
+# then, for each of macvlan and ipvlan with master: ens3
+sudo ip netns exec i9pod1 ip -d -br link show eth0</pre>
+<pre class="out">ens3 = <b>52:54:00:99:27:6a</b>
+
+--- macvlan ---
+eth0@if2         UP             <b>82:59:10:fe:90:c3</b>   &lt;- its own MAC
+--- ipvlan ---
+eth0@if2         UNKNOWN        <b>52:54:00:99:27:6a</b>   &lt;- the parent's MAC, byte for byte</pre>
+<p>That is the entire distinction, visible in one column. <code>macvlan</code> minted a new MAC;
+<code>ipvlan</code> is using <code>ens3</code>'s. Every practical consequence — switch port security,
+cloud provider support, DHCP behaviour, whether L2 broadcast reaches the container — follows from that one
+difference.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can say why <code>loopback</code> is mandatory and reproduce the failure it prevents, including the
+exact error text. You can explain when <code>static</code> is appropriate and demonstrate its one
+dangerous property. And you can distinguish <code>macvlan</code> from <code>ipvlan</code> in a sentence
+and prove it with one command.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A missing loopback presents as an application bug.</strong> Health checks against
+<code>localhost</code> fail, sidecars cannot reach their app, and nothing in the message says "network".
+If a pod's own <code>127.0.0.1</code> is unreachable, check <code>ip addr</code> inside it before
+debugging the application.</li>
+<li><strong><code>macvlan</code> on a cloud instance usually fails silently rather than loudly.</strong>
+The interface comes up and the address is assigned; the packets just never arrive, because the hypervisor
+drops frames from unexpected MACs. Nothing logs it.</li>
+<li><strong><code>ipvlan</code> in L3 mode drops broadcast and multicast to the container.</strong>
+Anything relying on discovery protocols, ARP-based failover, or mDNS will behave strangely in ways that
+look like an application problem.</li>
+<li><strong><code>static</code> plus a templating mistake is a duplicate-address outage.</strong> Because
+it has no store, the only thing preventing collisions is whoever wrote the config.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>lo</code> being up is assumed by every <code>localhost</code> probe in
+<a href="w3.html#cp-3-4">W3.4 — the three probes and their three different consequences</a>, and by the
+sidecar pattern that <a href="i8.html#cp-i8-5">I8.5</a> explains at the namespace level.
+<code>macvlan</code> and <code>ipvlan</code> are two of the datapath choices surveyed in
+<a href="w4.html#cp-4-7">W4.7 — datapath families: overlay vs routed vs eBPF</a>; the loopback interface
+itself is <a href="b8.html#cp-b8-1">B8.1</a>'s layering, and the MAC-per-port question is
+<a href="b9.html#cp-b9-3">B9.3</a>'s switch.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> each plugin has a page under
+<a href="https://www.cni.dev/plugins/current/">cni.dev/plugins/current</a> — the
+<code>ipvlan</code> one is worth reading for its <code>mode</code> options (<code>l2</code>,
+<code>l3</code>, <code>l3s</code>), which change the behaviour substantially. In the exam docs, search
+<em>probes</em> for the <code>localhost</code> assumption and <em>cluster networking</em> for where
+provider datapath choices are described.</p>
+</article>
 </div><!-- /g-the-plugins-that-ship -->
 
 <div class="quiz" id="quiz">
