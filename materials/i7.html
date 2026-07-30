@@ -396,6 +396,387 @@ init.pid:  <b>54899</b></pre></li>
 
 <p class="docs-links"><b>Docs:</b> <code>runc --help</code> for <code>--root</code>, and the OCI runtime spec's <code>bundle.md</code> for the two-item definition of a bundle. Then <code>runtime.md</code>'s state section for the fields <code>runc state</code> prints.</p>
 </article>
+<article class="lesson" id="cp-i7-5" data-id="i7-5">
+<div class="lesson-head"><span class="cp-id">I7.5</span><h4>The word that has two meanings, and the flag everyone forgets</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This one checkpoint will save you an hour of confusion on a real node, and it is the single most common way people conclude that a Kubernetes node "has no images". You ssh in, run <code>ctr images ls</code>, get an empty table, and start diagnosing a problem that does not exist — because every pod's image is sitting in a different containerd namespace and <code>ctr</code> defaulted you into the empty one.</p>
+
+<h5>The concept</h5>
+<p>Containerd namespaces have <strong>nothing to do with Linux namespaces</strong>. Same word, unrelated idea, and the collision is unfortunate enough that it is worth saying out loud before anything else. A Linux namespace (<a href="b6.html#cp-b6-1">B6.1</a>) isolates a process's view of the kernel. A containerd namespace partitions the daemon's own bookkeeping — its containers, its image names, its snapshots — so that several clients can share one daemon without stepping on each other's names.</p>
+<p>The building-services analogy holds: containerd is one company serving the whole building, and a namespace is a client account. Two tenants can each have a container called <code>web</code> and nothing collides, because the account is part of the key.</p>
+<p>In practice you will meet three:</p>
+<ul>
+<li><code>default</code> — where <code>ctr</code> and <code>nerdctl</code> put things when you do not say otherwise.</li>
+<li><code>k8s.io</code> — where the CRI plugin puts <em>everything</em> the kubelet creates. On a node running Kubernetes, this is the only namespace you care about.</li>
+<li><code>buildkit</code> — I6's builder kept its own account, which is why <a href="i6.html#cp-i6-8">I6.8</a>'s <code>nerdctl run</code> on a <code>buildctl</code>-built image decided the image was remote and tried to pull it.</li>
+</ul>
+<p>Now the subtle half, which matters more than the reflex. Namespaces separate <strong>names and metadata</strong>, not <strong>bytes</strong>. The content store on disk is one directory with no namespace anywhere in its path, and blobs in it are addressed by digest. So <code>ctr -n fresh content ls</code> genuinely shows zero blobs, while a pull into that namespace writes <em>no new files at all</em> — it only records that this account now references digests already present. You will measure exactly that below.</p>
+<p>That resolves an apparent contradiction from <a href="i5.html#cp-i5-15">I5.15</a>: a fresh containerd namespace is not a fresh node. If you are trying to reproduce a pull failure by switching namespaces, you are not clearing the cache — you are only clearing the index of it.</p>
+<p>Finally, and importantly: <strong>a namespace is not a security boundary.</strong> Any client that can reach the socket can name any namespace it likes.</p>
+
+<div class="specref">
+<p>containerd's own documentation is unusually direct about both halves — the sharing and the non-security:</p>
+<blockquote>Underlying image content is still shared via content addresses but image names and metadata are separate per namespace.</blockquote>
+<blockquote>It is important to note that namespaces, as implemented, is an administrative construct that is not meant to be used as a security feature. It is trivial for clients to switch namespaces.</blockquote>
+<cite>containerd Namespaces and Multi-Tenancy — <a href="https://github.com/containerd/containerd/blob/main/docs/namespaces.md">docs/namespaces.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the namespaces on your box. I6's builder left two of these behind.
+<pre class="cmd">sudo ctr namespace ls</pre>
+<pre class="out">NAME               LABELS
+<b>buildkit</b>
+buildkit_history
+<b>default</b>
+i5
+i5x
+i5y
+i5z</pre></li>
+
+<li>Ask the same question of two namespaces and get two different worlds.
+<pre class="cmd">echo "default: $(sudo ctr -n default images ls -q | wc -l) images"
+echo "k8s.io : $(sudo ctr -n k8s.io  images ls -q | wc -l) images"
+sudo ctr -n k8s.io containers ls</pre>
+<pre class="out">default: <b>48</b> images
+k8s.io : <b>0</b> images
+CONTAINER    IMAGE    RUNTIME</pre>
+<p>Note what did <em>not</em> happen: <code>k8s.io</code> does not exist on this box, and <code>ctr</code> did not say so. It printed an empty table, exactly as it would for a real but empty namespace. That silence is the trap.</p></li>
+
+<li>Create one, so the reflex is muscle memory rather than theory.
+<pre class="cmd">sudo ctr namespace create i7demo
+echo "blobs visible in default: $(sudo ctr -n default content ls -q | wc -l)"
+echo "blobs visible in i7demo : $(sudo ctr -n i7demo  content ls -q | wc -l)"</pre>
+<pre class="out">blobs visible in default: <b>183</b>
+blobs visible in i7demo : <b>0</b></pre></li>
+
+<li>Now the measurement that shows the metadata/bytes split. Count blob <em>files on disk</em>, pull into the fresh namespace, count again.
+<pre class="cmd">sudo ctr namespace create i7b
+sudo ls /var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/ | wc -l
+sudo ctr -n i7b images pull docker.io/library/alpine:3.21
+sudo ls /var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/ | wc -l</pre>
+<pre class="out">472
+...
+Completed pull from OCI Registry (docker.io/library/alpine:3.21)	elapsed: 2.9 s	total:  3.5 Mi	(1.2 MiB/s)
+<b>472</b></pre>
+<p><b>Delta zero.</b> The progress bar cheerfully reports 3.5 MiB at 1.2 MiB/s, and not one new blob file was written — that figure is the image's declared size, not bytes moved.</p></li>
+
+<li>Confirm the namespace did gain its own references.
+<pre class="cmd">echo "blobs visible in i7b: $(sudo ctr -n i7b content ls -q | wc -l)"</pre>
+<pre class="out">blobs visible in i7b: <b>34</b></pre>
+<p>Thirty-four new metadata rows, zero new bytes.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You reach for <code>-n k8s.io</code> without thinking on any node with a kubelet, and you can explain why an empty <code>ctr content ls</code> in a fresh namespace does not mean the node will re-download anything.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ctr</code> invents the namespace you name.</strong> A typo — <code>-n k8s.oi</code> — produces an empty table and exit 0, not an error. Every "the node has no images" incident starts here.</li>
+<li><strong><code>crictl</code> does not have this problem</strong>, because it talks CRI and CRI is hard-wired to <code>k8s.io</code>. If <code>crictl images</code> shows images and <code>ctr images ls</code> shows none, you have not found a bug; you have found the flag you forgot.</li>
+<li><strong>Namespaces are not isolation.</strong> Do not use them to separate tenants who should not see each other's containers — anyone with the socket can pass any namespace. The socket is the real boundary, and <a href="#cp-i7-14">I7.14</a> shows what it is worth.</li>
+<li><strong>Switching namespaces does not give you a clean cache.</strong> If you need a genuinely cold pull, remove the blobs (and let the collector run) rather than moving accounts — see <a href="#cp-i7-13">I7.13</a>.</li>
+<li><strong>A namespace cannot be called <code>version</code></strong>, a real reserved-word bug in containerd's API path. Harmless, but it will confuse you for ten minutes if you hit it.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the flag that makes <a href="w6.html#cp-6-2">W6.2's log-hunting ladder</a> work at all: everything the kubelet created lives in <code>k8s.io</code>, so <code>ctr -n k8s.io containers ls</code> is the raw view underneath <code>crictl ps</code>. It is also the reason the pods you see in <a href="w1.html#cp-1-20">W1.20</a>'s chain are invisible to a plain <code>ctr</code> — one flag stands between you and the entire cluster's container layer.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>namespaces.md</code> for the multi-tenancy model and the explicit "not a security feature" warning; <code>ctr namespace --help</code> for create/remove/label. On the Kubernetes side, search for "crictl" — its whole reason for existing is that it never lets you pick the wrong namespace.</p>
+</article>
+<article class="lesson" id="cp-i7-6" data-id="i7-6">
+<div class="lesson-head"><span class="cp-id">I7.6</span><h4>A record and a process are not the same object</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Container" is used for two different objects, and containerd is the layer where the difference becomes operationally real. Once you can say which of the two you are looking at, a whole class of confusing states stops being confusing: a container that exists but is not running, a stopped thing that still holds disk, and the delete that refuses with an error people find baffling.</p>
+
+<h5>The concept</h5>
+<p>In containerd:</p>
+<ul>
+<li>A <strong>container</strong> is pure metadata — an OCI spec, an image reference, a snapshot key, some labels. It is a record in the database. Nothing is executing.</li>
+<li>A <strong>task</strong> is a running process created from that record. It has a PID. It is the thing the shim is holding.</li>
+</ul>
+<p>The separation is not bureaucracy; it buys something specific. Because the container record already holds the resolved spec and the prepared snapshot, stopping and starting a workload does not re-resolve the image, re-check the registry or re-prepare the filesystem. The expensive work is done once at container-create time, and task start is cheap.</p>
+<p>If that sounds familiar, it should. It is exactly Kubernetes' own split between a container's <em>definition</em> in the pod spec and the <em>instance</em> that carries a restart count. A pod restarting in place is a new task against an unchanged container record, which is why the restart is fast and why the image is not pulled again.</p>
+<p>The state machine has one edge worth knowing precisely, because the tracker's phrasing of it turns out to be over-simplified. Killing a task does not remove it: the task goes to <code>STOPPED</code> and <em>keeps its record and its old PID</em>, so containerd can still be asked for its exit code. From there:</p>
+<ul>
+<li>Deleting the container while its task is <strong>RUNNING</strong> fails: <code>cannot delete a non stopped container</code>.</li>
+<li>Deleting the container while its task is <strong>STOPPED</strong> succeeds, and takes the task record with it — no separate <code>ctr task rm</code> is required.</li>
+</ul>
+<p>And the leak this sets up, which is the drill in <a href="#cp-i7-18">I7.18</a>: delete the <em>task</em> and forget the container, and the container record keeps referencing its snapshot forever. The process is gone, the disk is not. Nothing in <code>ctr task ls</code> will ever show it to you again.</p>
+
+<div class="specref">
+<p>The distinction is visible in the API surface itself — containerd exposes them as separate gRPC services with separate lifecycles, <code>containerd.services.containers.v1.Containers</code> and <code>containerd.services.tasks.v1.Tasks</code>. The runtime spec draws the same line one layer down, where a container exists in the <code>created</code> state before anything runs:</p>
+<blockquote>created : the runtime has finished the create operation (after the create operation is called), and the container process has neither exited nor executed the user-specified program</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md">runtime.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a container without starting anything, then ask both questions.
+<pre class="cmd">sudo ctr container create docker.io/library/alpine:3.21 split sleep 300
+sudo ctr container ls | grep -E 'CONTAINER|split'
+sudo ctr task ls</pre>
+<pre class="out">CONTAINER   IMAGE                           RUNTIME
+<b>split</b>       docker.io/library/alpine:3.21   io.containerd.runc.v2
+
+TASK   PID   STATUS</pre>
+<p>The container exists. There is no task, no PID, and no shim.</p></li>
+
+<li>Start the task and watch a PID appear against the same name.
+<pre class="cmd">sudo ctr task start -d split
+sudo ctr task ls | grep -E 'TASK|split'</pre>
+<pre class="out">TASK    PID     STATUS
+split   57139   <b>RUNNING</b></pre></li>
+
+<li>Kill the process. The interesting part is what does <em>not</em> disappear.
+<pre class="cmd">sudo ctr task kill -s SIGKILL split
+sudo ctr task ls | grep split
+sudo ctr container ls | grep split</pre>
+<pre class="out">split   57139   <b>STOPPED</b>
+split   docker.io/library/alpine:3.21   io.containerd.runc.v2</pre>
+<p>The task record survives with its old PID, and the container is untouched.</p></li>
+
+<li>Now the error. Recreate a running task and try to delete the container underneath it.
+<pre class="cmd">sudo ctr task start -d split
+sudo ctr container rm split</pre>
+<pre class="out">ctr: <b>cannot delete a non stopped container: {running 0 0001-01-01 00:00:00 +0000 UTC}</b></pre></li>
+
+<li>Kill it and try again — and notice you do not need <code>ctr task rm</code> at all.
+<pre class="cmd">sudo ctr task kill -s SIGKILL split; sleep 1
+sudo ctr container rm split; echo "exit=$?"
+sudo ctr container ls | grep split || echo "container gone"
+sudo ctr task ls | grep split || echo "task record gone too"</pre>
+<pre class="out">exit=<b>0</b>
+container gone
+task record gone too</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown a name, you can say whether it refers to a record or a process, predict whether <code>ctr container rm</code> will succeed, and describe the leak that deleting a task without its container produces.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Delete in the wrong order and read the error" only works while the task is running.</strong> A stopped task is removed together with its container in one step, exit 0. If you expected an error and did not get one, your task was already stopped — that is not a version difference.</li>
+<li><strong>A <code>STOPPED</code> task still lists a PID.</strong> That number refers to a process that no longer exists; do not <code>kill</code> it. Compare <a href="i3.html#cp-i3-9">I3.9</a>, where <code>runc state</code> reports <code>pid: 0</code> for the same situation — two layers, two conventions, and only one of them is safe to feed to <code>kill</code>.</li>
+<li><strong>The disk leak is silent by construction.</strong> <code>ctr task ls</code> cannot show you a container with no task, so the leaked snapshot is invisible to the command people check. <code>ctr container ls</code> and <code>ctr snapshot ls</code> are the ones that find it.</li>
+<li><strong><code>ctr run</code> hides all of this</strong> by doing create + start + attach in one call, which is why the distinction stays invisible until the day it matters.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism under <a href="w6.html#cp-6-16">W6.16's CrashLoopBackOff work</a>: <code>kubectl logs --previous</code> and <code>lastState.terminated.exitCode</code> are readable precisely because the stopped task's record — and its exit code — outlive the process. It is also why a pod with a high restart count has not re-pulled its image: the container record, snapshot and all, was never deleted between attempts.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>ctr container --help</code> and <code>ctr task --help</code> — read them side by side, the verb lists are deliberately different. Then the OCI runtime spec's <code>runtime.md</code> for the four container states, and the Kubernetes API reference for <code>containerStatuses[].lastState</code>.</p>
+</article>
+<article class="lesson" id="cp-i7-7" data-id="i7-7">
+<div class="lesson-head"><span class="cp-id">I7.7</span><h4>An image is a name pointing at one digest</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Once you have seen that an image is just a name pointing at one digest, three otherwise-puzzling behaviours become obvious at a glance: why <code>ctr images rm</code> can free zero bytes, why two tags for the same image cost one copy, and why a node can be holding an image perfectly well while <code>ctr images ls</code> shows nothing you recognise. This is also the checkpoint where I4 and I5's work stops being an exercise and becomes the thing that is actually on disk.</p>
+
+<h5>The concept</h5>
+<p>Strip away the tooling and containerd's image model is one sentence: <strong>an image is a name with a target descriptor</strong>. The descriptor is a media type, a size and a digest. That is all the image record holds.</p>
+<p>Everything else is reachable by walking from that digest, exactly as <code>pull.py</code> walked it in <a href="i5.html#cp-i5-14">I5.14</a>: the digest fetches an index, the index names per-platform manifests, a manifest names a config and a list of layers. containerd stores all of those as undifferentiated blobs in the content store — it does not have an "image file" anywhere, because there is no such thing.</p>
+<p>Three consequences follow immediately, and they are the ones that catch people out:</p>
+<ul>
+<li><strong>Tagging is free.</strong> A second name pointing at the same digest adds one row and zero bytes.</li>
+<li><strong><code>ctr images rm</code> deletes a name.</strong> The blobs stay until nothing references them <em>and</em> the garbage collector runs (<a href="#cp-i7-13">I7.13</a>). Deleting an image to free disk and watching <code>df</code> not move is the expected outcome, not a bug.</li>
+<li><strong>Content can be present without a recognisable name.</strong> Everything the kubelet pulls by digest is there by digest; blobs from a build or a half-finished pull have no name at all.</li>
+</ul>
+<p>The join to I4 is worth doing by hand once, and it is the lab below: take the digest out of <code>ctr images ls</code>, pull that blob out of the content store, and find yourself reading the same index JSON your own parser printed — same media type, same 16 entries, same eight <code>unknown/unknown</code> attestation manifests you learned to skip in <a href="i4.html#cp-i4-6">I4.6</a>.</p>
+<p>One detail to notice in passing, because <a href="#cp-i7-13">I7.13</a> is built on it: the blob listing carries <code>containerd.io/gc.ref.content.*</code> labels. Those are the reference graph, written down. The index blob for a multi-platform image carries one <code>gc.ref</code> label per manifest it points at — sixteen of them for <code>alpine:3.21</code> — and that is literally how the collector knows the manifests are still wanted.</p>
+
+<div class="specref">
+<p>containerd stores the relationships as labels because the blobs themselves are opaque to it — the client, not the daemon, understands what an image is:</p>
+<blockquote>an OCI image has a manifest which references a config file and layer tars. These resources are stored in <code>containerd</code> as generic blobs, it is the client that understands the relationships between these blobs and sets them up using labels on the content resources.</blockquote>
+<cite>containerd Garbage Collection — <a href="https://github.com/containerd/containerd/blob/main/docs/garbage-collection.md">docs/garbage-collection.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read one image row and identify the three fields that matter.
+<pre class="cmd">sudo ctr images ls | head -1
+sudo ctr images ls | grep 'library/alpine:3.21'</pre>
+<pre class="out">REF                             TYPE                                      DIGEST                                                                    SIZE      PLATFORMS
+docker.io/library/alpine:3.21   <b>application/vnd.oci.image.index.v1+json</b>   <b>sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>   3.5 MiB   linux/386,linux/amd64,linux/arm/v6,...,linux/s390x</pre>
+<p>A name, a media type and a digest. There is no fourth thing.</p></li>
+
+<li>Fetch that exact blob out of the content store and read it. This is I4's index.
+<pre class="cmd">D=$(sudo ctr images ls | grep 'library/alpine:3.21 ' | awk '{print $3}')
+sudo ctr content get $D | jq '{mediaType, "manifests[0]": .manifests[0]}'</pre>
+<pre class="out">{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests[0]": {
+    "digest": "sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339",
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "platform": { <b>"architecture": "amd64"</b>, <b>"os": "linux"</b> },
+    "size": 1022,
+    "annotations": {
+      "org.opencontainers.image.version": "3.21.7",
+      "org.opencontainers.image.source": "https://github.com/alpinelinux/docker-alpine.git#...",
+      ...
+    }
+  }
+}</pre></li>
+
+<li>Look at the same digest as a blob, and read the labels containerd hung on it.
+<pre class="cmd">sudo ctr content ls | grep "${D#sha256:}" | tr ',' '\n' | head -6</pre>
+<pre class="out">sha256:48b0309ca019d8...	<b>9.218kB</b>	44 hours	containerd.io/distribution.source.docker.io=library/alpine
+<b>containerd.io/gc.ref.content.m.0</b>=sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+containerd.io/gc.ref.content.m.1=sha256:1459b643bb61017ec8b54558c273b7fa1c1f6b68572464fdd480356caf1419aa
+containerd.io/gc.ref.content.m.2=sha256:b100acfd1266e73e3420e88f931e69cda55f2d14fa23f28b7c416c76a9184aca
+containerd.io/gc.ref.content.m.3=sha256:66658e3f9564ffc1bb369a4729c2778811a24ce64084f4b624144691e010687f</pre>
+<p>Sixteen of these — <code>m.0</code> through <code>m.15</code> — one per entry in the index, which is I4's eight architectures plus eight attestation manifests.</p></li>
+
+<li>Prove tagging is free. Add a second name for the same digest and count blobs before and after.
+<pre class="cmd">sudo ctr content ls -q | wc -l
+sudo ctr images tag docker.io/library/alpine:3.21 docker.io/library/alpine:copy
+sudo ctr content ls -q | wc -l</pre>
+<pre class="out">183
+docker.io/library/alpine:copy
+<b>183</b></pre></li>
+
+<li>Prove deleting a name frees nothing.
+<pre class="cmd">sudo ctr images rm docker.io/library/alpine:copy
+sudo ctr content ls -q | wc -l</pre>
+<pre class="out">docker.io/library/alpine:copy
+<b>183</b></pre>
+<p>Both names have been and gone; the blob count never moved.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can go from an image name to its index JSON in two commands without a registry, and you can predict — correctly — that removing an image frees no space until the collector runs.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ctr images rm</code> does not reclaim disk.</strong> If you are firefighting a full <code>/var</code>, this command will look like it worked and change nothing. You want <a href="#cp-i7-13">I7.13</a>'s collector.</li>
+<li><strong><code>SIZE</code> in <code>ctr images ls</code> is not disk usage.</strong> It is the compressed size from the manifest. What the image actually costs on disk is the <em>unpacked</em> snapshot, which is larger, plus blobs shared with other images, which are not yours alone.</li>
+<li><strong>The digest in that column is the index digest, not the manifest digest</strong> for your platform. If you are matching against something a registry told you, check which of the two you have — <a href="i5.html#cp-i5-4">I5.4</a>'s point about tags, digests and platforms applies here unchanged.</li>
+<li><strong><code>ctr content get</code> writes raw bytes to stdout.</strong> Pipe it. Doing it to a terminal with a layer digest instead of a manifest digest dumps a gzip stream into your session.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is why <a href="w6.html#cp-6-17">W6.17's image-failure triage</a> asks you to distinguish "the name did not resolve" from "the bytes are not here": they are separate stores with separate failure modes. It also explains an incident shape from <a href="i5.html#cp-i5-15">I5.15</a> — a manifest whose layer blob is missing is invisible on any node that already holds that layer, because the reference and the content are checked in different places.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>content-flow.md</code> for how blobs enter the store, and <code>garbage-collection.md</code> for the <code>gc.ref.content</code> label format. Cross-check against the OCI image spec's <code>descriptor.md</code> — the three fields in that image row are precisely a descriptor.</p>
+</article>
+<article class="lesson" id="cp-i7-8" data-id="i7-8">
+<div class="lesson-head"><span class="cp-id">I7.8</span><h4>Sixty-eight plugins in one binary, and a config file that isn't there</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>ctr plugins ls</code> is the fastest triage command on a container host, and almost nobody knows it exists. It tells you, in one screen, which of containerd's ~68 internal components loaded, which were skipped, and which failed — so "containerd is up but nothing works" resolves in seconds instead of a journal-reading session. This checkpoint also settles what containerd's configuration file actually is, which is not what most people assume.</p>
+
+<h5>The concept</h5>
+<p>containerd is one binary, but internally it is a registry of <strong>plugins</strong> that register themselves at start-up and declare dependencies on each other. "Plugin" here almost never means a file you installed — the snapshotters, the differs, the gRPC services and the CRI implementation are all compiled in. What the plugin model buys is <em>ordering</em> (a service starts only after what it needs) and <em>per-component failure</em> (a broken CRI configuration leaves one plugin in error state while the rest of the daemon runs happily).</p>
+<p>That last property is the reason to look. A daemon that is "up" can be missing exactly the piece you need, and the plugin table says which.</p>
+<p>Each plugin has a type and an id. On this box there are <strong>68</strong> of them, and the type histogram is a fair description of what containerd is:</p>
+<table class="langpair">
+<thead><tr><th>Type</th><th>Count</th><th>What they are</th></tr></thead>
+<tbody>
+<tr><td><code>io.containerd.grpc.v1</code></td><td>18</td><td>The API services clients call — containers, tasks, images, content, leases, events.</td></tr>
+<tr><td><code>io.containerd.service.v1</code></td><td>8</td><td>The implementations those gRPC endpoints wrap.</td></tr>
+<tr><td><code>io.containerd.snapshotter.v1</code></td><td>7</td><td>overlayfs, native, btrfs, zfs, devmapper, blockfile, erofs — only two loaded here.</td></tr>
+<tr><td><code>io.containerd.cri.v1</code></td><td>2</td><td><code>runtime</code> and <code>images</code> — the split that replaced 1.x's single CRI plugin.</td></tr>
+<tr><td>the rest</td><td>33</td><td>servers, differs, metrics, tracing, ttrpc, transfer, warnings.</td></tr>
+</tbody>
+</table>
+<p><strong>A skipped plugin is not a broken one.</strong> <code>btrfs</code>, <code>zfs</code> and <code>devmapper</code> report <code>skip</code> on this box because the filesystems they need are not present. That is normal and expected on every ordinary node. What you are hunting for is <code>error</code>.</p>
+<p>Now three corrections to what you will read elsewhere, all confirmed on this machine.</p>
+<p><strong>First: the config header is <code>version = 4</code>, not 3.</strong> containerd 2.0 moved 2→3 and 2.3 moved 3→4. Any guide — including this repo's own tracker text for this checkpoint — that tells you to confirm <code>version = 3</code> was written against an earlier 2.x.</p>
+<p><strong>Second: there may be no config file at all.</strong> On this box <code>/etc/containerd/</code> contains only the <code>certs.d</code> directory from <a href="i5.html#cp-i5-13">I5.13</a>'s mirror work — <code>config.toml</code> does not exist. containerd runs entirely on compiled-in defaults, and that is a perfectly normal production configuration. <code>containerd config default</code> prints what it <em>would</em> use; the file, when present, holds overrides only.</p>
+<p><strong>Third: the CRI plugin path is <code>io.containerd.cri.v1.runtime</code></strong> (and <code>…v1.images</code>), not 1.x's <code>io.containerd.grpc.v1.cri</code>. As <a href="i5.html#cp-i5-13">I5.13</a> found the hard way, config copied from a 1.7-era post lands under a plugin key nothing reads — and is <strong>silently ignored rather than rejected</strong>, which is the worst possible failure mode. Note that a plugin named <code>io.containerd.grpc.v1 cri</code> still exists and still reports <code>ok</code>; it is the gRPC endpoint, not the configuration path.</p>
+
+<div class="specref">
+<p>containerd's plugin documentation frames the whole daemon this way — extensibility through interfaces, with as little as possible done by the daemon itself:</p>
+<blockquote>containerd supports extending its functionality using most of its defined interfaces. This includes using a customized runtime, snapshotter, content store, and even adding gRPC interfaces.</blockquote>
+<p>which is also why so much of what you think of as "containerd behaviour" is really client behaviour — the labels in <a href="#cp-i7-7">I7.7</a>, for instance:</p>
+<blockquote>containerd has a smart client architecture, meaning any functionality which is not required by the daemon is done by the client. This includes most high level interactions such as creating a container's specification, interacting with an image registry, or loading an image from tar.</blockquote>
+<cite>containerd Plugins — <a href="https://github.com/containerd/containerd/blob/main/docs/PLUGINS.md">docs/PLUGINS.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Count what one binary is made of, then break it down by type.
+<pre class="cmd">sudo ctr plugins ls | tail -n +2 | wc -l
+sudo ctr plugins ls | tail -n +2 | awk '{print $1}' | sort | uniq -c | sort -rn | head -5</pre>
+<pre class="out"><b>68</b>
+     <b>18</b> io.containerd.grpc.v1
+      8 io.containerd.service.v1
+      7 io.containerd.snapshotter.v1
+      5 io.containerd.server.v1
+      2 io.containerd.metrics.v1</pre></li>
+
+<li>Look at the snapshotters — this is the table <a href="#cp-i7-10">I7.10</a> depends on.
+<pre class="cmd">sudo ctr plugins ls | grep snapshotter</pre>
+<pre class="out">io.containerd.snapshotter.v1   blockfile   linux/amd64   <b>skip</b>
+io.containerd.snapshotter.v1   btrfs       linux/amd64   skip
+io.containerd.snapshotter.v1   devmapper   linux/amd64   skip
+io.containerd.snapshotter.v1   erofs       linux/amd64   skip
+io.containerd.snapshotter.v1   native      linux/amd64   <b>ok</b>
+io.containerd.snapshotter.v1   <b>overlayfs</b>   linux/amd64   <b>ok</b>
+io.containerd.snapshotter.v1   zfs         linux/amd64   skip</pre>
+<p>Two loaded, five skipped for want of a filesystem. <code>overlayfs</code> is the default and the one you built by hand in <a href="b5.html#cp-b5-14">B5.14</a>.</p></li>
+
+<li>Find the CRI plugins — the path the kubelet's calls take.
+<pre class="cmd">sudo ctr plugins ls | grep -E 'cri|sandbox'</pre>
+<pre class="out">io.containerd.sandbox.store.v1           local          -            ok
+<b>io.containerd.cri.v1</b>                     <b>images</b>         -            ok
+<b>io.containerd.cri.v1</b>                     <b>runtime</b>        linux/amd64  ok
+io.containerd.podsandbox.controller.v1   podsandbox     -            ok
+io.containerd.sandbox.controller.v1      shim           -            ok
+io.containerd.grpc.v1                    cri            -            ok</pre></li>
+
+<li>Triage move: list everything not in <code>ok</code> state. On a healthy box this is all <code>skip</code>.
+<pre class="cmd">sudo ctr plugins ls | awk 'NR>1 &amp;&amp; $4!="ok"'</pre>
+<pre class="out">io.containerd.snapshotter.v1        blockfile   linux/amd64   skip
+...
+io.containerd.server.v1             metrics     -             skip
+io.containerd.tracing.processor.v1  otlp        -             skip
+io.containerd.differ.v1             erofs       -             skip
+io.containerd.server.v1             grpc-tcp    -             skip</pre>
+<p>No <code>error</code> rows. That is what healthy looks like.</p></li>
+
+<li>Now the configuration, and the two surprises.
+<pre class="cmd">sudo containerd config default | grep -E '^version|^\[' | head -3
+ls -l /etc/containerd/
+sudo cat /etc/containerd/config.toml</pre>
+<pre class="out"><b>version = 4</b>
+[debug]
+[plugins]
+
+total 4
+drwxr-xr-x 3 root root 4096 Jul 28 17:39 <b>certs.d</b>
+
+cat: /etc/containerd/config.toml: <b>No such file or directory</b></pre></li>
+
+<li>Confirm the 2.x plugin key in the default config.
+<pre class="cmd">sudo containerd config default | grep -n "io.containerd.cri.v1.runtime" | head -3</pre>
+<pre class="out">36:  [plugins.'<b>io.containerd.cri.v1.runtime</b>']
+58:    [plugins.'io.containerd.cri.v1.runtime'.containerd]
+63:      [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes]</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name the config version your containerd expects, find the CRI plugin's real key, list any plugin in error state in one command, and explain why a missing <code>config.toml</code> is not a problem.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>version = 3</code> is wrong on 2.3.</strong> The header is <code>4</code>. A config with the wrong version is not silently upgraded — check it first when a config that "worked before" stops applying.</li>
+<li><strong>Configuration under an unknown plugin key is ignored without a word.</strong> No warning, no error, no log line. This is the single nastiest property of containerd's config, and it is how <a href="i5.html#cp-i5-13">I5.13</a>'s two <code>config_path</code> settings trap people. After editing, verify the <em>behaviour</em>, never the file.</li>
+<li><strong><code>skip</code> is fine, <code>error</code> is not.</strong> Do not go installing btrfs tooling because a plugin says <code>skip</code>. Filter on <code>error</code>.</li>
+<li><strong><code>containerd config default</code> is not your config</strong>, and on a box with no <code>config.toml</code> it is also not a file anyone reads. It is a printout of the built-in defaults, useful as a template and as documentation. <code>containerd config dump</code> is the one that shows the merged, effective result.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Every kubelet-to-container problem passes through <code>io.containerd.cri.v1.runtime</code>, so on a <code>NotReady</code> node from <a href="w6.html#cp-6-10">W6.10's ladder</a> this table is the two-second check that says whether CRI even loaded. The <code>SystemdCgroup</code> setting that <a href="w1.html#cp-1-19">W1.19</a> depends on lives under that same key — and if you set it under the 1.x key on a 2.x daemon, the kubelet will simply keep disagreeing with containerd about cgroups while every file looks correct.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>PLUGINS.md</code> for the registry model and <code>docs/cri/config.md</code> for the CRI keys. Then <code>containerd config --help</code> — note <code>default</code> versus <code>dump</code>, which answer different questions.</p>
+</article>
 </div><!-- /g-the-process-tree -->
 
 <!-- ---------------- Objects ---------------- --><div class="grp" id="g-objects"><h3>Objects</h3>
