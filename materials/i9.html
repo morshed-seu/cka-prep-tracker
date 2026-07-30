@@ -1815,7 +1815,354 @@ itself is <a href="b8.html#cp-b8-1">B8.1</a>'s layering, and the MAC-per-port qu
 <em>probes</em> for the <code>localhost</code> assumption and <em>cluster networking</em> for where
 provider datapath choices are described.</p>
 </article>
+<article class="lesson" id="cp-i9-12" data-id="i9-12">
+<div class="lesson-head"><span class="cp-id">I9.12</span><h4>portmap, bandwidth and tuning — and finding your own B9 rule in a production stack</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the lesson where the black box opens for good. A pod spec's <code>hostPort</code> becomes a
+capability argument, which becomes an <code>iptables</code> DNAT rule in the node's nat table — and that
+rule is the one you wrote by hand in B9.16. Not analogous to it. The same rule. Once you have seen that,
+"how does hostPort work" stops being a question you look up.</p>
+
+<h5>The concept</h5>
+<p>Three chained plugins, three different kernel subsystems, one pattern: each is handed the interface and
+address in <code>prevResult</code> and configures one thing about it.</p>
+
+<table class="langpair">
+<thead><tr><th>Plugin</th><th>What it programs</th><th>Where the state lives</th><th>Beginner lesson</th></tr></thead>
+<tbody>
+<tr><td><code>portmap</code></td><td>DNAT from a host port to the pod's address</td><td><code>iptables</code> nat table</td><td><a href="b9.html#cp-b9-16">B9.16</a></td></tr>
+<tr><td><code>bandwidth</code></td><td>A token-bucket qdisc on the veth, plus an <code>ifb</code> device for the other direction</td><td><code>tc</code>, on the <em>host</em> side</td><td>—</td></tr>
+<tr><td><code>tuning</code></td><td>sysctls, and optionally the MAC/MTU/promisc flags</td><td><code>/proc/sys</code>, <em>inside</em> the namespace</td><td><a href="b9.html#cp-b9-6">B9.6</a></td></tr>
+</tbody>
+</table>
+
+<p><code>portmap</code> is the one with consequences beyond itself. Because the rule it writes lives in the
+node's nat table and matches on a host port, <strong>two pods wanting the same host port on one node cannot
+both work</strong> — the first matching rule wins, and the second pod's rule is never reached. That is why
+<code>hostPort</code> is a scheduling constraint: the scheduler treats the port as a consumable node
+resource and refuses to place a second claimant. I8 measured what happens when nothing enforces that —
+CRI itself does not deduplicate, so two sandboxes each got their rule and the first one won.</p>
+
+<p><code>bandwidth</code> has a wrinkle worth knowing: shaping only works on <em>egress</em> from an
+interface, so limiting traffic <em>into</em> a pod requires redirecting it through an intermediate
+functional block (<code>ifb</code>) device and shaping that device's egress instead. So one rate limit
+creates a device you did not ask for, named after the container.</p>
+
+<p><code>tuning</code>'s sysctls apply inside the network namespace, which means they are per pod and
+invisible from the host — the same value read in two places gives two answers. That is the whole point,
+and it is also how a "we set this sysctl and nothing changed" ticket happens.</p>
+
+<div class="specref">
+<p>Capability arguments are how a runtime passes structured, per-attachment data like a port list. The
+mechanism is defined by convention rather than in the spec proper:</p>
+<blockquote>Certain flags may be passed as "capability arguments" to plugins. These are also key-value pairs, where the key is a string and the value is any JSON-serializable type. ... To signal that a plugin accepts a capability argument, the plugin configuration must include a `capabilities` key.</blockquote>
+<cite>CNI CONVENTIONS.md — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/CONVENTIONS.md">CONVENTIONS.md</a></cite>
+<p>That <code>"capabilities": {"portMappings": true}</code> line in every conflist you have seen is the
+plugin opting in. Without it the runtime will not pass the port list, and the plugin will do nothing while
+succeeding.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a four-plugin chain: bridge, portmap, bandwidth, tuning. This is close to what a real node runs.
+<pre class="cmd">cat &gt; ~/i9/net.d/10-full.conflist &lt;&lt;'EOF'
+{ "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+    { "type": "bridge", "bridge": "i9br0", "isGateway": true, "ipMasq": true, "hairpinMode": true,
+      "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+                "routes": [ { "dst": "0.0.0.0/0" } ] } },
+    { "type": "portmap", "capabilities": { "portMappings": true } },
+    { "type": "bandwidth", "ingressRate": 8000000, "ingressBurst": 1000000,
+      "egressRate": 4000000, "egressBurst": 1000000 },
+    { "type": "tuning", "sysctl": { "net.ipv4.conf.eth0.arp_filter": "1" } } ] }
+EOF
+sudo -E env CAP_ARGS='{"portMappings":[{"hostPort":18080,"containerPort":80,"protocol":"tcp"}]}' \
+  cnitool add i9net /var/run/netns/i9pod1 &gt; ~/i9/full-result.json
+jq -r '.ips[0].address, .interfaces[1].name' ~/i9/full-result.json</pre>
+<pre class="out">10.90.0.2/24
+vethcf4c7083</pre></li>
+<li><code>portmap</code>'s rule. Read it as the B9 rule it is.
+<pre class="cmd">sudo iptables -t nat -S | grep 18080</pre>
+<pre class="out">-A CNI-DN-5ee93e7c626f981e7589e -s 10.90.0.0/24 -p tcp -m tcp --dport 18080 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-5ee93e7c626f981e7589e -s 127.0.0.1/32 -p tcp -m tcp --dport 18080 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-5ee93e7c626f981e7589e -p tcp -m tcp --dport 18080 <b>-j DNAT --to-destination 10.90.0.2:80</b>
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"i9net\" id: \"cnitool-c3af9…\"" -m multiport --dports 18080 -j CNI-DN-5ee93e7c626f981e7589e</pre>
+<p>The third line is B9.16, verbatim in shape: destination port 18080 rewritten to
+<code>10.90.0.2:80</code>. The two <code>SETMARK</code> lines above it handle the hairpin cases —
+traffic from the pod subnet or from <code>127.0.0.1</code> gets marked so a later
+<code>CNI-HOSTPORT-MASQ</code> rule will also rewrite its source, because a pod connecting to its own
+host port needs the reply to come back through the same rewrite.</p></li>
+<li><code>bandwidth</code>'s qdisc, and the device it created.
+<pre class="cmd">sudo tc qdisc show dev vethcf4c7083
+ip -o link show type ifb | awk -F': ' '{print $2}'</pre>
+<pre class="out">qdisc <b>tbf 1: root</b> refcnt 3 <b>rate 8Mbit</b> burst 125000b lat 25ms
+qdisc ingress ffff: parent ffff:fff1 ----------------
+<b>bwp5ee93e7c626f</b></pre>
+<pre class="cmd">sudo tc qdisc show dev bwp5ee93e7c626f</pre>
+<pre class="out">qdisc <b>tbf 1: root</b> refcnt 2 <b>rate 4Mbit</b> burst 125000b lat 25ms</pre>
+<p>Two token-bucket filters: 8 Mbit on the veth itself, 4 Mbit on an <code>ifb</code> device named after
+the container. Note both are on the <strong>host</strong> side — nothing inside the pod can see or change
+its own rate limit, which is exactly the property you want.</p></li>
+<li><code>tuning</code>'s sysctl, read from both sides of the namespace boundary.
+<pre class="cmd">sudo ip netns exec i9pod1 cat /proc/sys/net/ipv4/conf/eth0/arp_filter
+cat /proc/sys/net/ipv4/conf/ens3/arp_filter</pre>
+<pre class="out"><b>1</b>
+<b>0</b></pre>
+<p>Same sysctl name, two values, because <code>net.*</code> sysctls are namespaced. This is B3's
+namespace boundary showing up as a configuration surface.</p></li>
+<li>Prove the mapping works, end to end, with something listening in the pod.
+<pre class="cmd">sudo ip netns exec i9pod1 sh -c 'echo i9 &gt; /tmp/index.html; cd /tmp &amp;&amp; setsid python3 -m http.server 80 &gt;/dev/null 2&gt;&amp;1 &lt;/dev/null &amp;'
+sleep 3
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' --max-time 4 http://127.0.0.1:18080/</pre>
+<pre class="out">HTTP <b>200</b></pre>
+<p>A request to the node's own port 18080 arrived at a process inside a network namespace that has no
+route to the host and no port of its own on it. Three plugins and one DNAT rule.</p></li>
+<li>Now tear down and count what each plugin removed. This one has a sting.
+<pre class="cmd">sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "del exit=$?"
+echo "nat rules naming 18080: $(sudo iptables -t nat -S | grep -c 18080)"
+echo "ifb devices:            $(ip -o link show type ifb | wc -l)"</pre>
+<pre class="out">del exit=<b>0</b>
+nat rules naming 18080: <b>4</b>
+ifb devices:            <b>0</b></pre>
+<p><code>bandwidth</code> cleaned up perfectly. <code>portmap</code> left all four rules behind. The
+reason is the same shape as I9.9's leak but a different cause: <code>portmap</code>'s
+<code>DEL</code> needs the <em>port list</em> to know which rules to remove, and the port list is a
+capability argument — so the runtime must supply it again on teardown. <code>cnitool</code> does not read
+it back from its own cache, so <code>portmap</code> is handed nothing, removes nothing, and reports
+success.</p>
+<pre class="cmd"># the same DEL, with the capability args supplied again
+sudo -E env CAP_ARGS='{"portMappings":[{"hostPort":18080,"containerPort":80,"protocol":"tcp"}]}' \
+  cnitool del i9net /var/run/netns/i9pod1
+echo "nat rules naming 18080: $(sudo iptables -t nat -S | grep -c 18080)"</pre>
+<pre class="out">nat rules naming 18080: <b>0</b></pre>
+<p>So this particular leak is <code>cnitool</code>'s doing rather than the plugin's — a real runtime
+caches capability args and replays them. It is worth knowing anyway for two reasons: it is why your
+development loop can accumulate rules that a cluster would not, and it is a concrete demonstration of why
+the spec insists the runtime persist the attachment's <em>full</em> parameters and not just its
+result.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can trace <code>hostPort</code> from a pod spec to a specific line of <code>iptables -t nat -S</code>
+output and name the B9 lesson that wrote the same rule by hand. You can explain why <code>hostPort</code>
+is a scheduling constraint, why <code>bandwidth</code> needs an <code>ifb</code> device, and why a
+<code>tuning</code> sysctl reads differently inside and outside the pod.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>hostPort</code> collisions are a scheduler problem, not a networking one.</strong> Two
+pods claiming one host port on one node produce a rule that points at the wrong pod, and the symptom is a
+connection that succeeds at the TCP level and returns nothing. I8 proved CRI does not dedupe.</li>
+<li><strong>Without <code>"capabilities": {"portMappings": true}</code> the plugin does nothing and
+succeeds.</strong> No rule, no error. If <code>hostPort</code> silently has no effect, check the conflist
+for that key before anything else.</li>
+<li><strong>A rate limit lives on the host side and is invisible to the pod.</strong> Do not expect
+<code>tc</code> inside the container to show it, and do not let an application team tell you the limit is
+not applied because they cannot see it.</li>
+<li><strong>Ordering still binds: all three need <code>prevResult</code>.</strong> Any of them placed
+first fails with I9.6's "must be called as chained plugin".</li>
+</ul>
+
+<div class="k8s-link">
+<p>The DNAT rule here is the same family as the Service rewrites in
+<a href="w4.html#cp-4-9">W4.9 — a ClusterIP is a virtual IP</a>, and walking real chains on a node is
+<a href="w4.html#cp-4-10">W4.10 — walk the iptables chains behind one of your services</a>. The scheduling
+side of <code>hostPort</code> is <a href="w3.html#cp-3-16">W3.16 — requests vs limits: scheduler bookkeeping vs cgroup
+enforcement</a>, which is the same "the scheduler must account for a node-level resource" argument. The rule you are recognising is
+<a href="b9.html#cp-b9-16">B9.16 — publish a private service on a host port</a>, and the reply-path
+marking is <a href="b9.html#cp-b9-9">B9.9 — why NAT needs a memory: conntrack</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the three plugins are documented under
+<a href="https://www.cni.dev/plugins/current/meta/portmap/">cni.dev/plugins/current/meta/</a> —
+<code>portmap</code>, <code>bandwidth</code>, <code>tuning</code> and <code>firewall</code> are all
+"meta" plugins, which is the ecosystem's word for chained. In the exam docs, search <em>hostPort</em> and
+then <em>Services</em> to see the same mechanism described at two levels.</p>
+</article>
 </div><!-- /g-the-plugins-that-ship -->
+
+<!-- ---------------- In a real stack ---------------- --><div class="grp" id="g-in-a-real-stack"><h3>In a real stack</h3>
+<article class="lesson" id="cp-i9-13" data-id="i9-13">
+<div class="lesson-head"><span class="cp-id">I9.13</span><h4>Who actually execs the plugin — and what "installing a CNI" really is</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two questions get answered wrong constantly. "Does the kubelet run the CNI plugin?" — no, and knowing
+that removes a whole component from your search during an outage. "What does installing a CNI provider
+consist of?" — a privileged DaemonSet that writes one file and copies some binaries, plus a daemon that
+stays running to do the part CNI deliberately does not specify. Getting that split straight is the
+difference between fixing a broken cluster network in five minutes and restarting things hopefully.</p>
+
+<h5>The concept</h5>
+<p><strong>containerd's CRI plugin execs the plugin, during <code>RunPodSandbox</code>, before any
+application container exists.</strong> The kubelet never touches <code>/opt/cni/bin</code>. It asks CRI
+for a sandbox; the runtime creates the network namespace, pins it, runs the CNI chain against it, and
+returns the resulting pod IP in the sandbox's status. The kubelet learns the pod's address as a
+<em>field in a gRPC response</em>, which is why <code>kubectl get pod -o wide</code> can show an IP for a
+pod whose containers have not started.</p>
+
+<p>That ordering — namespace, then CNI, then pause, then app containers — is I8.7's finding, and it is why
+the pause container does not "hold" the pod's network namespace. The namespace was pinned and wired before
+pause existed.</p>
+
+<p>Now "installing a CNI". Strip the marketing and a provider's DaemonSet does three things on every
+node:</p>
+<ol>
+<li><strong>Copies binaries into <code>/opt/cni/bin</code></strong> from its container image.</li>
+<li><strong>Writes a <code>.conflist</code> into <code>/etc/cni/net.d</code></strong>. This is the moment
+the node's network becomes ready — and, per I9.5, the moment its filename starts deciding things.</li>
+<li><strong>Leaves a daemon running</strong>, which is doing work CNI has no vocabulary for.</li>
+</ol>
+
+<p>That third item is the important one, and it is where the honest boundary lies:</p>
+
+<table class="langpair">
+<thead><tr><th>CNI's job</th><th>The provider's daemon's job</th></tr></thead>
+<tbody>
+<tr><td>Attach <strong>one pod</strong> on <strong>this node</strong> to a network, and report its address</td><td>Learn every node's pod subnet from the API server</td></tr>
+<tr><td>Detach it again</td><td>Program routes, or VXLAN FDB entries, or BGP sessions, so nodes can reach each other's pods</td></tr>
+<tr><td>—</td><td>Enforce NetworkPolicy</td></tr>
+<tr><td>—</td><td>Watch for node additions and removals</td></tr>
+</tbody>
+</table>
+
+<p>Nothing in the CNI specification concerns node-to-node reachability. That is why the datapath families
+in W4.7 differ so wildly — overlay, routed, eBPF — while all of them speak the same twenty-line contract.
+The contract covers the last hop only.</p>
+
+<p>And it explains the shape of the most common "the cluster network is broken" incident: a node is
+<code>NotReady</code> with <code>NetworkReady: false</code> because <em>a file is missing</em>, which
+happens before any daemon has had a chance to misbehave. I8 measured a nasty property of that recovery
+path — restoring a deleted conf file with <code>mv</code> does <strong>not</strong> reload it, because
+containerd watches for filesystem events that <code>mv</code> into place does not generate. Only a
+content-writing <code>cp</code> works.</p>
+
+<div class="specref">
+<p>The spec assigns the namespace's creation and cleanup to the runtime, and says nothing whatever about
+how nodes reach each other:</p>
+<blockquote>- The container runtime must create a new network namespace for the container before invoking any plugins.<br>...<br>- The container runtime is responsible for cleanup of the container's network namespace.</blockquote>
+<cite>CNI spec 1.1.0, § Lifecycle &amp; Ordering — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>"Before invoking any plugins" is the sentence that settles the pause-container question, and the second
+bullet is why a plugin that cannot find <code>CNI_NETNS</code> on <code>DEL</code> should not treat that as
+an error.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install a conflist that sorts first, with the I9.6 debug plugin in the chain so we can see exactly what
+the runtime sends.
+<pre class="cmd">sudo tee /etc/cni/net.d/00-i9net.conflist &gt;/dev/null &lt;&lt;'EOF'
+{ "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+    { "type": "bridge", "bridge": "i9br0", "isGateway": true, "ipMasq": true, "hairpinMode": true,
+      "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+                "routes": [ { "dst": "0.0.0.0/0" } ] } },
+    { "type": "i9-dump" },
+    { "type": "portmap", "capabilities": { "portMappings": true } } ] }
+EOF
+sudo ls /etc/cni/net.d/
+sudo crictl info | jq -c '{NetworkReady: (.status.conditions[]|select(.type=="NetworkReady")|.status)}'</pre>
+<pre class="out">00-i9net.conflist
+default
+nerdctl-bridge.conflist
+{"NetworkReady":<b>true</b>}</pre>
+<p>Two live conflists in that directory now, and <code>00-</code> sorts first. Watch which one the node
+uses — this is I9.5's footgun about to fire in a controlled way.</p></li>
+<li>Create a real sandbox. No kubelet and no Kubernetes anywhere on this machine.
+<pre class="cmd">cat &gt; ~/i9/pod.json &lt;&lt;'EOF'
+{ "metadata": { "name": "i9-cni-pod", "namespace": "i9", "uid": "i9-cni-uid-1", "attempt": 0 },
+  "log_directory": "/tmp", "linux": {} }
+EOF
+POD=$(sudo crictl runp ~/i9/pod.json 2>/dev/null)
+sudo crictl inspectp "$POD" | jq -c '{ip: .status.network.ip}'
+sudo crictl inspectp "$POD" | jq -r '.info.runtimeSpec.linux.namespaces[]|select(.type=="network")|.path'</pre>
+<pre class="out">{"ip":"<b>10.90.0.2</b>"}
+<b>/var/run/netns/cni-6469b5d5-0b73-2ec5-d0fb-79f12d30eff3</b></pre>
+<p><code>10.90.0.2</code> is from <code>00-i9net.conflist</code>, not nerdctl's <code>10.4.0.0/24</code> —
+containerd took the lexically first file, as <code>maxConfNum: 1</code> promised. And the namespace is a
+bind mount under <code>/var/run/netns/</code> with a <code>cni-</code>prefixed name, which the runtime
+created and pinned before any of this.</p></li>
+<li>Read what containerd actually sent the plugins. This is the payoff for building
+<code>i9-dump</code>.
+<pre class="cmd">sudo sed -n '1,10p' /var/log/i9-dump.log</pre>
+<pre class="out">=== 12:36:37 CNI_COMMAND=ADD CNI_IFNAME=eth0
+--- environment parameters ---
+CNI_ARGS=<b>IgnoreUnknown=1</b>;K8S_POD_NAMESPACE=i9;K8S_POD_NAME=i9-cni-pod;<b>K8S_POD_INFRA_CONTAINER_ID=74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2</b>;K8S_POD_UID=i9-cni-uid-1
+CNI_COMMAND=ADD
+CNI_CONTAINERID=<b>74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2</b>
+CNI_IFNAME=eth0
+CNI_NETNS=/var/run/netns/cni-6469b5d5-0b73-2ec5-d0fb-79f12d30eff3
+CNI_PATH=/opt/cni/bin</pre>
+<p>Three things worth reading twice. <code>IgnoreUnknown=1</code> is there — I9.2's code-999 failure was
+not a quirk of my hand-typed command, it is why the real runtime sends this key first.
+<code>K8S_POD_INFRA_CONTAINER_ID</code> equals <code>CNI_CONTAINERID</code> equals the <em>sandbox</em>
+ID. And the "K8S_" prefixed keys are containerd's own convention, not the spec's — CNI still knows nothing
+about Kubernetes; a Kubernetes-shaped runtime just chose those names.</p></li>
+<li>Confirm who holds the reservation.
+<pre class="cmd">for f in /var/lib/cni/networks/i9net/10.*; do
+  printf "%s = %s\n" "$(basename "$f")" "$(sudo head -1 "$f")"
+done</pre>
+<pre class="out">10.90.0.2 = <b>74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2</b></pre>
+<p>The sandbox ID. Add ten containers to this pod and this file does not change — one pod is one CNI
+attachment, and CNI never learns that application containers exist.</p></li>
+<li>Tear down and confirm the reservation is released.
+<pre class="cmd">sudo crictl rmp -f "$POD" &gt;/dev/null
+sudo ls /var/lib/cni/networks/i9net/ | tr '\n' ' '; echo</pre>
+<pre class="out">last_reserved_ip.0 lock </pre>
+<p>Containerd called <code>DEL</code> in the right order with the namespace still present — the one case
+I9.9 measured as clean.</p></li>
+<li>Finally, look at what a real provider's install actually is, on any cluster you have. There is nothing
+mysterious in it.
+<pre class="cmd"># on a kubeadm cluster with flannel:
+kubectl -n kube-flannel get ds -o jsonpath='{.items[0].spec.template.spec.initContainers[*].name}'
+kubectl -n kube-flannel get ds -o jsonpath='{.items[0].spec.template.spec.volumes[*].hostPath.path}'</pre>
+<pre class="out">install-cni-plugin install-cni
+/opt/cni/bin /etc/cni/net.d /run/flannel ...</pre>
+<p>Two init containers whose whole job is copying files, host-path mounts of exactly the two directories
+from I9.5, and then a long-running container that is the daemon from the table above. "Installing a CNI"
+is <code>cp</code>, plus a process that watches the API server.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can say which component execs the plugin and at which CRI call, and prove it. You can draw the line
+between what CNI specifies (one pod, one node, one attachment) and what a provider's daemon does
+(inter-node routing, NetworkPolicy, subnet discovery), and use that line to decide which half of a broken
+cluster network to investigate. You can describe what a CNI DaemonSet installs.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A node is <code>NotReady</code> until a file exists.</strong> The most common "cluster network
+broken" incident is a missing or malformed <code>.conflist</code>, which is a five-second diagnosis with
+<code>crictl info | jq .status.conditions</code> and a much longer one if you start with the provider's
+pods.</li>
+<li><strong>Restoring a deleted conf file with <code>mv</code> does not recover the node.</strong>
+Containerd watches the directory for filesystem events, and a rename into place does not produce one it
+acts on — nor does <code>touch</code>. Use <code>cp</code>, which writes content. I8 measured this,
+including a mid-copy read of a half-written file producing "unexpected end of JSON input".</li>
+<li><strong>NetworkPolicy is not CNI.</strong> A cluster whose provider does not implement policy accepts
+every NetworkPolicy object you apply and enforces none of them, silently. Nothing in the CNI contract has
+anything to say about it.</li>
+<li><strong>The kubelet's <code>--cni-conf-dir</code> flags are long gone.</strong> Those directories are
+the <em>runtime's</em> configuration now. Setting anything CNI-related on the kubelet and expecting an
+effect is a dockershim-era habit.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the seam <a href="i8.html#cp-i8-7">I8.7 — RunPodSandbox triggers CNI ADD</a> opened from the CRI
+side, now closed from the CNI side. Reading a real provider's moving parts is
+<a href="w4.html#cp-4-6">W4.6 — inspect your actual CNI: flannel's moving parts</a>; the reason those
+providers differ so much below the contract is <a href="w4.html#cp-4-7">W4.7 — datapath families</a>; and
+the failure signatures are <a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose</a>. The policy half
+that CNI does not cover is <a href="w4.html#cp-4-23">W4.23 — the NetworkPolicy model</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> § Lifecycle &amp; Ordering in
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> for the runtime's
+obligations. In the exam docs, search <em>network plugins</em> for the installation contract and
+<em>cluster networking</em> for the provider comparison — and note that kubernetes.io deliberately stops
+describing behaviour at this boundary, which is itself the lesson.</p>
+</article>
+</div><!-- /g-in-a-real-stack -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
