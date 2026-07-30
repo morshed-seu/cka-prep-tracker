@@ -1665,43 +1665,141 @@ wait</a>, and the shim that holds it is <a href="i7.html#cp-i7-1">I7.1</a>.</p>
 node-level logging section describes this file layout and the rotation the kubelet performs on it.</p>
 </article>
 <article class="lesson" id="cp-i8-14" data-id="i8-14">
-<div class="lesson-head"><span class="cp-id">I8.14</span><h4>TODO headline</h4>
+<div class="lesson-head"><span class="cp-id">I8.14</span><h4>The CRI config: sandbox image, runtime handlers, and the cgroup driver</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
-<!-- CHECKPOINT: containerd's CRI configuration properly in /etc/containerd/config.toml: the sandbox image, the cgroup driver (SystemdCgroup), and the runtimes map whose keys become Kubernetes RuntimeClass handlers. Change the cgroup driver to disagree with the kubelet on purpose, then put it back — you will meet the consequence in the drill.
-     UNDER THE HOOD: The cgroup driver is not a preference, it is a claim about who owns the cgroup tree. With systemd, the runtime asks systemd to create a scope/slice and lets it manage the hierarchy; with cgroupfs, the runtime writes the directories itself. When the kubelet and the runtime disagree, both succeed at their own half and you get two parallel trees: containers run, but the kubelet's accounting looks at cgroups nothing is charged to, so limits are enforced somewhere it is not reading and eviction decisions are made on fiction. Since systemd is PID 1 on essentially every production node, systemd on both sides is the only correct answer — and this remains one of the most common node misconfigurations in the field. -->
-
 <h5>Why it matters</h5>
-<p>TODO plain-English hook.</p>
+<p>Three settings in the runtime's CRI configuration cause a disproportionate share of real node
+failures. One of them — the <strong>cgroup driver</strong> — is not a preference at all. It is a
+claim about who owns the cgroup tree, and when the kubelet and the runtime disagree, both succeed at
+their own half and the node quietly makes eviction decisions about a tree nothing is charged to.</p>
 
 <h5>The concept</h5>
-<p>TODO. Absorb and expand the "under the hood" note above.</p>
+<p>Start with an honest observation: <strong>this box has no
+<code>/etc/containerd/config.toml</code> at all</strong>, and CRI works perfectly. That was
+<a href="i7.html#cp-i7-8">I7.8</a>'s finding and it holds here — the file is optional, and the live
+values come from the API. Read the config from the runtime, not from a file that may not exist.</p>
 
-<div class="specref">
-<p>TODO what the spec actually says.</p>
-<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
-<cite>TODO spec, version — <a href="TODO">file</a></cite>
-</div>
+<p>The <strong>sandbox image</strong> is declared as a <em>pinned</em> image, which is one
+declaration doing two jobs: it names the pause image, and pinning is what stops image garbage
+collection from evicting the one image without which no pod can start.</p>
+
+<p>The <strong>runtimes map</strong> is a set of named handlers. Each key becomes a value you can
+name in a Kubernetes <code>RuntimeClass</code>, which is how a cluster offers gVisor or Kata
+alongside runc on the same node.</p>
+
+<p>And the <strong>cgroup driver</strong>. With <code>SystemdCgroup = false</code> (the upstream
+default) the runtime creates cgroup directories itself, and a container's cgroup path is a plain
+filesystem path. With <code>SystemdCgroup = true</code> the runtime asks systemd to create a
+<em>scope</em> inside a <em>slice</em> and lets systemd own the hierarchy — B7.12's machinery, driven
+by the runtime.</p>
+
+<p>Since systemd is PID 1 on essentially every production node, and systemd considers itself the
+sole owner of the cgroup tree, <strong><code>systemd</code> on both sides is the only correct
+answer</strong> — and kubeadm sets it on both. The failure when they disagree is the subject of the
+drill.</p>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
-<pre class="cmd">TODO</pre>
-<pre class="out">TODO captured output</pre></li>
+<li>Read the live configuration from the runtime. Note the absent file.
+<pre class="cmd">sudo ls -la /etc/containerd/
+sudo crictl info | jq -c '.config.containerd.runtimes.runc.options|{SystemdCgroup, BinaryName}'
+sudo crictl info | jq -c '.config.containerd|{defaultRuntimeName}'</pre>
+<pre class="out">drwxr-xr-x 3 root root 4096 Jul 28 17:39 <b>certs.d</b>        &lt;- and nothing else
+{"SystemdCgroup":<b>false</b>,"BinaryName":""}
+{"defaultRuntimeName":"runc"}</pre></li>
+
+<li>Find the sandbox image and the pinning that goes with it. The key is
+<code>pinned_images.sandbox</code> — <em>not</em> the 1.7-era <code>sandbox_image</code>.
+<pre class="cmd">containerd config default | grep -A2 pinned_images</pre>
+<pre class="out">    [plugins.'io.containerd.cri.v1.images'.<b>pinned_images</b>]
+      <b>sandbox = 'registry.k8s.io/pause:3.10.2'</b></pre></li>
+
+<li>List the runtime handlers. Each named one is a candidate <code>RuntimeClass</code> handler.
+<pre class="cmd">sudo crictl info | jq -c '.runtimeHandlers[]'</pre>
+<pre class="out">{"features":{"recursive_read_only_mounts":true,"user_namespaces":true}}
+{"features":{"recursive_read_only_mounts":true,"user_namespaces":true},"<b>name":"runc"</b>}</pre>
+<p>The first entry has no <code>name</code>: it is the default handler, reported with an empty name
+rather than repeated under its own. Both advertise <code>user_namespaces</code>, which is I1's
+subject reaching Kubernetes.</p></li>
+
+<li>Now change the driver on purpose. Generate a full default config rather than a fragment, because
+containerd will not merge a partial file with the defaults you expect.
+<pre class="cmd">containerd config default | sudo tee /etc/containerd/config.toml &gt;/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd; sleep 5
+sudo crictl info | jq -c '.config.containerd.runtimes.runc.options|{SystemdCgroup}'</pre>
+<pre class="out">{"SystemdCgroup":<b>true</b>}</pre></li>
+
+<li>Create a sandbox with the same config as before and read the cgroup path. This is the whole
+difference.
+<pre class="cmd">sudo jq -r '.linux.cgroupsPath' /run/containerd/io.containerd.runtime.v2.task/k8s.io/$P/config.json
+sudo systemctl list-units --type=scope | grep cri</pre>
+<pre class="out"><b>kubepods-besteffort.slice:cri-containerd:bc1207b730cd5d92a0a6197afbe623d35a07686c30a75f1e89e3c9443de8abbf</b>
+
+cri-containerd-bc1207b730cd….scope  loaded active running  libcontainer container bc1207b730cd…</pre>
+<p>Under <code>cgroupfs</code> the same field read <code>/i8demo/&lt;id&gt;</code> — a directory
+path. Under <code>systemd</code> it is a <code>slice:prefix:name</code> triple, and systemd has
+created a real transient unit for it.</p></li>
+
+<li>Look at both trees, which is what a mismatched node has.
+<pre class="cmd">sudo find /sys/fs/cgroup/kubepods.slice -maxdepth 2 -type d
+sudo ls -d /sys/fs/cgroup/kubepods
+sudo find /sys/fs/cgroup -maxdepth 1 -name 'kubepods*' -o -maxdepth 1 -name 'i8demo'</pre>
+<pre class="out">/sys/fs/cgroup/kubepods.slice
+/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice
+/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/cri-containerd-bc1207b730cd….scope
+
+ls: cannot access '/sys/fs/cgroup/kubepods': <b>No such file or directory</b>
+
+<b>/sys/fs/cgroup/i8demo</b>
+<b>/sys/fs/cgroup/kubepods.slice</b></pre>
+<p>A kubelet configured for <code>cgroupfs</code> would compute
+<code>/sys/fs/cgroup/kubepods/besteffort/pod&lt;uid&gt;</code> and find nothing there. Containers
+run. Limits are enforced. The accounting the kubelet reads is a directory that does not exist, and
+its eviction decisions are made on fiction.</p></li>
+
+<li>Put it back, and confirm the node is where you found it.
+<pre class="cmd">sudo rm -f /etc/containerd/config.toml
+sudo systemctl restart containerd; sleep 5
+sudo crictl info | jq -c '{SystemdCgroup:.config.containerd.runtimes.runc.options.SystemdCgroup,
+  cni:.lastCNILoadStatus, conditions:[.status.conditions[]|{(.type):.status}]}'</pre>
+<pre class="out">{"SystemdCgroup":<b>false</b>,"cni":"OK","conditions":[{"RuntimeReady":true},
+  {"NetworkReady":true},{"ContainerdHasNoDeprecationWarnings":true}]}</pre></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
-<p>TODO what the reader can now do.</p>
+<p>You can read a node's cgroup driver from the runtime without a config file, predict the shape of
+the cgroup path each setting produces, and find both trees on a node where the two sides
+disagree.</p>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong>TODO.</strong></li>
+<li><strong>The config key moved in containerd 2.x.</strong> The sandbox image is
+<code>plugins.'io.containerd.cri.v1.images'.pinned_images.sandbox</code>, not the 1.7-era
+<code>plugins.'io.containerd.grpc.v1.cri'.sandbox_image</code>. A mis-keyed setting is
+<strong>silently ignored</strong> — the same trap I7.8 and I5.13 documented for other keys.</li>
+<li><strong>A partial <code>config.toml</code> is not merged the way you expect.</strong> Generate
+the full default with <code>containerd config default</code> and edit it, rather than writing a
+three-line file.</li>
+<li><strong>The cgroup-driver mismatch produces no error at all.</strong> Both sides succeed. The
+only evidence is two trees on disk, and the symptom is unexplained evictions and restarts — which is
+the drill's first fault.</li>
+<li><strong>The default handler is reported with an empty name.</strong> Do not read
+<code>runtimeHandlers[0].name</code> and conclude something is broken.</li>
 </ul>
 
 <div class="k8s-link">
-<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+<p>Slices and scopes were built in <a href="b7.html#cp-b7-12">B7.12 — systemd was doing this all
+along: slices, scopes, and set-property</a>. The consequences of a mismatch show up as
+<a href="w6.html#cp-6-12">W6.12 — read node Conditions fluently: MemoryPressure, DiskPressure,
+PIDPressure</a> and the restart classics in <a href="w6.html#cp-6-11">W6.11</a>. The advanced track
+has no <code>RuntimeClass</code> lesson — the handlers map above is where that mechanism actually
+lives.</p>
 </div>
 
-<p class="docs-links"><b>Docs:</b> TODO.</p>
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>container runtimes</em> — the
+"cgroup drivers" section states the systemd-on-both-sides rule explicitly and shows the kubelet's
+<code>cgroupDriver</code> field. For handlers, search <em>runtime class</em>.</p>
 </article>
 </div><!-- /g-operating-it -->
 
