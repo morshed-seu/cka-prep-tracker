@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="containerd, the shim and the three on-disk stores: the full process tree from ctr run to the workload, what survives a daemon restart, containers versus tasks, content/snapshot/metadata stores, leases and the garbage collector.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I7 — Runtime architecture: containerd, shims, snapshotters — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I7 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4</a></li>
+    <li><a href="i5.html">I5</a></li>
+    <li><a href="i6.html">I6</a></li>
+    <li><a href="i7.html">I7 · Runtime architecture</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i7">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I7 — Runtime architecture: containerd, shims, snapshotters</h1>
+  <p>The heaviest module on the track — plan two sittings. Everything above <code>runc</code> and below the kubelet, assembled: who runs, who <em>stays</em> running, what survives a daemon restart, and where each of the three on-disk stores physically is.</p>
+  <p>Every module so far handed you one piece. I2 gave you the work order, I3 the contractor who reads it, I4 the flat-pack kit, I5 the warehouse it ships from, I6 the factory that packs it. containerd is the building-services company that employs all of them — and this is the module where the pieces stop being separate. By the end, nothing on a node's container layer is opaque to you, including every object <code>crictl</code> and <code>kubectl</code> politely hide.</p>
+  <div class="weights">
+    <span>Checkpoints<b>18</b></span>
+    <span>Hours<b>~7</b></span>
+    <span>Prerequisites<b>I2 · I3 · I4 · I5</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Draw the full process tree from <code>ctr run</code> to the workload, name every process in it, and say why <code>runc</code> is not one of them.</li>
+<li>Explain what survives a containerd restart and why — well enough to convince a sceptical colleague in three sentences.</li>
+<li>Separate containerd's nouns that people use interchangeably: namespaces, containers, tasks, images, plugins.</li>
+<li>Navigate all three on-disk stores — content, snapshotter, metadata — and say which can be rebuilt and which cannot.</li>
+<li>Use leases to stop the garbage collector deleting work you are not finished with.</li>
+<li>Talk to containerd directly: the socket and what access to it is worth, the gRPC surface, the event stream, and a client of your own.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I2, I3, I4, I5</strong> — the bundle, the runtime you drive by hand, the image format, and somewhere to pull from. This is the first module that needs all four at once, because containerd is precisely the thing that holds them together.</p>
+<p><strong>Which machine.</strong> The <code>sandbox</code> VM from I0, unchanged — Ubuntu 24.04, kernel 6.8.0. Every command and every line of output on this page was captured from it on 2026-07-30 running <strong>containerd 2.3.3</strong>, <strong>runc 1.5.1</strong> and <strong>nerdctl 2.3.5</strong>, with the local <code>registry:2</code> from I5 still listening on <code>127.0.0.1:5000</code>. Several details below differ from what you will read elsewhere precisely because they were captured on 2.x rather than 1.x — each one is called out where it appears.</p>
+<p><strong>A warning about the version you are reading against.</strong> containerd 2.x renamed plugins, moved configuration and deleted files that a decade of blog posts still tell you to read. Check your own <code>containerd --version</code> before trusting any runbook, including this one.</p>
+</div>
+
+<!-- ---------------- The process tree ---------------- --><div class="grp" id="g-the-process-tree"><h3>The process tree</h3>
+<article class="lesson" id="cp-i7-1" data-id="i7-1">
+<div class="lesson-head"><span class="cp-id">I7.1</span><h4>Where did runc go, and who is the workload's parent?</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Everyone who runs containers eventually draws the process tree on a whiteboard, and almost everyone draws it wrong. The wrong picture — <code>containerd</code> as the parent of everything, with <code>runc</code> sitting alongside the workload babysitting it — makes two very common node incidents unexplainable: why restarting containerd does not kill your pods, and why <code>ps</code> on a busy node never shows a single <code>runc</code>. Draw the tree once from a live machine and both stop being mysteries.</p>
+
+<h5>The concept</h5>
+<p>In <a href="i3.html#cp-i3-5">I3.5</a> you watched <code>runc create</code> return to your prompt while the container stayed up, and you learned why: <code>runc</code> is a contractor. It arrives with the work order, builds the namespaces, pivots the root, hands the job to the workload, and <strong>leaves</strong>. Nothing about that changes when containerd is driving instead of you. So the question I3 planted — <em>if runc leaves, who holds the door open?</em> — has to have an answer, and the answer is a fourth process that most diagrams omit entirely.</p>
+<p>That process is the <strong>shim</strong>, <code>containerd-shim-runc-v2</code>. It is the on-site foreman: the contractor finishes and drives away, but somebody has to stay in the building, keep the phone line open and sign for the work. Concretely, the shim holds three things nobody else can:</p>
+<ul>
+<li><strong>The workload's stdio.</strong> Something must be on the other end of the container's stdout pipe, or of its pty for an interactive container. If containerd held that end, stopping containerd would close the pipe under a running workload.</li>
+<li><strong>The exit status.</strong> On Linux only a process's <em>parent</em> can reap it and read its exit code. Whoever is to report "container exited 137" must be the parent — and must still be alive when it happens.</li>
+<li><strong>The identity of the container</strong> while containerd is not running at all.</li>
+</ul>
+<p>Now the part that surprises people. The shim is the workload's parent, but the shim's own parent is <strong>PID&nbsp;1</strong> — <code>systemd</code> — not containerd. containerd starts the shim <em>detached</em>, so it is immediately re-parented to init. That is deliberate, and it is the whole trick: because containerd is never an ancestor of anything that matters, containerd can die, be upgraded and come back without a single workload noticing. You will prove exactly that in <a href="#cp-i7-3">I7.3</a>.</p>
+<p>So the lineage of <em>who started whom</em> is <code>containerd → shim → workload</code>, but the live ancestry you see in <code>ps</code> is <code>systemd → shim → workload</code>. Both pictures are true; they answer different questions, and conflating them is what produces the wrong whiteboard drawing.</p>
+<div class="flow"><span>containerd</span><em>starts, detached</em><span>shim</span><em>fork/exec</em><span>runc</span><em>exits</em><span>workload</span></div>
+<p>Read that as a timeline, not as a family tree: only the shim and the workload are still alive by the time you type <code>ps</code>.</p>
+
+<div class="specref">
+<p>containerd's own runtime-v2 documentation is explicit that containerd does not run the container itself — it talks to something that outlives the call:</p>
+<blockquote>However, containerd itself does not actually directly invoke the runtime to start the container. Instead it expects to invoke the runtime, which will expose a socket - Unix-domain on Unix-like systems, named pipe on Windows - and listen for container commands via ttRPC over that socket.</blockquote>
+<p>and that the shim, not containerd, is what calls <code>runc</code>:</p>
+<blockquote>The shim then invokes the actual <code>runc</code> binary, passing it the container configuration, and the <code>runc</code> binary does the actual work of starting the container.</blockquote>
+<cite>containerd runtime v2 — <a href="https://github.com/containerd/containerd/blob/main/docs/runtime-v2.md">docs/runtime-v2.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start one container detached, so it keeps running while you inspect it from the same shell. Note the flag combination <code>ctr</code> refuses — <code>--rm</code> cleans up on exit, and there is no exit to hook when you detach.
+<pre class="cmd">sudo ctr run -d docker.io/library/alpine:3.21 demo sleep 600
+sudo ctr task ls</pre>
+<pre class="out">TASK   PID     STATUS
+demo   54899   RUNNING</pre></li>
+
+<li>Walk the ancestry upward from the workload's PID, one <code>ps</code> at a time. This is the whole lesson in three commands.
+<pre class="cmd">PID=$(sudo ctr task ls | grep '^demo ' | awk '{print $2}')
+ps -o pid,ppid,comm,args -p $PID
+ps -o pid,ppid,comm,args -p $(ps -o ppid= -p $PID | tr -d ' ')</pre>
+<pre class="out">    PID    PPID COMMAND         COMMAND
+  <b>54899   54876</b> sleep           sleep 600
+
+    PID    PPID COMMAND         COMMAND
+  <b>54876       1</b> containerd-shim /usr/local/bin/containerd-shim-runc-v2 -namespace default -id demo -address /run/containerd/containerd.sock</pre>
+<p>The workload's parent is the shim, and <b>the shim's parent is 1</b>.</p></li>
+
+<li>Ask <code>pstree</code> for the same thing, and notice which process is <em>not</em> in the chain.
+<pre class="cmd">pstree -aps $PID</pre>
+<pre class="out">systemd,1 --system --deserialize=88
+  `-containerd-shim,54876 -namespace default -id demo -address /run/containerd/containerd.sock
+      `-sleep,54899 600</pre>
+<p>containerd — PID 2805 on this box — appears nowhere in the workload's ancestry.</p></li>
+
+<li>Check the other direction: does containerd have any shim children at all?
+<pre class="cmd">pstree -ap $(pgrep -x containerd) | grep -c shim</pre>
+<pre class="out">0</pre></li>
+
+<li>Now answer I3's question directly.
+<pre class="cmd">pgrep -a -x runc || echo "no runc process exists"</pre>
+<pre class="out">no runc process exists</pre>
+<p>There is a container running, and there is no <code>runc</code> anywhere on the machine.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can draw the tree from memory and defend every edge: the workload's parent is a shim; the shim's parent is init; containerd is an ancestor of nothing; and <code>runc</code> is a process that existed for a few milliseconds at creation time and has not existed since.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ctr run -d --rm</code> is rejected outright</strong> — <code>ctr: flags --detach and --rm cannot be specified together</code>. <code>--rm</code> means "delete the container when the task exits", which requires <code>ctr</code> to still be attached and watching. Detach and you own the cleanup.</li>
+<li><strong>"The shim is containerd's child" is the single most common wrong belief here</strong>, and it survives because the lineage diagram in every blog post looks like a process tree. Check <code>PPID</code> on a real machine before you argue about it.</li>
+<li><strong>A missing <code>runc</code> in <code>ps</code> is not evidence that something is wrong.</strong> On a node with a hundred pods, seeing zero <code>runc</code> processes is the healthy state. Seeing several <em>stuck</em> ones is the interesting case — that is a container wedged mid-creation, not a container running.</li>
+<li><strong><code>--forest</code> will not rescue the wrong mental model.</strong> <code>ps -ef --forest</code> shows the same re-parented layout; it just makes it easier to misread, because the shim appears at top level next to other system daemons rather than under containerd.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the tree behind <a href="w1.html#cp-1-20">W1.20 — kubelet → containerd → shim → runc</a>, and it is why that arrow diagram must be read as a call chain rather than a <code>ps</code> hierarchy. On a real node the kubelet is a child of systemd, containerd is a child of systemd, and every shim is <em>also</em> a child of systemd — three independent trees, coupled only by sockets. When <a href="w6.html#cp-6-13">W6.13</a> asks you to narrate a node's death timeline, this is the structure that decides what dies in what order.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search containerd's docs for <code>runtime-v2</code> (the shim contract and its flow diagram), and <code>ps(1)</code> for <code>--forest</code> and the <code>ppid</code> output column. On the Kubernetes side, "container runtime interface" is the page that draws the same chain one layer up.</p>
+</article>
+<article class="lesson" id="cp-i7-2" data-id="i7-2">
+<div class="lesson-head"><span class="cp-id">I7.2</span><h4>The shim's directory, which is also the bundle</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The shim is not just a process — it is a process with a directory, and that directory is where a stuck container's evidence lives. When <code>ctr</code> hangs, when a pod will not terminate, when you need to know what a running container was actually configured with rather than what its manifest claims, this is where you look. It is also the moment the whole track joins up: the shim's working directory turns out to be the OCI <strong>bundle</strong> you hand-wrote in I2.</p>
+
+<h5>The concept</h5>
+<p>Every task gets a directory under <code>/run/containerd/io.containerd.runtime.v2.task/&lt;namespace&gt;/&lt;id&gt;/</code>. The path encodes three things you now know how to read: <code>io.containerd.runtime.v2</code> is the plugin that owns it (<a href="#cp-i7-8">I7.8</a>), the namespace is containerd's own tenancy boundary (<a href="#cp-i7-5">I7.5</a>), and the id is the container's name.</p>
+<p>Because it lives under <code>/run</code>, which is a tmpfs, <strong>the whole thing evaporates on reboot</strong> — correctly, since none of it describes anything that survives a reboot anyway.</p>
+<p>What is inside:</p>
+<table class="langpair">
+<thead><tr><th>File</th><th>What it is for</th></tr></thead>
+<tbody>
+<tr><td><code>config.json</code></td><td>The OCI runtime spec — literally the document you wrote by hand in <a href="i2.html#cp-i2-2">I2.2</a>, generated for you from the image config. <code>ociVersion 1.3.0</code>, the same one <code>runc --version</code> claims.</td></tr>
+<tr><td><code>rootfs/</code></td><td>The mounted root filesystem — the snapshotter's overlay stack, mounted here (<a href="#cp-i7-11">I7.11</a>).</td></tr>
+<tr><td><code>init.pid</code></td><td>The workload's PID as plain text, so state can be rebuilt from disk after containerd restarts.</td></tr>
+<tr><td><code>bootstrap.json</code></td><td>The shim's ttrpc socket address — how containerd finds this shim again.</td></tr>
+<tr><td><code>log</code></td><td>A <strong>named pipe</strong> the shim writes to and containerd drains into its journal.</td></tr>
+<tr><td><code>shim-binary-path</code></td><td>Which shim binary owns this task, so a later <code>delete</code> uses the same one.</td></tr>
+<tr><td><code>options.json</code></td><td>Runtime options passed in <code>CreateTaskRequest</code> — <code>{}</code> when you accept every default.</td></tr>
+<tr><td><code>work</code></td><td>A symlink to the task's persistent state under <code>/var/lib/containerd/</code>.</td></tr>
+</tbody>
+</table>
+<p><strong>Two things here have changed and the internet has not caught up.</strong> Older guides tell you to <code>cat</code> a file called <code>address</code> to find the shim's socket. On containerd 2.3.3 <em>there is no <code>address</code> file</em> — that information moved into <code>bootstrap.json</code>, which also records the protocol version and names ttrpc explicitly. And the socket itself is no longer an abstract-namespace address: it is a real path under <code>/run/containerd/s/</code>, named by a hash, reached through the <code>s</code> symlink in the task directory.</p>
+<p>On the "one shim per container" question, be careful — the popular phrasing is a simplification of something the shim gets to decide for itself. With <code>ctr</code>, one container does get one shim. Under Kubernetes it is <strong>one shim per pod</strong>, with the pod's containers grouped underneath, which is why <code>ps</code> on a node shows far fewer shims than containers.</p>
+
+<div class="specref">
+<p>The grouping is not containerd's rule at all — the documentation hands the decision to the shim:</p>
+<blockquote>containerd does not know or care about whether the shim to container relationship is one-to-one, or one-to-many. It is entirely up to the shim to decide.</blockquote>
+<p>and then names the Kubernetes case exactly:</p>
+<blockquote>In practice, this means that containers launched by Kubernetes, that are part of the same Kubernetes pod, are handled by a single shim, grouping on the <code>io.kubernetes.cri.sandbox-id</code> label set by the CRI plugin.</blockquote>
+<cite>containerd runtime v2 — <a href="https://github.com/containerd/containerd/blob/main/docs/runtime-v2.md">docs/runtime-v2.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the task directory of the container you started in I7.1.
+<pre class="cmd">sudo ls -l /run/containerd/io.containerd.runtime.v2.task/default/demo/</pre>
+<pre class="out">-rw-r--r-- 1 root root  134 Jul 30 12:53 <b>bootstrap.json</b>
+-rw-r--r-- 1 root root 2850 Jul 30 12:53 <b>config.json</b>
+-rw-r--r-- 1 root root    5 Jul 30 12:53 <b>init.pid</b>
+<b>prwx------</b> 1 root root    0 Jul 30 12:53 <b>log</b>
+-rw-r--r-- 1 root root    0 Jul 30 12:53 log.json
+-rw------- 1 root root    2 Jul 30 12:53 options.json
+drwxr-xr-x 1 root root 4096 Jul 30 12:53 <b>rootfs</b>
+-rw------- 1 root root    0 Jul 30 12:53 runtime
+lrwxrwxrwx 1 root root   17 Jul 30 12:53 <b>s -&gt; /run/containerd/s</b>
+-rw------- 1 root root   38 Jul 30 12:53 shim-binary-path
+lrwxrwxrwx 1 root root   62 Jul 30 12:53 work -&gt; /var/lib/containerd/io.containerd.runtime.v2.task/default/demo</pre>
+<p>Note the leading <code>p</code> on <code>log</code>: that is a FIFO, not a file.</p></li>
+
+<li>Read <code>bootstrap.json</code> — the file that replaced <code>address</code>.
+<pre class="cmd">sudo cat /run/containerd/io.containerd.runtime.v2.task/default/demo/bootstrap.json | jq .
+sudo ls /run/containerd/io.containerd.runtime.v2.task/default/demo/address</pre>
+<pre class="out">{
+  "version": 3,
+  <b>"address": "unix:///run/containerd/s/12117510a54ae87cb9f59e68c4b6897783ff70cec968b5b5967a0a0cd503057e"</b>,
+  <b>"protocol": "ttrpc"</b>
+}
+
+ls: cannot access '.../demo/address': No such file or directory</pre></li>
+
+<li>Confirm the shim really is listening on that socket, and that it is the process you identified in I7.1.
+<pre class="cmd">sudo ss -lxp | grep shim</pre>
+<pre class="out">u_str LISTEN 0 4096 <b>/run/containerd/s/12117510a54ae87cb9f59e68c4b6897783ff70cec968b5b5967a0a0cd503057e</b> 157693 * 0 users:(("containerd-shim",<b>pid=54876</b>,fd=10))</pre></li>
+
+<li>Prove the bundle claim: this <code>config.json</code> is I2's runtime spec.
+<pre class="cmd">sudo jq -r '.ociVersion, (.process.args|join(" ")), .linux.cgroupsPath' \
+  /run/containerd/io.containerd.runtime.v2.task/default/demo/config.json</pre>
+<pre class="out"><b>1.3.0</b>
+sleep 600
+/default/demo</pre></li>
+
+<li>Check what kind of files <code>log</code> and <code>log.json</code> are — <em>before</em> you are tempted to read them.
+<pre class="cmd">sudo stat -c '%n %F %A' \
+  /run/containerd/io.containerd.runtime.v2.task/default/demo/log \
+  /run/containerd/io.containerd.runtime.v2.task/default/demo/log.json</pre>
+<pre class="out">.../demo/log <b>fifo</b> prwx------
+.../demo/log.json regular empty file -rw-r--r--</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a container id you can find its bundle, read the exact OCI config it is running under, name the socket containerd uses to reach its shim, and state the file you must not <code>cat</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>cat</code> or <code>tail</code> on <code>log</code> hangs your terminal.</strong> It is a FIFO whose reader is containerd; opening it for reading as a second consumer just blocks. The shim's log output is already in the journal — use <code>journalctl -u containerd</code> instead. This one costs people a full session timeout the first time.</li>
+<li><strong>There is no <code>address</code> file on containerd 2.x.</strong> Any runbook that says <code>cat .../address</code> was written against 1.x. Read <code>bootstrap.json</code>.</li>
+<li><strong>"One shim per container" is only true outside Kubernetes.</strong> If you count shims on a node and compare against container count, expect them to differ by design — that is pod grouping, not a leak.</li>
+<li><strong>Everything here is on tmpfs.</strong> Do not plan to post-mortem a crashed node by reading <code>/run/containerd</code> after a reboot; it is gone. The durable half is the <code>work</code> symlink's target under <code>/var/lib/containerd</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The pod-grouping rule above is the mechanism behind <a href="w1.html#cp-1-21">W1.21 — the pause container</a>: the sandbox is what the shim is grouped around, and the pause process is what holds the pod's namespaces open while individual containers come and go. When <a href="w6.html#cp-6-2">W6.2</a> sends you hunting for logs below <code>kubectl logs</code>, the shim's FIFO into the containerd journal is the rung you are stepping onto.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>runtime-v2</code> doc for the shim lifecycle and the <code>CreateTaskRequest</code> options, and <code>ss(8)</code> for <code>-x</code> (unix sockets) and <code>-p</code> (owning process). For the FIFO behaviour, <code>fifo(7)</code>.</p>
+</article>
+<article class="lesson" id="cp-i7-3" data-id="i7-3">
+<div class="lesson-head"><span class="cp-id">I7.3</span><h4>Restart the daemon, keep the containers</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>This is the single most reassuring fact about a Kubernetes node, and the one operators most often refuse to believe until they have watched it: <strong>you can restart containerd under running workloads and nothing dies.</strong> Not "usually survives", not "restarts quickly" — the workload processes are not signalled at all. Upgrading a container runtime on a production node is a routine operation because of this, and knowing it turns a scary maintenance window into a boring one.</p>
+
+<h5>The concept</h5>
+<p>You already have every piece of the explanation from I7.1 and I7.2; this checkpoint just makes you assemble it.</p>
+<p>containerd is not in the workload's ancestry, so killing it orphans nothing. The shim is the parent, the shim is a child of init, and the shim keeps holding the stdio, the pty and the right to reap. Meanwhile everything containerd needs in order to <em>recognise</em> the container again is on disk rather than in memory: the metadata store has the container record (<a href="#cp-i7-12">I7.12</a>), the task directory has <code>init.pid</code>, and <code>bootstrap.json</code> has the socket to dial. So a fresh containerd walks the task directories, reconnects to each shim over ttrpc, and rebuilds its view of the world from state it did not create.</p>
+<p>This is the same idea as the reconciliation loop from <a href="b13.html#cp-b13-12">B13.12</a>, applied to a daemon's own memory: containerd does not <em>remember</em> what is running, it <strong>re-derives</strong> it. Anything that can be re-derived can be lost safely.</p>
+<p>The three-sentence version for a colleague, which the checkpoint asks you to practise:</p>
+<blockquote>Containerd isn't the parent of your container — a shim process is, and the shim's parent is init. Containerd only talks to that shim over a socket, and it writes down where the socket is, so when it comes back it just reconnects. Nothing ever signalled your process, so there was nothing for it to survive.</blockquote>
+
+<div class="specref">
+<p>The shim's exit-and-listen dance in the documented flow is exactly what makes this possible — the process that returns the socket address is not the process that keeps it:</p>
+<blockquote>if new, the shim:<br>1. creates a new process to listen on a socket for ttRPC commands from containerd<br>2. returns the address to that socket to containerd<br>3. exits</blockquote>
+<cite>containerd runtime v2 — <a href="https://github.com/containerd/containerd/blob/main/docs/runtime-v2.md">docs/runtime-v2.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Record the three PIDs and the workload's start time, so that afterwards you are comparing facts and not impressions.
+<pre class="cmd">PID=$(sudo ctr task ls | grep '^demo ' | awk '{print $2}')
+SHIM=$(ps -o ppid= -p $PID | tr -d ' ')
+echo "workload=$PID shim=$SHIM containerd=$(pgrep -x containerd)"
+ps -o lstart= -p $PID</pre>
+<pre class="out">workload=54899 shim=54876 containerd=<b>2805</b>
+Thu Jul 30 12:53:25 2026</pre></li>
+
+<li>Restart the daemon. This is the moment people expect an outage.
+<pre class="cmd">sudo systemctl restart containerd
+sleep 3
+echo "containerd is now $(pgrep -x containerd)"</pre>
+<pre class="out">containerd is now <b>56260</b></pre>
+<p>A different PID — this is genuinely a new process, not a reload.</p></li>
+
+<li>Check the workload and the shim.
+<pre class="cmd">ps -o pid,ppid,lstart,args -p $PID
+ps -o pid,ppid,args -p $SHIM</pre>
+<pre class="out">    PID    PPID                  STARTED COMMAND
+  <b>54899   54876 Thu Jul 30 12:53:25 2026</b> sleep 600
+
+    PID    PPID COMMAND
+  <b>54876       1</b> /usr/local/bin/containerd-shim-runc-v2 -namespace default -id demo -address /run/containerd/containerd.sock</pre>
+<p>Same PIDs, same start time. Nothing restarted, because nothing stopped.</p></li>
+
+<li>Confirm the new containerd re-attached to a container it never started.
+<pre class="cmd">sudo ctr task ls</pre>
+<pre class="out">TASK   PID     STATUS
+<b>demo   54899   RUNNING</b></pre></li>
+
+<li>Settle it with elapsed time, which cannot be faked by a fast restart.
+<pre class="cmd">ps -o pid,etime,args -p $PID</pre>
+<pre class="out">    PID     ELAPSED COMMAND
+  54899       <b>02:36</b> sleep 600</pre>
+<p>Two and a half minutes of continuous uptime across a daemon restart that happened seconds ago.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have watched containerd's PID change while the workload's PID, start time and elapsed time did not, and you can give the three-sentence explanation without reading it off the page.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>This does <em>not</em> extend to killing the shim.</strong> The shim is load-bearing in a way containerd is not; kill it and you get the orphan described in <a href="#cp-i7-18">I7.18</a>. "The runtime is restartable" is a statement about the daemon only.</li>
+<li><strong>Events are lost, not queued.</strong> If a container exits during the restart window, the exit is delivered when containerd reconnects — but anything watching <code>ctr events</code> (<a href="#cp-i7-15">I7.15</a>) simply misses the gap. Clients that assume an unbroken event stream will drift.</li>
+<li><strong>An upgrade that changes the shim binary does not upgrade running shims.</strong> Existing containers keep the old shim — <code>shim-binary-path</code> records which one — until they are recreated. A node can legitimately be running two shim versions at once after an upgrade.</li>
+<li><strong>Restarting the <em>kubelet</em> is a different question</strong> with a different answer, and so is restarting containerd on a node where the kubelet is watching. The kubelet may decide to re-sync pods for its own reasons; that is a Kubernetes-level behaviour layered on top of this Linux-level one.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is why runtime upgrades appear in node-maintenance runbooks without a drain step, and it is the fact that makes <a href="w6.html#cp-6-11">W6.11's kubelet fault-hunting</a> tractable: when you restart containerd while chasing a fault, you are not adding a second incident. It also sharpens <a href="w1.html#cp-1-20">W1.20</a> — the kubelet's connection to containerd is a gRPC client to a restartable server, so "containerd is down" and "the containers are down" are genuinely independent conditions on a node.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>systemctl(1)</code> for <code>restart</code> versus <code>reload</code>, and <code>ps(1)</code> for the <code>lstart</code> and <code>etime</code> columns — the two that make "it never restarted" provable rather than asserted.</p>
+</article>
+<article class="lesson" id="cp-i7-4" data-id="i7-4">
+<div class="lesson-head"><span class="cp-id">I7.4</span><h4>Asking the layer below containerd</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every layer in this stack keeps its own records, and when they disagree you need to be able to ask each one separately. Being able to query <code>runc</code> directly — underneath containerd, underneath the shim — is what lets you tell "containerd has lost track of a container" apart from "the container is genuinely gone". That distinction is the whole of the orphan drill in <a href="#cp-i7-18">I7.18</a>.</p>
+
+<h5>The concept</h5>
+<p>In <a href="i3.html#cp-i3-9">I3.9</a> you learned that <code>runc</code> keeps its state under a root directory, <code>/run/runc</code> by default, and that <code>--root</code> points it elsewhere. containerd uses that flag: each containerd <strong>namespace</strong> gets its own runc state directory under <code>/run/containerd/runc/&lt;namespace&gt;</code>. So on this box there is a <code>default</code> tree and a <code>buildkit</code> tree, because I6's builder was a separate tenant.</p>
+<p>The consequence is that you can run <code>runc list</code> against containerd's own state and see containerd's containers — with no daemon involved and no socket to dial. You are reading the same <code>state.json</code> you dissected in I3, written by the same <code>runc</code>, just in a directory containerd chose.</p>
+<p>And now the join that makes the module click. The <code>BUNDLE</code> column of that listing points at <code>/run/containerd/io.containerd.runtime.v2.task/default/demo</code> — <strong>the shim's directory from I7.2 is the runc bundle</strong>. They were never two things. containerd assembles a bundle in the place the shim will work from, and the shim hands that path to <code>runc</code> exactly as you handed a path to <code>runc</code> by hand in I3.</p>
+<div class="flow"><span>ctr</span><em>gRPC</em><span>containerd</span><em>ttrpc</em><span>shim</span><em>argv + bundle path</em><span>runc</span></div>
+<p>Four interfaces, three of them sockets, and the last one a directory on disk.</p>
+
+<div class="specref">
+<p>The runtime spec defines the bundle as precisely this pairing of a config and a rootfs in one directory — which is why the shim's working directory can <em>be</em> the bundle without anything special being arranged:</p>
+<blockquote>This bundle is the directory structure that is written to disk or transferred over the network. The bundle contains all the information needed to load and run a container.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/bundle.md">bundle.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find runc's state directories. One per containerd namespace.
+<pre class="cmd">sudo ls /run/containerd/runc/</pre>
+<pre class="out">buildkit
+default</pre></li>
+
+<li>List containers from below containerd. Note that containerd is not consulted at all here.
+<pre class="cmd">sudo runc --root /run/containerd/runc/default list</pre>
+<pre class="out">ID     PID     STATUS    BUNDLE                                                       CREATED                          OWNER
+demo   54899   running   <b>/run/containerd/io.containerd.runtime.v2.task/default/demo</b>   2026-07-30T06:53:26.667120795Z   root</pre></li>
+
+<li>Ask runc for its state — the same document I3 taught you to read.
+<pre class="cmd">sudo runc --root /run/containerd/runc/default state demo | jq '{id, pid, status, bundle, rootfs}'</pre>
+<pre class="out">{
+  "id": "demo",
+  <b>"pid": 54899</b>,
+  "status": "running",
+  <b>"bundle": "/run/containerd/io.containerd.runtime.v2.task/default/demo"</b>,
+  "rootfs": "/run/containerd/io.containerd.runtime.v2.task/default/demo/rootfs"
+}</pre></li>
+
+<li>Prove the bundle is the shim directory by listing it.
+<pre class="cmd">sudo ls /run/containerd/io.containerd.runtime.v2.task/default/demo</pre>
+<pre class="out">bootstrap.json  config.json  init.pid  log  log.json
+options.json    <b>rootfs</b>       runtime   s     shim-binary-path  work</pre>
+<p><code>config.json</code> plus <code>rootfs</code> — that is a bundle, exactly as I2 defined it.</p></li>
+
+<li>Cross-check all three layers on one PID. They must agree.
+<pre class="cmd">echo "ctr says:  $(sudo ctr task ls | grep '^demo ' | awk '{print $2}')"
+echo "runc says: $(sudo runc --root /run/containerd/runc/default state demo | jq -r .pid)"
+echo "init.pid:  $(sudo cat /run/containerd/io.containerd.runtime.v2.task/default/demo/init.pid)"</pre>
+<pre class="out">ctr says:  <b>54899</b>
+runc says: <b>54899</b>
+init.pid:  <b>54899</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can list containerd's containers without containerd, name the flag that makes it possible, and explain why the shim's working directory and the OCI bundle are the same path.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Forgetting <code>--root</code> gives you an empty list, not an error.</strong> Plain <code>sudo runc list</code> reads <code>/run/runc</code>, which containerd never writes to, so it truthfully reports nothing. That empty output has convinced more than one person their containers had vanished.</li>
+<li><strong>The namespace is part of the path.</strong> On a Kubernetes node the containers are under <code>/run/containerd/runc/k8s.io</code>, and <code>--root /run/containerd/runc/default</code> will again show you nothing at all. Same trap as <code>ctr -n</code> in <a href="#cp-i7-5">I7.5</a>, one layer down.</li>
+<li><strong>Do not <em>write</em> at this layer.</strong> <code>runc delete</code> or <code>runc kill</code> against containerd's root works, and leaves containerd holding a task record for something that no longer exists. Reading is diagnosis; writing is how you manufacture the fault in <a href="#cp-i7-18">I7.18</a>.</li>
+<li><strong><code>OWNER</code> says <code>root</code>, not the container's user.</strong> It is who created the container, not who runs inside it — <code>process.user.uid</code> in <code>config.json</code> is the field you want for that.</li>
+</ul>
+
+<div class="k8s-link">
+<p>On an exam node this is the deepest rung of <a href="w6.html#cp-6-2">W6.2's fallback ladder</a>: when <code>kubectl</code> is unavailable and <code>crictl</code> is also unhappy, <code>runc --root /run/containerd/runc/k8s.io list</code> still answers, because it reads files rather than talking to a daemon. It is also the concrete form of the bundle that <a href="w1.html#cp-1-23">W1.23</a> hints at when it walks you through <code>/var/lib/kubelet</code>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>runc --help</code> for <code>--root</code>, and the OCI runtime spec's <code>bundle.md</code> for the two-item definition of a bundle. Then <code>runtime.md</code>'s state section for the fields <code>runc state</code> prints.</p>
+</article>
+</div><!-- /g-the-process-tree -->
+
+<!-- ---------------- Objects ---------------- --><div class="grp" id="g-objects"><h3>Objects</h3>
+</div><!-- /g-objects -->
+
+<!-- ---------------- Storage internals ---------------- --><div class="grp" id="g-storage-internals"><h3>Storage internals</h3>
+</div><!-- /g-storage-internals -->
+
+<!-- ---------------- Talking to it ---------------- --><div class="grp" id="g-talking-to-it"><h3>Talking to it</h3>
+</div><!-- /g-talking-to-it -->
+
+<!-- ---------------- Project & drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+</div><!-- /g-project-drill -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i6.html">← I6</a><a href="../intermediate.html#i8">I8 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
