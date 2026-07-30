@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CNI from the contract down: exec a binary, JSON on stdin, JSON on stdout. Write a spec-compliant plugin in bash and have containerd call it for a real pod sandbox.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I9 — CNI: the interface the network speaks — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I9 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4</a></li>
+    <li><a href="i5.html">I5</a></li>
+    <li><a href="i6.html">I6</a></li>
+    <li><a href="i7.html">I7</a></li>
+    <li><a href="i8.html">I8</a></li>
+    <li><a href="i9.html">I9 · CNI, the network contract</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i9">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I9 — CNI: the interface the network speaks</h1>
+  <p>The smallest contract in the entire ecosystem, and the one that most often gets blamed for outages it merely reported. B9 already built the datapath by hand; this module is the twenty lines of agreement that turned that script into something a runtime can call.</p>
+  <p>Six hours here buys something no amount of reading a vendor's docs will: pod networking stops
+  being a black box with a logo on it. By the end you will have written a plugin in bash that
+  <strong>containerd calls for a real sandbox</strong>, and it will handle three cases the reference
+  plugins get wrong. Along the way this module contradicts several things commonly said about CNI —
+  including two things this repository's own tracker said before the labs were run.</p>
+  <div class="weights">
+    <span>Checkpoints<b>16</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>I8 · B9</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>The contract.</strong> Recite it in one sentence, then invoke a real plugin by hand with
+all six parameters set — doing manually what containerd does at <code>RunPodSandbox</code>. Read the
+five operations from the spec's own words, and find the one <em>MUST</em> that is violated more than
+any other sentence in the document.</li>
+<li><strong>Configuration.</strong> Explain what decides which network a node uses — and why the
+answer is different for <code>libcni</code> and for containerd, because they are two different
+mechanisms. Build a chain and watch <code>prevResult</code> cross the wire. Drive the whole thing
+with <code>cnitool</code>, no Kubernetes anywhere.</li>
+<li><strong>The plugins that ship.</strong> Read the reference <code>bridge</code> plugin against
+your own <code>net-up.sh</code> and find what the contract added. Learn <code>host-local</code>'s
+reservation tree well enough to diagnose a node that has no addresses left and no pods running.
+Recognise your B9 DNAT rule inside <code>portmap</code>.</li>
+<li><strong>In a real stack.</strong> Name who actually execs the plugin, and prove it. Then measure
+what the v1.1 additions do on today's plugins rather than what they were designed to do.</li>
+<li><strong>Project &amp; drill.</strong> Ship <code>cni-minibridge</code>, drive it with
+<code>cnitool</code>, install it as the node's CNI and serve traffic through it. Then plant three
+faults and read each one from the symptom end.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I8</strong> (the sandbox is what gets wired) and <strong>B9</strong> (veth, bridge, <code>ip_forward</code>, NAT, conntrack, netfilter). Keep <code>net-up.sh</code> open on one side of the screen for most of this module — the project is a rewrite of it.</p>
+<p><strong>Which machine.</strong> The <code>sandbox</code> VM, as every intermediate module so far.
+Every command and every line of output on this page was captured from a live run there against
+<strong>CNI plugins v1.9.1</strong>, <strong>libcni and <code>cnitool</code> v1.3.0</strong> and
+<strong>containerd 2.3.3</strong> on kernel 6.8.0. Two notes on the toolchain: <code>cnitool</code>
+is not packaged for Ubuntu 24.04, so it is built from source in I9.8 (one <code>go install</code>);
+and the plugin binaries were already in <code>/opt/cni/bin</code> from I0's setup.</p>
+<p><strong>A warning about spec versions.</strong> The CNI repository's git tags are
+<em>library</em> releases, not spec versions. The document describing spec <strong>1.1.0</strong>
+lives in <code>SPEC.md</code> at library tag <strong>v1.3.0</strong>, and the file at tag
+<code>v1.1.0</code> is an older spec that says "CNI defines 4 operations". Every quote on this page
+is fetched from the v1.3.0 tree.</p>
+</div>
+
+<!-- ---------------- The contract ---------------- --><div class="grp" id="g-the-contract"><h3>The contract</h3>
+<article class="lesson" id="cp-i9-1" data-id="i9-1">
+<div class="lesson-head"><span class="cp-id">I9.1</span><h4>The whole contract, in one sentence and one command</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Pod networking has a reputation for being the hardest part of Kubernetes, owned by a vendor whose
+internals you are not expected to understand. The interface itself is the opposite of that. It is
+small enough to state in one sentence, and you can verify that sentence with a single command in the
+next thirty seconds. Everything complicated about cluster networking sits on <em>one side</em> of
+this interface, and knowing exactly where the line falls is what lets you stop guessing during an
+outage.</p>
+
+<h5>The concept</h5>
+<p>Here is the sentence. <strong>The runtime executes a program; it passes configuration as JSON on
+that program's standard input and parameters in environment variables; it reads a JSON result from
+the program's standard output.</strong> That is CNI. There is no daemon to run, no socket to connect
+to, no library you must link against, no version-negotiation handshake over a wire.</p>
+
+<p>A <abbr title="Container Network Interface — the standard for attaching a container to a network">CNI</abbr>
+plugin is a file in a directory that the runtime runs like any other command. The calling convention
+is the one every Unix tool has used since the 1970s: arguments in the environment, input on stdin,
+output on stdout, a status code to say whether it worked. That is why plugins exist written in Go,
+Rust, Python and bash without anybody coordinating a client library, and why you will have written
+one by the end of this module.</p>
+
+<p>Compare this with <a href="i8.html#cp-i8-2">CRI</a>, which needed protobuf, gRPC and a generated
+client on both sides. The difference is not that container runtimes are more complicated than
+networks. It is that the <em>interaction</em> is different. CRI is a long-lived, bidirectional
+conversation: the kubelet streams logs, attaches to a TTY, watches for exits, and polls status
+forever. CNI is a one-shot errand — "attach this thing, tell me its address" — and a one-shot errand
+needs nothing more than exec. <strong>The interface's complexity followed the interaction's shape,
+not the subject's difficulty.</strong> That is the single most useful design lesson in this track.</p>
+
+<p>The registry's metaphor for it: the electrician is handed a room number and a job, does the work,
+reports back the socket they fitted, and leaves. Nobody keeps them on staff. If you want somebody on
+staff — watching the building, re-running wire between floors as tenants move — that is a different
+role, and I9.13 is where we find out that every real CNI provider hires one.</p>
+
+<div class="specref">
+<p>The spec states the calling convention in two sentences, and it is worth noticing how little it
+claims:</p>
+<blockquote>The CNI protocol is based on execution of binaries invoked by the container runtime. CNI defines the protocol between the plugin binary and the runtime.<br><br>The runtime passes parameters to the plugin via environment variables and configuration. It supplies configuration via stdin. The plugin returns a [result](#Section-5-Result-Types) on stdout on success, or an error on stderr if the operation fails. Configuration and results are encoded in JSON.</blockquote>
+<cite>CNI spec 1.1.0, § Section 2: Execution Protocol — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>Note the wording "an error on stderr". That sentence is loose, and the spec contradicts it later:
+§ Error requires the error object on stdout, and reserves stderr for "unstructured output such as
+logs". Every plugin in the field follows the later text, and so must yours — I9.4 is where getting
+this backwards produces one of the most misleading error messages in Kubernetes.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask a plugin what it is. The only thing this call needs is one environment variable and a scrap
+of JSON on stdin — no network, no configuration, no root.
+<pre class="cmd">echo '{"cniVersion":"1.1.0","name":"x","type":"bridge"}' | CNI_COMMAND=VERSION /opt/cni/bin/bridge</pre>
+<pre class="out">{"cniVersion":"1.1.0","supportedVersions":["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]}</pre>
+<p>That is the entire contract exercised once: environment variable in, JSON on stdin, JSON on
+stdout. You have just spoken CNI.</p></li>
+<li>Confirm there is nothing else there. If CNI had a daemon, this is where you would find its
+socket and its process.
+<pre class="cmd">file /opt/cni/bin/bridge
+ss -lx | grep -ci cni || echo "0 unix sockets matching cni"
+pgrep -a -f cni || echo "no process with cni in its command line"</pre>
+<pre class="out">/opt/cni/bin/bridge: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), <b>statically linked</b>, BuildID[sha1]=bc179bb8da7e413a11edaf88f00517d268a9a596, with debug_info, not stripped
+<b>0 unix sockets matching cni</b>
+<b>no process with cni in its command line</b>
+</pre>
+<p>Statically linked, and nothing running. Between pods, a CNI implementation is a directory of files
+that nobody is executing. That is worth holding onto, because it means <em>the state is not in a
+process</em> — it is in the kernel and on disk, which is exactly where I9.10 goes looking when a node
+runs out of addresses.</p></li>
+<li>Look at what the whole standard set costs.
+<pre class="cmd">ls /opt/cni/bin | tr '\n' ' '; echo
+du -sh /opt/cni/bin</pre>
+<pre class="out">LICENSE README.md bandwidth bridge dhcp dummy firewall host-device host-local ipvlan loopback macvlan portmap ptp sbr static tap tuning vlan vrf
+<b>94M	/opt/cni/bin</b></pre>
+<p>Eighteen plugins. Nearly all of what people mean by "our CNI" is in that list plus one JSON file,
+and the parts that are not are the subject of I9.13.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state the contract in one sentence without hedging, and you can demonstrate it with one
+command. You can also say why CNI is exec-based where CRI is gRPC-based, in terms of the interaction
+rather than the subject matter.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Installing a CNI" sounds like installing a service. It is not.</strong> There is no
+unit to enable, nothing to restart, and <code>systemctl status</code> will never tell you anything
+about it. When someone says the CNI is down, they mean either a file is wrong or a
+<em>provider's</em> daemon has stopped — and those are different problems with different fixes.
+I9.13 separates them.</li>
+<li><strong>The spec's own overview says errors go to stderr, and that is the one place it is
+wrong.</strong> § Error and the <code>STATUS</code> section both put the error object on stdout.
+Follow those.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the contract behind <a href="w4.html#cp-4-5">W4.5 — the CNI contract: exec a binary,
+JSON in, JSON out</a>. The comparison with a long-lived gRPC API is
+<a href="i8.html#cp-i8-2">I8.2 — a gRPC service, on a unix socket, defined by runtime.v1</a>, and the
+moment a pod's empty network namespace is handed to a plugin is
+<a href="i8.html#cp-i8-7">I8.7 — RunPodSandbox triggers CNI ADD, the seam where I9 begins</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the spec itself is short enough to read end to end in an hour —
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">containernetworking/cni
+SPEC.md at v1.3.0</a>. In the exam docs, search for <em>network plugins</em> to find where
+Kubernetes hands the whole subject to this contract and stops describing it.</p>
+</article>
+</div><!-- /g-the-contract -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>State the CNI contract in one sentence, without using the words "daemon" or "API".
+<details class="reveal"><summary>Answer</summary><p>The runtime executes a program, passing configuration as JSON on its standard input and parameters in environment variables, and reads a JSON result from its standard output. That is the whole of it — no daemon, no socket, no library to link.</p></details></li>
+
+<li>How many operations does the spec define, and why is the honest answer awkward?
+<details class="reveal"><summary>Answer</summary><p>Its own sentence says <em>"CNI defines 5 operations: <code>ADD</code>, <code>DEL</code>, <code>CHECK</code>, <code>GC</code>, and <code>VERSION</code>"</em>, and then it defines <code>STATUS</code> in a section of its own alongside them. So five are named and six can be sent. Anyone saying flatly "six verbs" is quoting something the spec does not say; anyone saying four is reading the older <code>SPEC.md</code> at library tag <code>v1.1.0</code>, since the CNI repo's git tags are library releases rather than spec versions.</p></details></li>
+
+<li>A pod is stuck in <code>Terminating</code> and the CNI plugin's log says "interface not found". What is the bug, and in which component?
+<details class="reveal"><summary>Answer</summary><p>The bug is in the plugin: its <code>DEL</code> returns an error when the interface is missing, violating the spec's requirement that plugins MUST accept repeated <code>DEL</code>s and return success when the resources are already gone. The runtime does the correct thing with an error — retries with backoff, forever — so the plugin's honest-looking message is the fault, not a diagnosis of one.</p></details></li>
+
+<li>Which parameters does <code>DEL</code> require, and which one is deliberately optional? Why that one?
+<details class="reveal"><summary>Answer</summary><p><code>CNI_COMMAND</code>, <code>CNI_CONTAINERID</code> and <code>CNI_IFNAME</code> are required; <strong><code>CNI_NETNS</code> is optional</strong>. That is the spec conceding that teardown routinely happens after the namespace is gone — a node reboot, a sandbox already destroyed — so a plugin that depends on reading the namespace during <code>DEL</code> cannot be correct.</p></details></li>
+
+<li>You add <code>99-mynetwork.conflist</code> to <code>/etc/cni/net.d</code> alongside <code>10-flannel.conflist</code> and nothing changes. Why? And what would have changed everything?
+<details class="reveal"><summary>Answer</summary><p>Containerd loads <code>maxConfNum</code> configurations — 1 by default — in sorted filename order, so <code>10-flannel</code> wins and <code>99-</code> is never read. Naming it <code>05-mynetwork.conflist</code> would have silently moved every new pod onto your network. Higher numbers do not mean higher precedence; they mean lower.</p></details></li>
+
+<li>Does <code>10-flannel.conflist.orig</code> still act as a live configuration file?
+<details class="reveal"><summary>Answer</summary><p>No. libcni matches on the file's <em>final</em> extension, which here is <code>.orig</code>, so the file is never read. <code>.bak</code> and <code>.disabled</code> behave the same way. Renaming within <code>.conflist</code> is what does not help.</p></details></li>
+
+<li>Why can't <code>portmap</code> be the first plugin in a chain, and what exactly does it say if it is?
+<details class="reveal"><summary>Answer</summary><p>It is a chained plugin: it needs the pod's address, which arrives in <code>prevResult</code> from the interface plugin ahead of it, in order to write a DNAT rule pointing at it. First in the list there is no <code>prevResult</code>, so it fails with <code>must be called as chained plugin</code> — identically whether or not port mappings were supplied, because the fault is its position.</p></details></li>
+
+<li>A chained plugin returns a result containing only <code>cniVersion</code>. Nothing errors on <code>ADD</code>. What have you broken?
+<details class="reveal"><summary>Answer</summary><p>Everything downstream of it. A chained plugin must pass <code>prevResult</code> through; dropping it means later plugins have no addresses to work with, and the runtime caches that truncated result — so every subsequent <code>CHECK</code> and <code>DEL</code> for the attachment is handed an empty picture too. The failure is silent at the point of the bug and surfaces somewhere else.</p></details></li>
+
+<li>A node reports "no IP addresses available" and is running three pods on a <code>/24</code>. Where do you look, and what exactly are you comparing?
+<details class="reveal"><summary>Answer</summary><p><code>ls /var/lib/cni/networks/&lt;network&gt;/</code>, and you compare its count of address files against <code>crictl pods -q | wc -l</code>. Each file is a reservation held regardless of whether its holder exists, and every <code>DEL</code> that did not run leaves one forever. Delete only the entries whose holders are gone — never the directory, or you will hand a live pod's address to a new one.</p></details></li>
+
+<li><code>bridge</code>'s <code>DEL</code> returned 0 and the pod's masquerade rule is still in the nat table. Is the plugin buggy?
+<details class="reveal"><summary>Answer</summary><p>Not by the letter of the spec, which is what makes it interesting. It learns the container's address by reading the namespace, and the namespace was already gone, so it could not build the rule to delete — and returning success in that situation is exactly what the idempotency MUST demands. The IPAM reservation <em>was</em> released, because that is keyed by container ID. Two of three realistic teardown orders leak this way. The fix, which <code>cni-minibridge</code> implements, is to look the address up in your own store instead.</p></details></li>
+
+<li>What is the single observable difference between <code>macvlan</code> and <code>ipvlan</code>, and name one practical consequence.
+<details class="reveal"><summary>Answer</summary><p><code>macvlan</code> gives the container its own MAC address; <code>ipvlan</code> shares the parent interface's MAC byte for byte and splits traffic by IP. Consequences follow from that alone: <code>macvlan</code> is refused by switch port security and by essentially every cloud hypervisor, while <code>ipvlan</code> survives those restrictions but loses L2 features such as broadcast to the container in L3 mode.</p></details></li>
+
+<li>Why is <code>loopback</code> mandatory, and what does its absence look like?
+<details class="reveal"><summary>Answer</summary><p>A fresh network namespace has a loopback interface that is <em>down</em>, and a successful interface-plugin <code>ADD</code> does not bring it up. Without it, <code>ping 127.0.0.1</code> inside the pod answers <strong>"Network is unreachable"</strong> — so the symptom is a failing health check, a sidecar that cannot reach its app, or a client that cannot connect to its own machine. Nothing in it says "networking".</p></details></li>
+
+<li>Which component execs the CNI plugin, at what moment, and what does the kubelet learn?
+<details class="reveal"><summary>Answer</summary><p>Containerd's CRI plugin, during <code>RunPodSandbox</code>, before any application container exists — the kubelet never execs a plugin. It learns the pod's address as a field in the sandbox status returned over gRPC, which is why <code>kubectl get pod -o wide</code> can show an IP for a pod whose containers have not started.</p></details></li>
+
+<li>Draw the line: what does CNI specify, and what is a provider's daemon doing?
+<details class="reveal"><summary>Answer</summary><p>CNI attaches <strong>one pod on one node</strong> to a network and reports its address, then detaches it. Everything else is the provider's: learning each node's pod subnet from the API server, programming routes or VXLAN FDB entries or BGP sessions so nodes reach each other's pods, and enforcing NetworkPolicy. Nothing in the spec concerns node-to-node reachability, which is why datapath families differ wildly while all speaking the same contract.</p></details></li>
+
+<li>Your cluster runs CNI plugins v1.9.1. Does <code>GC</code> reclaim leaked IPAM reservations?
+<details class="reveal"><summary>Answer</summary><p>No. The spec has the verb, libcni has the runtime half, and <strong>not one of the reference plugins registers a GC handler</strong> — so <code>CNI_COMMAND=GC</code> with an explicit valid-attachments list, or even an empty one, returns 0 and changes nothing. libcni's other GC phase synthesises <code>DEL</code>s from its own result cache, but that cache lives in <code>/var/run</code> and does not survive the reboot that caused the leak. The field repair is still <code>rm</code>.</p></details></li>
+
+<li>What does <code>cnitool gc &lt;net&gt; &lt;netns&gt;</code> do to a node with live pods?
+<details class="reveal"><summary>Answer</summary><p>Tears them all down. Its source passes <code>nil</code> for the valid-attachments list — "Currently just invoke GC without args, hence all network interface should be GC'ed!" — so libcni treats every cached attachment as stale and synthesises a <code>DEL</code> for each. It means "release everything cached", not "reclaim what leaked".</p></details></li>
+
+<li>Sandbox creation fails with <code>failed to unmarshal raw result: invalid character 'm' looking for beginning of value</code>. What is wrong, and did the plugin's work succeed?
+<details class="reveal"><summary>Answer</summary><p>A plugin wrote a human-readable line to stdout, which is the result channel — the <code>'m'</code> is the first character of its message. The fix is <code>&gt;&amp;2</code>. And yes, its actual work almost certainly succeeded: the bridge, veth and address were all created before the unreadable report, so a node suffering this accumulates wired namespaces and reserved addresses for pods that never started.</p></details></li>
+
+<li>Why does CNI use exec and JSON where CRI needed gRPC and protobuf?
+<details class="reveal"><summary>Answer</summary><p>Because the interaction differs, not the subject. CRI is a long-lived bidirectional conversation — streaming logs, attaching to TTYs, watching for exits, polling status. CNI is a one-shot errand: attach this, report the address. The interface's complexity followed the shape of the interaction, which is the most reusable design lesson in this track.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>You can state the CNI contract in one sentence and demonstrate it in one command, and say why it is
+exec-based where CRI is gRPC-based.</li>
+<li>You have invoked a real plugin by hand with all six parameters, and read a v1.1.0 result field by
+field — including what <code>ips[].interface</code> indexes.</li>
+<li>You can quote the operation count the way the spec words it, and you know which single <em>MUST</em>
+produces pods stuck in <code>Terminating</code> when it is broken.</li>
+<li>You can read an error object's code and decide whether the runtime should retry, fail fast or skip
+teardown — and you know two places the reference plugins do not conform.</li>
+<li>You can say what decides which network a node uses, as two different mechanisms for libcni and for
+containerd, and which renames disable a conflist.</li>
+<li>You have watched <code>prevResult</code> cross the wire, and can explain what a chained plugin does and
+does not receive.</li>
+<li>You have read the reference <code>bridge</code> plugin against your own <code>net-up.sh</code> and
+found both what the contract added and where the reference silently leaks.</li>
+<li>You can diagnose a node with no addresses and nothing running, in one <code>ls</code>, and repair it
+without breaking a live pod.</li>
+<li>You can trace <code>hostPort</code> from a pod spec to the exact <code>iptables</code> line you wrote by
+hand in B9.</li>
+<li>You know who execs the plugin, what "installing a CNI" consists of, and where CNI's responsibility
+stops and a provider's begins.</li>
+<li>You have measured what <code>GC</code> and <code>STATUS</code> actually do on today's plugins, rather
+than what they were designed to do.</li>
+<li>You have written a spec-compliant plugin that containerd drives for a real pod serving real traffic —
+and that fixes three things the reference plugins get wrong.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="b9.html#cp-b9-19">B9.19 — CNI v0.1, in two scripts: the mechanism this
+module gave a calling convention →</a></div>
+
+<nav class="pager"><a href="i8.html">← I8 · CRI</a><a href="../intermediate.html#i10">I10 · Container storage →</a></nav>
+
+<footer>
+<p>Authored against a live run on Ubuntu 24.04 (kernel 6.8.0) on <b>2026-07-30</b>:
+<b>CNI spec 1.1.0</b> (the <code>SPEC.md</code> at libcni tag <b>v1.3.0</b>, 2025-04-07 — the repo's git
+tags are library releases, and the file at tag <code>v1.1.0</code> is an older spec saying "4
+operations"), <b>CNI plugins v1.9.1</b>, <b>libcni and cnitool v1.3.0</b> built from source
+(<code>go install github.com/containernetworking/cni/cnitool@v1.3.0</code>; not packaged for noble),
+<b>containerd 2.3.3</b>, <b>crictl v1.36.0</b>, <b>iproute2 6.1.0</b>, <b>jq 1.7</b>.</p>
+<p>Version-sensitive findings this run produced, all verifiable from
+<code>labs/captures/i9-*.txt</code>: the spec mentions neither <code>/etc/cni/net.d</code>,
+<code>/opt/cni/bin</code> nor lexical ordering — those are containerd's, visible in
+<code>crictl info | jq .config.cni</code> where <code>maxConfNum: 1</code> is what makes filename order
+decisive. libcni resolves by <em>network name</em> among <code>.conflist</code> files only, falling back to
+<code>.conf</code>/<code>.json</code>, so a later-sorting file can win and every <code>.conflist</code>
+outranks every <code>.conf</code>; a <code>.conflist.orig</code> is inert, since matching is on the final
+extension. The <code>bridge</code> plugin rejects unknown <code>CNI_ARGS</code> with code 999, and works
+under Kubernetes only because containerd sends <code>IgnoreUnknown=1</code> (captured verbatim). An
+unusable subnet returns 999 where the spec's own worked example for code 7 is that exact message, and no
+reference error object carries the <code>cniVersion</code> the spec lists first. <code>bridge</code>'s
+<code>DEL</code> reads the address from the namespace, so two of three realistic teardown orders leak the
+masquerade rule while returning 0; the IPAM reservation is released in all three.
+<code>host-local</code>'s reservation files are <b>CRLF</b>, hold container ID and ifname, and allocation
+walks forward without backfilling. <b>Not one of the ten reference plugins registers a GC handler</b>, so
+<code>GC</code> — even with an empty valid-attachments list — reclaims nothing, and
+<code>host-local</code> never returns <code>STATUS</code> code 50 with a full pool; <code>cnitool gc</code>
+passes <code>nil</code>, which tears down every cached attachment including live ones.
+<code>macvlan</code> mints its own MAC where <code>ipvlan</code> shares the parent's byte for byte, and a
+fresh namespace answers <code>ping 127.0.0.1</code> with "Network is unreachable".</p>
+<p>Ships <a href="../labs/intermediate/cni-minibridge">labs/intermediate/cni-minibridge</a> (the plugin
+containerd drove end to end), <a href="../labs/intermediate/i9-dump">i9-dump</a> (a chained plugin that
+reveals <code>prevResult</code>) and
+<a href="../labs/intermediate/i9-reset.sh">i9-reset.sh</a> (CNI state lives in four places and all four
+outlive a failed call).</p>
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
