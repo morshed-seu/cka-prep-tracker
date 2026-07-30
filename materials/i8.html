@@ -1873,17 +1873,18 @@ Python server through a whole pod lifecycle without complaint, you have proved y
 contract rather than merely recognising it.</p>
 
 <h5>The concept</h5>
-<p><code>labs/intermediate/toycri.py</code> is one file that implements enough of
-<code>runtime.v1</code> for <code>crictl</code> to work: the handshake (<code>Version</code>,
-<code>Status</code>), the sandbox calls, the container calls, <code>ExecSync</code>, and a minimal
-<code>ImageService</code>.</p>
+<p>The project is two files, and the split is the point.
+<code>labs/intermediate/toycri.py</code> implements enough of <code>runtime.v1</code> for
+<code>crictl</code> to work — the handshake (<code>Version</code>, <code>Status</code>), the sandbox
+calls, the container calls, <code>ExecSync</code>, and a minimal <code>ImageService</code>.
+<code>labs/intermediate/toybundle.py</code> is everything below the gRPC layer, and
+<strong>none of it is new</strong>.</p>
 
-<p>Nothing under the gRPC layer is new. The bundle is I2's — a <code>config.json</code> and a
-rootfs. The runtime is I3's runc. The rootfs is unpacked from a real image with I4's layer-is-a-tar
-rule and I5's <code>skopeo copy</code>. The namespace-joining is the field you read in I8.5, written
-by your own code. The log records are the format you decoded in I8.13, produced by a
-thirty-line function. The whole server is a translation layer, which is exactly what a real one
-is.</p>
+<p>That second file is I2's bundle (a <code>config.json</code> and a rootfs, generated rather than
+typed), I3's runc, I4's layer-is-a-tar rule with I5's <code>skopeo copy</code> to fetch it, and
+I8.13's log format written by a thirty-line function. Split that way, <code>toycri.py</code> reads as
+nothing but translation — protobuf in, existing machinery out — which is exactly what a real CRI
+server is.</p>
 
 <p>Two things it does <em>not</em> do, both stated in the file rather than hidden. There is no CNI,
 so every sandbox gets an empty network namespace with a dead loopback (B9.1) — I9 is where that gets
@@ -1901,14 +1902,15 @@ rpc Version(VersionRequest) returns (VersionResponse) {}</blockquote>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>Compile the protobufs. The proto has <strong>no imports</strong>, so this is a single command
-with no dependency hunting.
+<li>Compile the protobufs. The proto has <strong>no imports</strong> — it is one
+self-contained file in one package — so this is a single command with no dependency hunting.
+<code>prepare-protos</code> fetches and compiles it for you.
 <pre class="cmd">~/.venv-intermediate/bin/pip install -q grpcio-tools
 cd labs/intermediate
-curl -sSLO https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto
-~/.venv-intermediate/bin/python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. api.proto
+~/.venv-intermediate/bin/python ./toycri.py prepare-protos
 ls api_pb2*.py</pre>
-<pre class="out">api_pb2.py  api_pb2_grpc.py</pre></li>
+<pre class="out">compiled api_pb2.py and api_pb2_grpc.py in /home/ubuntu/labs/intermediate
+api_pb2.py  api_pb2_grpc.py</pre></li>
 
 <li>Build a rootfs from a real image, then start the server.
 <pre class="cmd">sudo ./toycri.py prepare-rootfs docker://docker.io/library/alpine:3.21
@@ -1994,11 +1996,13 @@ code that makes the pod's containers share a network namespace.</p>
 <li><strong>A detached container inherits your process's stdout, so
 <code>subprocess.run(capture_output=True)</code> on <code>runc create</code> hangs forever.</strong>
 It waits for an EOF that arrives only when the container dies. This is the same trap that makes
-<code>multipass exec</code> hang, and it is why <code>runc_spawn()</code> redirects to a file. It is
+<code>multipass exec</code> hang, and it is why <code>toybundle.runc_spawn()</code> redirects
+to a file. It is
 also why a real shim <em>owns</em> the container's stdio rather than borrowing its parent's.</li>
 <li><strong>An <code>rm -rf</code> of a bundle whose rootfs is still bind-mounted deletes the shared
 source.</strong> A bind mount is the same inodes under a second name (B5.11), so
-<code>shutil.rmtree</code> walks straight through it. The fix in <code>_cleanup_bundle()</code> is
+<code>shutil.rmtree</code> walks straight through it. The fix in
+<code>toybundle._cleanup_bundle()</code> is
 to unmount, <em>verify</em> with <code>os.path.ismount</code>, and refuse to recurse otherwise —
 plus a read-only bind, which turns the accident into an error instead of a data loss. This comment
 exists because it happened.</li>

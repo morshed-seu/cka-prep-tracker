@@ -1,10 +1,15 @@
-# captured 2026-07-30T08:19:32Z on sandbox
+# captured 2026-07-30T08:46:43Z on sandbox
 # --- snippet ---
 # cd ~/i8
+# sudo pkill -f "[t]oycri.py"; sleep 1
+# for m in $(mount | grep -o "/var/lib/toycri/[^ ]*rootfs"); do sudo umount -l "$m" 2>/dev/null; done
+# sudo rm -rf /var/lib/toycri /run/toycri; sleep 1
+# sudo ~/.venv-intermediate/bin/python ~/i8/toycri.py prepare-rootfs docker://docker.io/library/alpine:3.21 2>&1 | tail -1
 # sudo setsid ~/.venv-intermediate/bin/python ~/i8/toycri.py serve > ~/i8/toycri.log 2>&1 < /dev/null &
-# sleep 3
+# sleep 3; cat ~/i8/toycri.log
 # E="--runtime-endpoint unix:///run/toycri.sock --image-endpoint unix:///run/toycri.sock"
 # sudo rm -f /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log
+# echo
 # echo "### crictl cannot tell it is not talking to containerd"
 # sudo crictl $E version
 # echo
@@ -34,8 +39,9 @@
 # echo "--- the field that does it, in the config.json toycri generated:"
 # sudo jq -c ".linux.namespaces" /var/lib/toycri/containers/$C/config.json
 # echo
-# echo "### 7. ExecSync really execs"
-# sudo crictl $E exec -s "$C" sh -c "hostname; ip -o addr show; echo rc-test"
+# echo "### 7. ExecSync really execs; streaming Exec is honestly unimplemented"
+# sudo crictl $E exec -s "$C" sh -c "hostname; ip -o addr show"
+# sudo timeout 15 crictl $E exec "$C" true 2>&1 | grep -o "code = [A-Za-z]* desc = [^\"]*" | head -1
 # echo
 # echo "### 8. teardown, in the order the proto requires"
 # sudo crictl $E stop "$C" >/dev/null; sudo crictl $E rm "$C" >/dev/null
@@ -45,6 +51,9 @@
 # sudo runc --root /run/toycri/runc list
 # ls /var/lib/toycri/rootfs | tr "\n" " "; echo
 # --- output ---
+rootfs ready at /var/lib/toycri/rootfs (17 files)
+toycri listening on unix:///run/toycri.sock  (crictl --runtime-endpoint unix:///run/toycri.sock)
+
 ### crictl cannot tell it is not talking to containerd
 Version:  0.1.0
 RuntimeName:  toycri
@@ -52,38 +61,38 @@ RuntimeVersion:  0.1.0
 RuntimeApiVersion:  v1
 
 ### 1. RunPodSandbox   2. CreateContainer   3. StartContainer
-  pod=7acbf9d7798c486aa2a07f2d40bbbbe3bdd4da6152ce4d668ab624e01e24abe4
-  ctr=cad359920e444ce2b72009cb74a3b8cb179883ef59d14bf6a73187d33da92a1b
+  pod=5a7234187d3447a29b3defcfecdcde8da157f72f10e4478e994bae701ada596f
+  ctr=df545e4821f140fa8ac08f3ed70ce336fa9438e3f53249f18abe80552fb24d17
   started
 
 ### 4. ListPodSandbox / ListContainers
 POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
-7acbf9d7798c4       1 second ago        Ready               demo                i8                  0                   toycri
+5a7234187d344       1 second ago        Ready               demo                i8                  0                   toycri
 CONTAINER           IMAGE                           CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
-cad359920e444       docker.io/library/alpine:3.21   1 second ago        Running             app                 0                   7acbf9d7798c4       unknown             unknown
+df545e4821f14       docker.io/library/alpine:3.21   1 second ago        Running             app                 0                   5a7234187d344       unknown             unknown
 
 ### 5. the log toycri wrote, in the CRI format I8.13 decodes
-2026-07-30T14:19:35.632283998+06:00 stdout F hello from inside the pod
+2026-07-30T14:46:58.165757579+06:00 stdout F hello from inside the pod
 --- crictl logs reading it back:
 hello from inside the pod
 
 ### 6. pause, and the app container joined to its namespaces
-  ns       pause=91429            app=91468             
+  ns       pause=96997            app=97035             
   net      net:[4026532349]       net:[4026532349]       SHARED
   ipc      ipc:[4026532347]       ipc:[4026532347]       SHARED
   uts      uts:[4026532346]       uts:[4026532346]       SHARED
   pid      pid:[4026532348]       pid:[4026532348]       SHARED
   mnt      mnt:[4026532345]       mnt:[4026532405]       private
 --- the field that does it, in the config.json toycri generated:
-[{"type":"ipc","path":"/proc/91429/ns/ipc"},{"type":"uts","path":"/proc/91429/ns/uts"},{"type":"network","path":"/proc/91429/ns/net"},{"type":"mount"},{"type":"pid","path":"/proc/91429/ns/pid"}]
+[{"type":"ipc","path":"/proc/96997/ns/ipc"},{"type":"uts","path":"/proc/96997/ns/uts"},{"type":"network","path":"/proc/96997/ns/net"},{"type":"mount"},{"type":"pid","path":"/proc/96997/ns/pid"}]
 
-### 7. ExecSync really execs
+### 7. ExecSync really execs; streaming Exec is honestly unimplemented
 demo
 1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
 1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
-rc-test
 
 
+code = Unimplemented desc = Method not implemented!
 
 ### 8. teardown, in the order the proto requires
 POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
