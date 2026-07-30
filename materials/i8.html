@@ -960,6 +960,334 @@ two paths every one of these failures involves.</p>
 </article>
 </div><!-- /g-the-sandbox-model -->
 
+<!-- ---------------- The call sequence ---------------- --><div class="grp" id="g-the-call-sequence"><h3>The call sequence</h3>
+<article class="lesson" id="cp-i8-8" data-id="i8-8">
+<div class="lesson-head"><span class="cp-id">I8.8</span><h4>Four verbs: pull, runp, create, start</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>One pod becomes four calls, always in the same order. Memorising them is not trivia — it is a
+diagnostic tool. Each call has a different set of things that can go wrong, so knowing which call
+failed tells you which third of the problem space to search, before you have read a single log line.</p>
+
+<h5>The concept</h5>
+<p>The sequence is <code>PullImage</code> → <code>RunPodSandbox</code> → <code>CreateContainer</code>
+→ <code>StartContainer</code>, followed by <code>ListContainers</code> and
+<code>ContainerStatus</code> polling for as long as the pod lives.</p>
+
+<p>But it is not a script. The kubelet is a reconciler — B13's loop, and
+<a href="w1.html#cp-1-19">W1.19</a>'s <code>syncLoop</code> — that compares the pod spec it has been
+given against what the runtime reports and issues whichever calls close the gap. That is why the
+same sequence handles a container that crashed (create and start it again), a sandbox that
+disappeared (make a new one, and accept a new IP), and a pod that has not changed at all (issue
+nothing). The order is a consequence of dependencies, not of a program counter.</p>
+
+<p>The dependency chain reads as a fault-isolation table:</p>
+
+<table class="langpair">
+<thead><tr><th>What exists</th><th>What failed</th><th>Where to look</th></tr></thead>
+<tbody>
+<tr><td>nothing at all</td><td><code>RunPodSandbox</code></td><td>CNI, or the sandbox image (I8.7,
+I8.4)</td></tr>
+<tr><td>a sandbox, no container</td><td><code>PullImage</code> or <code>CreateContainer</code></td>
+<td>registry and credentials (I5), or the container config</td></tr>
+<tr><td>a container that exits immediately</td><td>nothing in CRI</td><td>the workload — read its
+exit code and its logs</td></tr>
+</tbody>
+</table>
+
+<p>Two details of the calls themselves are worth noticing while you make them. First,
+<code>CreateContainer</code> takes <em>both</em> the container config and the sandbox config — the
+runtime needs the pod's DNS, log directory and cgroup parent to build the container correctly, and
+CRI is stateless enough that it asks for them again rather than remembering. Second, create and
+start are separate calls for exactly the reason <a href="i2.html#cp-i2-11">I2.11</a> gave for runc:
+everything expensive and fallible happens in create, so start is a fast, near-certain operation, and
+a supervisor can prepare many containers and release them together.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Drive one pod, start to finish, in the kubelet's order.
+<pre class="cmd">sudo crictl pull docker.io/library/alpine:3.21
+POD=$(sudo crictl -t 60s runp sandbox.json)
+CTR=$(sudo crictl create "$POD" container.json sandbox.json)
+sudo crictl start "$CTR"</pre>
+<pre class="out">Image is up to date for sha256:2607caa9805847fac4de202017bb1b830deb09f4c07dc9964a0157abbc604577
+<b>d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e</b>
+<b>7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19</b>
+7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19</pre></li>
+
+<li>Confirm the result through both list calls, then read what the workload printed.
+<pre class="cmd">sudo crictl pods
+sudo crictl ps
+sudo crictl logs "$CTR"</pre>
+<pre class="out">POD ID          CREATED                  STATE   NAME   NAMESPACE   ATTEMPT   RUNTIME
+d703566d914ca   Less than a second ago   <b>Ready</b>   demo   i8          0         (default)
+
+CONTAINER       IMAGE                           CREATED   STATE     NAME   ATTEMPT   POD ID          POD       NAMESPACE
+7eb9180e012e9   docker.io/library/alpine:3.21   …         <b>Running</b>   app    0         d703566d914ca   unknown   unknown
+
+<b>hello from inside the pod</b></pre>
+<p>The <code>POD</code> and <code>NAMESPACE</code> columns say <code>unknown</code>, and that is not
+a bug — see I8.12. Nothing in CRI's structure carries the pod's name down to the container; the
+kubelet puts it in labels, and this hand-written config has none.</p></li>
+
+<li>Prove that create needs the sandbox config too, by leaving it out.
+<pre class="cmd">sudo crictl create "$POD" container.json</pre>
+<pre class="out">NAME:
+   crictl create - Create a new container
+
+USAGE:
+   crictl create [command options] POD <b>container-config</b>.[json|yaml] <b>pod-config</b>.[json|yaml]</pre>
+<p>crictl requires it because <code>CreateContainerRequest</code> requires it: the message carries
+<code>config</code>, <code>sandbox_config</code> and <code>pod_sandbox_id</code>, all three.</p></li>
+
+<li>Watch the fault-isolation table work. Ask for a container whose image is not present and has no
+registry behind it.
+<pre class="cmd">sudo crictl create "$POD" bad-image.json sandbox.json</pre>
+<pre class="out">E0730 14:34:50 remote_runtime.go:410] "CreateContainer in sandbox from runtime service failed"
+  err="rpc error: code = <b>NotFound</b> desc = failed to check if this is a checkpoint image:
+  <b>failed to resolve image \"docker.io/library/nosuchimage:1\": not found</b>"</pre>
+<pre class="cmd">sudo crictl pods; sudo crictl ps -a</pre>
+<pre class="out">POD ID          CREATED                  STATE   NAME   NAMESPACE   ATTEMPT   RUNTIME
+13992e70a48de   Less than a second ago   <b>Ready</b>   demo   i8          0         (default)
+CONTAINER   IMAGE   CREATED   STATE   NAME   ATTEMPT   POD ID   POD   NAMESPACE</pre>
+<p>A sandbox exists; no container does. That is row two of the table, and it points at the
+ImageService — not at the workload, not at the network. (The odd "failed to check if this is a
+checkpoint image" prefix is containerd testing the reference against the checkpoint-restore path
+<a href="i3.html#cp-i3-12">I3.12</a> described, before treating it as an ordinary image.)</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can recite the four verbs from memory, and given "the pod has an IP but no container" or "the
+pod has no IP at all", you can name the failed call before looking at anything.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The sequence is a fixpoint, not a script.</strong> The kubelet reissues whichever calls
+close the gap, so a crash-looping container is this sequence running its last two steps over and
+over. Do not expect to see it start at the top each time.</li>
+<li><strong>A new sandbox means a new IP.</strong> Container restarts preserve the pod IP; sandbox
+recreation does not. If you are chasing "the IP changed but the pod was never rescheduled", the
+sandbox was replaced.</li>
+<li><strong><code>crictl create</code> does not pull.</strong> The kubelet pulls first as a separate
+call; crictl expects the image to be present and fails with <code>NotFound</code> otherwise. That
+asymmetry surprises people driving CRI by hand.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The loop that issues these calls is <a href="w1.html#cp-1-19">W1.19 — the kubelet's syncLoop and
+its three pod sources</a>; the reconciler pattern behind it is
+<a href="b13.html#cp-b13-12">B13.12 — the reconciliation loop</a>. The create/start split is the
+same one runc makes, <a href="i2.html#cp-i2-11">I2.11 — why create and start are two
+operations</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>pod lifecycle</em> and read the
+container-states section — <code>Waiting</code>, <code>Running</code>, <code>Terminated</code> are
+the API's summary of what <code>ContainerStatus</code> returns here.</p>
+</article>
+<article class="lesson" id="cp-i8-9" data-id="i8-9">
+<div class="lesson-head"><span class="cp-id">I8.9</span><h4>ExecSync and Exec: two paths, and the one that leaves gRPC</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>kubectl exec</code> can fail with an error naming a host and port that appear nowhere in
+your kubeconfig. Liveness probes can wedge a node's runtime. Both are explained by one design
+decision: <strong>interactive exec does not travel over the kubelet's gRPC connection at all.</strong></p>
+
+<h5>The concept</h5>
+<p>gRPC is a poor fit for an interactive terminal. A terminal session is long-lived, bidirectional,
+and carries out-of-band events like window resizes; gRPC streams can do it, but badly, and the
+kubelet would become a proxy for every byte. So CRI splits the problem in two.</p>
+
+<p><strong><code>ExecSync</code></strong> is the simple case: run a command, wait, return stdout,
+stderr and the exit code in one response. This is the <em>probe</em> path — every
+<code>exec</code> liveness and readiness probe in your cluster is an <code>ExecSync</code> call. It
+is synchronous by definition, which is why a heavyweight probe with a generous timeout can occupy
+runtime resources and, at scale, make a node sluggish in a way that names no workload.</p>
+
+<p><strong><code>Exec</code></strong> is the streaming case, and it does something unusual: it does
+not stream. It <em>returns a URL</em>. The runtime hosts a small HTTP server — the streaming server
+— generates a single-use URL for this exec session, and returns it. The API server is then
+redirected to that URL and the terminal traffic flows directly between them. <code>Attach</code> and
+<code>PortForward</code> work the same way.</p>
+
+<p>Two consequences follow. First, the streaming endpoint is a separate network path with separate
+reachability and authentication concerns from the rest of the API — which is why
+<code>kubectl exec</code> can fail while everything else works, with an error naming an address you
+have never configured. Second, <code>PortForward</code> is a tunnel into the <em>sandbox's network
+namespace</em>: it works for a pod with no Service at all, and it therefore tells you exactly nothing
+about whether Service routing is healthy.</p>
+
+<div class="specref">
+<p>The two calls, one line apart in the proto, and the word that distinguishes them:</p>
+<blockquote>// ExecSync runs a command in a container synchronously.<br>
+rpc ExecSync(ExecSyncRequest) returns (ExecSyncResponse) {}<br>
+// Exec <b>prepares a streaming endpoint</b> to execute a command in the container.<br>
+rpc Exec(ExecRequest) returns (ExecResponse) {}</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run the probe path, and notice how a non-zero exit is reported.
+<pre class="cmd">sudo crictl exec -s "$CTR" sh -c 'echo probe ok; exit 0'
+sudo crictl exec -s "$CTR" sh -c 'exit 7'</pre>
+<pre class="out">probe ok
+time="..." level=fatal msg="execing command in container 7eb9180e…:
+  <b>command terminated with exit code 7</b>"</pre>
+<p><code>-s</code> is crictl's flag for <code>ExecSync</code>. Without it, crictl uses the streaming
+path — which is the opposite of what most people assume.</p></li>
+
+<li>Find the streaming server. It is listening right now, on loopback, with a port nobody
+configured.
+<pre class="cmd">sudo ss -ltnp | awk 'NR==1||/containerd/'</pre>
+<pre class="out">State  Recv-Q Send-Q Local Address:Port  Peer Address:Port  Process
+LISTEN 0      4096       <b>127.0.0.1:44303</b>      0.0.0.0:*          users:(("containerd",pid=56260,fd=19))</pre></li>
+
+<li>Confirm it is an HTTP server, not another gRPC listener.
+<pre class="cmd">curl -s -i http://127.0.0.1:44303/ | head -4</pre>
+<pre class="out"><b>HTTP/1.1 404 Not Found</b>
+Date: Thu, 30 Jul 2026 08:02:15 GMT
+Content-Length: 19
+Content-Type: text/plain; charset=utf-8</pre>
+<p>A plain HTTP 404. The URLs it serves are single-use session tokens, so a made-up path gets the
+same answer.</p></li>
+
+<li>Watch the split happen. Run an exec each way and look at the connections to that port while it
+is live.
+<pre class="cmd">sudo crictl exec "$CTR" sleep 4 &amp;      # default: streaming Exec
+sleep 2; sudo ss -tn '( sport = :44303 or dport = :44303 )' | tail -n +2
+
+sudo crictl exec -s "$CTR" sleep 4 &amp;   # ExecSync
+sleep 2; sudo ss -tn '( sport = :44303 or dport = :44303 )' | tail -n +2</pre>
+<pre class="out">ESTAB 0      0          127.0.0.1:45252    <b>127.0.0.1:44303</b>
+ESTAB 0      0          <b>127.0.0.1:44303</b>    127.0.0.1:45252
+
+</pre>
+<p>The streaming exec opens a TCP connection to the streaming server. <code>ExecSync</code> touches
+it not at all — the whole call fits in one gRPC round trip over the unix socket.</p></li>
+
+<li>Confirm that an exec-ed process really is a sibling of the workload, in the same namespaces —
+not a proxy, not a copy.
+<pre class="cmd">sudo crictl exec -s "$CTR" sh -c 'readlink /proc/self/ns/net; readlink /proc/self/ns/mnt'
+echo "workload: $(sudo readlink /proc/$AP/ns/net) $(sudo readlink /proc/$AP/ns/mnt)"</pre>
+<pre class="out">net:[4026532285]
+mnt:[4026532347]
+workload: <b>net:[4026532285]  mnt:[4026532347]</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can say which of the two calls a liveness probe uses, demonstrate that the other one opens a
+second connection, and explain why <code>kubectl exec</code> has firewall requirements that
+<code>kubectl get</code> does not.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>crictl's default exec is the streaming one; <code>-s</code> is the probe path.</strong>
+If you are trying to reproduce probe behaviour, use <code>-s</code>, or you are testing a different
+code path from the one that is failing.</li>
+<li><strong>Exec output never appears in the container's logs.</strong> The log file is fd 1 and 2
+of the container's <em>init</em> process only. Anything you run with exec writes to your terminal
+and nowhere else — which also means a debugging command you ran will not be in the log a colleague
+reads later.</li>
+<li><strong>An <code>exec</code> probe is a real process creation, every period, for every
+replica.</strong> A 1-second period across a few hundred pods is a measurable load on the runtime,
+and the symptom is a slow node with no single guilty workload.</li>
+<li><strong><code>PortForward</code> proves nothing about Services.</strong> It tunnels into the
+sandbox netns directly. If port-forward works and the Service does not, the pod is fine and the
+problem is entirely in Service routing.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The exec path is where <a href="w7.html#cp-7-1">W7</a>'s authentication story gets its awkward
+special case, and <a href="w6.html#cp-6-3">W6.3 — kubectl debug: ephemeral containers</a> is the
+tool that exists because exec cannot help you in a container with no shell. The socket-level view of
+a streaming connection is <a href="b9.html#cp-b9-17">B9.17 — unix domain sockets</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>liveness readiness probes</em> —
+the exec-probe section is <code>ExecSync</code> — and for <em>port forward</em> to see the tunnel
+described from the user's side.</p>
+</article>
+<article class="lesson" id="cp-i8-10" data-id="i8-10">
+<div class="lesson-head"><span class="cp-id">I8.10</span><h4>TODO headline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<!-- CHECKPOINT: the two calls that make a pod useful from outside — Attach and PortForward (both streaming, both URL-based like exec) — and the one behind in-place pod resize: UpdateContainerResources. Change a running container's limits with crictl update and read the cgroup file before and after to prove it took effect.
+     UNDER THE HOOD: In-place pod resize went GA in Kubernetes v1.35, the version this track targets, and this call is the whole mechanism: the kubelet writes new values into the container's cgroup v2 files, which is precisely B7's lab, done by an API. That is why growing a memory limit takes effect immediately and shrinking one may not (the pages are already charged), and why CPU changes are smooth while memory changes can meet an OOM kill. PortForward is worth one honest sentence too: it is a tunnel to the sandbox's network namespace, which is why it works for a pod with no Service and tells you nothing about whether Service routing is healthy. -->
+
+<h5>Why it matters</h5>
+<p>TODO plain-English hook.</p>
+
+<h5>The concept</h5>
+<p>TODO. Absorb and expand the "under the hood" note above.</p>
+
+<div class="specref">
+<p>TODO what the spec actually says.</p>
+<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
+<cite>TODO spec, version — <a href="TODO">file</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
+<pre class="cmd">TODO</pre>
+<pre class="out">TODO captured output</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>TODO what the reader can now do.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>TODO.</strong></li>
+</ul>
+
+<div class="k8s-link">
+<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> TODO.</p>
+</article>
+<article class="lesson" id="cp-i8-11" data-id="i8-11">
+<div class="lesson-head"><span class="cp-id">I8.11</span><h4>TODO headline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<!-- CHECKPOINT: the pod down in the correct order and then in the wrong one: crictl stop and rm the containers, then crictl stopp and rmp the sandbox. Try removing the sandbox first and read what happens. The rule to keep: the sandbox is created first and destroyed last.
+     UNDER THE HOOD: Deletion runs the creation sequence in reverse for a reason: the sandbox owns the network namespace, so tearing it down first would strand containers with a namespace that is going away, and the CNI DEL — which must run to release the pod's IP — is bound to sandbox teardown. Get this wrong and you leak IPAM reservations, which is I9's third fault and a real node-level outage mode: a node that refuses new pods because a subnet full of addresses is held by pods that no longer exist. It is also why a terminating pod's grace period is spent on containers, with the sandbox removed only afterwards. -->
+
+<h5>Why it matters</h5>
+<p>TODO plain-English hook.</p>
+
+<h5>The concept</h5>
+<p>TODO. Absorb and expand the "under the hood" note above.</p>
+
+<div class="specref">
+<p>TODO what the spec actually says.</p>
+<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
+<cite>TODO spec, version — <a href="TODO">file</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
+<pre class="cmd">TODO</pre>
+<pre class="out">TODO captured output</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>TODO what the reader can now do.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>TODO.</strong></li>
+</ul>
+
+<div class="k8s-link">
+<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> TODO.</p>
+</article>
+</div><!-- /g-the-call-sequence -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
