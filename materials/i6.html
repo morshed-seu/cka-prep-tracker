@@ -1205,6 +1205,209 @@ Completed pull from OCI Registry (127.0.0.1:5000/i6/hand:v1)	elapsed: 0.1 s	tota
 </article>
 </div><!-- /g-building-without-docker -->
 
+<!-- ---------------- Reading images others built ---------------- --><div class="grp" id="g-reading-images-others-bu"><h3>Reading images others built</h3>
+<article class="lesson" id="cp-i6-10" data-id="i6-10">
+<div class="lesson-head"><span class="cp-id">I6.10</span><h4>Reading someone else's build: attributing bytes to instructions</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Most images you deal with, you did not build. When one of them is 400 MB and slowing every rollout, "it's a big image" is not actionable — <em>"57% of it is one <code>apt-get install</code> in the base image's Dockerfile"</em> is. This checkpoint turns <code>history</code> into that answer, using nothing but <code>skopeo</code> and <code>jq</code> against a registry, with no pull at all. It is also where you learn precisely how much to trust what you read.</p>
+
+<h5>The concept</h5>
+<p>You already know the two fields. The manifest's <code>layers</code> array holds each layer's compressed size, in order. The config's <code>history</code> array holds one entry per build step, in order, each with <code>created</code>, <code>created_by</code> and possibly <code>empty_layer</code>. And from <a href="#cp-i6-1">I6.1</a>, the non-empty history entries correspond one-to-one, in order, with the layers.</p>
+<p>So the join is mechanical: <strong>filter <code>history</code> to the entries without <code>empty_layer</code>, zip that list against <code>layers</code> by position, and you have bytes attributed to build steps.</strong> Sort descending and the first line usually explains the whole image. That is the entire technique, it is about six lines of <code>jq</code>, and it works on any image in any registry because both documents are just JSON you can fetch.</p>
+<p>Two caveats, and they are not footnotes — they are the reason this is a starting point for investigation rather than an answer.</p>
+<p>First, <strong><code>created_by</code> is free-form text written by whichever tool produced the image.</strong> Not a specification, not validated, not necessarily a Dockerfile instruction at all. The lab makes this vivid: one of <code>python:3.13</code>'s seven layers reports <code>created_by</code> of <code>#&nbsp;debian.sh --arch 'amd64' out/ 'trixie' '@1783900800'</code>, which is Debian's own rootfs build script and nothing to do with any Dockerfile. Meanwhile <a href="#cp-i6-9">I6.9</a>'s hand-built image happily claims it was created by "tar, jq and sha256sum", because nothing stops it. Treat <code>created_by</code> as a strong hint from a cooperative producer, never as evidence.</p>
+<p>Second, <strong>history can be absent or useless.</strong> It is an OPTIONAL field. A squashed image, a hand-assembled one, or anything from a builder that does not bother has no usable trail — and, as <a href="#cp-i6-5">I6.5</a> showed, a multi-stage build legitimately erases the build stage from the record, so the best-built images often have the thinnest history. Both facts are why SBOMs and provenance attestations exist: they are the same idea done deliberately, signed, and with a schema, instead of inferred from a text field.</p>
+<p>There is a third thing worth knowing, and it is the reason this works without a pull. Manifests and configs are small — hundreds of bytes to a few kilobytes — while layers are hundreds of megabytes. Fetching the two documents costs essentially nothing, and from <a href="i5.html#cp-i5-3">I5.3</a> you know that resolving and reading a manifest does not move a rate-limit counter the way pulling does. You can audit an image far more cheaply than you can download it.</p>
+
+<div class="specref">
+<p>Everything this technique relies on is normative, and so is its central weakness. The ordering guarantees are firm; the content of <code>created_by</code> is described in six words and constrained by nothing.</p>
+<blockquote><strong>history</strong> <em>array of objects</em>, OPTIONAL<br><br>Describes the history of each layer.<br>The array is ordered from first to last.<br><br>- <strong>created_by</strong> <em>string</em>, OPTIONAL<br>&nbsp;&nbsp;The command which created the layer.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md#properties">config.md § Properties</a></cite>
+<p>Note that <code>history</code> is OPTIONAL and its ordering is guaranteed, while <code>created_by</code> is OPTIONAL and its <em>content</em> is unconstrained. That asymmetry is exactly what makes the positional join reliable and the attribution advisory.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Pick a genuinely large public image and resolve it to a single platform without pulling anything. <code>skopeo inspect --raw</code> fetches the index; you select the entry yourself, exactly as in <a href="i4.html#cp-i4-8">I4.8</a>.
+<pre class="cmd">cd ~
+skopeo inspect --raw docker://docker.io/library/python:3.13 &gt; idx.json
+D=$(jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' idx.json | head -1)
+echo "  amd64 manifest: $D"
+skopeo inspect --raw docker://docker.io/library/python@$D &gt; man.json
+jq -r '"  layers: \(.layers|length), total \([.layers[].size]|add) bytes"' man.json</pre>
+<pre class="out">  amd64 manifest: sha256:62ce035b689c9ca811b8c06d1268330ead68fdd922b2fe021aac3812d6a7475e
+  layers: <b>7</b>, total <b>412660988</b> bytes</pre>
+<p>412 MB, and so far you have downloaded two small JSON documents.</p></li>
+
+<li>Fetch the config, then check <a href="#cp-i6-1">I6.1</a>'s arithmetic on someone else's image before relying on it. If the numbers do not line up, the join below is meaningless.
+<pre class="cmd">skopeo inspect --config docker://docker.io/library/python@$D &gt; cfg.json
+jq -r '"history: \(.history|length), empty_layer: \([.history[]|select(.empty_layer==true)]|length), layers: \(.rootfs.diff_ids|length)"' cfg.json</pre>
+<pre class="out">history: <b>12</b>, empty_layer: <b>5</b>, layers: <b>7</b></pre>
+<p>12 − 5 = 7. The correspondence holds, so position <em>n</em> of the filtered history really does describe layer <em>n</em>.</p></li>
+
+<li>Write the join as a <code>jq</code> program. Keeping it in a file avoids fighting your shell over <code>$</code>, which is worth doing once so you can reuse this on any image.
+<pre class="cmd">cat &gt; audit.jq &lt;&lt;'JQ'
+[ range(0; ($sizes[0]|length))
+  | { size: $sizes[0][.], by: ($hist[0][.] // "(no history entry)") } ]
+| sort_by(-.size)
+| .[]
+| "\(.size)  \(.by[0:88])"
+JQ
+jq -r '[.layers[].size]' man.json &gt; sizes.json
+jq -r '[.history[] | select(.empty_layer != true) | .created_by]' cfg.json &gt; hist.json
+jq -nr --slurpfile sizes sizes.json --slurpfile hist hist.json -f audit.jq</pre>
+<pre class="out"><b>236258363</b>  RUN /bin/sh -c set -ex; 	apt-get update; 	apt-get install -y --no-install-recommends 		a
+67792989  RUN /bin/sh -c set -eux; 	apt-get update; 	apt-get install -y --no-install-recommends
+<b>49312572</b>  <b># debian.sh --arch 'amd64' out/ 'trixie' '@1783900800'</b>
+27573123  RUN /bin/sh -c set -eux; 		wget -O python.tar.xz "https://www.python.org/ftp/python/${PY
+25638468  RUN /bin/sh -c set -eux; 	apt-get update; 	apt-get install -y --no-install-recommends
+6085223  RUN /bin/sh -c set -eux; 	apt-get update; 	apt-get install -y --no-install-recommends
+250  RUN /bin/sh -c set -eux; 	for src in idle3 pip3 pydoc3 python3 python3-config; do 		dst=</pre>
+<p>There is the answer, in one line: <b>236,258,363 bytes — 57% of the image — is a single <code>apt-get install</code></b>, the build-dependencies layer that <code>python</code>'s Dockerfile installs so that packages with C extensions can compile. Now you know what to do about it: that layer is why the <code>-slim</code> variant exists, and why a multi-stage build that compiles against <code>python:3.13</code> and runs on <code>python:3.13-slim</code> is the standard fix.</p></li>
+
+<li>Now look at the third line again, because it is the caveat made concrete.
+<pre class="cmd">jq -r '.history[] | select(.empty_layer != true) | .created_by' cfg.json | sed -n '1p'</pre>
+<pre class="out"># debian.sh --arch 'amd64' out/ 'trixie' '@1783900800'</pre>
+<p>That is not a Dockerfile instruction. It is Debian's rootfs build script, recorded by whatever assembled the <code>debian:trixie</code> base image — a 49 MB layer whose <code>created_by</code> tells you the tool and the suite and nothing about any container build. <code>created_by</code> is a string a producer chose. Read it as testimony, not as a record.</p></li>
+
+<li>Finally, use the friendly tool on an image you have locally, so you know what it is doing when you reach for it in a hurry. It is the same two fields, formatted.
+<pre class="cmd">sudo nerdctl image history --human=false i6/ms:single 2&gt;/dev/null | head -6</pre>
+<p>When it is available it is quicker than the <code>jq</code>; when it is not — a remote image, a registry you can only <code>curl</code>, a CI container with no runtime — the <code>jq</code> above still works, which is why it is worth having written it once.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given any image reference in any registry, you can name the layer responsible for most of its size and the build step that produced it, without pulling the image. You can check the history/layer correspondence before trusting it, and you can state two distinct reasons the attribution might be wrong.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>created_by</code> is unvalidated free-form text, and <a href="#cp-i6-9">I6.9</a> proved you can write anything in it.</strong> An image whose history claims a clean build from a trusted base is making a claim, not providing evidence. For evidence you want signatures and provenance attestations, which is a different mechanism with a schema and a key.</li>
+<li><strong>No history, or useless history, is legal and common.</strong> Squashed images, hand-built images and multi-stage builds all produce thin or absent trails — and per <a href="#cp-i6-5">I6.5</a> the erasure is the feature. If <code>history</code> is empty you have layer sizes and nothing else, and the next step is to unpack the biggest layer and look, as <a href="#cp-i6-11">I6.11</a> does.</li>
+<li><strong>Compare compressed with compressed.</strong> The manifest's <code>size</code> is the compressed blob, which is what a pull costs; a tool's <code>SIZE</code> column is usually the unpacked total, which is what the node's disk costs. Both matter, they differ by a lot, and mixing them makes the arithmetic stop adding up — as it did between the two columns in <a href="#cp-i6-4">I6.4</a>.</li>
+<li><strong>The positional join breaks silently if the correspondence does not hold.</strong> A malformed or exotic image can have more layers than non-empty history entries; the <code>// "(no history entry)"</code> fallback exists so you notice rather than mis-attribute. Always run step 2 first.</li>
+<li><strong>Auditing is cheap, pulling is not — and only one of them costs you rate limit.</strong> Two small JSON fetches per image means you can sweep a whole registry's worth of images from a laptop. Per <a href="i5.html#cp-i5-6">I5.6</a>, be aware which requests count against you before you loop over a thousand tags.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the tool for the recurring cluster question "why is this rollout slow", and it works on images you cannot rebuild. Image size is pull time, pull time is pod startup, and one fat layer in a shared base image multiplies across every workload that inherits it — so finding it once fixes many things. It also makes <a href="w6.html#cp-6-17">W6.17</a>'s image failures much less mysterious: an image whose largest layer is 236 MB will time out its pull on a slow node or a throttled registry long before a small one does. And the trust caveat is the reason <a href="w3.html#cp-3-6">W3.6</a>'s digest pinning matters more than any inspection you can do: what you audit and what the cluster runs are only the same artefact if the reference cannot move.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>config.md § Properties</code> for <code>history</code>, <code>created_by</code> and <code>empty_layer</code> — note which are OPTIONAL. <code>skopeo inspect --help</code> for <code>--raw</code> versus <code>--config</code>, a distinction that maps exactly onto manifest versus config. On the Kubernetes side, search for <em>"images"</em> for the pull mechanics your findings will feed into.</p>
+</article>
+<article class="lesson" id="cp-i6-11" data-id="i6-11">
+<div class="lesson-head"><span class="cp-id">I6.11</span><h4>Finding a secret somebody believed they had deleted</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everything in this module now converges on one exercise. You are going to build an image the way a competent, careful engineer builds one when they need a deploy key during the build — copy it in, use it, delete it, verify it is gone — and then recover that key from the published image with two commands. Not to be clever: because the fix for this class of mistake depends entirely on understanding that it is not a mistake in the deletion, and the only way to believe that is to do it.</p>
+
+<h5>The concept</h5>
+<p>There is no new mechanism here. <a href="#cp-i6-4">I6.4</a> established that a later layer cannot remove bytes from an earlier one; it can only add a whiteout. <a href="i4.html#cp-i4-1">I4.1</a> established that layers are content-addressed and therefore immutable. <a href="i5.html#cp-i5-2">I5.2</a> established that a blob URL is fetchable by anyone permitted to pull the repository. Put those three together and the conclusion is unavoidable: <strong>a file written in one build step and deleted in a later one is in the published image, readable by anyone who can pull it.</strong></p>
+<p>What makes it worth its own checkpoint is how little the attack needs. Not root, not an exploit, not a running container, not even a full pull — <code>curl</code> for one blob and <code>tar</code> to list it. The verification the author performed was real and honest: <code>ls</code> says the file is gone, <code>find /</code> returns nothing, because the overlay filesystem is faithfully applying the whiteout exactly as <a href="b5.html#cp-b5-15">B5.15</a> taught. The runtime view is correct. The runtime view is not the artefact.</p>
+<p>And there are two independent leak channels, which matters because they need different defences and different searches:</p>
+<ul>
+<li><strong>Layer contents</strong> — a file that was in the tree when a step's snapshot was taken. Found by unpacking layer tars. Defended against by never letting the bytes into a sealed layer: a secret mount (<a href="#cp-i6-6">I6.6</a>), or a discarded stage (<a href="#cp-i6-5">I6.5</a>).</li>
+<li><strong>Config metadata</strong> — a build arg or an <code>ENV</code>, sitting in <code>history</code>. Found by reading one small JSON document, as in <a href="#cp-i6-6">I6.6</a>. Invisible to any scanner that only unpacks layers, because the filesystem genuinely contains nothing.</li>
+</ul>
+<p>So the response, when this happens to you, is fixed and there is no negotiating with it. <strong>Treat the credential as disclosed and rotate it.</strong> "We removed it in the next layer" describes the bug rather than a fix. "We deleted the tag" does not help either: the blob is content-addressed and may remain fetchable by digest, and per <a href="i5.html#cp-i5-11">I5.11</a> and <a href="i5.html#cp-i5-3">I5.3</a> any mirror, node or downstream repository that replicated it kept its own copy. You cannot recall bytes you published.</p>
+
+<div class="specref">
+<p>The spec spells out that whiteouts are a directive to the party <em>applying</em> the layers, and that they never touch the layer holding the file. Read the last clause as a security property: the file is not deleted, its presence is hidden from the extracted result. Anyone who reads the archive instead of the result is unaffected.</p>
+<blockquote>A whiteout file is an empty file with a special filename that signifies a path should be deleted.<br>A whiteout filename consists of the prefix <code>.wh.</code> plus the basename of the path to be deleted.<br>[…]<br>Whiteout files MUST only apply to resources in lower/parent layers.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md#whiteouts">layer.md § Whiteouts</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the image the careful way. Copy in a deploy key, use it, then remove the whole directory — this is what the code review approves.
+<pre class="cmd">mkdir -p ~/i6/sec &amp;&amp; cd ~/i6/sec
+cat &gt; deploy_key &lt;&lt;'EOF'
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+FAKEKEYFORTHELABONLYnotarealkeyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+-----END OPENSSH PRIVATE KEY-----
+EOF
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21
+COPY deploy_key /root/.ssh/deploy_key
+RUN echo "pretending to clone a private repo" &amp;&amp; rm -rf /root/.ssh
+EOF
+sudo nerdctl build --no-cache -q -t 127.0.0.1:5000/i6/sec:v1 .
+sudo nerdctl push --insecure-registry 127.0.0.1:5000/i6/sec:v1</pre></li>
+
+<li>Verify it the way the author would, and note that the verification is completely sound. Nothing here is a mistake.
+<pre class="cmd">sudo nerdctl run --rm 127.0.0.1:5000/i6/sec:v1 sh -c \
+  "ls -la /root/.ssh 2>&amp;1; find / -name deploy_key 2>/dev/null | wc -l"</pre>
+<pre class="out">ls: /root/.ssh: <b>No such file or directory</b>
+<b>0</b></pre>
+<p>Gone from the filesystem, and a whole-filesystem search finds nothing. If your standard of evidence is the running container, this image is clean.</p></li>
+
+<li>Now change the standard of evidence. List the layers from the registry — three of them, and their sizes already tell the story.
+<pre class="cmd">MAN=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+      http://127.0.0.1:5000/v2/i6/sec/manifests/v1)
+echo "$MAN" | jq -r '.layers[] | "  \(.size)  \(.digest)"'</pre>
+<pre class="out">  3646875  sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+  <b>286</b>  sha256:8544f1700cd3b9776a04cae2b8b2b30efe69eac0929805d7cace942d5ad5b1b1
+  <b>125</b>  sha256:586affd374cd8951d1c07bec40b941dce7e0522959c816d679bc2b61a95aafb1
+</pre>
+<p>The base, then a 286-byte layer, then a 125-byte layer. The <code>rm -rf</code> did not shrink anything — it added the third one.</p></li>
+
+<li>Search every layer's table of contents for the filename. No pull, no container: <code>curl</code> a blob and pipe it to <code>tar t</code>.
+<pre class="cmd">for d in $(echo "$MAN" | jq -r '.layers[].digest'); do
+  hit=$(curl -s http://127.0.0.1:5000/v2/i6/sec/blobs/$d | tar tzf - 2>/dev/null \
+        | grep -i 'ssh\|deploy_key' || true)
+  [ -n "$hit" ] &amp;&amp; { echo "  $d"; echo "$hit" | sed 's/^/      /'; }
+done</pre>
+<pre class="out">  sha256:8544f1700cd3b9776a04cae2b8b2b30efe69eac0929805d7cace942d5ad5b1b1
+      root/.ssh/
+      <b>root/.ssh/deploy_key</b>
+  sha256:586affd374cd8951d1c07bec40b941dce7e0522959c816d679bc2b61a95aafb1
+      <b>root/.wh..ssh</b></pre>
+<p>Both halves visible at once: the key in the second layer, and in the third the whiteout <code>root/.wh..ssh</code> that hides the directory from the merged view — <a href="i4.html#cp-i4-11">I4.11</a>'s <code>.wh.</code> encoding, doing precisely what it is specified to do.</p></li>
+
+<li>And now take the key.
+<pre class="cmd">for d in $(echo "$MAN" | jq -r '.layers[].digest'); do
+  curl -s http://127.0.0.1:5000/v2/i6/sec/blobs/$d \
+    | tar xzOf - root/.ssh/deploy_key 2>/dev/null &amp;&amp; break
+done</pre>
+<pre class="out">-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+FAKEKEYFORTHELABONLYnotarealkeyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+-----END OPENSSH PRIVATE KEY-----</pre>
+<p>Two commands, ordinary tools, no privilege. The key was published the moment the image was pushed.</p></li>
+
+<li>Then check the other channel, because a layer scan would have missed it entirely. This is <a href="#cp-i6-6">I6.6</a>'s image, whose only added layer was the 32-byte empty blob.
+<pre class="cmd">C=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+    http://127.0.0.1:5000/v2/i6/leak/manifests/v1 | jq -r .config.digest)
+curl -s http://127.0.0.1:5000/v2/i6/leak/blobs/$C \
+  | jq -r '.history[].created_by' | grep -o 'ghp_[A-Za-z0-9]*'</pre>
+<pre class="out"><b>ghp_S3cr3tT0k3nDoNotShare</b>
+<b>ghp_S3cr3tT0k3nDoNotShare</b></pre>
+<p>Two leaks, two entirely different searches. A tool that unpacks layers finds the first and is blind to the second; a tool that greps <code>history</code> finds the second and is blind to the first. Real scanners do both, and knowing why is the point.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can recover a deleted file from a pushed image using only <code>curl</code>, <code>jq</code> and <code>tar</code>, and separately extract build args from a config. You can explain why the author's verification was sound and still insufficient, and you can state the only correct response to a leaked credential without hedging.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The runtime view is not the artefact, and this is the whole lesson.</strong> <code>ls</code>, <code>find</code>, <code>kubectl exec</code> and every filesystem scan of a <em>running</em> container see the merged overlay, which is exactly what the whiteout is designed to make look clean. Scan the layers, not the container.</li>
+<li><strong>Two channels, two searches.</strong> Layer tars for file contents, the config's <code>history</code> for build args and <code>ENV</code>. Checking only one is the most common gap in a home-grown scanner, and the metadata channel is the one that leaves no filesystem evidence at all.</li>
+<li><strong>Deleting the tag does not unpublish the blob.</strong> Per <a href="i5.html#cp-i5-3">I5.3</a> the content is addressed by digest and may stay fetchable, and per <a href="i5.html#cp-i5-11">I5.11</a> a cross-repository mount means copies can exist in repositories you do not control. Even a real registry deletion needs garbage collection to run before the bytes go — and any node that pulled it has them locally regardless.</li>
+<li><strong>Rotation is the fix, and it is not optional.</strong> The credential was disclosed at push time to everyone with pull access. Rebuilding the image correctly is necessary and does nothing about the copies already out there.</li>
+<li><strong>Public base images are a much larger surface than you think.</strong> "Anyone who can pull" for a public image means anyone at all, and the same technique works on every image on every public registry. That is a reason to assume disclosure quickly, and a reason to be careful what you go looking for in other people's images.</li>
+<li><strong>Git history is a separate leak with the same shape.</strong> If the key was ever committed, <code>.dockerignore</code> (<a href="#cp-i6-2">I6.2</a>) and a rebuilt image do not touch it. Rotate once, fix both.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the sharpest possible argument for why <a href="w3.html#cp-3-23">W3.23</a>'s Secrets have to be a runtime object rather than something baked in. A Kubernetes Secret is at least a named API object with RBAC on it, an audit log, and encryption at rest available; a credential in a layer has no access control finer than "can pull this image", which — via the <code>imagePullSecrets</code> of <a href="w3.html#cp-3-21">W3.21</a> — is typically every node in the cluster and every workload that can read a pull secret. Note as well that the node's content store keeps those layers after the pod is gone, so a leaked key persists on disk across every node that ever ran the workload, which is a far wider blast radius than the Secret machinery would ever have given it.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>layer.md § Whiteouts</code> for why deletion is a directive to the consumer, and <code>config.md § Properties</code> for the metadata channel. Search the Docker docs for <em>"build secrets"</em> for the mechanism that prevents the first leak. On the Kubernetes side, search for <em>"good practices for Kubernetes Secrets"</em> and <em>"encrypting confidential data at rest"</em> — everything they offer applies only to credentials that are Secrets in the first place.</p>
+</article>
+</div><!-- /g-reading-images-others-bu -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
