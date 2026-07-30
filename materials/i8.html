@@ -1956,67 +1956,278 @@ implementation of the network side; the beginner-track ancestor of both is
 specification.</p>
 </article>
 <article class="lesson" id="cp-i8-16" data-id="i8-16">
-<div class="lesson-head"><span class="cp-id">I8.16</span><h4>TODO headline</h4>
+<div class="lesson-head"><span class="cp-id">I8.16</span><h4>Debugging drill — three faults that all say "the node is broken"</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
-<!-- CHECKPOINT: drill. Three faults. A cgroup-driver mismatch — everything starts, then pods are evicted or restart for no visible reason, and the only evidence is two cgroup trees. A missing or unpullable sandbox image, which fails every pod on the node with an error naming no user workload. And a wrong &#45;&#45;runtime-endpoint, whose connection error is routinely mistaken for "containerd is down" — learn to tell the two apart in one command.
-     UNDER THE HOOD: (none) -->
-
 <h5>Why it matters</h5>
-<p>TODO plain-English hook.</p>
+<p>Each of these three is common, each presents as a node-level failure with no guilty workload, and
+each has a one-command discriminator. Do them with the page scrolled away.</p>
 
 <h5>The concept</h5>
-<p>TODO. Absorb and expand the "under the hood" note above.</p>
-
-<div class="specref">
-<p>TODO what the spec actually says.</p>
-<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
-<cite>TODO spec, version — <a href="TODO">file</a></cite>
-</div>
+<p>The pattern to notice across all three is that <strong>the error text is the least reliable
+evidence</strong>. Two of the three produce messages that are either byte-identical to a different
+fault or silent altogether. What separates them is a targeted question asked of a different layer.</p>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
-<pre class="cmd">TODO</pre>
-<pre class="out">TODO captured output</pre></li>
+<li><strong>Fault 1 — the cgroup-driver mismatch.</strong> Set the runtime to
+<code>SystemdCgroup = true</code> while the kubelet believes <code>cgroupfs</code> (on this box,
+simulate the kubelet's half by looking for the tree it would read). Everything starts. Then find the
+evidence.
+<pre class="cmd">sudo find /sys/fs/cgroup -maxdepth 1 -name 'kubepods*'
+sudo ls -d /sys/fs/cgroup/kubepods</pre>
+<pre class="out"><b>/sys/fs/cgroup/kubepods.slice</b>
+ls: cannot access '/sys/fs/cgroup/kubepods': <b>No such file or directory</b></pre>
+<details class="reveal"><summary>Hint 1</summary><p>There is no error to find. Both halves
+succeeded. Ask instead: where does each side <em>think</em> the pod cgroups are?</p></details>
+<details class="reveal"><summary>Hint 2</summary><p><code>systemd</code> produces
+<code>kubepods.slice/kubepods-besteffort.slice/…scope</code>; <code>cgroupfs</code> produces
+<code>kubepods/besteffort/…</code>. Exactly one of those exists on a mismatched node, and the
+kubelet is reading the other.</p></details>
+<details class="reveal"><summary>Solution</summary><p>Read the runtime's driver with
+<code>crictl info | jq '.config.containerd.runtimes.runc.options.SystemdCgroup'</code> and the
+kubelet's with <code>grep cgroupDriver /var/lib/kubelet/config.yaml</code>. They must both say
+systemd. Fix whichever is wrong, then restart both — and note that <em>existing</em> containers keep
+their old cgroup paths until they are recreated, so the node stays inconsistent until the pods
+turn over.</p></details></li>
+
+<li><strong>Fault 2 — the unpullable sandbox image.</strong> Point
+<code>pinned_images.sandbox</code> at a tag that does not exist and restart containerd. The node
+reports itself completely healthy.
+<pre class="cmd">sudo crictl info | jq -c '{conditions:[.status.conditions[]|{(.type):.status}]}'
+sudo crictl images | head -3
+sudo crictl -t 60s runp sandbox.json</pre>
+<pre class="out">{"conditions":[{"RuntimeReady":<b>true</b>},{"NetworkReady":<b>true</b>},
+  {"ContainerdHasNoDeprecationWarnings":true}]}
+IMAGE                      TAG      IMAGE ID        SIZE
+docker.io/library/alpine   3.21     2607caa980584   3.66MB
+registry.k8s.io/pause      3.10     873ed75102791   320kB
+
+E0730 14:20:55 "RunPodSandbox from runtime service failed" err="rpc error: code = NotFound
+  desc = failed to pull image <b>\"registry.k8s.io/pause:9.9.9\"</b>: … not found"</pre>
+<details class="reveal"><summary>Hint 1</summary><p>Read the image name in the error and then look
+for it in the pod spec. It is not there — and it is not in any pod spec on the cluster.</p></details>
+<details class="reveal"><summary>Hint 2</summary><p>Every pod on the node fails identically,
+including ones that were working an hour ago with images already present locally. What image does
+<em>every</em> pod need?</p></details>
+<details class="reveal"><summary>Solution</summary><p>The sandbox image. Read the configured value
+with <code>containerd config default | grep -A2 pinned_images</code> (or from
+<code>/etc/containerd/config.toml</code> if one exists), correct the tag, restart containerd. In an
+air-gapped cluster the same fault appears with a <em>correct</em> tag that the local registry does
+not carry — pre-pull it and confirm with <code>crictl images | grep pause</code>, checking the exact
+tag rather than assuming <code>3.10</code>.</p>
+<p>There is a second, nastier presentation of the same root cause: if the image is merely
+<em>slow</em> rather than missing, crictl's 10-second timeout fires first and you get
+<code>DeadlineExceeded … RST_STREAM … CANCEL</code>, which names nothing at all. Same fault, two
+completely different fingerprints; the runtime's journal is what distinguishes them.</p></details></li>
+
+<li><strong>Fault 3 — the wrong runtime endpoint.</strong> Three scenarios, and the first two are
+routinely confused.
+<pre class="cmd"># A: the endpoint is wrong (nothing was ever there)
+sudo crictl --runtime-endpoint unix:///run/nosuch.sock ps
+# B: the endpoint is right, containerd is stopped
+sudo systemctl stop containerd; sudo crictl ps</pre>
+<pre class="out">A: dial unix <b>/run/nosuch.sock</b>: connect: no such file or directory
+B: dial unix <b>/run/containerd/containerd.sock</b>: connect: no such file or directory</pre>
+<details class="reveal"><summary>Hint 1</summary><p>Compare the two messages word for word. Apart
+from the path, they are identical — because systemd removes the socket when the unit stops, so
+"nothing is listening" and "nothing was ever there" look the same from the client.</p></details>
+<details class="reveal"><summary>Hint 2</summary><p>The client cannot distinguish them. Ask a
+different layer.</p></details>
+<details class="reveal"><summary>Solution</summary><p><code>systemctl is-active containerd</code>.
+<code>inactive</code> means the runtime is down (B); <code>active</code> means the runtime is fine
+and your endpoint is wrong (A). Confirm the endpoint you are actually using with
+<code>crictl config --get runtime-endpoint</code>, and the one the kubelet uses with
+<code>--container-runtime-endpoint</code> on its command line — they are configured separately and
+can disagree.</p>
+<p>A third case is worth knowing because it looks different: point crictl at a socket that exists
+but speaks something else (<code>/run/systemd/private</code>). The dial <em>succeeds</em> and the
+failure moves into the gRPC handshake — <code>code = Unavailable</code> after a pause, rather than an
+immediate connect error. Connect-time failure means the socket is absent; handshake-time failure
+means it is there and wrong.</p></details></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
-<p>TODO what the reader can now do.</p>
+<p>For each of the three, you can name the single command that identifies it, and you can explain
+why the error message alone is not enough in two of the three cases.</p>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong>TODO.</strong></li>
+<li><strong>Fixing the cgroup driver does not fix running pods.</strong> Existing containers keep
+the cgroup paths they were created with. The node stays half-broken until the pods are recreated,
+which is why the standard remediation drains the node.</li>
+<li><strong>A healthy <code>crictl info</code> does not mean pods will start.</strong> All three
+conditions were true throughout fault 2. Readiness conditions cover the plugin's state, not its
+ability to obtain the one image every pod needs.</li>
+<li><strong>Restore the box after each fault.</strong> Remove
+<code>/etc/containerd/config.toml</code>, restart containerd, and confirm
+<code>lastCNILoadStatus: "OK"</code> plus all three conditions true before moving on.</li>
 </ul>
 
 <div class="k8s-link">
-<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+<p>Fault 1's symptom set is <a href="w6.html#cp-6-12">W6.12 — read node Conditions fluently</a>;
+fault 2 is a member of the <a href="w6.html#cp-6-17">W6.17 — image failures</a> family that names no
+user workload; fault 3 lives on <a href="w6.html#cp-6-10">W6.10 — the NotReady ladder, end to
+end</a>. All three are node-level faults, which is <a href="w6.html#cp-6-11">W6.11 — the kubelet
+classics</a>' territory.</p>
 </div>
 
-<p class="docs-links"><b>Docs:</b> TODO.</p>
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>container runtimes</em> (cgroup
+drivers), <em>debugging kubernetes nodes with crictl</em> (endpoints), and
+<em>troubleshooting kubeadm</em>, whose "pods are not accessible" section covers the sandbox-image
+case for air-gapped clusters.</p>
 </article>
 </div><!-- /g-project-drill -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>State the CRI contract in one sentence, then name one operational consequence of each clause.
+<details class="reveal"><summary>Answer</summary><p>A gRPC service, on a unix socket, defined by
+<code>runtime.v1</code>. <em>gRPC</em>: the contract is a generated <code>.proto</code>, which is
+why the two sides upgrade independently. <em>Unix socket</em>: the trust boundary is the file mode,
+so write access is root on the node with no audit trail. <em>runtime.v1</em>: a stable versioned
+namespace, which is what made removing dockershim survivable.</p></details></li>
+
+<li>What did the dockershim removal actually break, and name two things people believed it broke
+that it did not.
+<details class="reveal"><summary>Answer</summary><p>It broke nodes whose container runtime was the
+Docker daemon; the fix was almost always pointing the kubelet at containerd, which Docker had been
+using underneath anyway. It did <em>not</em> break images built with Docker (they are OCI images)
+and it did not affect Docker on a developer machine.</p></details></li>
+
+<li>Why must a pod have a container that does nothing?
+<details class="reveal"><summary>Answer</summary><p>Because a namespace is destroyed when the last
+process in it exits unless something pins it, and the pod's namespaces must exist before the first
+app container starts, survive app containers coming and going, and die last. On this box
+<code>/pause</code> was one thread, 624 kB resident, blocked in <code>__do_sys_pause</code>.</p></details></li>
+
+<li>Which of the pod's namespaces does the pause container actually hold on containerd, and which
+one does it not?
+<details class="reveal"><summary>Answer</summary><p>It holds IPC and UTS (and PID, when sharing is
+on) via <code>/proc/&lt;pid&gt;/ns/</code>. It does <em>not</em> hold the network namespace: that is
+created and bind-mount pinned at <code>/var/run/netns/cni-&lt;uuid&gt;</code> before pause exists,
+because CNI ADD has to run against it first. The sandbox's own config joins it by
+path.</p></details></li>
+
+<li>Where does the switch for <code>shareProcessNamespace</code> live in the CRI request, and what
+happens if you put it in the other place?
+<details class="reveal"><summary>Answer</summary><p>On the <strong>container</strong> config's
+<code>linux.security_context.namespace_options.pid</code>. Setting it on the sandbox config alone
+has no effect on app containers and produces no warning. With <code>POD</code> the app's PID 1 is
+the pause process; with <code>CONTAINER</code> it is the app itself.</p></details></li>
+
+<li>A pod is stuck in <code>ContainerCreating</code>, the event mentions the network, and
+<code>kubectl logs</code> says the container is not found. Why are there no logs?
+<details class="reveal"><summary>Answer</summary><p>Because CNI ADD happens inside
+<code>RunPodSandbox</code>, before any container is created. The failure is at sandbox creation, so
+no container was ever started and there is nothing to log. <code>crictl ps -a</code> is empty for
+that pod.</p></details></li>
+
+<li>You restored a deleted CNI config file with <code>mv</code> and the node is still
+<code>NetworkReady=false</code> ten minutes later. What happened, and what fixes it?
+<details class="reveal"><summary>Answer</summary><p>containerd's config watcher fired on the rename
+<em>out</em> and reloaded to nothing; the rename <em>in</em> produced no event, and neither did
+<code>touch</code>. A content write does — <code>cp</code> the file's contents into place, or restart
+containerd. Check <code>crictl info | jq -r .lastCNILoadStatus</code>.</p></details></li>
+
+<li>Name the four calls for one pod, and say what each failure point implies.
+<details class="reveal"><summary>Answer</summary><p><code>PullImage</code> →
+<code>RunPodSandbox</code> → <code>CreateContainer</code> → <code>StartContainer</code>. Nothing at
+all means the sandbox failed: CNI or the sandbox image. A sandbox with no container means the image
+or the container config. A container that starts and exits means the workload.</p></details></li>
+
+<li>Which exec path does a liveness probe use, and how would you prove which one a given command
+took?
+<details class="reveal"><summary>Answer</summary><p><code>ExecSync</code>. Prove it by watching
+connections to the runtime's streaming server: the streaming <code>Exec</code> opens a TCP
+connection to <code>127.0.0.1:&lt;stream port&gt;</code>, <code>ExecSync</code> opens none. Note that
+<code>crictl exec</code> defaults to <em>streaming</em>; <code>-s</code> selects
+<code>ExecSync</code>.</p></details></li>
+
+<li>You call <code>UpdateContainerResources</code> to shrink a memory limit and it returns success.
+Is the container safe?
+<details class="reveal"><summary>Answer</summary><p>No. If the new limit is below current usage, the
+kernel reclaims what it can and OOM-kills what it cannot — measured here as exit 137, reason
+<code>OOMKilled</code>, two seconds after a successful call. The v1.33+ contract says the
+<em>runtime</em> must not restart the container to resize; it says nothing about the
+kernel.</p></details></li>
+
+<li>Decode this log record: <code>2026-07-30T14:00:46.508944247+06:00 stdout P xxxx…</code>. Whose
+timestamp is it, and what does <code>P</code> mean?
+<details class="reveal"><summary>Answer</summary><p>The runtime's, taken when it read the bytes off
+the pipe, in the node's local offset. <code>P</code> is a partial record: the application line
+exceeded <code>maxContainerLogLineSize</code> (16384 here) and continues in the next record, ending
+with an <code>F</code>. A consumer must reassemble them.</p></details></li>
+
+<li>Why does <code>crictl ps</code> sometimes print <code>unknown</code> in the POD column?
+<details class="reveal"><summary>Answer</summary><p>Because the pod name comes from
+<code>io.kubernetes.pod.*</code> labels the kubelet sets on each container, not from anything in
+CRI's message structure. A container created by hand has empty labels and no pod
+name.</p></details></li>
+
+<li>What is the relationship between <code>metadata.attempt</code>, the file
+<code>1.log</code>, and the RESTARTS column?
+<details class="reveal"><summary>Answer</summary><p>They are the same number. CRI reserves the name
+<code>&lt;container&gt;_&lt;pod&gt;_&lt;ns&gt;_&lt;uid&gt;_&lt;attempt&gt;</code>, so a restart must
+increment <code>attempt</code>; that value becomes the log filename and is what
+<code>kubectl</code> reports as the restart count.</p></details></li>
+
+<li>The kubelet says <code>systemd</code> and the runtime says <code>cgroupfs</code>. What is the
+symptom, and what is the evidence?
+<details class="reveal"><summary>Answer</summary><p>No error at all — both halves succeed. Pods run,
+limits are enforced, and the kubelet's accounting reads a tree nothing is charged to, so evictions
+and restarts happen for no visible reason. The evidence is two trees on disk:
+<code>/sys/fs/cgroup/kubepods.slice/…</code> exists while
+<code>/sys/fs/cgroup/kubepods/…</code> does not, or the reverse.</p></details></li>
+
+<li><code>crictl ps</code> fails with <code>dial unix /run/containerd/containerd.sock: connect: no
+such file or directory</code>. Name the two possible causes and the one command that separates
+them.
+<details class="reveal"><summary>Answer</summary><p>Either containerd is stopped (systemd removes
+the socket with the unit) or the endpoint is wrong. The messages are identical.
+<code>systemctl is-active containerd</code> settles it.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>You can state what CRI is, what it replaced, and what dockershim's removal did and did not
+break — and verify every clause of the contract on a node in one command each.</li>
+<li>You can create a pod with no Kubernetes anywhere, read the pause process off <code>/proc</code>,
+and point at the single config field that makes containers in a pod share a network namespace.</li>
+<li>You can drive a pod's whole lifecycle in the kubelet's order, name which call failed from the
+symptom alone, and predict which resource changes are safe to apply to a running container.</li>
+<li>You can debug a node's runtime from below the kubelet: read raw CRI logs, find containers
+<code>kubectl</code> has forgotten, read the cgroup driver from a machine with no config file, and
+separate "the runtime is down" from "your endpoint is wrong" in one command.</li>
+<li>You have written a CRI server that <code>crictl</code> drives end to end, and you know exactly
+which part of it I9 replaces.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="b6.html#cp-b6-3">Go deeper: B6.3 — namespace identity, reading
+membership by inode under /proc →</a></div>
 
-<nav class="pager"><a href="i7.html">← I7</a><a href="../intermediate.html#i9">I9 · TODO →</a></nav>
+<nav class="pager"><a href="i7.html">← I7 · containerd, shims, snapshotters</a><a href="../intermediate.html#i9">I9 · CNI →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+<p>Authored against <strong>Kubernetes v1.35</strong> (the CKA's target), with every command run on
+Ubuntu 24.04 / kernel 6.8.0 carrying <strong>containerd 2.3.3</strong>, <strong>runc 1.5.1</strong>,
+<strong>crictl v1.36.0</strong> and CNI plugins v1.9.1. Verified 2026-07-30.</p>
+<p>Version-sensitive findings from those runs, in case they have moved by the time you read this:
+the default sandbox image is <strong><code>registry.k8s.io/pause:3.10.2</code></strong>, declared at
+<code>plugins.'io.containerd.cri.v1.images'.pinned_images.sandbox</code> — not the 1.7-era
+<code>sandbox_image</code> key, and not <code>pause:3.10</code>. CRI is three plugins
+(<code>io.containerd.cri.v1.images</code>, <code>io.containerd.cri.v1.runtime</code>,
+<code>io.containerd.grpc.v1.cri</code>). <code>maxContainerLogLineSize</code> is
+<strong>16384</strong>, which is exactly where a <code>P</code> record becomes an <code>F</code>.
+<code>SystemdCgroup</code> defaults to <strong><code>false</code></strong> upstream (kubeadm sets it
+true). <code>crictl exec</code> defaults to the <em>streaming</em> path and <code>-s</code> selects
+<code>ExecSync</code>. In-place pod resize is <strong>GA in v1.35</strong>, and a memory shrink below
+current usage returns success and then OOM-kills the container. Restoring a CNI config with
+<code>mv</code> does not trigger containerd's reload; a content write does.</p>
+<p>Spec quotations are verbatim from <code>cri-api</code>'s
+<code>pkg/apis/runtime/v1/api.proto</code>, fetched rather than recalled.</p>
 </footer>
 </main>
 </div>
