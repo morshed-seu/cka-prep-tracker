@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="I6 — Building images: a Dockerfile as layer-producing operations plus a cache-key function, BuildKit's DAG and mounts, multi-platform indexes, and assembling an image by hand with no builder at all.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I6 — Building images — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I6 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4 · The OCI image spec</a></li>
+    <li><a href="i5.html">I5 · Registries</a></li>
+    <li><a href="i6.html">I6 · Building images</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i6">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I6 — Building images</h1>
+  <p>A Dockerfile is two things at once: a sequence of layer-producing operations, and a cache-key function. Learn to read it as both — then build an image with no Dockerfile and no Docker, which is the only way to be certain you understood it.</p>
+  <p>This module is where images stop being something a tool produces for you. Four of the corrections in it are to beliefs almost everyone holds — that <code>WORKDIR</code> is free, that the whole build context is uploaded, that a comment busts the cache, that <code>rm</code> reclaims space — and every one of them is settled here by measurement rather than assertion. By the last checkpoint you will have built an image with no Dockerfile, no builder and no daemon, using nothing but <code>tar</code>, <code>jq</code> and <code>sha256sum</code>, which is the only way to be certain the format holds no more mysteries.</p>
+  <div class="weights">
+    <span>Checkpoints<b>13</b></span>
+    <span>Hours<b>~5</b></span>
+    <span>Prerequisites<b>I4, I5</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>Semantics.</strong> Sort any instruction into layer-producing or config-amending by asking about mechanism rather than reciting a list; say what a build context actually transfers and why <code>.dockerignore</code> is a secrecy control; derive the cache key from seven builds and predict which edit stops the cache hitting; and price the layer that a <code>RUN rm</code> adds instead of removing.</li>
+<li><strong>Doing it properly.</strong> Write a multi-stage build and use <code>--target</code> to debug the builder stage; use BuildKit's DAG, cache mounts and secret mounts, and find a <code>--build-arg</code> token sitting in plain text in an image's <code>history</code>; build a multi-platform image and pay the emulation bill knowingly.</li>
+<li><strong>Building without Docker.</strong> Drive <code>buildkitd</code> through <code>buildctl</code> to see the frontend and exporter the friendly tools hide; then assemble a working image entirely by hand, with no builder in the picture at all.</li>
+<li><strong>Reading images others built.</strong> Use <code>history</code> as the audit trail it is, attribute an image's bulk to the instruction that caused it, and recover a credential from a layer that its author believed was deleted.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I4</strong> (layers, digests, chain IDs) and <strong>I5</strong> (you need somewhere to push to — the local <code>registry:2</code> from I5.9).</p>
+<p><strong>Which machine.</strong> Everything below ran on the <code>sandbox</code> VM from I0, which already carries containerd, <code>nerdctl</code>, <code>runc</code> and <code>skopeo</code>. This module adds two things to it — the BuildKit tarball, and QEMU emulation for the one multi-platform lab — and <a href="#cp-i6-8">I6.8</a> sets both up before it needs them. Deliberately, there is no Docker on this machine at any point.</p>
+<p><strong>Versions the output came from.</strong> BuildKit v0.32.0, containerd 2.3.3, nerdctl 2.3.5, runc 1.5.1, skopeo 1.13.3, <code>registry:2</code>, Ubuntu 24.04 on kernel 6.8.0, against OCI image-spec v1.1.1 and distribution-spec v1.1.1. Where a number in this module is a measurement — a byte count, a transfer size, a build time — it came from that machine, and your numbers will differ in magnitude while the ratios hold.</p>
+</div>
+
+<!-- ---------------- Semantics ---------------- --><div class="grp" id="g-semantics"><h3>Semantics</h3>
+<article class="lesson" id="cp-i6-1" data-id="i6-1">
+<div class="lesson-head"><span class="cp-id">I6.1</span><h4>Two kinds of instruction, and the one that fools everybody</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A Dockerfile looks like a shell script, which is exactly why people misread it. It is not a script — it is a list of steps, where each step either <strong>changes the filesystem</strong> (and so becomes a layer you will store, push and download forever) or merely <strong>writes a note in the image's config</strong> (and so costs nothing at all). Sorting your instructions into those two piles is the single skill that turns build behaviour from mysterious into predictable, and almost every "why is my image 800 MB" and "why does my CI take nine minutes" question is answered by it.</p>
+
+<h5>The concept</h5>
+<p>You already have the machinery for this. From <a href="i4.html#cp-i4-9">I4.9</a>, a layer is a tar file of changes. From <a href="i4.html#cp-i4-13">I4.13</a>, the image config is a JSON document of pre-declared defaults. A build walks your instructions in order and, for each one, does one of two things:</p>
+<ul>
+<li><strong>Produce a layer.</strong> The step runs against a snapshot of the filesystem so far, and whatever changed is packed into a new tar. That tar gets a <code>digest</code>, a <code>diff_id</code>, and a slot in <code>rootfs.diff_ids</code>. <code>RUN</code>, <code>COPY</code> and <code>ADD</code> all work this way.</li>
+<li><strong>Amend the config.</strong> The step touches no files; it just sets a field — <code>Env</code>, <code>Cmd</code>, <code>User</code>, <code>Labels</code>. Nothing is stored, nothing is pushed, and the image's layer count does not move. <code>ENV</code>, <code>CMD</code>, <code>ENTRYPOINT</code>, <code>USER</code>, <code>LABEL</code> and <code>EXPOSE</code> all work this way.</li>
+</ul>
+<p>Both kinds still get a line in the config's <code>history</code> array, which is what makes the split visible: a config-amending step is marked <code>empty_layer: true</code>, and a layer-producing step is not. So the arithmetic from <a href="i4.html#cp-i4-13">I4.13</a> holds on every image ever built — <b>history entries minus empty ones equals the number of layers</b> — and you can audit any image's build by reading two fields.</p>
+<p>That is why an image with thirty instructions may have only five layers, and why re-ordering your <code>ENV</code> and <code>LABEL</code> lines is free while moving a <code>COPY</code> is not: only the layer-producing steps change the filesystem, and therefore only they change the chain ID (<a href="i4.html#cp-i4-12">I4.12</a>) that every subsequent step's cache key is built on.</p>
+<p>And now the part that catches everyone, including the author of this module's own checkpoint list. <strong><code>WORKDIR</code> produces a layer.</strong> It has to: it creates the directory if it is missing, and creating a directory is a filesystem change. So the neat "config-amending" bucket that every tutorial puts <code>WORKDIR</code> in is wrong, and the lab below proves it in two lines of <code>jq</code>.</p>
+<p>It is stranger than that. <code>WORKDIR</code> takes a layer slot <em>even when the directory already exists and nothing changes</em> — the step still goes through the snapshot path, the snapshot still gets diffed, and the diff comes out empty. What lands in <code>rootfs.diff_ids</code> is then the <strong>empty layer</strong>: 1024 zero bytes, <code>diff_id sha256:5f70bf18a086…</code>, compressing to a 32-byte blob. If you have read many image configs you have seen that digest before; now you know where it comes from.</p>
+<p>So the reliable rule is not a list of instruction names to memorise. It is a question about mechanism: <strong>does this step go through the filesystem-snapshot path?</strong> If yes it consumes a <code>diff_id</code>, possibly an empty one. If no, it is <code>empty_layer: true</code>. Ask the mechanism, not the tutorial.</p>
+
+<div class="specref">
+<p>The spec never lists which Dockerfile instructions make layers — it could not, since it knows nothing about Dockerfiles. It defines the <em>test</em> instead, and the test is about filesystem diffs, not instruction names. That is precisely why <code>WORKDIR</code> falls on the side it does.</p>
+<blockquote><strong>empty_layer</strong> <em>boolean</em>, OPTIONAL<br><br>This field is used to mark if the history item created a filesystem diff.<br>It is set to true if this history item doesn't correspond to an actual layer in the rootfs section (for example, Dockerfile's ENV command results in no change to the filesystem).</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md#properties">config.md § Properties</a></cite>
+<p>Worth noticing: the spec's own worked example of a config has exactly two <code>diff_ids</code>, and the second one is <code>sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef</code> — the same empty layer your <code>WORKDIR</code> is about to produce.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a Dockerfile that mixes both kinds of instruction deliberately: nine lines, of which only some should cost you anything. Predict the layer count before you build — write your guess down, because the point of this lab is to be wrong about it.
+<pre class="cmd">mkdir -p ~/i6/sem &amp;&amp; cd ~/i6/sem
+echo "second file" &gt; two.txt
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21
+ENV FOO=bar
+LABEL org.opencontainers.image.title=i6-semantics
+WORKDIR /app
+RUN echo hello &gt; /app/one
+COPY two.txt /app/two.txt
+USER nobody
+EXPOSE 8080
+CMD ["/bin/sh","-c","cat /app/one /app/two.txt"]
+EOF
+sudo nerdctl build -t i6/sem:v1 .</pre>
+<pre class="out">#4 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#4 DONE 0.3s
+
+#6 <b>[2/4] WORKDIR /app</b>
+#6 DONE 0.1s
+
+#7 [3/4] RUN echo hello &gt; /app/one
+#7 DONE 0.3s
+
+#8 [4/4] COPY two.txt /app/two.txt
+#8 DONE 0.1s
+...
+Loaded image: docker.io/i6/sem:v1</pre>
+<p>The first clue is in the step counter. Nine instructions, and the builder numbers only <b>four</b> steps — the five config-amending lines never became steps at all. And <code>WORKDIR</code> is one of the four.</p></li>
+
+<li>Now stop guessing and read the config. Pull the manifest out of containerd's content store, follow it to the config blob, and count both fields.
+<pre class="cmd">MAN=$(sudo ctr -n default images ls name==docker.io/i6/sem:v1 | awk 'NR==2{print $3}')
+CFG=$(sudo ctr -n default content get "$MAN" | jq -r .config.digest)
+sudo ctr -n default content get "$CFG" | jq '{n_layers: (.rootfs.diff_ids|length), n_history: (.history|length)}'</pre>
+<pre class="out">{
+  "n_layers": <b>4</b>,
+  "n_history": 10
+}</pre>
+<p>Ten history entries for nine instructions, because <code>alpine:3.21</code> brought two of its own along. Four layers, so six entries must be empty.</p></li>
+
+<li>Print the history with each entry labelled by which bucket it fell into. This is the classification, done by the builder rather than by you.
+<pre class="cmd">sudo ctr -n default content get "$CFG" \
+  | jq -r '.history[] | "\(if .empty_layer then "EMPTY " else "LAYER " end)\(.created_by)"'</pre>
+<pre class="out">LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+EMPTY CMD ["/bin/sh"]
+EMPTY ENV FOO=bar
+EMPTY LABEL org.opencontainers.image.title=i6-semantics
+<b>LAYER WORKDIR /app</b>
+LAYER RUN /bin/sh -c echo hello &gt; /app/one # buildkit
+LAYER COPY two.txt /app/two.txt # buildkit
+EMPTY USER nobody
+EMPTY EXPOSE [8080/tcp]
+EMPTY CMD ["/bin/sh" "-c" "cat /app/one /app/two.txt"]</pre>
+<p>Six <code>EMPTY</code>, four <code>LAYER</code>, and 10 − 6 = 4 matches <code>n_layers</code> exactly. <code>ENV</code>, <code>LABEL</code>, <code>USER</code>, <code>EXPOSE</code> and both <code>CMD</code>s were free. <code>WORKDIR</code> was not.</p></li>
+
+<li>Confirm the free ones really did land somewhere, so "costs nothing" does not get mistaken for "does nothing". Every <code>EMPTY</code> line above set a field in <code>config</code>.
+<pre class="cmd">sudo ctr -n default content get "$CFG" \
+  | jq '{Env: .config.Env, User: .config.User, WorkingDir: .config.WorkingDir,
+         ExposedPorts: .config.ExposedPorts, Labels: .config.Labels}'</pre>
+<pre class="out">{
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    <b>"FOO=bar"</b>
+  ],
+  "User": "nobody",
+  "WorkingDir": "/app",
+  "ExposedPorts": { "8080/tcp": {} },
+  "Labels": { "org.opencontainers.image.title": "i6-semantics" }
+}</pre>
+<p>Note that <code>WORKDIR</code> did both jobs: it set <code>WorkingDir</code> <em>and</em> made a layer. It is the only instruction here that appears on both sides of the split.</p></li>
+
+<li>Open the <code>WORKDIR</code> layer and see what a directory creation costs. It is the second of the four layers.
+<pre class="cmd">L=$(sudo ctr -n default content get "$MAN" | jq -r '.layers[1].digest')
+sudo ctr -n default content get "$L" | tar tvzf -</pre>
+<pre class="out">drwxr-xr-x 0/0               0 2026-07-30 08:45 <b>app/</b></pre>
+<p>One tar entry, one directory, no files. Small — but a real layer, with a real digest, that every node pulling this image will fetch.</p></li>
+
+<li>Now the sharper version of the experiment. Point <code>WORKDIR</code> at directories that <em>already exist</em> in the base image, so there is genuinely nothing to create, and see whether it still takes a slot.
+<pre class="cmd">mkdir -p ~/i6/wd &amp;&amp; cd ~/i6/wd
+printf 'FROM alpine:3.21\nWORKDIR /tmp\nWORKDIR /etc\n' &gt; Dockerfile
+sudo nerdctl build -q -t i6/wd:v1 . &gt;/dev/null
+M=$(sudo ctr -n default images ls name==docker.io/i6/wd:v1 | awk 'NR==2{print $3}')
+C=$(sudo ctr -n default content get "$M" | jq -r .config.digest)
+sudo ctr -n default content get "$C" | jq -r '"layers: \(.rootfs.diff_ids|length)",
+  (.history[] | "\(if .empty_layer then "EMPTY " else "LAYER " end)\(.created_by)")'</pre>
+<pre class="out">layers: <b>3</b>
+LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+EMPTY CMD ["/bin/sh"]
+<b>LAYER WORKDIR /tmp</b>
+<b>LAYER WORKDIR /etc</b></pre>
+<p>Both still <code>LAYER</code>. Nothing was created, nothing changed, and two layer slots were consumed anyway.</p></li>
+
+<li>So what is in those two layers? Look at the digests before you look at the contents.
+<pre class="cmd">for i in 1 2; do
+  sudo ctr -n default content get "$M" | jq -r ".layers[$i] | \"layer[$i]  \(.size) bytes  \(.digest)\""
+done
+sudo ctr -n default content get "$C" | jq -r '.rootfs.diff_ids[]'</pre>
+<pre class="out">layer[1]  32 bytes  <b>sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1</b>
+layer[2]  32 bytes  <b>sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1</b>
+
+sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+<b>sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef</b>
+<b>sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef</b></pre>
+<p>The <em>same</em> digest twice, and the same <code>diff_id</code> twice — content addressing (<a href="i4.html#cp-i4-1">I4.1</a>) doing its job. Two steps produced identical nothing, so they are one blob stored once. That <code>diff_id</code> is the constant from the spec example above.</p></li>
+
+<li>Finish the identification: decompress the 32-byte blob and measure what an "empty" layer actually is.
+<pre class="cmd">sudo ctr -n default content get sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1 \
+  | gunzip -c | wc -c
+sudo ctr -n default content get sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1 \
+  | gunzip -c | sha256sum</pre>
+<pre class="out"><b>1024</b>
+<b>5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef</b>  -</pre>
+<p>1024 zero bytes — two 512-byte tar terminator blocks and nothing else — hashing to the empty <code>diff_id</code>, gzipping to the 32-byte blob. Three digests you will now recognise on sight.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Handed any Dockerfile, you can predict its image's layer count before building, and check your prediction with two <code>jq</code> expressions. You can state the mechanism-level rule — does the step go through the snapshot path — rather than reciting a list. And you can recognise <code>sha256:5f70bf18a086…</code> and its 32-byte compressed form as the empty layer, wherever they turn up.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>WORKDIR</code> is on the expensive side of the split, and nearly every tutorial says otherwise.</strong> The cost is small — an empty layer, or a one-directory layer — but it is a real slot in <code>rootfs.diff_ids</code>, and it means moving a <code>WORKDIR</code> line invalidates the cache for everything below it, exactly like moving a <code>COPY</code>. If you have ever seen a "harmless" reshuffle trigger a full rebuild, this is a strong candidate.</li>
+<li><strong>"Empty layer" and <code>empty_layer: true</code> are different things, and the collision is unfortunate.</strong> The 1024-zero-byte layer <em>is</em> a layer with a digest and a slot; <code>empty_layer: true</code> means there is no layer at all. An image can therefore have empty layers and no empty-layer history entries, or the reverse.</li>
+<li><strong>The step numbers in the build log count vertices, not lines.</strong> <code>[2/4]</code> for a nine-line Dockerfile is not the builder skipping your work — it is the builder telling you five of your lines are free. Reading that counter is a fast sanity check on your own classification.</li>
+<li><strong><code>history</code> is written by whichever tool built the image, and it is free-form text.</strong> The <code>created_by</code> strings above end in <code># buildkit</code> because BuildKit wrote them; another builder writes something else, and a hand-assembled image (I6.9) may have no history at all. Treat it as a strong hint, never as proof — a point that returns in <a href="#cp-i6-10">I6.10</a>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This split is why <a href="w3.html#cp-3-21">W3.21</a> exists at all. Everything on the config-amending side — <code>ENV</code>, <code>CMD</code>, <code>USER</code>, <code>EXPOSE</code> — is a <em>default</em> baked into the image, and every one of those defaults can be overridden by the pod spec without rebuilding anything: <code>env</code>, <code>command</code>/<code>args</code>, <code>securityContext.runAsUser</code>. Anything on the layer-producing side cannot be, because it is bytes in a tar in a registry. That is the real dividing line behind "configuration belongs in a ConfigMap, not in the image", and the reason <a href="w3.html#cp-3-23">W3.23</a> insists a Secret is a runtime object: a secret written by a <code>RUN</code> is a layer, and layers are not configurable, they are shipped.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>config.md § Properties</code> for <code>rootfs.diff_ids</code>, <code>history</code> and <code>empty_layer</code> — the only normative text in play here. For the instruction semantics themselves, search the Docker docs for <em>"Dockerfile reference"</em>, remembering it is a reference and not a standard. On the Kubernetes side, search for <em>"define a command and arguments for a container"</em> to see which of these fields a pod spec can override.</p>
+</article>
+<article class="lesson" id="cp-i6-2" data-id="i6-2">
+<div class="lesson-head"><span class="cp-id">I6.2</span><h4>The build context, and the folklore about it that is now wrong</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>When you type <code>docker build .</code>, that trailing dot is not decoration — it names the <strong>build context</strong>, the set of files the builder is allowed to reach. Understanding what actually crosses from your directory into the builder is how you explain a build that takes six seconds before running a single instruction, and it is how credentials end up in public images. Both stories are in this checkpoint, and one of them has changed since the advice you have probably read.</p>
+
+<h5>The concept</h5>
+<p>The builder is a separate program from the client, often on a separate machine, and it cannot see your disk. So before anything runs, the client has to hand over the files. The old Docker daemon did that the blunt way: it tarred up the whole directory and uploaded it. That is where the standard warning comes from — <em>the entire context is transferred whether you reference it or not, so a stray <code>.env</code> or a 2 GB <code>.git</code> costs you on every build</em>.</p>
+<p><strong>On BuildKit, that is no longer true, and the lab below measures it.</strong> BuildKit runs the transfer as a session between client and builder and moves files <em>on demand</em>: it resolves your Dockerfile into a graph first, sees which paths the graph actually references, and pulls only those across. A 100 MB file sitting beside your Dockerfile that nothing copies is transferred as zero bytes. Repeating the old warning as fact is one of the most widespread pieces of stale container advice, and it matters because it teaches people to fear the wrong thing.</p>
+<p>What is still completely true is the consequence, and it has simply moved one step along. The transfer is driven by what the graph references — so the risk is not "having files in the directory", it is <strong>writing an instruction that references all of them</strong>. And there is exactly one such instruction, it is extremely common, and it is <code>COPY . .</code>. The moment you write it, every byte in that directory is both transferred <em>and</em> baked into a layer that will be pushed to a registry: the <code>.env</code> with your cloud credentials, the <code>.git</code> directory containing the history where you already removed a key once, the private key someone left in the tree. From <a href="i4.html#cp-i4-1">I4.1</a>, that layer is content-addressed and immutable, and from <a href="#cp-i6-4">I6.4</a>, deleting the file later does not remove it.</p>
+<p>So <code>.dockerignore</code> deserves a better framing than the performance tweak it is usually sold as. It is a <strong>secrecy control</strong> — the list of things you are declaring your build has no business seeing, enforced at the point where files cross the boundary rather than left to the discipline of everyone who ever edits the Dockerfile. Read it the way you would read a firewall rule, not a cache hint. The speed improvement is real and it is the lesser half.</p>
+<p>One detail about <em>how</em> it is enforced, because it explains the numbers in the lab. <code>.dockerignore</code> is applied by the client while it builds the file list, before the transfer decision — so an ignored file is not "sent and then discarded", it is never a candidate. That is also why the exclusion works even for <code>COPY . .</code>: by the time the graph asks for everything, "everything" already has your exclusions taken out of it.</p>
+
+<div class="specref">
+<p>There is no OCI spec for the build context — the specs cover the image, the runtime and the registry, and stop at the door of how the image is produced. This is the first checkpoint in the intermediate track where the honest answer is <em>no standard governs this</em>, and it is worth sitting with, because it explains the ecosystem you are looking at: builds are where the tools differ most, precisely because nobody wrote a contract for them.</p>
+<p>The closest thing to normative text is BuildKit's own documentation of the syntax, which is a de-facto standard by adoption rather than a specification. Treat its behaviour as observed, not guaranteed — which is exactly why this checkpoint measures instead of asserting.</p>
+<cite>No OCI spec applies — see <a href="https://github.com/moby/buildkit#dockerignore">moby/buildkit § .dockerignore</a> and the Dockerfile reference</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a context that looks like a real project's worst self: a big binary artefact, a credentials file, and a <code>.git</code> directory. Then a Dockerfile that copies exactly one small file.
+<pre class="cmd">mkdir -p ~/i6/ctx/.git &amp;&amp; cd ~/i6/ctx
+dd if=/dev/urandom of=junk.bin bs=1M count=100 status=none
+echo "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY" &gt; .env
+head -c 2000 /dev/urandom &gt; .git/objects-pack
+echo "app" &gt; app.txt
+printf 'FROM alpine:3.21\nCOPY app.txt /app.txt\n' &gt; Dockerfile
+du -sh .</pre>
+<pre class="out"><b>101M</b>	.</pre></li>
+
+<li>Build it and watch the context vertex. The folklore predicts about 101 MB crossing the wire before the first instruction runs. Check.
+<pre class="cmd">sudo nerdctl build --no-cache --progress=plain -t i6/ctx:v1 . 2&gt;&amp;1 \
+  | grep -A2 "load build context"</pre>
+<pre class="out">#4 [internal] load build context
+#4 transferring context: <b>38B</b> done
+#4 DONE 0.0s</pre>
+<p>Thirty-eight bytes. Not 101 MB — the 100 MB file, the <code>.env</code> and the <code>.git</code> directory were never sent, because nothing in the graph asked for them. That is the folklore falsified in one command.</p></li>
+
+<li>Now change one line — copy the directory instead of the file — and measure the same vertex again. Nothing about the files on disk changed.
+<pre class="cmd">printf 'FROM alpine:3.21\nCOPY . /src/\n' &gt; Dockerfile
+sudo nerdctl build --no-cache --progress=plain -t i6/ctx:all . 2&gt;&amp;1 \
+  | grep -A2 "load build context"</pre>
+<pre class="out">#5 [internal] load build context
+#5 transferring context: <b>104.89MB</b> 0.4s done
+#5 DONE 0.4s</pre>
+<p>38 B to 104.89 MB, from a single-character change to an instruction. The context is not a property of your directory; it is a property of what your Dockerfile reaches for.</p></li>
+
+<li>Look at what that instruction put in the image. This is the actual failure mode, and it is worth seeing rather than being warned about.
+<pre class="cmd">sudo nerdctl run --rm i6/ctx:all ls -la /src/
+sudo nerdctl run --rm i6/ctx:all cat /src/.env</pre>
+<pre class="out">total 102424
+-rw-rw-r--    1 root     root            63 Jul 30 02:48 <b>.env</b>
+drwxrwxr-x    2 root     root          4096 Jul 30 02:48 <b>.git</b>
+-rw-rw-r--    1 root     root            30 Jul 30 02:48 Dockerfile
+-rw-rw-r--    1 root     root             4 Jul 30 02:48 app.txt
+-rw-rw-r--    1 root     root     104857600 Jul 30 02:48 <b>junk.bin</b>
+
+<b>AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY</b></pre>
+<p>A 100 MB image, and a live credential printable by anyone who can run the image — or, as <a href="#cp-i6-11">I6.11</a> shows, by anyone who can merely <em>pull</em> it.</p></li>
+
+<li>Add the control and rebuild the identical Dockerfile. Time both, because the performance half of the story is real too.
+<pre class="cmd">printf 'junk.bin\n.env\n.git\n' &gt; .dockerignore
+time sudo nerdctl build --no-cache --progress=plain -t i6/ctx:ign . 2&gt;&amp;1 \
+  | grep -A2 "load build context"
+sudo nerdctl run --rm i6/ctx:ign ls -a /src/</pre>
+<pre class="out">#4 [internal] load build context
+#4 transferring context: <b>114B</b> 0.0s done
+#4 DONE 0.0s
+
+real	0m0.887s
+
+.
+..
+.dockerignore
+Dockerfile
+app.txt</pre>
+<p>104.89 MB to 114 B, and 5.679 s to 0.887 s for the same build of the same Dockerfile. The secret and the junk are gone from the image, and note the exclusion held even though the instruction still says <code>COPY . /src/</code> — because the filtering happens while the file list is built, upstream of what the graph can ask for.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state what determines the size of a context transfer (the instructions, not the directory), demonstrate it with two builds differing by one line, and explain why <code>.dockerignore</code> is a secrecy control rather than a cache hint. You can also correct the stale version of this advice when you meet it, and say precisely which builder it was true of.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The old advice is not malicious, it is dated — check which builder you are on before repeating either version.</strong> The classic Docker daemon really did tar the whole directory. If you are on a CI image pinned to an ancient Docker, or building with something that shells out to the legacy builder, the 101 MB transfer is back. <code>--progress=plain</code> and the context vertex tell you which world you are in, in one build.</li>
+<li><strong><code>.dockerignore</code> does not protect you from a <code>RUN</code> that fetches a secret itself.</strong> It governs what crosses from your directory, nothing more. A <code>RUN curl</code> that pulls a token into a layer is untouched by it — that is what <a href="#cp-i6-6">I6.6</a>'s secret mount is for.</li>
+<li><strong><code>.dockerignore</code> itself lands in the image when you <code>COPY . .</code></strong> — you can see it in the last listing above. Harmless, but a good reminder that the file is an instruction to the client, not a magic invisible marker.</li>
+<li><strong>Excluding a path from the context does not remove it from your Git history, and images built before you added the file are unaffected.</strong> If a credential was ever in a pushed layer, <code>.dockerignore</code> is the fix going forward and rotation is the fix for what already happened. <a href="#cp-i6-11">I6.11</a> is where that becomes uncomfortably concrete.</li>
+<li><strong>A missing <code>.dockerignore</code> and an empty one are the same thing, but a typo is not.</strong> The file has its own pattern syntax, close to but not identical to <code>.gitignore</code>; an exclusion that silently fails to match looks exactly like a working one until you check the transferred byte count. Check the byte count.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes never sees your build context — but it pays for it. Every byte a careless <code>COPY . .</code> adds is a byte the kubelet's image pull moves on every node that schedules the pod, which is a large share of the cold-start latency people blame on the scheduler; <a href="w6.html#cp-6-17">W6.17</a>'s slow and failing pulls are frequently a 900 MB image that should have been 90 MB. The secrecy half lands on <a href="w3.html#cp-3-23">W3.23</a>: a credential swept into a layer by <code>COPY . .</code> defeats every protection Kubernetes offers a Secret, because it was never a Secret — it is image content, replicated to every node that runs the workload and to every mirror that caches it.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> No OCI spec covers this — search the Docker docs for <em>"build context"</em> and <em>".dockerignore file"</em>, and BuildKit's repo for the session-based transfer if you want the mechanism. On the Kubernetes side, search for <em>"pre-pulled images"</em> and <em>"image pull policy"</em>, which is where image size stops being your problem and becomes the node's.</p>
+</article>
+</div><!-- /g-semantics -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i5.html">← I5</a><a href="../intermediate.html#i7">I7 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
