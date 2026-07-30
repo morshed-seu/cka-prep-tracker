@@ -528,7 +528,325 @@ wrong</a> made about CRI: interfaces that expect to be retried must make retryin
 plugin's obligation and the runtime's are two halves of one argument. In the exam docs, search
 <em>pod termination</em> for the lifecycle the stuck state belongs to.</p>
 </article>
+<article class="lesson" id="cp-i9-4" data-id="i9-4">
+<div class="lesson-head"><span class="cp-id">I9.4</span><h4>Errors are objects with numbers — and stdout belongs to the result</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A CNI error is structured data, which is what lets a runtime tell "this plugin cannot speak your
+version" apart from "the network is broken" and act differently. But that only works if the plugin
+produces the object instead of printing a sentence. Get this backwards and you generate one of the
+most disorienting messages in Kubernetes: a <strong>JSON parse failure while creating a pod
+sandbox</strong>, which sends the operator to investigate the runtime when the actual bug is a
+debugging <code>echo</code> in a shell script.</p>
+
+<h5>The concept</h5>
+<p>On failure a plugin exits non-zero and writes an object with four fields: <code>cniVersion</code>,
+a numeric <code>code</code>, a short <code>msg</code>, and an optional longer <code>details</code>.
+Codes 0–99 are reserved by the spec; 100 and up are the plugin's own.</p>
+
+<table class="langpair">
+<thead><tr><th>Code</th><th>Meaning</th><th>What the runtime can do with it</th></tr></thead>
+<tbody>
+<tr><td><code>1</code></td><td>Incompatible CNI version</td><td>Retry at a lower version, or fail fast with a clear message</td></tr>
+<tr><td><code>2</code></td><td>Unsupported field in the network configuration</td><td>Surface the offending key to the operator</td></tr>
+<tr><td><code>3</code></td><td>Container unknown or does not exist</td><td><strong>Skip the <code>DEL</code></strong> — there is nothing to clean up</td></tr>
+<tr><td><code>4</code></td><td>Invalid environment variables</td><td>A bug in the runtime, not the network</td></tr>
+<tr><td><code>5</code></td><td>I/O failure</td><td>Possibly transient</td></tr>
+<tr><td><code>6</code></td><td>Failed to decode content</td><td>Malformed configuration or result</td></tr>
+<tr><td><code>7</code></td><td>Invalid network config</td><td>An operator has to fix a file; retrying is pointless</td></tr>
+<tr><td><code>11</code></td><td>Try again later</td><td><strong>Retry</strong> — a transient condition the plugin expects to clear</td></tr>
+<tr><td><code>50</code>&nbsp;/&nbsp;<code>51</code></td><td>Plugin not available (<code>STATUS</code> only)</td><td>Stop sending ADDs to this node</td></tr>
+</tbody>
+</table>
+
+<p>Look at the third column and the value of the scheme becomes obvious. Code 11 means retry; code 7
+means stop and page someone. Code 3 means the runtime can skip teardown entirely. A bare exit 1 with a
+message on stderr collapses all of that into "something went wrong."</p>
+
+<p>The channel rule follows from this, and it is absolute: <strong>stdout is the result channel.
+Every human-readable word goes to stderr.</strong> Not "should mostly" — a single stray line on stdout
+makes the whole invocation unparseable, because the runtime is reading that stream as JSON and nothing
+else.</p>
+
+<div class="specref">
+<p>The error object, and the sentence that settles the channel question the overview muddled in I9.1:</p>
+<blockquote>Plugins should output a JSON object with the following keys if they encounter an error:<br><br>- `cniVersion`: The protocol version in use - "1.1.0"<br>- `code`: A numeric error code, see below for reserved codes.<br>- `msg`: A short message characterizing the error.<br>- `details`: A longer message describing the error.</blockquote>
+<cite>CNI spec 1.1.0, § Error — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<blockquote>In addition, stderr can be used for unstructured output such as logs.</blockquote>
+<cite>ibid.</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask for a spec version the plugin cannot produce. This is code 1, and note how usefully specific
+<code>details</code> is.
+<pre class="cmd">echo '{"cniVersion":"9.9.9","name":"i9net","type":"bridge"}' &gt; ~/i9/e-badver.json
+sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e1 CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; ~/i9/e-badver.json; echo "exit=$?"</pre>
+<pre class="out">{
+    "<b>code": 1</b>,
+    "msg": "incompatible CNI versions",
+    "details": "config is \"9.9.9\", plugin supports [\"0.1.0\" \"0.2.0\" \"0.3.0\" \"0.3.1\" \"0.4.0\" \"1.0.0\" \"1.1.0\"]"
+}exit=1</pre></li>
+<li>Feed it something that is not JSON, then omit a required variable, then use a verb it does not
+know. Three different codes, all correct.
+<pre class="cmd">echo 'this is not json' &gt; ~/i9/e-notjson.json
+sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e2 CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; ~/i9/e-notjson.json
+
+sudo env CNI_COMMAND=ADD CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json
+
+sudo env CNI_COMMAND=FLY CNI_CONTAINERID=e5 CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json</pre>
+<pre class="out">{ "<b>code": 6</b>, "msg": "error unmarshall network config: invalid character 'h' in literal true (expecting 'r')" }
+{ "<b>code": 4</b>, "msg": "<b>required env variables [CNI_CONTAINERID] missing</b>" }
+{ "<b>code": 4</b>, "msg": "unknown CNI_COMMAND: FLY" }</pre>
+<p>Code 4's message names the variable, as the spec requires it to. That is the difference between a
+five-second fix and an hour.</p></li>
+<li>Now a configuration that is valid JSON but describes an unusable network — a <code>/31</code>,
+which has no host addresses at all.
+<pre class="cmd">echo '{"cniVersion":"1.1.0","name":"i9tiny","type":"bridge","bridge":"i9tiny0",
+"ipam":{"type":"host-local","subnet":"192.168.0.0/31"}}' &gt; ~/i9/e-tiny.json
+sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e3 CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; ~/i9/e-tiny.json</pre>
+<pre class="out">{
+    "<b>code": 999</b>,
+    "msg": "invalid range set 0: <b>Network 192.168.0.0/31 too small to allocate from</b>"
+}</pre>
+<p>Compare that against the spec's worked example for code 7, verbatim:</p>
+<pre class="out">{
+  "cniVersion": "1.1.0",
+  "<b>code": 7</b>,
+  "msg": "Invalid Configuration",
+  "details": "<b>Network 192.168.0.0/31 too small to allocate from.</b>"
+}</pre>
+<p>The spec's illustration of code 7 <em>is this exact condition, with this exact sentence</em> — and
+the reference implementation returns 999. That is a real conformance gap, not a quibble: 999 is the
+plugins repository's catch-all, so a runtime cannot distinguish "an operator wrote a bad subnet" from
+any other failure and cannot decide whether retrying is worthwhile. Note also that none of these error
+objects carries the <code>cniVersion</code> field the spec lists first.</p></li>
+<li>Now the important one: what a failed ADD leaves behind. Run the same bad configuration again.
+<pre class="cmd">sudo env CNI_COMMAND=ADD CNI_CONTAINERID=leak-demo CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge &lt; ~/i9/e-tiny.json
+sudo ip netns exec i9pod1 ip -br link
+ip -br link show i9tiny0</pre>
+<pre class="out">{
+    "code": 999,
+    "msg": "<b>container veth name (\"eth0\") peer provided (\"vethcff53319\") already exists</b>"
+}
+lo               DOWN
+<b>eth0@if60        DOWN</b>           42:d5:14:f4:76:f8 &lt;BROADCAST,MULTICAST&gt;
+<b>i9tiny0          DOWN</b>           36:af:16:88:58:c7 &lt;NO-CARRIER,BROADCAST,MULTICAST,UP&gt;</pre>
+<p>Read that error message as an operator would. It says the interface already exists — which is true,
+and completely misleading. The <em>first</em> attempt created the bridge and the veth pair before
+asking IPAM for an address, then failed at the allocation step and left both behind. The second
+attempt trips over the wreckage of the first, and reports the wreckage instead of the cause. The
+subnet is never mentioned again.</p>
+<p>This is why the spec insists a <code>DEL</code> must follow even a failed <code>ADD</code>, and why
+your own plugin will roll back its own half-finished work rather than trusting anyone to do it.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a code you can say whether the runtime should retry, fail fast, or skip teardown. You can
+explain why a plugin that prints a friendly message on stdout produces an error naming JSON rather
+than networking. And you can describe what a failed ADD leaves behind, and why the retry's error
+message misidentifies the problem.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Code 999 is the reference plugins' catch-all, and it is a conformance gap.</strong> Do not
+learn the spec's code table from the plugins' behaviour — an unusable subnet should be 7, and the
+spec's own example proves it.</li>
+<li><strong>The most misleading error you will meet is "interface already exists".</strong> It almost
+always means an earlier attempt failed after creating the veth. Look for the <em>first</em> failure in
+the logs, not the loudest one.</li>
+<li><strong>One <code>echo</code> on stdout breaks everything.</strong> Not just the message — the
+entire result. There is no partial parse. I9.16's first fault is precisely this, and the symptom names
+neither the plugin's logic nor the network.</li>
+<li><strong>Exit status and the error object are both required.</strong> An object with a non-zero
+<code>code</code> but exit 0 tells the runtime the call succeeded; it will believe the exit status.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Structured failures with actionable codes are the same argument
+<a href="i8.html#cp-i8-16">I8.16</a> made about distinguishing a dead socket from a wrong endpoint,
+and the "read the first failure, not the loudest" habit is the core of
+<a href="w6.html#cp-6-1">W6.1 — the triage ladder</a>. Pod events showing a sandbox-creation failure
+are <a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose and read the signatures</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> § Error in
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> has the full code
+table — it is one screen, worth reading once properly. In the exam docs, search
+<em>troubleshooting clusters</em> for where sandbox-creation failures surface as pod events.</p>
+</article>
 </div><!-- /g-the-contract -->
+
+<!-- ---------------- Configuration ---------------- --><div class="grp" id="g-configuration"><h3>Configuration</h3>
+<article class="lesson" id="cp-i9-5" data-id="i9-5">
+<div class="lesson-head"><span class="cp-id">I9.5</span><h4>Two directories the spec never mentions — and what really decides which network wins</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everyone learns "configs in <code>/etc/cni/net.d</code>, binaries in <code>/opt/cni/bin</code>, the
+first file wins." Two of those three claims are conventions rather than requirements, and the third is
+a simplification that will mislead you at exactly the wrong moment. This lesson replaces the folk rule
+with the two real mechanisms — which are different for <code>libcni</code> and for containerd — because
+an operator who believes the folk rule adds a file expecting it to be ignored and silently moves every
+new pod onto a different network.</p>
+
+<h5>The concept</h5>
+<p>Start with what may be the most surprising fact in this module. <strong>The CNI specification
+contains no mention of <code>/etc/cni/net.d</code>, no mention of <code>/opt/cni/bin</code>, and no
+mention of lexical ordering.</strong> Grep the document; there are zero hits. It says a runtime "must
+be provided a list of paths to search for CNI plugins" and leaves both the search paths and how a
+configuration is chosen entirely to the runtime.</p>
+
+<p>So those paths are containerd's configuration, and you can read them from containerd rather than
+from memory. That is where the decisive setting lives too, and it is not the one people quote.</p>
+
+<p>Now the two mechanisms, which really are different:</p>
+
+<p><strong>libcni</strong> — the library <code>cnitool</code>, containerd and CRI-O all use — resolves
+a network <em>by name</em>. Its <code>LoadNetworkConf(dir, name)</code> scans <code>.conflist</code>
+files only, sorts them, and returns the first whose <code>name</code> field matches what you asked
+for. Only if no <code>.conflist</code> matched does it fall back to the deprecated single-plugin
+<code>.conf</code>/<code>.json</code> form. That produces two rules people rarely state:</p>
+<ul>
+<li>Sort order decides only among files that <em>all</em> carry the name you asked for. A
+later-sorting file absolutely does win if it is the only one with that name.</li>
+<li>Every <code>.conflist</code> outranks every <code>.conf</code>, regardless of sort order, because
+they are two separate passes.</li>
+</ul>
+
+<p><strong>containerd's CRI plugin</strong> does something simpler and stricter: it loads
+<code>maxConfNum</code> configurations — <strong>which defaults to 1</strong> — taking them in sorted
+order, and uses that one for every pod. It never asks for a network by name, so the name field is
+irrelevant to the choice. <em>This</em> is where "the first file wins" is true, and
+<code>maxConfNum: 1</code> is the setting that makes it true.</p>
+
+<p>And the extension matters more than the number. libcni matches on the file's <em>final</em>
+extension, so <code>10-flannel.conflist.orig</code> has extension <code>.orig</code> and is never
+read at all. The commonly-repeated warning that a <code>.orig</code> backup is still a live config is
+wrong — but the underlying fear is right, because a file named
+<code>05-cilium.conflist</code> dropped next to <code>10-flannel.conflist</code> genuinely does take
+over the node.</p>
+
+<div class="specref">
+<p>What the spec actually delegates, and how little it constrains:</p>
+<blockquote>Furthermore, the runtime must be provided a list of paths to search for CNI plugins. This must also be provided to plugins during execution via the `CNI_PATH` environment variable.</blockquote>
+<cite>CNI spec 1.1.0, § Attachment Parameters — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>That is the whole of it. No directory, no ordering, no file naming. Everything in this lesson below
+that sentence is implementation behaviour you have to verify per runtime — which is why the lab
+verifies it.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Ask containerd where it looks, instead of assuming. These values come from containerd's config,
+not from CNI.
+<pre class="cmd">sudo crictl info | jq '.config.cni'</pre>
+<pre class="out">{
+  "binDir": "",
+  "binDirs": [ "<b>/opt/cni/bin</b>" ],
+  "confDir": "<b>/etc/cni/net.d</b>",
+  "confTemplate": "",
+  "ipPref": "",
+  "<b>maxConfNum": 1</b>,
+  "setupSerially": false,
+  "useInternalLoopback": false
+}</pre>
+<p><code>maxConfNum: 1</code> is the whole footgun in one field. Containerd will load exactly one
+configuration, and "which one" is decided by sorting filenames.</p></li>
+<li>Read what is on the box. This VM has nerdctl's network from I0, which is a four-plugin chain.
+<pre class="cmd">sudo ls /etc/cni/net.d/
+sudo jq -r '.cniVersion, .name, ([.plugins[].type]|tostring)' /etc/cni/net.d/nerdctl-bridge.conflist</pre>
+<pre class="out">default
+nerdctl-bridge.conflist
+<b>1.0.0
+bridge
+["bridge","portmap","firewall","tuning"]</b></pre></li>
+<li>Now test libcni's rule properly, in a private directory so nothing on the node breaks.
+<code>cnitool</code> honours <code>NETCONFPATH</code>. Four experiments, each one line of output.
+<pre class="cmd"># A: two .conflist files, both named "ordertest"
+#    05-a.conflist -> bridge i9ord5  (10.91.5.0/24)
+#    10-b.conflist -> bridge i9ord10 (10.91.10.0/24)
+sudo -E cnitool add ordertest /var/run/netns/i9pod1 | jq -r '.ips[0].address'</pre>
+<pre class="out"><b>10.91.5.2/24</b>   &lt;- 05 sorted first and won</pre>
+<pre class="cmd"># B: same two files, but only the LATER one is named "ordertest"
+#    05-a.conflist -> name "somethingelse"
+#    10-b.conflist -> name "ordertest"</pre>
+<pre class="out"><b>10.91.10.2/24</b>  &lt;- the NAME decided, not the sort order</pre>
+<pre class="cmd"># C: a .conf sorting FIRST against a .conflist sorting LAST, both named "ordertest"
+#    01-single.conf  -> bridge i9ord5
+#    99-list.conflist -> bridge i9ord10</pre>
+<pre class="out"><b>10.91.10.3/24</b>  &lt;- every .conflist outranks every .conf</pre>
+<pre class="cmd"># D: the .conf alone, with no .conflist anywhere</pre>
+<pre class="out"><b>10.91.5.2/24</b>   &lt;- the deprecated single-plugin form still works, up-converted</pre>
+<p>Case B is the one that breaks the folk rule. Case C is the one nobody expects. (Case C landed on
+<code>.3</code> rather than <code>.2</code> because <code>last_reserved_ip.0</code> carried over from
+case B — I9.10's subject.)</p></li>
+<li>Now the extension question, decided empirically. Each row puts a probe file that sorts
+<em>first</em> against a <code>99-fallback.conflist</code>, and reports which one libcni used.
+<pre class="cmd">for ext in conflist conf json conflist.orig conflist.bak conflist.disabled yaml; do
+  # 01-probe.$ext -> 10.91.5.0/24 ; 99-fallback.conflist -> 10.91.10.0/24
+  ...
+done</pre>
+<pre class="out">  01-probe.conflist           <b>considered</b>
+  01-probe.conf               never read
+  01-probe.json               never read
+  01-probe.conflist.orig      <b>never read</b>
+  01-probe.conflist.bak       never read
+  01-probe.conflist.disabled  never read
+  01-probe.yaml               never read</pre>
+<p><code>.conf</code> and <code>.json</code> read "never read" here only because a matching
+<code>.conflist</code> existed and satisfied the first pass — case D above proved they work when it
+does not. The genuinely important row is <code>.orig</code>: <strong>renaming a conflist to
+<code>.conflist.orig</code>, <code>.bak</code> or <code>.disabled</code> really does disable
+it</strong>, because the extension is the last dotted component.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can say where <code>/etc/cni/net.d</code> comes from (containerd's config, not the spec) and
+read it from a live node. You can describe libcni's name-based resolution and containerd's
+<code>maxConfNum</code> selection as two different mechanisms, and predict which file wins in all four
+lab cases. You know which renames actually disable a config file.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Numbering a file higher does not give it precedence — it takes precedence away.</strong>
+Lower sorts first, and first is what containerd takes. An operator adding
+<code>99-mynetwork.conflist</code> next to <code>10-flannel.conflist</code> and seeing no change has
+met this; so has one adding <code>05-cilium.conflist</code> and losing the node's whole network.</li>
+<li><strong>Two live conflists in that directory is a bug even when one is "just a backup".</strong>
+Give the backup a different extension, or move it out of the directory entirely. Both work; only one
+is obvious to the next person.</li>
+<li><strong>"The first file wins" is containerd's rule, not libcni's, and not CNI's.</strong> If you
+test with <code>cnitool</code> and reason about containerd — or the reverse — you will predict the
+wrong file. <code>cnitool</code> asks by name; containerd does not ask at all.</li>
+<li><strong><code>maxConfNum</code> can be raised, and then the rule changes again.</strong> Do not
+carry a mental model of the default into a cluster whose containerd config you have not read.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the directory <a href="w4.html#cp-4-6">W4.6 — inspect your actual CNI: flannel's moving
+parts</a> has you read on a real node, and getting it wrong is one of the faults in
+<a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose and read the signatures</a>. The pattern —
+two settings that look interchangeable and are not — is the same trap
+<a href="i5.html#cp-i5-13">I5.13</a> found with containerd's two registry <code>config_path</code>
+keys.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> § Section 1 of
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> for the
+configuration format, and
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/libcni/conf.go">libcni/conf.go</a> for
+<code>LoadNetworkConf</code> — thirty lines, and the only authority on the two-pass rule. In the exam
+docs, search <em>network plugins</em> for where Kubernetes states the directory as a convention.</p>
+</article>
+</div><!-- /g-configuration -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
