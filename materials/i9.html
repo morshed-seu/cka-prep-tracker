@@ -846,6 +846,337 @@ configuration format, and
 <code>LoadNetworkConf</code> — thirty lines, and the only authority on the two-pass rule. In the exam
 docs, search <em>network plugins</em> for where Kubernetes states the directory as a convention.</p>
 </article>
+<article class="lesson" id="cp-i9-6" data-id="i9-6">
+<div class="lesson-head"><span class="cp-id">I9.6</span><h4>Chaining: prevResult on the wire, and why order is not a preference</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A real node's network configuration is not one plugin, it is four or five in a row. Understanding
+how they hand work to each other explains why the ecosystem's plugins stay so small, why
+<code>hostPort</code> is implemented by something that never allocated an address, and why swapping two
+entries in a list breaks a node in a way the error message describes perfectly — if you know what it is
+telling you.</p>
+
+<h5>The concept</h5>
+<p>A <code>.conflist</code> holds a <code>plugins</code> array, and the runtime executes them in order.
+The first is an <strong>interface plugin</strong>: it creates the interface and gets it an address. Each
+one after it is a <strong>chained plugin</strong>, and it receives everything the earlier plugins built,
+as a <code>prevResult</code> object injected into its configuration on stdin.</p>
+
+<p>That single mechanism is why the plugin set is a set of small tools rather than one large one:</p>
+
+<div class="flow"><span>bridge<em>creates eth0, gets 10.92.0.2</em></span><em>→</em><span>portmap<em>writes DNAT to 10.92.0.2</em></span><em>→</em><span>bandwidth<em>shapes that veth</em></span><em>→</em><span>tuning<em>sets sysctls in that namespace</em></span></div>
+
+<p><code>portmap</code> needs to know the pod's address in order to write a DNAT rule pointing at it,
+and it gets that address without ever having asked IPAM for anything. <code>bandwidth</code> shapes the
+interface it is told about. <code>tuning</code> sets sysctls on it. None of them can work first, because
+none of them creates anything to work on — and that is not a convention or a preference, it is what
+"chained plugin" means.</p>
+
+<p>Teardown reverses it. On <code>DEL</code> the runtime walks the array <strong>backwards</strong>, so
+the last plugin added is the first undone, and every one of them is handed the <em>final</em> result of
+the original <code>ADD</code> rather than a partial one. That is why the runtime has to remember the
+result at all — and it does, in a cache file on disk, which the lab reads.</p>
+
+<div class="specref">
+<p>Chaining, from the runtime's side:</p>
+<blockquote>2. Derive request configuration from the plugin configuration, with the following parameters:<br>    - If this is the first plugin in the list, no previous result is provided,<br>    - For all additional plugins, the previous result is the result of the previous plugins.</blockquote>
+<cite>CNI spec 1.1.0, § Adding an attachment — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>And the two rules that govern teardown:</p>
+<blockquote>- The list of plugins is executed in **reverse order**<br>- The previous result provided is always the final result of the _add_ operation.</blockquote>
+<cite>CNI spec 1.1.0, § Deleting an attachment</cite>
+<p>Which forces an obligation on the runtime that is easy to miss, and is the reason a cache exists:</p>
+<blockquote>The runtime must store the result returned by the final plugin persistently, as it is required for _check_ and _delete_ operations.</blockquote>
+<cite>CNI spec 1.1.0, § Adding an attachment</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>The cleanest way to see <code>prevResult</code> is to put a plugin in the chain whose only job is
+to record what it was handed. <code>labs/intermediate/i9-dump</code> does exactly that, and passes the
+previous result through untouched — which is itself the rule a chained plugin most often breaks.
+<pre class="cmd">sudo install -m0755 labs/intermediate/i9-dump /opt/cni/bin/i9-dump
+cat &gt; ~/i9/net.d/10-chain.conflist &lt;&lt;'EOF'
+{
+  "cniVersion": "1.1.0",
+  "name": "i9chain",
+  "plugins": [
+    { "type": "bridge", "bridge": "i9chain0", "isGateway": true, "ipMasq": true,
+      "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+                "routes": [ { "dst": "0.0.0.0/0" } ] } },
+    { "type": "i9-dump" },
+    { "type": "portmap", "capabilities": { "portMappings": true } }
+  ]
+}
+EOF</pre></li>
+<li>Run the chain with a port mapping. <code>CAP_ARGS</code> is how <code>cnitool</code> supplies
+capability arguments — the structured cousin of <code>CNI_ARGS</code>, and the mechanism a pod spec's
+<code>hostPort</code> travels through.
+<pre class="cmd">sudo -E env CAP_ARGS='{"portMappings":[{"hostPort":18099,"containerPort":80,"protocol":"tcp"}]}' \
+  cnitool add i9chain /var/run/netns/i9pod1 | jq -c '.ips'</pre>
+<pre class="out">[{"address":"<b>10.92.0.2/24</b>","gateway":"10.92.0.1","interface":2}]</pre></li>
+<li>Now read what the <em>second</em> plugin was handed on stdin.
+<pre class="cmd">sudo cat /var/log/i9-dump.log</pre>
+<pre class="out">=== 09:08:22 CNI_COMMAND=ADD CNI_IFNAME=eth0
+--- environment parameters ---
+CNI_ARGS=
+CNI_COMMAND=ADD
+CNI_CONTAINERID=cnitool-c3af9ea7303b56406479
+CNI_NETNS=/var/run/netns/i9pod1
+CNI_PATH=/opt/cni/bin
+--- stdin ---
+{
+  "cniVersion": "1.1.0",
+  "name": "i9chain",
+  "<b>prevResult": {</b>
+    "cniVersion": "1.1.0",
+    "interfaces": [
+      { "mac": "9a:d3:a5:68:b2:ac", "name": "i9chain0" },
+      { "mac": "3a:4e:a3:c0:bc:9d", "name": "vethe9fbc5cb" },
+      { "mac": "aa:11:17:ba:51:67", "name": "eth0", "sandbox": "/var/run/netns/i9pod1" }
+    ],
+    "<b>ips": [ { "address": "10.92.0.2/24", "gateway": "10.92.0.1", "interface": 2 } ]</b>,
+    "routes": [ { "dst": "0.0.0.0/0" } ]
+  },
+  "type": "i9-dump"
+}</pre>
+<p>Two details worth noticing. The environment parameters are <em>identical</em> to the first plugin's —
+same container ID, same netns, same ifname. And the configuration contains only
+<code>cniVersion</code>, <code>name</code>, <code>prevResult</code> and this plugin's own
+<code>type</code>: the bridge's keys are <strong>not</strong> passed along. A chained plugin sees the
+result, never the earlier plugin's settings.</p></li>
+<li>Confirm the third plugin used an address it never allocated.
+<pre class="cmd">sudo iptables -t nat -S | grep 18099</pre>
+<pre class="out">-A CNI-DN-e1934a5559f4338ad545c -s 10.92.0.0/24 -p tcp -m tcp --dport 18099 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-e1934a5559f4338ad545c -s 127.0.0.1/32 -p tcp -m tcp --dport 18099 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-e1934a5559f4338ad545c -p tcp -m tcp --dport 18099 <b>-j DNAT --to-destination 10.92.0.2:80</b>
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"i9chain\" id: \"cnitool-c3af9ea7303b56406479\"" -m multiport --dports 18099 -j CNI-DN-e1934a5559f4338ad545c</pre>
+<p><code>10.92.0.2</code> came from <code>prevResult</code>. That is the whole trick.</p></li>
+<li>Now put <code>portmap</code> first and see what happens. This is not a subtle degradation.
+<pre class="cmd"># plugins: [ portmap, bridge ]  — the wrong way round
+sudo -E env CAP_ARGS='{"portMappings":[{"hostPort":18099,"containerPort":80,"protocol":"tcp"}]}' \
+  cnitool add i9chain /var/run/netns/i9pod1; echo "exit=$?"</pre>
+<pre class="out">plugin type="portmap" failed (add): <b>must be called as chained plugin</b>
+exit=1</pre>
+<p>The plugin says exactly what is wrong, in five words. It has no <code>prevResult</code>, so it has no
+address to write a rule for, so there is nothing it can do — the same class of mistake as piping into a
+command that expected an argument. Omitting the port mapping entirely produces the identical error: the
+problem is the position, not the arguments.</p></li>
+<li>Finally, watch teardown run the chain backwards, and see where the <code>prevResult</code> on
+<code>DEL</code> comes from.
+<pre class="cmd">sudo ls /var/lib/cni/results/
+sudo -E cnitool del i9chain /var/run/netns/i9pod1; echo "exit=$?"
+sudo cat /var/log/i9-dump.log   # after truncating it before the DEL</pre>
+<pre class="out">bridge-default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90-eth0
+<b>i9chain-cnitool-c3af9ea7303b56406479-eth0</b>
+
+exit=0
+
+=== 09:09:36 <b>CNI_COMMAND=DEL</b> CNI_IFNAME=eth0
+--- stdin ---
+{
+  "cniVersion": "1.1.0",
+  "name": "i9chain",
+  "<b>prevResult": {</b> ... "ips": [ { "address": "10.92.0.4/24", ... } ] },
+  "type": "i9-dump"
+}</pre>
+<p>The cache filename is <code>&lt;network&gt;-&lt;containerID&gt;-&lt;ifname&gt;</code> — the attachment
+identity from I9.2. On <code>DEL</code> the chained plugin gets the full original result read back from
+that file, which is how it knows what to undo after the interface is already gone. Run
+<code>DEL</code> again with the cache now deleted and it still returns 0, because I9.3's MUST does not
+depend on the cache existing.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain what <code>prevResult</code> is, which plugins can and cannot come first and why,
+and what a chained plugin does <em>not</em> receive. You can predict that reversing bridge and portmap
+fails at the position rather than the arguments, and you can find the runtime's result cache on disk and
+say what its filename encodes.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A chained plugin must pass <code>prevResult</code> through.</strong> If it returns something
+smaller, every plugin after it — and the runtime's own cache, and therefore every later
+<code>CHECK</code> and <code>DEL</code> — loses the addresses. This is the most common bug in
+hand-written chained plugins after the stdout mistake, and it is silent on ADD.</li>
+<li><strong>Editing the conflist between ADD and DEL leaks whatever you removed.</strong> Teardown walks
+the list as it is <em>now</em>, so a plugin you deleted from the array is never asked to undo its work.
+The spec says the configuration "should not change between add and delete" for exactly this reason.</li>
+<li><strong>The whole chain runs for one attachment, with the same container ID.</strong> Four plugins
+is still one pod, one address, one cache entry.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The DNAT rule <code>portmap</code> wrote is the mechanism behind <code>hostPort</code>, and the same
+rewrite family as <a href="w4.html#cp-4-9">W4.9 — a ClusterIP is a virtual IP, it exists only as
+rewrite rules</a>. Reading real chains on a node is
+<a href="w4.html#cp-4-6">W4.6 — inspect your actual CNI</a>; the rule syntax and first-match-wins
+reading are <a href="b9.html#cp-b9-11">B9.11</a> and <a href="b9.html#cp-b9-14">B9.14</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> § Section 3 of
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> covers adding,
+deleting and checking an attachment in three short lists — read all three together, since the reverse
+ordering only makes sense against the forward one.
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/CONVENTIONS.md">CONVENTIONS.md</a> has
+the capability-args mechanism <code>portMappings</code> uses.</p>
+</article>
+<article class="lesson" id="cp-i9-7" data-id="i9-7">
+<div class="lesson-head"><span class="cp-id">I9.7</span><h4>Versions are negotiated per plugin, and the result's shape changes with them</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The <code>cniVersion</code> in a config file is not documentation and it is not a compatibility
+declaration about your cluster. It is a <em>request for a particular result format</em>, made
+independently to each plugin in the chain. Get it wrong in a plugin you write and the result will be
+parsed, misread, and fail somewhere that blames a different component entirely.</p>
+
+<h5>The concept</h5>
+<p>Each plugin advertises the set of spec versions whose results it can produce, via
+<code>CNI_COMMAND=VERSION</code>. The configuration names one of them. Because the negotiation is
+per-plugin and per-invocation, <strong>a chain can legitimately mix plugins built against different
+spec generations</strong>, as long as each supports the version being asked for. There is no
+cluster-wide CNI version, and nothing to upgrade in lockstep.</p>
+
+<p>The differences between generations are small in count and large in consequence:</p>
+
+<table class="langpair">
+<thead><tr><th>Version</th><th>Result shape</th><th>Arrived with</th></tr></thead>
+<tbody>
+<tr><td><code>0.1.0</code>–<code>0.2.0</code></td><td>Flat: a single <code>ip4</code> (and <code>ip6</code>) object. No interface list at all.</td><td>The original</td></tr>
+<tr><td><code>0.3.0</code>–<code>0.3.1</code></td><td><code>interfaces</code> + <code>ips</code> + <code>routes</code>, with <code>ips[].interface</code> indexing the array</td><td>The structure still in use</td></tr>
+<tr><td><code>0.4.0</code></td><td>Same shape</td><td><code>CHECK</code></td></tr>
+<tr><td><code>1.0.0</code></td><td>Same shape, <code>dns</code> no longer emitted when empty</td><td>Stability commitment</td></tr>
+<tr><td><code>1.1.0</code></td><td>Same shape</td><td><code>GC</code>, <code>STATUS</code>, and the <code>cniVersions</code> array</td></tr>
+</tbody>
+</table>
+
+<p>The one real break is between <code>0.2.0</code> and <code>0.3.0</code>: the flat
+<code>ip4</code> object was replaced by the <code>interfaces</code>/<code>ips</code> pair, and there is
+no way to express "which interface" in the older form. libcni converts between the shapes so a modern
+runtime can still drive an ancient plugin, which is why those versions are still in every plugin's
+supported list rather than removed.</p>
+
+<p>1.1.0 also added a second way to state the version: <code>cniVersions</code>, an <em>array</em> of
+acceptable versions, letting the runtime pick the highest that everything in the chain supports rather
+than forcing the config author to guess the floor.</p>
+
+<div class="specref">
+<p>Who chooses, and on what basis:</p>
+<blockquote>CNI runtimes MUST select the highest supported version from the set of network configuration versions given by the `cniVersion` and `cniVersions` fields. Runtimes MAY consider the set of supported plugin versions as reported by the VERSION command when determining available versions.</blockquote>
+<cite>CNI spec 1.1.0, § Version considerations — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>Note the asymmetry: consulting the config is a MUST, consulting the plugins is only a MAY. So a
+runtime is permitted to ask for a version a plugin cannot do and let the plugin refuse — which is
+precisely what step 3 below demonstrates.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Compare what six plugins advertise. Five are the reference set; the sixth is the bash plugin from
+I9.6, which deliberately claims less.
+<pre class="cmd">for p in bridge host-local portmap loopback dhcp i9-dump; do
+  printf '  %-12s ' "$p"
+  echo "{\"cniVersion\":\"1.1.0\",\"name\":\"x\",\"type\":\"$p\"}" \
+    | sudo env CNI_COMMAND=VERSION /opt/cni/bin/$p | jq -c '.supportedVersions'
+done</pre>
+<pre class="out">  bridge       ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  host-local   ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  portmap      ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  loopback     ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  dhcp         ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  <b>i9-dump      ["0.3.1","0.4.0","1.0.0","1.1.0"]</b></pre>
+<p>The reference plugins all support everything back to <code>0.1.0</code>, which is why version skew
+is rarely the actual problem on a node running only them. A hand-written plugin narrowing that list is
+the normal case for anything you build — supporting the pre-<code>0.3.0</code> flat form is real work
+for no benefit.</p></li>
+<li>Now ask the same plugin for the same ADD at four different versions, and look only at the top-level
+keys of each result.
+<pre class="cmd">for ver in 0.2.0 0.3.1 0.4.0 1.1.0; do
+  # same bridge config, only cniVersion changes
+  echo "--- cniVersion $ver ---"
+  sudo env CNI_COMMAND=ADD ... /opt/cni/bin/bridge &lt; ~/i9/v.json | jq -c 'keys'
+done</pre>
+<pre class="out">--- cniVersion 0.2.0 ---
+["cniVersion","dns",<b>"ip4"</b>]
+--- cniVersion 0.3.1 ---
+["cniVersion","dns",<b>"interfaces","ips","routes"</b>]
+--- cniVersion 0.4.0 ---
+["cniVersion","dns","interfaces","ips","routes"]
+--- cniVersion 1.1.0 ---
+[<b>"cniVersion","interfaces","ips","routes"</b>]</pre>
+<p>Two changes visible in one command: the flat-to-structured break at 0.3.x, and <code>dns</code>
+disappearing at 1.x when it is empty rather than being emitted as <code>{}</code>.</p></li>
+<li>Look at the old flat form in full, so you would recognise it in a log.
+<pre class="cmd">sudo env CNI_COMMAND=ADD CNI_CONTAINERID=flat ... /opt/cni/bin/bridge &lt; ~/i9/v020.json | jq .</pre>
+<pre class="out">{
+  "cniVersion": "0.2.0",
+  "<b>ip4": {
+    "ip": "10.92.0.6/24",</b>
+    "gateway": "10.92.0.1",
+    "routes": [ { "dst": "0.0.0.0/0" } ]
+  },
+  "dns": {}
+}</pre>
+<p>No <code>interfaces</code> array, so nothing to index — which is exactly why
+<code>ips[].interface</code> could not exist before 0.3.0, and why a chained plugin needing to know
+<em>which</em> interface an address belongs to cannot work against this shape.</p></li>
+<li>Ask for a version nothing supports, and read the refusal.
+<pre class="cmd">sudo env CNI_COMMAND=ADD ... /opt/cni/bin/bridge &lt; ~/i9/v150.json; echo "exit=$?"</pre>
+<pre class="out">{
+    "<b>code": 1</b>,
+    "msg": "incompatible CNI versions",
+    "details": "config is \"1.5.0\", plugin supports [\"0.1.0\" ... \"1.1.0\"]"
+}exit=1</pre>
+<p>Code 1, with the supported list in <code>details</code>. This is the error a config file copied from
+a newer cluster produces, and it names both halves of the mismatch.</p></li>
+<li>Use the 1.1.0 <code>cniVersions</code> array instead: offer a set and let the runtime choose.
+<pre class="cmd">cat &gt; ~/i9/net.d/10-multi.conflist &lt;&lt;'EOF'
+{ "cniVersions": [ "0.3.1", "1.0.0", "1.1.0" ], "name": "i9multi", "plugins": [
+  { "type": "bridge", "bridge": "i9chain0", "isGateway": true,
+    "ipam": { "type": "host-local", "subnet": "10.92.0.0/24" } },
+  { "type": "i9-dump" } ] }
+EOF
+sudo -E cnitool add i9multi /var/run/netns/i9pod1 | jq -c '{cniVersion}'</pre>
+<pre class="out">{"cniVersion":"<b>1.1.0</b>"}</pre>
+<p>Both plugins support 1.1.0, so the highest offered version was chosen. Had <code>i9-dump</code>
+topped out at <code>1.0.0</code>, a runtime that consults <code>VERSION</code> would have settled
+there — without the config author needing to know.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain what <code>cniVersion</code> actually requests, and why a chain may mix plugins from
+different spec generations. You can name the one breaking change in the result shape and say why
+<code>ips[].interface</code> could not exist before it. You recognise a code 1 refusal and can read both
+sides of the mismatch out of it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Claiming a version you do not implement is worse than claiming a lower one.</strong> A plugin
+that advertises <code>1.1.0</code> and emits a <code>0.3.1</code>-shaped result will be parsed against
+the wrong schema. The failure surfaces later, in a plugin further down the chain or in the runtime's
+cache, and blames the wrong component.</li>
+<li><strong>The version in the file is the request; the plugin's list is the capability.</strong> Two
+different things, and only the second is discoverable at runtime.</li>
+<li><strong><code>cniVersions</code> is 1.1.0-only.</strong> A conf using it against an older runtime has
+no <code>cniVersion</code> at all, which is a config error rather than a graceful downgrade. Keep both
+fields if you need to support both.</li>
+<li><strong><code>dns: {}</code> appearing or vanishing is a version artefact, not a signal.</strong>
+Do not write a parser that requires it.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The pattern — a version field that selects a wire format rather than describing a product — is the
+same one <a href="i4.html#cp-i4-7">I4.7 — OCI or Docker: telling the media types apart</a> found in
+OCI manifests, where changing three media-type strings changes the manifest digest while moving no
+bytes. Version skew between a config and a binary is
+one of the signatures in <a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> § Version considerations and § Section 5: Result Types in
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a>. The released-version
+list at the top of that file is the authoritative mapping from spec version to library tag — worth
+bookmarking, since the git tags do not match the spec numbers.</p>
+</article>
 </div><!-- /g-configuration -->
 
 <div class="quiz" id="quiz">
