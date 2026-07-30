@@ -557,6 +557,288 @@ curl -s http://127.0.0.1:5000/v2/i6/two/blobs/$B | tar xzOf - big.bin | head -c 
 </article>
 </div><!-- /g-semantics -->
 
+<!-- ---------------- Doing it properly ---------------- --><div class="grp" id="g-doing-it-properly"><h3>Doing it properly</h3>
+<article class="lesson" id="cp-i6-5" data-id="i6-5">
+<div class="lesson-head"><span class="cp-id">I6.5</span><h4>Multi-stage: throwing a whole filesystem away</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><a href="#cp-i6-4">I6.4</a> left you with an unsatisfying choice: chain everything into one giant <code>RUN</code> and lose your cache granularity, or split it up and ship the garbage. Multi-stage builds dissolve that choice. You get to be as wasteful as you like — install a 250 MB toolchain, unpack sources, leave caches lying around — in a stage whose layers are then <em>discarded entirely</em> rather than whitened out. This is the single largest, cheapest improvement available to most real Dockerfiles, and it is one keyword.</p>
+
+<h5>The concept</h5>
+<p>A Dockerfile may contain more than one <code>FROM</code>. Each <code>FROM</code> starts a new <strong>stage</strong> with its own filesystem, and a stage can be named with <code>AS name</code>. <code>COPY --from=name /path /dest</code> then reaches into a previous stage's finished filesystem and copies a file out of it, exactly as <code>COPY</code> reaches into your build context.</p>
+<p>Here is the part that matters, and it is a stronger claim than "delete it afterwards": <strong>only the last stage becomes the image.</strong> The earlier stages' layers are never referenced by the final manifest, so they are never in <code>rootfs.diff_ids</code>, never pushed and never pulled. Compare that with <a href="#cp-i6-4">I6.4</a>, where the 100 MB stayed in a blob anyone could fetch. Here the compiler, the headers, the package index, the source tree and any credential you used along the way were never in a layer of the resulting image <em>at all</em>. There is nothing to extract, because there is nothing there.</p>
+<p>The canonical shape is compile-then-copy: a first stage with the whole toolchain that produces one artefact, and a final stage on a minimal base that copies just that artefact in. The lab below does it with a C program and a static binary, because that makes the arithmetic brutal — 261.9 MB against 8.6 MB for byte-identical behaviour. In a Go or Rust project the ratio is often larger still.</p>
+<p>Two properties fall out that are worth noticing separately. First, stages need not be used: an unreferenced stage is simply not built (<a href="#cp-i6-6">I6.6</a> shows why — the DAG prunes it). Second, and much more useful than most people realise, <strong><code>--target</code> lets you build any stage as an image in its own right</strong>. When a compile fails only inside the build, you do not need a second Dockerfile or a hand-assembled debug container: <code>--target build</code> gives you an image of the builder stage, with the toolchain and the sources exactly as the failing step saw them, and you can open a shell in it. This is the underused half of the feature.</p>
+<p>The one real cost is to auditability, and it is worth knowing before you rely on it. Because the earlier stages are not in the image, they are also not in the image's <code>history</code> — the lab shows the final image's history mentioning a bare <code>COPY /hello /usr/local/bin/hello</code>, with the <code>--from=build</code> stripped and no hint that a compiler ever existed. Excellent for not leaking; awkward when the question is "what produced this binary?", which is the gap <a href="#cp-i6-10">I6.10</a> runs into and that provenance attestations exist to fill.</p>
+
+<div class="specref">
+<p>There is no such thing as a build stage in the OCI specs, and the definition of an image is the reason. An image is its filesystem changes and its execution parameters — and nothing else. There is no third field for "how this was produced", which is precisely why the discarded stages leave no trace, for good and for ill.</p>
+<blockquote>An OCI <em>Image</em> is an ordered collection of root filesystem changes and the corresponding execution parameters for use within a container runtime.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the same program two ways. The single-stage version is what a first draft looks like; the multi-stage version compiles in a throwaway stage and copies out one file.
+<pre class="cmd">mkdir -p ~/i6/ms &amp;&amp; cd ~/i6/ms
+cat &gt; hello.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+int main(void){ puts("hello from a statically linked binary"); return 0; }
+EOF
+cat &gt; Dockerfile.single &lt;&lt;'EOF'
+FROM alpine:3.21
+RUN apk add --no-cache build-base
+COPY hello.c /src/hello.c
+RUN gcc -static -o /usr/local/bin/hello /src/hello.c
+CMD ["hello"]
+EOF
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21 AS build
+RUN apk add --no-cache build-base
+COPY hello.c /src/hello.c
+RUN gcc -static -o /hello /src/hello.c
+
+FROM alpine:3.21
+COPY --from=build /hello /usr/local/bin/hello
+CMD ["hello"]
+EOF</pre></li>
+
+<li>Build both and check they are actually equivalent before comparing costs — the comparison is only interesting if the behaviour is identical.
+<pre class="cmd">sudo nerdctl build --no-cache -q -f Dockerfile.single -t i6/ms:single .
+sudo nerdctl build --no-cache -q -t i6/ms:multi .
+sudo nerdctl run --rm i6/ms:single
+sudo nerdctl run --rm i6/ms:multi</pre>
+<pre class="out">hello from a statically linked binary
+hello from a statically linked binary</pre></li>
+
+<li>Now the bill.
+<pre class="cmd">sudo nerdctl images | grep -E "REPOSITORY|i6/ms"</pre>
+<pre class="out">REPOSITORY   TAG      IMAGE ID       PLATFORM      SIZE       BLOB SIZE
+i6/ms        multi    be6ec5d18778   linux/amd64   <b>8.598MB</b>    3.676MB
+i6/ms        single   3a00e392baee   linux/amd64   <b>261.9MB</b>    90.51MB</pre>
+<p>261.9 MB against 8.6 MB, and 90.5 MB against 3.7 MB over the wire. One keyword.</p></li>
+
+<li>Read both configs to see <em>why</em>, rather than trusting the number. The point is what is missing from the second one.
+<pre class="cmd">for t in single multi; do
+  M=$(sudo ctr -n default images ls name==docker.io/i6/ms:$t | awk 'NR==2{print $3}')
+  C=$(sudo ctr -n default content get "$M" | jq -r .config.digest)
+  echo "=== i6/ms:$t ==="
+  sudo ctr -n default content get "$C" \
+    | jq -r '"layers: \(.rootfs.diff_ids|length)", (.history[]|"  \(if .empty_layer then "EMPTY" else "LAYER" end) \(.created_by)")'
+done</pre>
+<pre class="out">=== i6/ms:single ===
+layers: <b>4</b>
+  LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+  EMPTY CMD ["/bin/sh"]
+  <b>LAYER RUN /bin/sh -c apk add --no-cache build-base # buildkit</b>
+  LAYER COPY hello.c /src/hello.c # buildkit
+  LAYER RUN /bin/sh -c gcc -static -o /usr/local/bin/hello /src/hello.c # buildkit
+  EMPTY CMD ["hello"]
+=== i6/ms:multi ===
+layers: <b>2</b>
+  LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+  EMPTY CMD ["/bin/sh"]
+  <b>LAYER COPY /hello /usr/local/bin/hello # buildkit</b>
+  EMPTY CMD ["hello"]</pre>
+<p>The <code>build-base</code> layer is not smaller in the multi-stage image; it is <em>absent</em>. So is the source copy. And look closely at that last <code>created_by</code>: it says <code>COPY /hello /usr/local/bin/hello</code> with the <code>--from=build</code> gone. The image's own audit trail does not record that a build stage existed.</p></li>
+
+<li>Confirm the toolchain really is gone rather than merely hidden. This is the difference from <a href="#cp-i6-4">I6.4</a>, stated as a command.
+<pre class="cmd">sudo nerdctl run --rm i6/ms:multi sh -c "which gcc || echo no gcc in the multi-stage image"
+sudo nerdctl run --rm i6/ms:single sh -c "which gcc"</pre>
+<pre class="out"><b>no gcc in the multi-stage image</b>
+/usr/bin/gcc</pre>
+<p>And unlike a whitened-out file, there is no layer in the registry to fetch it from — the blob was never part of this image's manifest.</p></li>
+
+<li>Now the debugging half. Build only the first stage and get inside it, with the toolchain and the intermediate artefact exactly as the build saw them.
+<pre class="cmd">sudo nerdctl build --target build -q -t i6/ms:builder .
+sudo nerdctl run --rm i6/ms:builder sh -c "gcc --version | head -1; ls -l /hello"</pre>
+<pre class="out">gcc (Alpine 14.2.0) 14.2.0
+-rwxr-xr-x    1 root     root         76488 Jul 30 03:05 /hello</pre>
+<p>No second Dockerfile, no commented-out final stage. When a compile fails only inside the build, this is how you go and look.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can convert a single-stage Dockerfile into a multi-stage one and state the size difference before measuring it. You can explain why this is a stronger guarantee than deleting files, in terms of what is and is not in the final manifest. And you can reach into any stage with <code>--target</code> to debug a failure that only happens during a build.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>COPY --from</code> copies files, not behaviour.</strong> A dynamically linked binary copied onto a smaller base will fail at runtime with a missing-loader error that looks nothing like a missing library — the lab uses <code>-static</code> for exactly that reason. If you copy a dynamic binary, copy its libraries too, or use a base that has them. This is the most common way a multi-stage conversion breaks.</li>
+<li><strong>The final stage's base is a real choice, and <code>scratch</code> is not always the right one.</strong> An empty base means no shell, no <code>ca-certificates</code>, no timezone data and no <code>/etc/passwd</code> — which is excellent for attack surface and miserable for debugging, and it makes <code>kubectl exec</code> useless. That trade-off is the reason <a href="w6.html#cp-6-3">W6.3</a>'s ephemeral debug containers exist.</li>
+<li><strong>Stage names are not namespaces.</strong> Two stages both named <code>build</code>, or a stage referenced before it is defined, fail in ways whose error messages point at the <code>COPY</code> rather than at the naming. Name stages for what they produce.</li>
+<li><strong>Multi-stage hides the build from <code>history</code>, which cuts both ways.</strong> Nothing in the final image records the compiler version, the source revision or the flags used, so <a href="#cp-i6-10">I6.10</a>'s audit trail is thinner for exactly the images that are best built. If you need that record, it has to be added deliberately — a <code>LABEL</code>, or the provenance attestations of <a href="#cp-i6-7">I6.7</a>'s tooling.</li>
+<li><strong>An unused stage costs nothing, but an unused stage that <em>fails</em> also costs nothing — until someone references it.</strong> A broken stage nothing copies from will sit undetected in your Dockerfile indefinitely, because it is never built.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the checkpoint that makes the difference on a real cluster, and the mechanism is <a href="i5.html#cp-i5-3">I5.3</a>'s: image size is pull time, pull time is pod start time, and pod start time is what a rollout, a scale-up under load and a node replacement all wait on. A 90 MB image against a 3.7 MB one is the difference between an autoscaler that reacts in seconds and one that reacts in minutes. The security half aims squarely at what <a href="w3.html#cp-3-23">W3.23</a> is about: a build-time credential in a discarded stage is genuinely not in the shipped artefact, which is a claim you can defend, unlike "we deleted it in the next layer". And the smaller the final base, the more <a href="w6.html#cp-6-3">W6.3</a>'s <code>kubectl debug</code> becomes your only way in — plan for that before the incident, not during it.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> No spec covers stages — search the Docker docs for <em>"multi-stage builds"</em> and <em>"build target"</em>. On the Kubernetes side, search for <em>"ephemeral containers"</em>, which is what you will need once your final stage stops shipping a shell.</p>
+</article>
+<article class="lesson" id="cp-i6-6" data-id="i6-6">
+<div class="lesson-head"><span class="cp-id">I6.6</span><h4>BuildKit: a graph, two mounts, and one leak</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everything you have measured so far — the lazy context transfer, the vertex numbers that do not match your line numbers, the cache that survives across builds — comes from one design decision: BuildKit treats a build as a <strong>graph</strong> to be solved, not a script to be run. Once you see the graph, three features stop looking like unrelated flags and become obvious consequences of it. And one long-standing bad habit becomes indefensible, because you will read a live credential out of an image in one line.</p>
+
+<h5>The concept</h5>
+<p>BuildKit parses your Dockerfile into a <abbr title="directed acyclic graph — nodes with dependencies, and no cycles">DAG</abbr> of operations, where each node's inputs are other nodes. From there, three behaviours follow with no extra machinery:</p>
+<ul>
+<li><strong>Independent branches run concurrently.</strong> Two stages that do not depend on each other have no edge between them, so nothing orders them, so they run at once. The lab measures two 6-second stages completing in 7.7 seconds.</li>
+<li><strong>Branches nothing needs are never built.</strong> Solving a graph means computing what the requested output depends on; a stage nobody copies from is not in that set. <code>--target</code> is just naming a different output node.</li>
+<li><strong>Steps are addressed by content, not position.</strong> Which is <a href="#cp-i6-3">I6.3</a>'s cache key, now visibly the same idea: a node's identity is its operation plus its inputs' identities.</li>
+</ul>
+<p>The two mounts follow from the same model. A <code>RUN</code> step's output is the filesystem diff it produces — so if you want a directory that the step can read and write but that is <em>not</em> part of that diff, you attach it as a mount rather than putting it in the tree:</p>
+<ul>
+<li><strong><code>--mount=type=cache,target=/path</code></strong> — a persistent directory shared across builds, contributing nothing to any layer. This is what finally made <code>pip</code>, <code>npm</code> and <code>apt</code> caches safe to keep: previously your choice was to delete the cache (slow builds) or ship it (fat images).</li>
+<li><strong><code>--mount=type=secret,id=name</code></strong> — a file present at <code>/run/secrets/name</code> for the duration of one <code>RUN</code>, and in no layer afterwards. The step can read the real credential; the image contains no trace of it.</li>
+</ul>
+<p>Which brings us to the leak, and it is worth being precise about why it is not a bug. <code>--build-arg</code> was never a secret mechanism. Build args are recorded in the image config's <code>history</code>, in plain text, because <code>history</code>'s job is to record what produced each layer — the spec says <code>created_by</code> is "The command which created the layer", and the value of an <code>ARG</code> is part of that command. So a token passed as a build arg is published with the image, readable by anyone who can pull it.</p>
+<p>The lab shows it is worse than the usual warning suggests, in two ways. The token appears <strong>twice</strong> — once as its own <code>ARG NAME=value</code> entry and once inlined into the <code>RUN</code> entry as <code>RUN |1 NAME=value /bin/sh -c …</code>. And the image's only layer is the 32-byte empty blob from <a href="#cp-i6-1">I6.1</a>, because the <code>RUN</code> wrote nothing to disk — so a secret scanner that unpacks layer tars finds absolutely nothing. The credential is pure metadata, and metadata is exactly where nobody looks.</p>
+
+<div class="specref">
+<p>The spec does not warn you about build args, because from its point of view nothing is wrong: a field defined to hold the command that created a layer is holding the command that created a layer. The leak is a misuse of a working feature, which is why it cannot be fixed and had to be replaced.</p>
+<blockquote><strong>created_by</strong> <em>string</em>, OPTIONAL<br><br>The command which created the layer.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md#properties">config.md § Properties</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>First see the graph. Two stages that each sleep for six seconds and depend on nothing, plus a final stage that needs both.
+<pre class="cmd">mkdir -p ~/i6/dag &amp;&amp; cd ~/i6/dag
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21 AS a
+RUN echo a-start; sleep 6; echo a-done
+
+FROM alpine:3.21 AS b
+RUN echo b-start; sleep 6; echo b-done
+
+FROM alpine:3.21
+COPY --from=a /etc/alpine-release /a
+COPY --from=b /etc/alpine-release /b
+EOF
+time sudo nerdctl build --no-cache --progress=plain -t i6/dag:v1 . 2&gt;&amp;1 \
+  | grep -E "a-start|a-done|b-start|b-done"</pre>
+<pre class="out">#5 [a 2/2] RUN echo a-start; sleep 6; echo a-done
+#5 <b>0.178</b> a-start
+#5 6.178 a-done
+#6 [b 2/2] RUN echo b-start; sleep 6; echo b-done
+#6 <b>0.167</b> b-start
+#6 6.170 b-done
+
+real	0m<b>7.666</b>s</pre>
+<p>Twelve seconds of sleeping in a 7.7-second build. Those leading numbers are each vertex's own elapsed time, and both stages report starting at ~0.17 s — they began together because nothing in the graph ordered them.</p></li>
+
+<li>Now ask for one stage only, and watch the other branch not happen. This is pruning, not skipping — stage <code>b</code> was never part of what had to be solved.
+<pre class="cmd">time sudo nerdctl build --no-cache --progress=plain --target a -t i6/dag:onlya . 2&gt;&amp;1 \
+  | grep -E "a-start|a-done|b-start|b-done"</pre>
+<pre class="out">#5 [a 2/2] RUN echo a-start; sleep 6; echo a-done
+#5 0.155 a-start
+#5 6.158 a-done
+
+real	0m7.382s</pre>
+<p>No <code>b</code> lines at all. Same wall clock as the two-stage build, which is the other way of seeing that <code>b</code> was free in the first place.</p></li>
+
+<li>Attach a cache mount and prove it survives between builds. Vary a build arg so the step's key changes each time and the step genuinely reruns — using <code>--no-cache</code> here would confound the experiment, for a reason step 4 makes clear.
+<pre class="cmd">mkdir -p ~/i6/cm &amp;&amp; cd ~/i6/cm
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21
+ARG N
+RUN --mount=type=cache,target=/pkgcache \
+    echo "run $N" &gt;&gt; /pkgcache/log &amp;&amp; echo "cache mount holds $(wc -l &lt; /pkgcache/log) line(s)"
+EOF
+b(){ sudo nerdctl build $2 --progress=plain --build-arg N=$1 -t i6/cm3:v$1 . 2&gt;&amp;1 \
+     | grep "cache mount holds"; }
+b 1; b 2; b 3</pre>
+<pre class="out">#5 0.091 cache mount holds <b>2</b> line(s)
+#5 0.132 cache mount holds <b>3</b> line(s)
+#5 0.115 cache mount holds <b>4</b> line(s)</pre>
+<p>Accumulating across separate builds, exactly as a package cache needs to. It starts at 2 rather than 1 because an earlier experiment on this machine already wrote a line — cache mounts are keyed by their <em>target path</em> by default, so unrelated projects mounting <code>/pkgcache</code> share one cache. Give it an explicit <code>id=</code> if that is not what you want.</p></li>
+
+<li>Now run the same thing with <code>--no-cache</code>, and then once more without, because the result is not what the flag's name suggests.
+<pre class="cmd">b 99 --no-cache
+b 4</pre>
+<pre class="out">#5 0.120 cache mount holds <b>1</b> line(s)
+#5 0.105 cache mount holds <b>2</b> line(s)</pre>
+<p>Read those two lines carefully. <code>--no-cache</code> did not merely re-run the step — it <strong>emptied the cache mount</strong>, leaving only the line that build wrote. And the following ordinary build sees 2, not 5, so the four earlier lines were <em>destroyed</em> rather than hidden. If you habitually add <code>--no-cache</code> to "get a clean build", you are also throwing away every package cache in the Dockerfile, which is usually the opposite of what you wanted.</p></li>
+
+<li>Attach a secret mount, and check that the step really sees the true credential — compare the hash computed inside the build against the file on the host.
+<pre class="cmd">mkdir -p ~/i6/mnt &amp;&amp; cd ~/i6/mnt
+echo "supersecret-token-value" &gt; tok.txt
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21
+RUN --mount=type=secret,id=tok \
+    sha256sum /run/secrets/tok &amp;&amp; wc -c &lt; /run/secrets/tok
+EOF
+sudo nerdctl build --no-cache --progress=plain --secret id=tok,src=tok.txt -t i6/mnt:v1 . 2&gt;&amp;1 \
+  | grep -E "^#[0-9]+ [0-9]"
+sha256sum tok.txt</pre>
+<pre class="out">#6 0.128 <b>742edcb40dde760800ab8f9042417ae3b791f3e46389a10f1ca37c65159bf9dd</b>  /run/secrets/tok
+#6 0.128 24
+
+<b>742edcb40dde760800ab8f9042417ae3b791f3e46389a10f1ca37c65159bf9dd</b>  tok.txt</pre>
+<p>Same hash, same 24 bytes — the real secret, not a placeholder.</p></li>
+
+<li>And confirm neither mount left anything behind in the image.
+<pre class="cmd">sudo nerdctl run --rm i6/mnt:v1 ls -la /run/secrets</pre>
+<pre class="out">ls: /run/secrets: <b>No such file or directory</b></pre></li>
+
+<li>Now do it the wrong way, so you never do it again. Pass a token as a build arg and push the result.
+<pre class="cmd">mkdir -p ~/i6/arg &amp;&amp; cd ~/i6/arg
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21
+ARG GITHUB_TOKEN
+RUN echo "fetching a private dependency with $GITHUB_TOKEN" &gt; /dev/null
+EOF
+sudo nerdctl build --no-cache -q --build-arg GITHUB_TOKEN=ghp_S3cr3tT0k3nDoNotShare \
+  -t 127.0.0.1:5000/i6/leak:v1 .
+sudo nerdctl push --insecure-registry 127.0.0.1:5000/i6/leak:v1
+MAN=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+      http://127.0.0.1:5000/v2/i6/leak/manifests/v1)
+echo "$MAN" | jq -r '.layers[] | "  \(.size)  \(.digest)"'</pre>
+<pre class="out">  3646875  sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+  <b>32  sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1</b></pre>
+<p>The only thing the <code>RUN</code> added is the empty layer — the token is in no file, so nothing that scans filesystems will ever find it. Now look where it actually is.</p></li>
+
+<li>Read the config's history straight out of the registry. No pull, no container, no privilege beyond being allowed to fetch the image.
+<pre class="cmd">C=$(echo "$MAN" | jq -r .config.digest)
+curl -s http://127.0.0.1:5000/v2/i6/leak/blobs/$C | jq -r '.history[].created_by'</pre>
+<pre class="out">ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+CMD ["/bin/sh"]
+<b>ARG GITHUB_TOKEN=ghp_S3cr3tT0k3nDoNotShare</b>
+<b>RUN |1 GITHUB_TOKEN=ghp_S3cr3tT0k3nDoNotShare /bin/sh -c echo "fetching a private dependency with $GITHUB_TOKEN" &gt; /dev/null # buildkit</b></pre>
+<p>Twice, in plain text. Once as the <code>ARG</code> entry, once inlined into the <code>RUN</code> entry by the <code>|1</code> prefix that records how many args were in scope.</p></li>
+
+<li>And the version an attacker actually runs, which is the whole point.
+<pre class="cmd">curl -s http://127.0.0.1:5000/v2/i6/leak/blobs/$C \
+  | jq -r '.history[].created_by' | grep -o "ghp_[A-Za-z0-9]*"</pre>
+<pre class="out"><b>ghp_S3cr3tT0k3nDoNotShare</b>
+<b>ghp_S3cr3tT0k3nDoNotShare</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain concurrency, stage pruning and cache keys as three consequences of one graph rather than three features. You can add a cache mount and a secret mount to a Dockerfile and prove neither is in the resulting image, and you can say what <code>--no-cache</code> does to a cache mount. Given any pushed image, you can extract every build arg it was built with in one command.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>--no-cache</code> destroys cache mounts.</strong> Measured above: four accumulated lines became one, permanently. Reach for it to diagnose a suspected stale-cache problem, not as a routine "make it clean" flag, or your dependency caches never survive.</li>
+<li><strong>Cache mounts are shared by target path unless you say otherwise.</strong> Two projects both mounting <code>/root/.cache/pip</code> use the same cache — usually fine and occasionally the source of a baffling cross-project interaction. <code>id=</code> is how you separate them; <code>sharing=locked</code> is how you stop two concurrent builds corrupting one.</li>
+<li><strong>A secret mount protects the layer, not the command's output.</strong> If your <code>RUN</code> prints the secret, it is in the build log, and build logs are frequently more widely readable than images — CI systems keep them, forward them, and put them behind weaker access control. Redirect, do not echo.</li>
+<li><strong><code>ARG</code> is not <code>ENV</code>, and neither is a secret.</strong> An <code>ARG</code> leaks through <code>history</code>; an <code>ENV</code> leaks through <code>history</code> <em>and</em> sits in the config where it is handed to the process at runtime and shows up in <code>/proc/PID/environ</code> — which is <a href="b12.html#cp-b12-13">B12.13</a>, arriving in a new place.</li>
+<li><strong>Deleting the tag does not unpublish the token.</strong> The config blob is content-addressed and may remain fetchable by digest, and <a href="i5.html#cp-i5-11">I5.11</a>'s cross-repo mounts and any mirror mean copies exist elsewhere. A leaked build arg is a rotation, not a cleanup.</li>
+<li><strong>Cache mounts live in the builder, so they are invisible to your Dockerfile's correctness.</strong> A build that only succeeds because something is in the cache mount fails on a fresh builder — the same class of bug as this module's second drill fault (<a href="#cp-i6-13">I6.13</a>).</li>
+</ul>
+
+<div class="k8s-link">
+<p>The leak is the sharp end for Kubernetes. A registry credential, cloud key or Git token passed as a build arg is published to everyone who can pull the image — which, for an internal registry, is typically every node and every workload in the cluster, since <a href="w3.html#cp-3-21">W3.21</a>'s <code>imagePullSecrets</code> grant pull access, not per-image access. No amount of care with the Secret objects in <a href="w3.html#cp-3-23">W3.23</a> helps, because the credential never was a Secret; it is image metadata, replicated wherever the image goes. Note too that the <code>history</code> you just read is the same field <a href="#cp-i6-10">I6.10</a> uses as an audit trail — which is the honest summary of this checkpoint: <code>history</code> is a feature, and treating it as private is the mistake.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>config.md § Properties</code> for <code>created_by</code>, so you can see the leak is by design. Search the BuildKit docs for <em>"RUN --mount"</em>, <em>"cache mounts"</em> and <em>"build secrets"</em>; the Docker docs for <em>"build arguments"</em>, which say plainly that they are not for secrets. On the Kubernetes side, search for <em>"pull an image from a private registry"</em> to see how coarse pull authorisation actually is.</p>
+</article>
+</div><!-- /g-doing-it-properly -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
