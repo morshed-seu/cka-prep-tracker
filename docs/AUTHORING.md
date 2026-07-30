@@ -81,6 +81,20 @@ Two more, learned the hard way and worth never repeating:
   not a silent success. Anything emulated (I6.7) or `apt`/`apk`-heavy wants
   `run_in_background` plus a generous timeout, and a recursive `grep -r /` inside
   a container will eat the whole budget on its own.
+- **`sudo` does not extend to redirects or globs — the unprivileged shell
+  evaluates those first.** `sudo tr -d x < /root/file` is *permission denied*,
+  and `sudo rm /etc/cni/net.d/00-*` on a mode-0700 directory silently deletes
+  nothing because the pattern never expands. Wrap the whole thing:
+  `sudo sh -c 'rm -f /etc/cni/net.d/00-*'`. This cost three separate rounds in
+  I-S14 and each time the symptom looked like the *lab* being wrong.
+- **Never run two `tools/vm.sh` calls concurrently.** They share
+  `~/.vmrun/run.sh` and `~/.vmrun/out`, so a backgrounded capture and a
+  foreground one interleave and each reads the other's output. Serialise them.
+- **Anything non-trivial belongs in a file, not a snippet.** Once a lab needs
+  quoting inside quoting, write it locally, `vm.sh put` it, and
+  `vm.sh cap NAME 'bash ~/x.sh'`. In I-S14 an escaped `\"` inside a snippet made
+  `grep` search for literal quote characters and produced a plausible-looking
+  wrong answer — the worst possible failure mode for a captured lab.
 
 ## Commit discipline
 
@@ -105,6 +119,12 @@ Two more, learned the hard way and worth never repeating:
 
 `check-page.py` is tuned to **zero false positives** on the existing site. If it
 fires, it is real — do not "fix" it by loosening the check.
+
+One near-exception worth knowing, met in I-S14: quoting Go source that contains
+`context.TODO()` trips both the un-captured-output check *and*
+`publish-module.sh`'s TODO gate. The answer is still not to loosen either one —
+move the line out of `<pre class="out">` (it is source, not output) and mark the
+argument as an explicit `[…]` elision rather than silently rewording a quote.
 
 ## Conventions that bite
 
