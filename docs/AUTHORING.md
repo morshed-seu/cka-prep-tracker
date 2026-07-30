@@ -99,8 +99,16 @@ Two more, learned the hard way and worth never repeating:
 ## Commit discipline
 
 - **≤500 added lines per commit touching code** (global rule; HTML counts).
-  A module page is 5–7 commits, split on checkpoint-group boundaries:
-  `I-S9a`, `I-S9b`, … Docs-only commits are exempt.
+  Plan **~2 lessons per commit**, not one checkpoint group: a group of four
+  lessons runs ~600 lines. Docs-only commits are exempt; so are
+  `labs/captures/` transcripts, which get one commit of their own at the end.
+- **A new file counts entirely as added lines**, so a freshly scaffolded page
+  busts the limit on its own (733 lines for a 16-checkpoint module). Never
+  commit the bare scaffold. Instead grow the page from the scratchpad with
+  unwritten articles **omitted** rather than stubbed — emit a group wrapper only
+  when that group has a written lesson, and keep head/quiz/footer from the final
+  file, so every intermediate state is valid HTML and the last one is
+  byte-identical to what you reviewed. `diff` it before committing.
 - The checkers stay **red mid-module** — `check-links.sh` reports the
   not-yet-written anchors. That is expected; say so in the commit message.
   They go green at `publish-module.sh`.
