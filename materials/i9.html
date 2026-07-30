@@ -1177,7 +1177,309 @@ one of the signatures in <a href="w4.html#cp-4-8">W4.8 — break the CNI on purp
 list at the top of that file is the authoritative mapping from spec version to library tag — worth
 bookmarking, since the git tags do not match the spec numbers.</p>
 </article>
+<article class="lesson" id="cp-i9-8" data-id="i9-8">
+<div class="lesson-head"><span class="cp-id">I9.8</span><h4>cnitool: a runtime you can drive by hand</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Debugging a plugin through a Kubernetes pod means a sandbox creation, a kubelet retry backoff, and a
+hunt through two logs for each attempt. Debugging it through <code>cnitool</code> means one command and
+a JSON blob on your terminal. This is the tool you will build the project with, and the difference in
+iteration speed is roughly two orders of magnitude.</p>
+
+<h5>The concept</h5>
+<p><code>cnitool</code> is a thin command-line wrapper over <strong>libcni</strong> — the same library
+containerd and CRI-O link against. It finds configurations, orders the chain, injects
+<code>prevResult</code>, marshals stdin, parses results, and maintains the attachment cache. So "it
+works under <code>cnitool</code>" is a meaningful statement about spec compliance, not a toy result:
+the code doing the driving is the production code.</p>
+
+<p>What it adds on top is a command line: <code>cnitool add|check|del|gc|status &lt;net&gt;
+&lt;netns&gt;</code>, where <code>&lt;net&gt;</code> is a network <em>name</em> (I9.5's resolution rule)
+and <code>&lt;netns&gt;</code> is a namespace path. Two environment variables steer it:
+<code>NETCONFPATH</code> for the config directory — which is how you experiment without touching
+<code>/etc/cni/net.d</code> — and <code>CNI_PATH</code> for the binaries.</p>
+
+<p>One behaviour is worth knowing before it confuses you: <strong><code>cnitool</code> derives the
+container ID deterministically from the namespace path.</strong> The same netns always produces the same
+<code>cnitool-&lt;hex&gt;</code> ID. That is genuinely useful — it means you can run
+<code>del</code> twice against the same namespace and be testing real idempotency rather than two
+unrelated attachments — but it also means a leaked reservation from an earlier experiment will collide
+with your next one on the same namespace, and the error will not mention that.</p>
+
+<p>It is not packaged for Ubuntu 24.04, so you build it. That is one command and about twenty seconds.</p>
+
+<div class="specref">
+<p>What you are standing in for when you drive a plugin by hand is a runtime, and the spec constrains one
+in ways worth knowing before you start hammering the same namespace:</p>
+<blockquote>- The container runtime must not invoke parallel operations for the same container, but is allowed to invoke parallel operations for different containers. This includes across multiple attachments.<br>  - **Exception**: The runtime must exclusively execute either _gc_ or _add_ and _delete_. The runtime must ensure that no _add_ or _delete_ operations are in progress before executing _gc_, and must wait for _gc_ to complete before issuing new _add_ or _delete_ commands.</blockquote>
+<cite>CNI spec 1.1.0, § Lifecycle &amp; Ordering — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>And on <code>CHECK</code>, the rule that makes step 5's failure a diagnosis rather than something to
+retry:</p>
+<blockquote>- A runtime may assume that a failed `CHECK` means the container is permanently in a misconfigured state.</blockquote>
+<cite>CNI spec 1.1.0, § <code>CHECK</code> — Runtime considerations</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build and install it. The tag is the <em>library</em> version, v1.3.0 — the one carrying spec 1.1.0,
+per the warning at the top of this page.
+<pre class="cmd">sudo apt-get install -y golang-go
+export PATH=$PATH:/usr/lib/go-1.22/bin
+go install github.com/containernetworking/cni/cnitool@v1.3.0
+sudo install -m0755 ~/go/bin/cnitool /usr/local/bin/cnitool
+cnitool</pre>
+<pre class="out">cnitool: Add, check, remove, gc or status network interfaces from a network namespace
+  cnitool add    &lt;net&gt; &lt;netns&gt;
+  cnitool check  &lt;net&gt; &lt;netns&gt;
+  cnitool del    &lt;net&gt; &lt;netns&gt;
+  <b>cnitool gc     &lt;net&gt; &lt;netns&gt;
+  cnitool status &lt;net&gt; &lt;netns&gt;</b></pre>
+<p>All five verbs, including the two that arrived with 1.1.0. Those last two are I9.14's subject.</p></li>
+<li>Point it at a private config directory and attach a namespace. This chain is bridge plus portmap.
+<pre class="cmd">export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+sudo ip netns add i9pod1
+sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -c '{ips: [.ips[].address]}'</pre>
+<pre class="out">{"ips":["<b>10.90.0.2/24</b>"]}</pre>
+<p><code>sudo -E</code> matters: the plugin needs root to touch the namespace and the nat table, and
+<code>-E</code> is what carries <code>NETCONFPATH</code> and <code>CNI_PATH</code> across the
+privilege boundary. Forgetting it produces a "network not found" error that looks like a config problem.</p></li>
+<li>Run <code>CHECK</code>. On the happy path it is silent — the same convention as <code>DEL</code>.
+<pre class="cmd">sudo -E cnitool check i9net /var/run/netns/i9pod1; echo "exit=$?"</pre>
+<pre class="out"><b>exit=0</b></pre></li>
+<li>Confirm the attachment really works end to end, which is what <code>ipMasq</code> was for.
+<pre class="cmd">sudo ip netns exec i9pod1 ping -c3 -W2 1.1.1.1 | tail -2</pre>
+<pre class="out">3 packets transmitted, <b>3 received, 0% packet loss</b>, time 2003ms
+rtt min/avg/max/mdev = 6.944/8.991/10.221/1.457 ms</pre>
+<p>A namespace with no route to anywhere five commands ago now reaches the internet, through B9.8's
+masquerade written by a program.</p></li>
+<li>Now break it behind the runtime's back and let <code>CHECK</code> earn its place. Deleting the
+interface from inside the namespace is what a misbehaving init container or a confused operator does.
+<pre class="cmd">sudo ip netns exec i9pod1 ip link del eth0
+sudo -E cnitool check i9net /var/run/netns/i9pod1; echo "exit=$?"</pre>
+<pre class="out"><b>Interface name eth0 not found</b>
+exit=1</pre>
+<p>That is the value of <code>CHECK</code> in one line: it consults <code>prevResult</code> for what
+should exist and reports what does not, without changing anything. A runtime may treat a failed
+<code>CHECK</code> as permanent — the spec says it "may assume that a failed CHECK means the container is
+permanently in a misconfigured state" — so this is a diagnosis, not a probe to poll.</p></li>
+<li>Tear down twice, then <code>CHECK</code> something that was never attached.
+<pre class="cmd">sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "first  exit=$?"
+sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "second exit=$?"
+sudo -E cnitool check i9net /var/run/netns/i9pod1; echo "check  exit=$?"</pre>
+<pre class="out"><b>first  exit=0
+second exit=0</b>
+host-local: Failed to find address added by container cnitool-c3af9ea7303b56406479
+<b>check  exit=1</b></pre>
+<p>Two <code>DEL</code>s, both clean — I9.3's MUST, now with a real runtime doing the calling. And
+<code>CHECK</code> on a torn-down attachment fails from the <em>IPAM</em> plugin rather than the
+interface one, because <code>host-local</code> is asked to confirm its reservation too and the
+reservation is gone. Note the container ID in that message: the same deterministic
+<code>cnitool-c3af9ea…</code> as before, because the namespace path has not changed.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can drive a full CNI chain with no container runtime present, using a config directory of your
+own. You can make <code>CHECK</code> both pass and fail, and say which plugin in the chain reported the
+failure in each case. You know why <code>sudo -E</code> rather than plain <code>sudo</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Plain <code>sudo</code> drops <code>NETCONFPATH</code>, and the resulting error blames the
+network name.</strong> Use <code>sudo -E</code>, or pass the variables inline with <code>env</code>.</li>
+<li><strong>The container ID is derived from the namespace path, so reusing a path reuses the
+ID.</strong> Convenient for idempotency testing; confusing when a leaked reservation from an earlier run
+collides and the error says "duplicate allocation is not allowed" without mentioning why the previous
+holder is still on file.</li>
+<li><strong><code>cnitool</code> is not containerd.</strong> It resolves the network by name, where
+containerd takes the lexically first file (I9.5). Testing config precedence with
+<code>cnitool</code> and reasoning about a node will give you the wrong answer — and its
+<code>gc</code> differs even more sharply, which I9.14 measures.</li>
+<li><strong>Keep the namespace between runs.</strong> Recreating it each time hides idempotency bugs;
+the whole point of a stable path is that you can hammer the same attachment.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Driving the interface by hand, one layer below the thing that normally calls it, is the same method as
+<a href="i8.html#cp-i8-12">I8.12 — crictl as a reflex, and the things kubectl cannot show you</a>: when
+the layer above is slow to iterate and vague in its errors, go under it. In the cluster, the equivalent
+manual attachment is <a href="w4.html#cp-4-2">W4.2 — build a pod network by hand</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b>
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/cnitool/README.md">cnitool's README</a>
+is one page and documents both environment variables. For what it is wrapping, read
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/libcni/api.go">libcni/api.go</a> —
+<code>AddNetworkList</code> and <code>DelNetworkList</code> are the two functions containerd calls, and
+they are short.</p>
+</article>
 </div><!-- /g-configuration -->
+
+<!-- ---------------- The plugins that ship ---------------- --><div class="grp" id="g-the-plugins-that-ship"><h3>The plugins that ship</h3>
+<article class="lesson" id="cp-i9-9" data-id="i9-9">
+<div class="lesson-head"><span class="cp-id">I9.9</span><h4>bridge, read against your own net-up.sh — and the leak it hides</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the module's thesis made literal. Put the reference <code>bridge</code> plugin next to the
+bash script you wrote in B9 and the mechanism is the same, step for step. What the plugin adds is the
+contract — and, it turns out, four pieces of hard-won operational detail your script did not have, plus
+one bug your script cannot have because it never claimed to be idempotent.</p>
+
+<h5>The concept</h5>
+<p><code>net-up.sh</code> and <code>bridge</code> do the same seven things:</p>
+
+<table class="langpair">
+<thead><tr><th>Step</th><th><code>net-up.sh</code> (B9.19)</th><th><code>bridge</code> plugin</th></tr></thead>
+<tbody>
+<tr><td>Create the bridge if absent</td><td><code>ip link add cni0 type bridge</code></td><td>Same, plus reconciles an existing bridge's settings</td></tr>
+<tr><td>Give it the gateway address</td><td><code>ip addr add 10.20.0.1/24</code></td><td>Same, when <code>isGateway</code></td></tr>
+<tr><td>Make a veth pair</td><td><code>ip link add veth1 type veth peer name eth0</code></td><td>Same, host side named from a hash</td></tr>
+<tr><td>Move one end into the namespace</td><td><code>ip link set eth0 netns pod1</code></td><td>Same, using <code>CNI_NETNS</code></td></tr>
+<tr><td>Name it, address it, route it</td><td>Three <code>ip</code> commands in <code>netns exec</code></td><td>Same, address from the IPAM plugin</td></tr>
+<tr><td>Turn the host into a router</td><td><code>sysctl net.ipv4.ip_forward=1</code></td><td>Same</td></tr>
+<tr><td>Masquerade egress</td><td>One <code>-s 10.20.0.0/24 -o ens3 -j MASQUERADE</code></td><td>A per-container chain</td></tr>
+</tbody>
+</table>
+
+<p>No new mechanism. Not one. The difference is in the last row and in four details the lab measures —
+and the four are exactly the kind of thing you only write after being paged:</p>
+
+<ol>
+<li><strong>The masquerade rule is per pod, not per subnet.</strong> <code>net-up.sh</code> writes one
+rule covering the whole range, which can only ever be removed all at once. The plugin writes
+<code>-s 10.90.0.2/32 → CNI-&lt;hash&gt;</code>, and inside that chain it <em>ACCEPTs traffic destined
+for the pod subnet before masquerading anything</em>, and excludes multicast. Pod-to-pod traffic that
+leaves the bridge therefore keeps its real source address, where the blanket rule's correctness depended
+on the <code>-o ens3</code> qualifier.</li>
+<li><strong><code>hairpin_mode</code> on the bridge port.</strong> Without it a frame cannot leave the
+bridge by the same port it entered, so a pod cannot reach <em>itself</em> through its own Service VIP —
+a failure that looks like a broken Service and is a bridge setting.</li>
+<li><strong><code>accept_ra=0</code> on the host-side veth.</strong> The host stops accepting IPv6
+router advertisements from inside the container. <code>net-up.sh</code> leaves this at 1, meaning a
+container could advertise itself as the node's IPv6 router.</li>
+<li><strong><code>arp_notify=1</code> inside the namespace.</strong> The interface sends a gratuitous
+ARP on coming up, so the bridge learns its MAC immediately instead of on first traffic.</li>
+</ol>
+
+<p>And then there is the thing the plugin gets <em>wrong</em>, which is the most useful part of this
+lesson. <strong><code>bridge</code>'s <code>DEL</code> learns the container's address by reading it out
+of the network namespace.</strong> When the namespace is already gone — a routine situation, per I9.3 —
+it cannot learn the address, so it cannot construct the rule to delete. It returns success, correctly,
+because the idempotency MUST requires that. And the masquerade rule stays on the node forever.</p>
+
+<div class="specref">
+<p>The best-effort principle that makes the leak conformant, and names <code>bridge</code> specifically:</p>
+<blockquote>Plugins should generally complete a `DEL` action without error even if some resources are missing. ... For another example, the `bridge` plugin should delegate the DEL action to the IPAM plugin and clean up its own resources even if the container network namespace and/or container network interface no longer exist.</blockquote>
+<cite>CNI spec 1.1.0, § <code>DEL</code> — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>Read the last clause closely: it says the plugin <em>should</em> clean up its own resources in that
+situation. The measurement below shows it does not manage to, for the one resource whose identity it
+only knows via the namespace.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run your B9 script, then read what it left in the nat table and on the veth.
+<pre class="cmd">sudo ~/i9/net-up.sh up 1
+sudo iptables -t nat -S POSTROUTING | grep 10.20.0
+cat /sys/class/net/veth1/brport/hairpin_mode
+cat /proc/sys/net/ipv6/conf/veth1/accept_ra</pre>
+<pre class="out">bridge cni0 = 10.20.0.1/24, egress via ens3
+  pod1 = 10.20.0.2
+<b>-A POSTROUTING -s 10.20.0.0/24 -o ens3 -j MASQUERADE</b>
+<b>0</b>
+<b>1</b></pre>
+<p>One rule for the whole subnet, no hairpin, and IPv6 RAs accepted from the container.</p></li>
+<li>Now the plugin, doing the same job, and read the same three things.
+<pre class="cmd">sudo -E cnitool add i9net /var/run/netns/i9pod1 &gt;/dev/null
+sudo iptables -t nat -S | grep -E 'CNI-5ee|10.90.0'</pre>
+<pre class="out">-A POSTROUTING <b>-s 10.90.0.2/32</b> -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9…\"" -j CNI-5ee93e7c626f981e7589e5a5
+-A CNI-5ee93e7c626f981e7589e5a5 <b>-d 10.90.0.0/24</b> -m comment --comment "name: \"i9net\" …" <b>-j ACCEPT</b>
+-A CNI-5ee93e7c626f981e7589e5a5 <b>! -d 224.0.0.0/4</b> -m comment --comment "name: \"i9net\" …" -j MASQUERADE</pre>
+<pre class="cmd">HV=vethb3b8ec40   # the host-side veth from the result's interfaces[1]
+cat /sys/class/net/$HV/brport/hairpin_mode
+cat /proc/sys/net/ipv6/conf/$HV/accept_ra
+sudo ip netns exec i9pod1 cat /proc/sys/net/ipv4/conf/eth0/arp_notify</pre>
+<pre class="out"><b>1</b>
+<b>0</b>
+<b>1</b></pre>
+<p>Per-pod source, subnet exempted, multicast excluded, hairpin on, RAs refused, gratuitous ARP on.
+Six differences, none of them a new mechanism — all of them B9 primitives applied with more care.</p></li>
+<li>Now measure the leak, in the three orders a teardown really happens in. Count the plugin's
+POSTROUTING rules before and after each <code>DEL</code>.
+<pre class="cmd">count() { sudo iptables -t nat -S POSTROUTING | grep -c i9net; }
+
+# case 1: clean ADD, clean DEL
+sudo -E cnitool add i9net /var/run/netns/i9pod1 &gt;/dev/null; echo "after ADD: $(count)"
+sudo -E cnitool del i9net /var/run/netns/i9pod1;            echo "after DEL: $(count)"</pre>
+<pre class="out">after ADD: 1
+<b>after DEL: 0</b></pre>
+<pre class="cmd"># case 2: ADD, then destroy eth0 from inside, then DEL
+sudo -E cnitool add i9net /var/run/netns/i9pod1 &gt;/dev/null; echo "after ADD: $(count)"
+sudo ip netns exec i9pod1 ip link del eth0
+sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "del exit=$?"; echo "after DEL: $(count)"</pre>
+<pre class="out">after ADD: 1
+del exit=<b>0</b>
+after DEL: <b>1</b>
+    LEAKED -A POSTROUTING -s 10.90.0.3/32 … -j CNI-5ee93e7c626f981e7589e5a5</pre>
+<pre class="cmd"># case 3: ADD, then delete the whole namespace, then DEL
+sudo -E cnitool add i9net /var/run/netns/i9pod1 &gt;/dev/null
+sudo ip netns del i9pod1
+sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "del exit=$?"; echo "after DEL: $(count)"</pre>
+<pre class="out">del exit=<b>0</b>
+after DEL: <b>1</b>
+    LEAKED -A POSTROUTING -s 10.90.0.2/32 … -j CNI-5ee93e7c626f981e7589e5a5</pre>
+<p><strong>Two of three teardown orders leak, silently, with exit 0.</strong> Case 3 is not exotic: the
+runtime deleting the sandbox's netns before calling <code>DEL</code>, or a node rebooting between the
+two, produces exactly it.</p></li>
+<li>Check what did get cleaned up, because it is not nothing.
+<pre class="cmd">sudo ls /var/lib/cni/networks/i9net/</pre>
+<pre class="out">last_reserved_ip.0  lock</pre>
+<p>The <em>IPAM reservation was released</em> in all three cases. That is the asymmetry to remember:
+IPAM is keyed by container ID, which <code>DEL</code> always has, while the nat rule is keyed by the
+address, which it can only learn from the namespace. Same call, same exit code, two different outcomes —
+and it is the reason your project will keep the address in its own store.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can walk your own <code>net-up.sh</code> line by line against the reference plugin and account
+for every difference. You can name at least four operational details the plugin adds, and say what each
+one prevents. And you can state, with the measurement, which teardown orders leak a masquerade rule and
+why the IPAM reservation survives that leak.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A node that has been up for months can carry thousands of stale <code>CNI-&lt;hash&gt;</code>
+chains.</strong> Each one is one pod that was torn down in the wrong order. They cost a little memory
+and a lot of confusion when you are reading the nat table during an incident —
+<code>iptables -t nat -S | wc -l</code> on a busy node is worth knowing.</li>
+<li><strong>Exit 0 is not evidence of a complete teardown.</strong> The spec deliberately makes
+<code>DEL</code> best-effort <em>and</em> idempotent, which together mean "success" can hide partial
+work. If you need to know, check the resource, not the status.</li>
+<li><strong>Never delete a pod's veth or namespace by hand and expect the runtime to cope.</strong> You
+have just removed the only copy of the information its teardown needs.</li>
+<li><strong>The plugin never deletes the bridge.</strong> After the last pod goes, <code>cni0</code> or
+its equivalent stays, down and empty. That is correct — another pod may arrive — but it means the bridge's
+existence proves nothing about whether anything is attached.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Every row of the comparison table maps to a beginner lesson:
+<a href="b9.html#cp-b9-3">B9.3 — a bridge is a virtual switch</a>,
+<a href="b9.html#cp-b9-6">B9.6 — turn the host into a router: ip_forward</a>, and
+<a href="b9.html#cp-b9-8">B9.8 — give the private subnet real internet access</a>. The stale-rule
+accumulation is what makes <a href="w4.html#cp-4-10">W4.10 — walk the iptables chains behind one of your
+services</a> harder than it should be on a long-lived node, and the hairpin detail explains a class of
+"the Service works from everywhere except its own pod" report.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the plugin's own documentation is
+<a href="https://www.cni.dev/plugins/current/main/bridge/">cni.dev/plugins/current/main/bridge</a>, which
+lists every configuration key including <code>hairpinMode</code> and <code>promiscMode</code>. § <code>DEL</code>
+of <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> is the paragraph
+that makes the leak conformant.</p>
+</article>
+</div><!-- /g-the-plugins-that-ship -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
