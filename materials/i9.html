@@ -2162,7 +2162,459 @@ obligations. In the exam docs, search <em>network plugins</em> for the installat
 <em>cluster networking</em> for the provider comparison — and note that kubernetes.io deliberately stops
 describing behaviour at this boundary, which is itself the lesson.</p>
 </article>
+<article class="lesson" id="cp-i9-14" data-id="i9-14">
+<div class="lesson-head"><span class="cp-id">I9.14</span><h4>GC and STATUS: what 1.1.0 added, and what today's plugins do with it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Both verbs 1.1.0 added exist to delete a class of race by replacing a bad inference with a statement.
+Both are well designed. And on the plugin set your cluster is almost certainly running, <strong>neither
+does anything at all</strong> — which is a more useful thing to know than the design intent, because it
+means I9.10's field repair is still the field repair.</p>
+
+<h5>The concept</h5>
+<p><strong><code>GC</code> exists because nothing could safely clean up leaked IPAM reservations.</strong>
+The plugin sees one call at a time and cannot know what else should exist; the runtime knows the full set of
+live attachments but does not own the reservation store. Neither party has enough information alone.
+<code>GC</code> closes the loop: the runtime hands the plugin
+<code>cni.dev/valid-attachments</code> — the complete list of <code>(containerID, ifname)</code> pairs that
+should exist — and everything else is the plugin's to reclaim.</p>
+
+<p><strong><code>STATUS</code> exists because runtimes used to infer readiness from a file's
+existence.</strong> A conf file appearing meant "network ready", so nodes went <code>Ready</code> and
+accepted pods a fraction of a second before their provider's agent had finished programming routes,
+producing pods with addresses that could not reach anything. <code>STATUS</code> lets the plugin say so
+itself, with codes 50 ("cannot service ADD") and 51 ("and existing containers may have limited
+connectivity").</p>
+
+<p>In libcni, <code>GC</code> is <strong>two phases</strong>, and confusing them will make the lab's results
+look like bugs:</p>
+<ol>
+<li><strong>libcni synthesises a <code>DEL</code></strong> for every attachment in its own result cache
+(I9.6's <code>/var/lib/cni/results/</code>) that is not in the valid list. This works against any plugin,
+including ones predating 1.1.0 — it is just ordinary teardown.</li>
+<li><strong>Then it calls <code>CNI_COMMAND=GC</code></strong> on each plugin with the valid-attachments
+list injected — but only if the conflist's <code>cniVersion</code> is at least 1.1.0.</li>
+</ol>
+
+<p>Phase one depends on the cache; phase two depends on the plugin. That distinction is the whole lesson,
+because the cache lives in <code>/var/run</code> — a tmpfs — while reservations live in
+<code>/var/lib</code>. <strong>A reboot destroys the cache and preserves the reservations</strong>, which is
+precisely the situation <code>GC</code> was invented for and precisely the one where phase one has nothing
+to work from.</p>
+
+<div class="specref">
+<p>The verb, its input, and the sentence that stops anyone treating it as a shortcut:</p>
+<blockquote>The GC command provides a way for runtimes to specify the expected set of attachments to a network. The network plugin may then remove any resources related to attachments that do not exist in this set.</blockquote>
+<blockquote>- `cni.dev/valid-attachments` (array of objects): The list of **still valid** attachments to this network:<br>    - `containerID` (string): the value of CNI_CONTAINERID as provided during the CNI ADD operation<br>    - `ifname` (string): the value of CNI_IFNAME as provided during the CNI ADD operation</blockquote>
+<blockquote>The runtime MUST NOT use GC as a substitute for DEL. Plugins may be unable to clean up some resources from GC that they would have been able to clean up from DEL.</blockquote>
+<cite>CNI spec 1.1.0, § <code>GC</code> — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>One implementation detail the spec does not mention and libcni does: it injects the list under
+<em>two</em> keys, because of a naming mistake in the spec text —
+<code>cni.dev/valid-attachments</code> and also <code>cni.dev/attachments</code>, with the comment
+<code>// #1101: spec used incorrect variable name</code>. A plugin should accept either.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create three attachments, then simulate the reboot: destroy the namespaces and the result cache,
+leaving the reservations.
+<pre class="cmd">for i in 1 2 3; do sudo ip netns add i9pod$i; sudo -E cnitool add i9net /var/run/netns/i9pod$i &gt;/dev/null; done
+for i in 1 2 3; do sudo ip netns del i9pod$i; done
+sudo sh -c 'rm -f /var/lib/cni/results/i9net-*'
+echo "network namespaces left:  $(ip netns list | wc -l)"
+echo "cached attachments left:  $(sudo ls /var/lib/cni/results/ | grep -c i9net)"
+echo "reservations still held:  $(sudo ls /var/lib/cni/networks/i9net | grep -c '^10\.')"</pre>
+<pre class="out">network namespaces left:  <b>0</b>
+cached attachments left:  <b>0</b>
+reservations still held:  <b>3</b></pre>
+<p>This is the exact state a rebooted node is in, and the exact state <code>GC</code> was designed to
+fix.</p></li>
+<li>Run <code>cnitool gc</code>. Phase one has no cache to read.
+<pre class="cmd">sudo ip netns add i9pod1
+sudo -E cnitool gc i9net /var/run/netns/i9pod1; echo "gc exit=$?"
+echo "reservations after: $(sudo ls /var/lib/cni/networks/i9net | grep -c '^10\.')"</pre>
+<pre class="out">gc exit=<b>0</b>
+reservations after: <b>3</b></pre></li>
+<li>So call the verb directly with a real list — keep one holder, declare the rest invalid. This is phase
+two, exercised properly.
+<pre class="cmd">KEEP=$(sudo sed -n 1p /var/lib/cni/networks/i9net/10.90.0.3 | tr -d '\r')
+jq -n --arg id "$KEEP" '{cniVersion:"1.1.0", name:"i9net", type:"host-local",
+   ipam:{type:"host-local", subnet:"10.90.0.0/24"},
+   "cni.dev/valid-attachments":[{containerID:$id, ifname:"eth0"}]}' &gt; ~/i9/gc.json
+jq -c '.["cni.dev/valid-attachments"]' ~/i9/gc.json
+sudo env CNI_COMMAND=GC CNI_PATH=/opt/cni/bin /opt/cni/bin/host-local &lt; ~/i9/gc.json; echo "gc exit=$?"
+echo "reservations after: $(sudo ls /var/lib/cni/networks/i9net | grep -c '^10\.')"</pre>
+<pre class="out">[{"containerID":"cnitool-6c80ef25d4a4145c2395","ifname":"eth0"}]
+gc exit=<b>0</b>   (success, and no output)
+reservations after: <b>3</b>   &lt;-- unchanged</pre></li>
+<li>Try the strongest possible instruction: an empty list, meaning nothing is valid.
+<pre class="cmd">jq -n '{cniVersion:"1.1.0", name:"i9net", type:"host-local",
+   ipam:{type:"host-local", subnet:"10.90.0.0/24"},
+   "cni.dev/valid-attachments":[]}' &gt; ~/i9/gc2.json
+sudo env CNI_COMMAND=GC CNI_PATH=/opt/cni/bin /opt/cni/bin/host-local &lt; ~/i9/gc2.json; echo "gc exit=$?"
+echo "reservations after: $(sudo ls /var/lib/cni/networks/i9net | grep -c '^10\.')"</pre>
+<pre class="out">gc exit=<b>0</b>
+reservations after: <b>3</b>   &lt;-- still unchanged</pre>
+<p>A well-formed success that does nothing. Here is why, and it is not subtle:</p>
+<pre class="out">plugins v1.9.1 — does the plugin register a GC handler?
+  bridge 0   ipvlan 0   macvlan 0   loopback 0   portmap 0
+  bandwidth 0   tuning 0   firewall 0   <b>host-local 0</b>   static 0</pre>
+<p><strong>Not one of the ten reference plugins implements <code>GC</code>.</strong>
+<code>host-local</code>'s <code>main.go</code> defines <code>cmdAdd</code>, <code>cmdDel</code> and
+<code>cmdCheck</code> and nothing else. The <code>skel</code> dispatcher accepts the verb, version-gates
+it, and calls a handler that was never set — so you get exit 0 and silence.</p></li>
+<li>Confirm the dispatch path is nevertheless real, by asking for <code>GC</code> at a version that does not
+allow it.
+<pre class="cmd">jq -n '{cniVersion:"1.0.0", name:"i9net", type:"host-local",
+   ipam:{type:"host-local", subnet:"10.90.0.0/24"}, "cni.dev/valid-attachments":[]}' &gt; ~/i9/gc3.json
+sudo env CNI_COMMAND=GC CNI_PATH=/opt/cni/bin /opt/cni/bin/host-local &lt; ~/i9/gc3.json; echo "exit=$?"</pre>
+<pre class="out">{
+    "code": 1,
+    "msg": "<b>config version does not allow GC</b>"
+}exit=1</pre>
+<p>So the plugin genuinely parses and routes the verb — it has simply been given nothing to do. A conflist
+still on <code>cniVersion: 1.0.0</code> (like the nerdctl one on this box) cannot even be asked.</p></li>
+<li><code>STATUS</code>, same shape. Ask five plugins, then exhaust the pool and ask again.
+<pre class="cmd">for p in bridge host-local portmap loopback macvlan; do
+  out=$(jq -n --arg t "$p" '{cniVersion:"1.1.0",name:"i9net",type:$t,ipam:{type:"host-local",subnet:"10.90.0.0/24"}}' \
+        | sudo env CNI_COMMAND=STATUS CNI_PATH=/opt/cni/bin "/opt/cni/bin/$p" 2&gt;&amp;1)
+  printf '  %-11s exit=%d output=[%s]\n' "$p" "$?" "$out"
+done</pre>
+<pre class="out">  bridge      exit=0 output=[]
+  host-local  exit=0 output=[]
+  portmap     exit=0 output=[]
+  loopback    exit=0 output=[]
+  macvlan     exit=0 output=[]</pre>
+<p>Silence and exit 0 is the correct answer for "ready", so this is conformant. But fill a
+<code>/30</code>'s single usable address and <code>host-local</code> still says ready — it never returns
+code 50, the code that exists for exactly this condition. Compare with the project in I9.15, which
+does.</p></li>
+<li>Which leaves the repair unchanged from I9.10.
+<pre class="cmd">sudo rm -f /var/lib/cni/networks/i9net/10.90.0.2 /var/lib/cni/networks/i9net/10.90.0.4
+echo "reservations after rm: $(sudo ls /var/lib/cni/networks/i9net | grep -c '^10\.')"</pre>
+<pre class="out">reservations after rm: <b>1</b></pre></li>
+<li>One more thing worth knowing about <code>cnitool gc</code> specifically, because it is a foot-gun in
+development. Its own source says:
+<pre class="cmd"># cnitool/cnitool.go, case CmdGC — this is source, not output.
+# The comment is verbatim; the context argument is elided as […].
+// Currently just invoke GC without args, hence all network interface should be GC'ed!
+exit(cninet.GCNetworkList([…], netconf, nil))</pre>
+<p>Passing <code>nil</code> means <em>no attachment is valid</em>, so phase one synthesises a
+<code>DEL</code> for every cached attachment — <strong>including live ones</strong>. With three running
+attachments and a populated cache, <code>cnitool gc</code> tore down all three:</p>
+<pre class="cmd">echo "reservations: $(...)   cached: $(...)"
+sudo -E cnitool gc i9net /var/run/netns/i9pod1
+echo "reservations: $(...)   cached: $(...)"</pre>
+<pre class="out">reservations: 3   cached: 3
+reservations: <b>0</b>   cached: <b>0</b></pre>
+<p><code>cnitool gc</code> is therefore "release everything this network has cached", not "reclaim what
+leaked". Do not point it at a node you care about.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain what bad inference each verb replaces. You can describe libcni's two GC phases and say
+which one depends on the result cache and which on the plugin — and why a reboot defeats the first. You can
+state, with evidence, that no reference plugin implements <code>GC</code>, and that
+<code>host-local</code> never reports code 50. And you know what <code>cnitool gc</code> will do to a live
+node.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"CNI 1.1 has GC, so leaked addresses are solved" is false today.</strong> The spec has it, libcni
+has the runtime half, and the plugins do not have the plugin half. Check before relying on it: run
+<code>CNI_COMMAND=GC</code> against your IPAM plugin with an empty list and see whether anything
+changes.</li>
+<li><strong>The result cache is in <code>/var/run</code> and does not survive a reboot; reservations are in
+<code>/var/lib</code> and do.</strong> That asymmetry is why GC's cache-based phase cannot fix the
+post-reboot case, which is the main case.</li>
+<li><strong><code>GC</code> is not a substitute for <code>DEL</code>, and the spec says so
+explicitly.</strong> A runtime that skips teardown intending to sweep later will leak everything a plugin
+can only clean up when the namespace still exists.</li>
+<li><strong>A conflist below <code>cniVersion: 1.1.0</code> cannot be asked for either verb.</strong> The
+refusal is code 1 from <code>skel</code>, before any plugin logic runs.</li>
+<li><strong><code>STATUS</code> is advisory and a plugin must not rely on being called.</strong> The spec is
+explicit that other operations arrive regardless of what <code>STATUS</code> said, so it can never be used
+as an admission gate.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>NetworkReady</code> — the condition <code>STATUS</code> was designed to inform — is the one you
+read in <a href="i8.html#cp-i8-3">I8.3</a> and break in
+<a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose and read the signatures</a>. The wider pattern,
+replacing an inference with a statement so a race disappears, is
+<a href="b13.html#cp-b13-12">B13.12 — the reconciliation loop, and watch versus poll</a>; the accounting
+that outlives what it accounts for is <a href="i9.html#cp-i9-10">I9.10</a>, and
+<a href="i7.html#cp-i7-13">I7.13</a> measured containerd's own GC doing this job properly for
+content.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> §&nbsp;<code>GC</code> and §&nbsp;<code>STATUS</code> of
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> — both short, and the
+STATUS section's "Plugin considerations" list is the part people skip. For the two-phase behaviour, read
+<code>GCNetworkList</code> in
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/libcni/api.go">libcni/api.go</a>; it is
+forty lines and settles every question this lesson raises.</p>
+</article>
 </div><!-- /g-in-a-real-stack -->
+
+<!-- ---------------- Project & drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson" id="cp-i9-15" data-id="i9-15">
+<div class="lesson-head"><span class="cp-id">I9.15</span><h4>Mini project — cni-minibridge, and containerd calling your bash script</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>By the end of this lesson containerd will create a pod sandbox, exec a shell script you wrote, take the
+IP address that script prints, and serve HTTP traffic to a container through it. That is the whole point of
+the module: pod networking is a contract you have implemented, not a product you have configured. And
+because you know where the reference plugins fall short — you measured it in I9.9 and I9.14 — your plugin
+can be better than them in three specific, spec-mandated ways.</p>
+
+<h5>The concept</h5>
+<p><code>labs/intermediate/cni-minibridge</code> is <code>net-up.sh</code> with a contract bolted on. The
+mechanism is unchanged: a bridge, a veth pair, an address, a route, a masquerade rule. Everything new is
+protocol.</p>
+
+<p>The design decisions that matter, each one traceable to a lab earlier in this module:</p>
+
+<table class="langpair">
+<thead><tr><th>Decision</th><th>Why, and where it came from</th></tr></thead>
+<tbody>
+<tr><td>Every diagnostic goes to stderr via one <code>log()</code> helper</td><td>I9.4 — one stray stdout line makes the result unparseable</td></tr>
+<tr><td>Errors are objects built by <code>jq</code>, with the spec's codes</td><td>I9.4 — and it returns <strong>7</strong> for an unusable config where the reference returns 999</td></tr>
+<tr><td><code>CNI_COMMAND</code> is validated <em>before</em> stdin is read</td><td>A missing verb is code 4, not a config error; diagnosing it needs no config</td></tr>
+<tr><td><code>DEL</code> finds the address in the <strong>store</strong>, never the namespace</td><td>I9.9 — the leak. This is the single most important line in the file</td></tr>
+<tr><td>Reservations are CRLF, in host-local's format</td><td>I9.10 — one set of tools then reads both stores</td></tr>
+<tr><td>Every read-modify-write of the store holds <code>flock</code></td><td>The spec requires plugins to handle concurrent execution and lock shared IPAM state</td></tr>
+<tr><td>The masquerade rule is per address, with <code>! -d $SUBNET</code></td><td>I9.9 — per-pod so DEL can remove exactly one, subnet-exempt so pod-to-pod is not NATed</td></tr>
+<tr><td><code>GC</code> is implemented</td><td>I9.14 — no reference plugin does, so leaked reservations are still cleaned by hand</td></tr>
+<tr><td><code>STATUS</code> returns code 50 on an exhausted pool</td><td>I9.14 — the case those codes exist for, which <code>host-local</code> never reports</td></tr>
+<tr><td>A failed wiring step rolls back its own work</td><td>I9.4 — otherwise the retry reports "already exists" and hides the real cause</td></tr>
+</tbody>
+</table>
+
+<p>One implementation detail is worth calling out because it teaches something about B6. <code>ip link set
+… netns</code> wants a namespace <em>name</em>, and <code>CNI_NETNS</code> is a <em>path</em>. Paths under
+<code>/run/netns</code> are already named — that is what the directory is <em>for</em> — so the plugin uses
+the basename. Anything else gets a temporary bind mount into that directory, which is precisely how
+<code>ip netns</code> and containerd pin a namespace in the first place.</p>
+
+<div class="specref">
+<p>The concurrency requirement that forces the lock, and the one that makes rollback the plugin's own
+problem:</p>
+<blockquote>- Plugins must handle being executed concurrently across different containers. If necessary, they must implement locking on shared resources (e.g. IPAM databases).</blockquote>
+<cite>CNI spec 1.1.0, § Lifecycle &amp; Ordering — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<blockquote>If an interface of the requested name already exists in the container, the CNI plugin MUST return with an error.</blockquote>
+<cite>CNI spec 1.1.0, § <code>ADD</code></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install it and check the three things that need no network at all.
+<pre class="cmd">sudo install -m0755 labs/intermediate/cni-minibridge /opt/cni/bin/minibridge
+echo '{}' | CNI_COMMAND=VERSION /opt/cni/bin/minibridge
+echo '{}' | /opt/cni/bin/minibridge; echo "exit=$?"
+echo '{"cniVersion":"9.9.9","name":"x"}' | CNI_COMMAND=ADD /opt/cni/bin/minibridge; echo "exit=$?"</pre>
+<pre class="out">{"cniVersion":"1.1.0","supportedVersions":["0.3.1","0.4.0","1.0.0","1.1.0"]}
+{"cniVersion":"1.1.0",<b>"code":4</b>,"msg":"required env variables [CNI_COMMAND] missing","details":"set CNI_COMMAND to one of ADD, DEL, CHECK, GC, STATUS, VERSION"}
+exit=1
+{"cniVersion":"1.1.0",<b>"code":1</b>,"msg":"incompatible CNI versions","details":"config is \"9.9.9\", minibridge supports 0.3.1,0.4.0,1.0.0,1.1.0"}
+exit=1</pre>
+<p>Codes 4 and 1, with <code>cniVersion</code> present — which, per I9.4, the reference plugins omit.</p></li>
+<li>Now drive it with <code>cnitool</code>, which is the real test of compliance. Note the non-default
+<code>mtu</code>, to prove the config is being read rather than ignored.
+<pre class="cmd">cat &gt; ~/i9/net.d/10-minibridge.conflist &lt;&lt;'EOF'
+{ "cniVersion": "1.1.0", "name": "minibridge", "plugins": [
+    { "type": "minibridge", "bridge": "mbr0", "ipMasq": true, "mtu": 1450,
+      "ipam": { "subnet": "10.99.0.0/24" } } ] }
+EOF
+sudo ip netns add i9pod1
+sudo -E cnitool add minibridge /var/run/netns/i9pod1 | jq .</pre>
+<pre class="out">{
+  "cniVersion": "1.1.0",
+  "interfaces": [
+    { "mac": "12:f8:ff:63:cb:88", "name": "mbr0" },
+    { "mac": "12:a5:08:d3:9a:9d", "name": "<b>mb5c4aa8f9f77</b>" },
+    { "mac": "26:74:b4:81:b1:f6", "name": "eth0", "sandbox": "/var/run/netns/i9pod1" }
+  ],
+  "ips": [ { "address": "<b>10.99.0.2/24</b>", "gateway": "10.99.0.1", "interface": 2 } ],
+  "routes": [ { "dst": "0.0.0.0/0", "gw": "10.99.0.1" } ]
+}</pre>
+<p>A well-formed v1.1.0 result, and <code>cnitool</code> — i.e. libcni — accepted it without complaint. The
+host veth name is <code>mb</code> plus eleven hex characters of a hash: unique per attachment and inside
+the 15-character interface-name limit.</p></li>
+<li>Confirm reality matches the claim, and that the store is host-local-compatible.
+<pre class="cmd">sudo ip netns exec i9pod1 ip -br addr; sudo ip netns exec i9pod1 ip route
+echo "bridge MTU $(cat /sys/class/net/mbr0/mtu), pod MTU $(sudo ip netns exec i9pod1 cat /sys/class/net/eth0/mtu)"
+sudo cat /var/lib/cni/minibridge/minibridge/10.99.0.2 | tr -d '\r' | tr '\n' '/'; echo</pre>
+<pre class="out">lo               DOWN
+eth0@if57        UP             10.99.0.2/24 fe80::2474:b4ff:fe81:b1f6/64
+default via 10.99.0.1 dev eth0
+10.99.0.0/24 dev eth0 proto kernel scope link src 10.99.0.2
+bridge MTU <b>1450</b>, pod MTU <b>1450</b>
+<b>cnitool-c3af9ea7303b56406479/eth0/</b></pre></li>
+<li>Prove it works: egress through the masquerade, and a second pod on the same bridge.
+<pre class="cmd">sudo ip netns exec i9pod1 ping -c3 -W2 1.1.1.1 | tail -2
+sudo ip netns add i9pod2
+sudo -E cnitool add minibridge /var/run/netns/i9pod2 | jq -r '.ips[0].address'
+sudo ip netns exec i9pod1 ping -c3 -W2 10.99.0.3 | tail -2</pre>
+<pre class="out">3 packets transmitted, <b>3 received, 0% packet loss</b>, time 2003ms
+rtt min/avg/max/mdev = 6.944/8.991/10.221/1.457 ms
+10.99.0.3/24
+3 packets transmitted, <b>3 received, 0% packet loss</b>, time 2064ms
+rtt min/avg/max/mdev = 0.041/0.074/0.104/0.025 ms</pre></li>
+<li><code>CHECK</code> — pass, catch a break, pass again.
+<pre class="cmd">sudo -E cnitool check minibridge /var/run/netns/i9pod1; echo "check exit=$?"
+sudo ip netns exec i9pod1 ip addr del 10.99.0.2/24 dev eth0
+sudo -E cnitool check minibridge /var/run/netns/i9pod1; echo "check exit=$?"
+sudo ip netns exec i9pod1 ip addr add 10.99.0.2/24 dev eth0
+sudo -E cnitool check minibridge /var/run/netns/i9pod1; echo "check exit=$?"</pre>
+<pre class="out">check exit=<b>0</b>
+<b>address mismatch; prevResult says 10.99.0.2/24, namespace has</b>
+check exit=<b>1</b>
+check exit=<b>0</b></pre>
+<p>That message is <code>cnitool</code> rendering our structured error's <code>msg</code> and
+<code>details</code> — the runtime read the object and reformatted it, which is what the codes are for.</p></li>
+<li><code>STATUS</code>: ready on a <code>/24</code>, code 50 on a full <code>/30</code>.
+<pre class="cmd">jq -n '{cniVersion:"1.1.0",name:"minibridge",type:"minibridge",ipam:{subnet:"10.99.0.0/24"}}' \
+  | sudo env CNI_COMMAND=STATUS CNI_PATH=/opt/cni/bin /opt/cni/bin/minibridge; echo "exit=$?"
+# with a /30 whose single usable address is already reserved:
+sudo env CNI_COMMAND=STATUS CNI_PATH=/opt/cni/bin /opt/cni/bin/minibridge &lt; /tmp/mbfull.json; echo "exit=$?"</pre>
+<pre class="out">exit=<b>0</b>
+{"cniVersion":"1.1.0",<b>"code":50</b>,"msg":"The plugin is not available","details":"no IP addresses available in 10.98.0.0/30"}
+exit=<b>1</b></pre>
+<p>Compare I9.14: <code>host-local</code> in the same condition says ready.</p></li>
+<li>Now the important test — the teardown order that leaks in the reference plugin. Destroy the namespace
+<em>first</em>, then <code>DEL</code>.
+<pre class="cmd">masq() { sudo iptables -t nat -S POSTROUTING | grep -c 'minibridge:minibridge'; }
+sudo ip netns add i9pod3
+sudo -E cnitool add minibridge /var/run/netns/i9pod3 | jq -r '.ips[0].address'
+echo "masq rules now: $(masq)"
+sudo ip netns del i9pod3
+sudo -E cnitool del minibridge /var/run/netns/i9pod3; echo "del exit=$?"
+echo "masq rules after: $(masq)"</pre>
+<pre class="out">10.99.0.2/24
+masq rules now: 2
+del exit=<b>0</b>
+masq rules after: <b>1</b>   &lt;- only the surviving pod's. Nothing leaked.</pre>
+<p>The reference plugin leaks here (I9.9, case 3). This one does not, because <code>DEL</code> looked the
+address up in its own store by container ID rather than asking a namespace that no longer exists. And note
+<code>10.99.0.2</code> was reused — unlike <code>host-local</code>, this allocator backfills the lowest free
+address.</p></li>
+<li><code>GC</code>: plant two reservations whose holders are gone, keep the live one, and reclaim.
+<pre class="cmd">sudo sh -c 'printf "a-pod-that-died\r\neth0\r\n" &gt; /var/lib/cni/minibridge/minibridge/10.99.0.50'
+sudo sh -c 'printf "another-dead-pod\r\neth0\r\n" &gt; /var/lib/cni/minibridge/minibridge/10.99.0.51'
+LIVE=$(sudo cat /var/lib/cni/minibridge/minibridge/10.99.0.3 | tr -d '\r' | sed -n 1p)
+jq -n --arg id "$LIVE" '{cniVersion:"1.1.0",name:"minibridge",type:"minibridge",
+   ipam:{subnet:"10.99.0.0/24"},
+   "cni.dev/valid-attachments":[{containerID:$id,ifname:"eth0"}]}' &gt; /tmp/mbgc.json
+sudo env CNI_COMMAND=GC CNI_PATH=/opt/cni/bin /opt/cni/bin/minibridge &lt; /tmp/mbgc.json</pre>
+<pre class="out">minibridge: gc: reclaiming 10.99.0.50 held by a-pod-that-died/eth0
+minibridge: gc: reclaiming 10.99.0.51 held by another-dead-pod/eth0
+<b>minibridge: gc: reclaimed 2 reservation(s)</b></pre>
+<pre class="cmd">sudo ls /var/lib/cni/minibridge/minibridge | grep '^10\.'</pre>
+<pre class="out"><b>10.99.0.3</b></pre>
+<p>The live attachment kept, the two dead ones reclaimed — and every one of those progress lines went to
+stderr, so a runtime parsing stdout saw nothing but the silence <code>GC</code> requires on success.</p></li>
+<li><strong>Now hand it to containerd.</strong> Install it as the node's CNI, with
+<code>portmap</code> chained behind it, and run a real sandbox with a host port.
+<pre class="cmd">sudo tee /etc/cni/net.d/00-minibridge.conflist &gt;/dev/null &lt;&lt;'EOF'
+{ "cniVersion": "1.1.0", "name": "minibridge", "plugins": [
+    { "type": "minibridge", "bridge": "mbr0", "ipMasq": true, "mtu": 1450,
+      "ipam": { "subnet": "10.99.0.0/24" } },
+    { "type": "portmap", "capabilities": { "portMappings": true } } ] }
+EOF
+sleep 3
+sudo crictl info | jq -c '{NetworkReady: (.status.conditions[]|select(.type=="NetworkReady")|.status)}'</pre>
+<pre class="out">{"NetworkReady":<b>true</b>}</pre>
+<pre class="cmd">cat &gt; ~/i9/pod-mb.json &lt;&lt;'EOF'
+{ "metadata": { "name": "mb-pod", "namespace": "i9", "uid": "mb-uid-1", "attempt": 0 },
+  "log_directory": "/tmp",
+  "port_mappings": [ { "protocol": 0, "container_port": 80, "host_port": 18099 } ],
+  "linux": {} }
+EOF
+POD=$(sudo crictl runp ~/i9/pod-mb.json 2>/dev/null)
+sudo crictl inspectp "$POD" | jq -c '{ip: .status.network.ip}'
+sudo iptables -t nat -S POSTROUTING | grep minibridge
+sudo iptables -t nat -S | grep '18099 -j DNAT'</pre>
+<pre class="out">{"ip":"<b>10.99.0.2</b>"}
+-A POSTROUTING -s 10.99.0.2/32 ! -d 10.99.0.0/24 -m comment --comment "minibridge:minibridge" -j MASQUERADE
+-A CNI-DN-ea643b49e5004c0b1edcb -p tcp -m tcp --dport 18099 <b>-j DNAT --to-destination 10.99.0.2:80</b></pre>
+<p>Containerd took <code>10.99.0.2</code> from a bash script, and <code>portmap</code> — a real Go plugin —
+chained onto our result and wrote a DNAT rule to the address we allocated. Our <code>prevResult</code> was
+good enough for a production plugin to consume.</p></li>
+<li>Put a container in that sandbox and serve traffic through the whole path.
+<pre class="cmd"># alpine 3.21's busybox has nc and wget but NOT httpd, so serve with nc
+CID=$(sudo crictl create "$POD" ~/i9/ctr-mb.json ~/i9/pod-mb.json)
+sudo crictl start "$CID"; sleep 3
+curl -s --max-time 5 http://127.0.0.1:18099/
+curl -s --max-time 5 -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:18099/
+sudo crictl exec "$CID" ping -c2 -W2 1.1.1.1 | tail -2
+sudo crictl exec "$CID" ip route</pre>
+<pre class="out"><b>minibridge</b>
+HTTP <b>200</b>
+2 packets transmitted, <b>2 packets received, 0% packet loss</b>
+round-trip min/avg/max = 21.145/22.072/23.000 ms
+<b>default via 10.99.0.1 dev eth0</b>
+10.99.0.0/24 dev eth0 scope link  src 10.99.0.2</pre>
+<p>Traffic in through a host port, traffic out to the internet, both through a network set up by a shell
+script that containerd executed. That is the module.</p></li>
+<li>Tear the sandbox down and confirm nothing leaked.
+<pre class="cmd">sudo crictl rmp -f "$POD"
+echo "reservations: $(sudo ls /var/lib/cni/minibridge/minibridge | grep -c '^10\.')"
+echo "masq rules:   $(sudo iptables -t nat -S POSTROUTING | grep -c minibridge)"
+echo "18099 rules:  $(sudo iptables -t nat -S | grep -c 18099)"
+ip -br link show mbr0</pre>
+<pre class="out">reservations: <b>0</b>
+masq rules:   <b>0</b>
+18099 rules:  <b>0</b>
+mbr0             <b>DOWN</b></pre>
+<p>Clean, including <code>portmap</code>'s rules — a real runtime replays capability arguments on teardown,
+which is the half <code>cnitool</code> skipped in I9.12. The bridge stays, down and empty, exactly as the
+reference plugin leaves its own.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have a plugin that libcni accepts, that implements all six operations, that survives every
+idempotency case from I9.3, that does not leak in the teardown order the reference plugin leaks in, and
+that containerd will drive for a real pod serving real traffic. You can point at the line in it that fixes
+each of the three shortcomings you measured earlier in the module.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Write <code>DEL</code> first, and test it against an empty world before <code>ADD</code>
+exists.</strong> It is the operation with the strictest requirement and the one most likely to be written
+optimistically.</li>
+<li><strong>Do not put the plugin's log in <code>/tmp</code>.</strong> The runtime execs plugins as root,
+<code>/tmp</code> is sticky, and the root-owned file that results cannot be unlinked by the unprivileged
+shell you are testing from. This cost a debugging round while writing
+<code>i9-dump</code>; both scripts default to <code>/var/log</code>.</li>
+<li><strong>A <code>jq</code> program that interpolates shell variables will eventually meet a value
+containing a control character.</strong> host-local's CRLF is exactly that value. Use
+<code>jq --arg</code> and let <code>jq</code> do the escaping.</li>
+<li><strong>Test with the namespace destroyed before <code>DEL</code>.</strong> If you only ever test the
+tidy order, you will ship the reference plugin's leak.</li>
+<li><strong>Fifteen characters is the whole interface-name budget.</strong> A host-side veth named from a
+container ID must be hashed and truncated; the kernel's error if you overrun it names neither the limit
+nor the field.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now built the thing <a href="w4.html#cp-4-5">W4.5 — the CNI contract</a> describes and
+<a href="w4.html#cp-4-6">W4.6 — inspect your actual CNI</a> asks you to read on a real cluster. The
+progression is the track's whole shape: <a href="b9.html#cp-b9-19">B9.19 — CNI v0.1, in two scripts</a>
+built the mechanism, <a href="i3.html#cp-i3-11">I3.11</a> drove it from a runtime hook, and this lesson
+gave it the calling convention that makes it a plugin.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> read your own plugin against
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> § Section 2 line by
+line — that is the conformance review. The reference implementation to compare against is
+<a href="https://github.com/containernetworking/plugins/tree/v1.9.1/plugins/main/bridge">plugins/main/bridge</a>,
+which is about 700 lines of Go doing what these 430 lines of bash do, plus IPv6 and the reconciliation of an
+existing bridge's settings.</p>
+</article>
+</div><!-- /g-project-drill -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
