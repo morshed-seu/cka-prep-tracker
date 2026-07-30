@@ -700,82 +700,263 @@ authoritative list of what is and is not shared is the <code>NamespaceOption</co
 <code>api.proto</code>.</p>
 </article>
 <article class="lesson" id="cp-i8-6" data-id="i8-6">
-<div class="lesson-head"><span class="cp-id">I8.6</span><h4>TODO headline</h4>
+<div class="lesson-head"><span class="cp-id">I8.6</span><h4>Reading a sandbox config field by field, and finding what each one became</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
-<!-- CHECKPOINT: a real sandbox config field by field: DNS configuration (which becomes the resolv.conf written into the sandbox), port mappings, the linux security context, cgroup parent, and the log directory. Change the DNS block, recreate the sandbox, and find the file it produced on disk.
-     UNDER THE HOOD: This is where B10's resolver lesson meets Kubernetes and where several classic mysteries get their explanation. The runtime — not the workload, not the container image — writes the sandbox's resolv.conf, which is why every pod on a cluster has the same nameserver regardless of its base image, and why ndots:5 in that generated file makes an external lookup take five failed queries before it succeeds. The log directory field is the other quiet one: it is where the CRI log files I12 dissects will be written, chosen by the kubelet, and the reason kubectl logs works at all. -->
-
 <h5>Why it matters</h5>
-<p>TODO plain-English hook.</p>
+<p>Several classic Kubernetes mysteries — why every pod has the same nameserver regardless of its
+base image, why an external DNS lookup takes five failed queries first, where
+<code>kubectl logs</code> reads from — are not Kubernetes behaviour at all. They are fields in the
+sandbox config, and each one leaves a trace on disk you can go and look at.</p>
 
 <h5>The concept</h5>
-<p>TODO. Absorb and expand the "under the hood" note above.</p>
+<p>The sandbox config is where the kubelet tells the runtime everything about the pod that is not a
+container. Four fields are worth following all the way to their consequences.</p>
+
+<p><strong><code>dns_config</code></strong> becomes a <code>resolv.conf</code> that the
+<em>runtime</em> writes, in its own directory, and bind-mounts over whatever the image had. This is
+the answer to "why does every pod resolve through the cluster DNS service even though my base image
+never heard of it" — nothing in the image is consulted. It is also where
+<code>options ndots:5</code> comes from, and B10.4 already showed you what that costs: a name with
+fewer than five dots is tried against every search-domain suffix first, so
+<code>api.example.com</code> becomes four failed queries and then a successful one.</p>
+
+<p><strong><code>log_directory</code></strong>, combined with each container's
+<code>log_path</code>, decides where the container's stdout and stderr are written. The kubelet
+chooses the value; the runtime creates the file. This is the whole reason
+<code>kubectl logs</code> works, and I8.13 dissects the format.</p>
+
+<p><strong><code>port_mappings</code></strong> — the <code>hostPort</code> feature — becomes iptables
+DNAT rules installed by the CNI <code>portmap</code> plugin, which is B9.16 done by machine.</p>
+
+<p><strong><code>linux.cgroup_parent</code></strong> is the directory (or systemd slice) under which
+the runtime places the pod's cgroups. It is how the kubelet keeps a QoS hierarchy, and it is one
+half of the cgroup-driver disagreement in I8.14.</p>
 
 <div class="specref">
-<p>TODO what the spec actually says.</p>
-<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
-<cite>TODO spec, version — <a href="TODO">file</a></cite>
+<p>The log fields, with the spec's own example paths — these are exactly the paths you will find on
+any real node:</p>
+<blockquote>// Path to the directory on the host in which container log files are<br>
+// stored.<br>
+// By default the log of a container going into the LogDirectory will be<br>
+// hooked up to STDOUT and STDERR. […]<br>
+// E.g.,<br>
+//&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;PodSandboxConfig.LogDirectory = `/var/log/pods/&lt;NAMESPACE&gt;_&lt;NAME&gt;_&lt;UID&gt;/`<br>
+//&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ContainerConfig.LogPath = `containerName/Instance#.log`<br>
+string log_directory = 3;</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
 </div>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
-<pre class="cmd">TODO</pre>
-<pre class="out">TODO captured output</pre></li>
+<li>Find the <code>resolv.conf</code> the runtime wrote. It is not in any image and not in any
+container — it is in the sandbox's own directory on the host.
+<pre class="cmd">SB=/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/$POD
+sudo ls -l $SB
+sudo cat $SB/resolv.conf</pre>
+<pre class="out">-rw-r--r-- 1 root root   8 Jul 30 13:56 hostname
+-rw-r--r-- 1 root root 541 Jul 30 13:56 hosts
+-rw-r--r-- 1 root root  98 Jul 30 13:56 <b>resolv.conf</b>
+
+search i8.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+<b>options ndots:5</b></pre></li>
+
+<li>Confirm it reaches the container as a bind mount over the image's own file — three of them, in
+fact.
+<pre class="cmd">sudo jq -c '.mounts[]|select(.destination|test("resolv|hosts|hostname"))' \
+  /run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR/config.json
+sudo crictl exec $CTR cat /etc/resolv.conf</pre>
+<pre class="out">{"destination":"<b>/etc/hostname</b>","type":"bind","source":".../sandboxes/d703566d.../hostname",...}
+{"destination":"<b>/etc/hosts</b>","type":"bind","source":".../sandboxes/d703566d.../hosts",...}
+{"destination":"<b>/etc/resolv.conf</b>","type":"bind","source":".../sandboxes/d703566d.../resolv.conf",...}
+
+search i8.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5</pre>
+<p>All three are per-<em>sandbox</em>, not per-container — which is why every container in a pod
+agrees about DNS and the hostname, and why editing <code>/etc/resolv.conf</code> inside a container
+survives nothing.</p></li>
+
+<li>Find what <code>port_mappings</code> became. The CNI portmap plugin wrote real iptables rules —
+the machinery of B9.15 and B9.16, installed for you.
+<pre class="cmd">sudo iptables -t nat -S | grep -i 'CNI-HOSTPORT\|18080' | head -6</pre>
+<pre class="out">-N CNI-HOSTPORT-DNAT
+-A PREROUTING -m addrtype --dst-type LOCAL -j <b>CNI-HOSTPORT-DNAT</b>
+-A OUTPUT -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"d703566d…\""
+   -m multiport --dports <b>18080</b> -j CNI-DN-0fd1f35b30bf921e4a521
+-A CNI-DN-0fd1f35b30bf921e4a521 -p tcp -m tcp --dport 18080 -j <b>DNAT --to-destination 10.4.0.38:80</b></pre></li>
+
+<li>Now try the failure this makes possible. Create a <em>second</em> sandbox asking for the same
+<code>host_port</code>.
+<pre class="cmd">sudo crictl -t 60s runp sandbox2.json   # same "host_port": 18080
+sudo iptables -t nat -S CNI-HOSTPORT-DNAT | grep -c 18080
+curl -s --max-time 4 http://127.0.0.1:18080/ ; echo "curl exit $?"</pre>
+<pre class="out"><b>2</b>
+curl exit <b>7</b></pre>
+<p><strong>CRI accepted both.</strong> Two DNAT rules now match port 18080; the first one wins, and
+it points at the pod that has nothing listening — so the host port is dead even though a working
+server is one rule further down. Delete the first sandbox and the same port starts working
+immediately. Nothing in the runtime deduplicates host ports: in Kubernetes that is a
+<em>scheduler</em> predicate, not a runtime check, which is exactly why a hostPort collision
+manifests as unschedulable pods rather than as a runtime error.</p></li>
+
+<li>Follow <code>cgroup_parent</code> into the tree, and find the log file the two log fields
+produced.
+<pre class="cmd">sudo jq -r '.linux.cgroupsPath' /run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR/config.json
+sudo find /var/log/pods -type f</pre>
+<pre class="out"><b>/i8demo/7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19</b>
+<b>/var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log</b></pre>
+<p><code>&lt;cgroup_parent&gt;/&lt;container id&gt;</code>, a plain directory path, because this
+runtime is using the <code>cgroupfs</code> driver. I8.14 shows what the same field produces under
+the systemd driver, and why the difference is dangerous.</p></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
-<p>TODO what the reader can now do.</p>
+<p>You can change the <code>dns_config</code> block, recreate the sandbox, and point at the file on
+disk that changed — and you can explain to someone why editing <code>/etc/resolv.conf</code> in
+their Dockerfile has no effect in a pod.</p>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong>TODO.</strong></li>
+<li><strong><code>ndots:5</code> is written by the runtime, from a field the kubelet sends.</strong>
+It is not in your image and not in your pod spec unless you override it with
+<code>dnsConfig</code>. The cost is real: every external name shorter than five dots costs several
+failed queries first, which is B10.4's lab and a genuine latency bug in busy clusters.</li>
+<li><strong>Nothing checks host-port conflicts at the CRI layer.</strong> Two sandboxes may both
+claim one host port, the first DNAT rule wins, and the symptom is a connection refused on a port
+that "is definitely mapped". If you are debugging hostPort, count the rules.</li>
+<li><strong>The log directory must exist.</strong> The kubelet creates it; crictl does not. Driving
+CRI by hand without <code>mkdir -p</code> gives you a container with no readable logs and no error
+saying so.</li>
 </ul>
 
 <div class="k8s-link">
-<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+<p>The resolver behaviour this configures is <a href="b10.html#cp-b10-3">B10.3 — /etc/resolv.conf
+line by line: nameserver, search, options ndots</a> and <a href="b10.html#cp-b10-4">B10.4 — watch a
+short name fan out</a>. The DNAT machinery is <a href="b9.html#cp-b9-16">B9.16 — publish a private
+service on a host port</a>. In the advanced track, <a href="w6.html#cp-6-21">W6.21 — the DNS ladder
+as reflex</a> is where these files get checked under time pressure.</p>
 </div>
 
-<p class="docs-links"><b>Docs:</b> TODO.</p>
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>DNS for Services and Pods</em> —
+the "Pod's DNS Config" and "ndots" sections describe exactly the file you just read. For host ports,
+search <em>hostPort</em> and note that the documentation warns about the scheduling constraint, not
+about a runtime error.</p>
 </article>
 <article class="lesson" id="cp-i8-7" data-id="i8-7">
-<div class="lesson-head"><span class="cp-id">I8.7</span><h4>TODO headline</h4>
+<div class="lesson-head"><span class="cp-id">I8.7</span><h4>RunPodSandbox triggers CNI ADD — the seam where I9 begins</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
-<!-- CHECKPOINT: the seam where the next module begins: RunPodSandbox is what triggers the CNI ADD. Delete your CNI configuration, run crictl runp again, and read the failure — a pod that cannot get an IP fails at sandbox creation, before a single application container has been considered.
-     UNDER THE HOOD: The ordering explains an entire family of cluster symptoms. Because networking is attached to the sandbox, and the sandbox precedes every app container, a broken CNI produces pods stuck in ContainerCreating with an error mentioning networking and no container logs to read — there is nothing to log, nothing was started. It also explains why a pod keeps its IP across container restarts but not across pod restarts: the IP belongs to the sandbox's network namespace, not to any container. I9 opens exactly this seam and makes you implement the other side of it. -->
-
 <h5>Why it matters</h5>
-<p>TODO plain-English hook.</p>
+<p>"Pod stuck in <code>ContainerCreating</code>, no logs, error mentions the network" is one of the
+most common failure shapes in Kubernetes, and it has one structural explanation: <strong>networking
+is attached to the sandbox, and the sandbox is created before any application container
+exists.</strong> There is nothing to log because nothing was started.</p>
 
 <h5>The concept</h5>
-<p>TODO. Absorb and expand the "under the hood" note above.</p>
+<p>Inside <code>RunPodSandbox</code>, the runtime creates a network namespace, pins it as a file,
+and invokes the <strong>CNI</strong> plugin chain with <code>ADD</code> — handing it that namespace
+path and expecting an IP back. Only if that succeeds does it start the pause container. The IP
+belongs to the sandbox's network namespace, not to any container, which is why a pod keeps its
+address across container restarts and loses it when the sandbox is recreated.</p>
 
-<div class="specref">
-<p>TODO what the spec actually says.</p>
-<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
-<cite>TODO spec, version — <a href="TODO">file</a></cite>
-</div>
+<p>Everything downstream follows from the ordering. If CNI cannot run, the sandbox never becomes
+ready; if the sandbox never becomes ready, no container is ever created; if no container is created,
+<code>kubectl logs</code> has nothing to read and <code>kubectl describe</code> is your only
+evidence. It also explains why the reverse order matters at teardown (I8.11): the CNI
+<code>DEL</code> that releases the IP is bound to sandbox teardown, so skipping it leaks addresses.</p>
+
+<p>containerd exposes its CNI state in two places worth knowing: the <code>NetworkReady</code>
+condition from <code>Status()</code>, and a <code>lastCNILoadStatus</code> string that says why the
+config failed to load. Between them they name the fault precisely.</p>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
-<pre class="cmd">TODO</pre>
-<pre class="out">TODO captured output</pre></li>
+<li>Take the CNI configuration away and watch the runtime notice. Nothing is restarted here — a
+config watcher picks it up.
+<pre class="cmd">sudo mv /etc/cni/net.d/nerdctl-bridge.conflist /root/cni-backup/
+sleep 6
+sudo crictl info | jq -c '.status.conditions[]|select(.type=="NetworkReady")'
+sudo crictl info | jq -r '.lastCNILoadStatus'</pre>
+<pre class="out">{"message":"Network plugin returns error: cni plugin not initialized",
+ "reason":"<b>NetworkPluginNotReady</b>","status":<b>false</b>,"type":"NetworkReady"}
+cni config load failed: <b>no network config found in /etc/cni/net.d</b>: cni plugin not
+initialized: failed to load cni config</pre></li>
+
+<li>Now try to create a pod. Read where the failure lands.
+<pre class="cmd">sudo crictl -t 60s runp sandbox.json</pre>
+<pre class="out">E0730 14:05:20 remote_runtime.go:237] "RunPodSandbox from runtime service failed"
+  err="rpc error: code = Unknown desc = <b>failed to setup network for sandbox</b>
+  \"5f231bdc20dcda43106f26382189490c1759dee9a773ffd8b94ded6cc3e1680a\":
+  cni plugin not initialized"</pre>
+<p>Note what exists at this point: a sandbox <em>ID</em>, and nothing else. No container was
+considered. In a real cluster this is <code>FailedCreatePodSandBox</code> in the pod's events, the
+pod sitting in <code>ContainerCreating</code>, and <code>kubectl logs</code> answering that the
+container is not found — because it never was.</p></li>
+
+<li>Confirm the absence directly.
+<pre class="cmd">sudo crictl ps -a</pre>
+<pre class="out">CONTAINER   IMAGE   CREATED   STATE   NAME   ATTEMPT   POD ID   POD   NAMESPACE</pre></li>
+
+<li>Put the file back — and discover that restoring it is not enough.
+<pre class="cmd">sudo mv /root/cni-backup/nerdctl-bridge.conflist /etc/cni/net.d/
+for i in $(seq 1 20); do
+  printf '  t+%ss NetworkReady=%s\n' "$i" \
+    "$(sudo crictl info | jq -r '.status.conditions[]|select(.type=="NetworkReady").status')"
+  sleep 1
+done | tail -3
+sudo touch /etc/cni/net.d/nerdctl-bridge.conflist   # still nothing, 15s later</pre>
+<pre class="out">  t+18s NetworkReady=<b>false</b>
+  t+19s NetworkReady=<b>false</b>
+  t+20s NetworkReady=<b>false</b></pre>
+<p>The file is on disk, byte-identical, and the node is still not ready. containerd's own log says
+why:</p>
+<pre class="cmd">sudo journalctl -u containerd --since -6min | grep 'fs change event'</pre>
+<pre class="out">"failed to reload cni configuration after receiving fs change event(<b>RENAME</b>
+ \"/etc/cni/net.d/nerdctl-bridge.conflist\")" error="cni config load failed: no network
+ config found in /etc/cni/net.d…"</pre>
+<p>Exactly one event, for the move <em>out</em>. The move back in produced none, and neither did
+<code>touch</code>. A <strong>content write</strong> does:</p>
+<pre class="cmd">sudo cp /root/cni-backup/nerdctl-bridge.conflist /etc/cni/net.d/nerdctl-bridge.conflist
+sleep 3
+sudo crictl info | jq -c '{cni:.lastCNILoadStatus, ready:[.status.conditions[]|{(.type):.status}]}'</pre>
+<pre class="out">{"cni":"<b>OK</b>","ready":[{"RuntimeReady":true},{"<b>NetworkReady":true</b>},
+  {"ContainerdHasNoDeprecationWarnings":true}]}</pre>
+<p>And pods work again immediately. Watch for one more thing in that journal: the mid-copy
+<code>WRITE</code> event produced <code>unexpected end of JSON input</code>, because containerd read
+the file while <code>cp</code> was still writing it. It recovered on the next event, but a node
+briefly reported itself un-ready for a reason that was never true.</p></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
-<p>TODO what the reader can now do.</p>
+<p>You can produce a pod stuck at sandbox creation on demand, name the two runtime fields that
+identify the cause, and explain without looking it up why there are no container logs to read.</p>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong>TODO.</strong></li>
+<li><strong>Restoring a CNI config with <code>mv</code> may not take.</strong> containerd's watcher
+reloaded on the rename <em>out</em> and not on the rename <em>in</em>; <code>touch</code> did not
+help either, since it changes no content. Copy the file's contents into place, or restart the
+runtime. A node sitting at <code>NetworkReady=false</code> with a perfectly good config file on disk
+is this bug, and it looks impossible until you check <code>lastCNILoadStatus</code>.</li>
+<li><strong>Writing a CNI config in place has a race.</strong> The watcher can read a half-written
+file and report a JSON parse error. It is transient, but if you are automating config deployment,
+expect a brief <code>NetworkReady=false</code> window.</li>
+<li><strong>A pod's IP belongs to the sandbox.</strong> Container restarts keep it; a sandbox
+recreation does not. If an address changed, a container did not restart — the pod's sandbox was
+replaced, which is a different and more serious event.</li>
 </ul>
 
 <div class="k8s-link">
-<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+<p>This is the failure behind <a href="w6.html#cp-6-15">W6.15 — the Pending-pod checklist</a> and a
+common rung of <a href="w6.html#cp-6-10">W6.10 — the NotReady ladder, end to end</a>. The plugin
+chain on the other side of this seam is I9's whole subject; you built its ancestor by hand in
+<a href="b9.html#cp-b9-19">B9.19 — mini project: CNI v0.1, in two scripts</a>.</p>
 </div>
 
-<p class="docs-links"><b>Docs:</b> TODO.</p>
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>network plugins</em> — the CNI
+requirements section names <code>/etc/cni/net.d</code> and <code>/opt/cni/bin</code>, which are the
+two paths every one of these failures involves.</p>
 </article>
 </div><!-- /g-the-sandbox-model -->
 
