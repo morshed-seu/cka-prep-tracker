@@ -1,0 +1,59 @@
+#!/bin/bash
+# i9-dump — a chained CNI plugin that does nothing to the network.
+#
+# Its whole job is to record what the runtime handed it and then pass the
+# previous plugin's result through unchanged, so you can read `prevResult` on
+# the wire instead of taking the spec's word for it. Drop it into a .conflist
+# after `bridge` and tail /var/log/i9-dump.log.
+#
+# The log deliberately does NOT default into /tmp: the runtime execs plugins as
+# root, /tmp is sticky, and the root-owned file that results cannot be unlinked
+# by the unprivileged shell you are testing from.
+#
+# It also demonstrates the two rules a bash plugin most often breaks:
+#   * stdout is the result channel — nothing human-readable ever goes there;
+#   * a chained plugin MUST pass prevResult through, or the plugins after it
+#     (and the runtime's own cache) lose the addresses.
+#
+# Used by materials/i9.html, lessons I9.6 and I9.14.
+set -u
+
+config=$(cat)
+log=${I9_DUMP_LOG:-/var/log/i9-dump.log}
+
+{
+  echo "=== $(date -u +%H:%M:%S) CNI_COMMAND=${CNI_COMMAND:-unset} CNI_IFNAME=${CNI_IFNAME:-unset}"
+  echo "--- environment parameters ---"
+  env | grep '^CNI_' | sort
+  echo "--- stdin ---"
+  printf '%s\n' "$config" | jq . 2>/dev/null || printf '%s\n' "$config"
+} >>"$log" 2>&1
+
+case "${CNI_COMMAND:-}" in
+  ADD)
+    # Pass prevResult through untouched. If we are first in the chain there is
+    # no prevResult, and an interface plugin would build one here; we are not
+    # one, so emit the minimum a runtime will parse.
+    prev=$(printf '%s\n' "$config" | jq -c '.prevResult // empty')
+    if [ -n "$prev" ]; then
+      printf '%s\n' "$prev"
+    else
+      printf '%s\n' "$config" | jq -c '{cniVersion: .cniVersion, interfaces: [], ips: [], routes: []}'
+    fi
+    ;;
+  DEL|CHECK)
+    # Nothing to undo and nothing to verify. Success is silence.
+    ;;
+  GC)
+    printf '%s\n' "$config" | jq -c '{gc_saw_valid_attachments: ."cni.dev/valid-attachments"}' >>"$log"
+    ;;
+  STATUS)
+    ;;
+  VERSION)
+    printf '%s\n' '{"cniVersion":"1.1.0","supportedVersions":["0.3.1","0.4.0","1.0.0","1.1.0"]}'
+    ;;
+  *)
+    printf '%s\n' '{"cniVersion":"1.1.0","code":4,"msg":"unknown CNI_COMMAND","details":"i9-dump understands ADD, DEL, CHECK, GC, STATUS and VERSION"}'
+    exit 1
+    ;;
+esac
