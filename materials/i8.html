@@ -1209,82 +1209,230 @@ the exec-probe section is <code>ExecSync</code> — and for <em>port forward</em
 described from the user's side.</p>
 </article>
 <article class="lesson" id="cp-i8-10" data-id="i8-10">
-<div class="lesson-head"><span class="cp-id">I8.10</span><h4>TODO headline</h4>
+<div class="lesson-head"><span class="cp-id">I8.10</span><h4>UpdateContainerResources, and what in-place pod resize really does</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
-<!-- CHECKPOINT: the two calls that make a pod useful from outside — Attach and PortForward (both streaming, both URL-based like exec) — and the one behind in-place pod resize: UpdateContainerResources. Change a running container's limits with crictl update and read the cgroup file before and after to prove it took effect.
-     UNDER THE HOOD: In-place pod resize went GA in Kubernetes v1.35, the version this track targets, and this call is the whole mechanism: the kubelet writes new values into the container's cgroup v2 files, which is precisely B7's lab, done by an API. That is why growing a memory limit takes effect immediately and shrinking one may not (the pages are already charged), and why CPU changes are smooth while memory changes can meet an OOM kill. PortForward is worth one honest sentence too: it is a tunnel to the sandbox's network namespace, which is why it works for a pod with no Service and tells you nothing about whether Service routing is healthy. -->
-
 <h5>Why it matters</h5>
-<p>TODO plain-English hook.</p>
+<p>In-place pod resize went <strong>GA in Kubernetes v1.35</strong>, the version this track targets.
+Underneath the feature gate and the API machinery there is one CRI call, and what it does is write
+into the container's cgroup v2 files — which is B7's lab, driven by an API. Watching it happen makes
+the feature's limits obvious rather than mysterious.</p>
 
 <h5>The concept</h5>
-<p>TODO. Absorb and expand the "under the hood" note above.</p>
+<p><code>UpdateContainerResources</code> changes a running container's limits without recreating it.
+The runtime writes the new values into <code>memory.max</code>, <code>cpu.max</code>,
+<code>cpu.weight</code> and friends, and the kernel applies them to a process that never noticed.</p>
+
+<p>The asymmetry between growing and shrinking is not a Kubernetes quirk; it is how cgroups work.
+<strong>Growing a limit is always safe</strong> — the cgroup's current usage is already below the new
+ceiling by definition. <strong>Shrinking a memory limit below current usage is a kill.</strong> The
+kernel is asked to make usage fit under a smaller number; it reclaims what it can, and if it cannot
+reclaim enough, it invokes the OOM killer inside that cgroup. CPU has no equivalent hazard — a
+smaller quota just throttles.</p>
+
+<p>Kubernetes' own contract acknowledges this. Since v1.33 the CRI contract specifies that runtimes
+must <em>not</em> deliberately restart a container to apply a resize, and must return an error if a
+restart would be required. Note what that does and does not promise: the <em>runtime</em> will not
+restart your container. The <em>kernel</em> may still kill it, and the call will have returned
+success first.</p>
+
+<p>There is one more thing worth checking here, because <a href="i3.html#cp-i3-8">I3.8</a> found the
+opposite for bare runc: does anything on disk record the change?</p>
 
 <div class="specref">
-<p>TODO what the spec actually says.</p>
-<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
-<cite>TODO spec, version — <a href="TODO">file</a></cite>
+<p>The call's contract, verbatim — note "transactionally", which is the runtime's promise, not the
+kernel's:</p>
+<blockquote>// UpdateContainerResources updates ContainerConfig of the container synchronously.<br>
+// If runtime fails to transactionally update the requested resources, an error is returned.</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
 </div>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
-<pre class="cmd">TODO</pre>
-<pre class="out">TODO captured output</pre></li>
+<li>Find the container's cgroup and read what its config asked for. Start a workload that holds
+about 20 MiB resident inside a 64 MiB limit.
+<pre class="cmd">CG=/sys/fs/cgroup$(sudo jq -r '.linux.cgroupsPath' \
+     /run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR/config.json)
+for f in memory.max cpu.max cpu.weight; do printf '%-12s %s\n' "$f" "$(sudo cat $CG/$f)"; done
+sudo cat $CG/memory.current</pre>
+<pre class="out">memory.max   <b>67108864</b>
+cpu.max      <b>20000 100000</b>
+cpu.weight   100
+<b>21250048</b></pre></li>
+
+<li>Grow the limits. This is the whole mechanism behind a successful in-place resize.
+<pre class="cmd">sudo crictl update --memory 134217728 --cpu-quota 50000 --cpu-share 512 "$CTR"
+for f in memory.max cpu.max cpu.weight; do printf '%-12s %s\n' "$f" "$(sudo cat $CG/$f)"; done
+sudo crictl inspect "$CTR" | jq -r '.status.state'</pre>
+<pre class="out">memory.max   <b>134217728</b>
+cpu.max      <b>50000 100000</b>
+cpu.weight   <b>59</b>
+CONTAINER_RUNNING</pre>
+<p><code>--cpu-share 512</code> became <code>cpu.weight 59</code>, not 512 — the same logarithmic
+rescale from cgroup v1 shares to v2 weight that <a href="i2.html#cp-i2-8">I2.8</a> measured
+(2→1, 512→59, 1024→100, 4096→303). Nothing is lost, but the number you read back is never the number
+you wrote.</p></li>
+
+<li>Ask whether the change is recorded anywhere on disk. Compare the bundle with the API's answer.
+<pre class="cmd">sudo jq -c '.linux.resources|{memory:.memory.limit, cpu:.cpu}' \
+  /run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR/config.json
+sudo crictl inspect "$CTR" | jq -c '.info.runtimeSpec.linux.resources|{memory,cpu}'</pre>
+<pre class="out">{"memory":<b>67108864</b>,"cpu":{"quota":20000,"period":100000}}
+{"memory":{"limit":<b>134217728</b>,"swap":134217728},"cpu":{"period":100000,"quota":50000,"shares":512}}</pre>
+<p>The bundle on disk still says 64 MiB — like <code>runc update</code>, the update does not rewrite
+<code>config.json</code>. But unlike bare runc, <strong>CRI's status reports the new value</strong>,
+because containerd keeps its own updated spec in the metadata store. So the disagreement between the
+two is expected here, and <code>crictl inspect</code> is the one to believe.</p></li>
+
+<li>Now shrink the memory limit below what is already charged, and watch what "success" means.
+<pre class="cmd">sudo cat $CG/memory.current        # 21250048
+sudo crictl update --memory 8388608 "$CTR"
+echo "UpdateContainerResources returned $?"
+sleep 2
+sudo crictl inspect "$CTR" | jq -c '.status|{state,exitCode,reason}'</pre>
+<pre class="out">21250048
+64616fd8f4f59026464e9938f73fdb5710d91466e24c573225738d34afa5c44d
+UpdateContainerResources returned <b>0</b>
+{"state":"<b>CONTAINER_EXITED</b>","exitCode":<b>137</b>,"reason":"<b>OOMKilled</b>"}</pre>
+<p>The call succeeded. Two seconds later the container was dead: exit 137 — <code>128 + 9</code>,
+SIGKILL, B2.8's arithmetic — with reason <code>OOMKilled</code>. The runtime did exactly what the
+contract requires and did not restart anything; the kernel did the killing.</p></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
-<p>TODO what the reader can now do.</p>
+<p>You can change a running container's limits and show the cgroup file before and after, and you
+can explain why a memory <em>increase</em> is safe to apply live while a <em>decrease</em> is a
+decision with a body count.</p>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong>TODO.</strong></li>
+<li><strong>The call returning success does not mean the container survived.</strong> Writing
+<code>memory.max</code> below <code>memory.current</code> succeeds at the API and kills at the
+kernel, asynchronously. Check the container's state afterwards, not the call's return code.</li>
+<li><strong><code>--cpu-share</code> is rescaled and will not read back.</strong> 512 becomes
+<code>cpu.weight 59</code>. If you are verifying a change by reading the cgroup file, know the
+mapping or compare ratios rather than absolute values.</li>
+<li><strong>The bundle's <code>config.json</code> is stale after an update.</strong> Read the value
+from <code>crictl inspect</code>, not from the file on disk — a habit worth forming, because the
+file is the more obvious place to look and it is wrong.</li>
 </ul>
 
 <div class="k8s-link">
-<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+<p>The cgroup files being written here are exactly <a href="b7.html#cp-b7-8">B7.8 — memory: current,
+high (throttle) vs max (kill)</a> and <a href="b7.html#cp-b7-9">B7.9 — the OOM kill: exit 137,
+memory.events, and the dmesg verdict</a>. Exit code 137 as a diagnostic is
+<a href="w6.html#cp-6-16">W6.16 — CrashLoopBackOff mastery: --previous, lastState, and the
+exit-code alphabet</a>.</p>
 </div>
 
-<p class="docs-links"><b>Docs:</b> TODO.</p>
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>resize CPU and memory resources
+assigned to containers</em> — the task page describes the resize policies and the restart behaviour
+this call implements. The graduation history is in the v1.35 release notes.</p>
 </article>
 <article class="lesson" id="cp-i8-11" data-id="i8-11">
-<div class="lesson-head"><span class="cp-id">I8.11</span><h4>TODO headline</h4>
+<div class="lesson-head"><span class="cp-id">I8.11</span><h4>Teardown, in reverse, and what happens when you get it wrong</h4>
 <label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
-<!-- CHECKPOINT: the pod down in the correct order and then in the wrong one: crictl stop and rm the containers, then crictl stopp and rmp the sandbox. Try removing the sandbox first and read what happens. The rule to keep: the sandbox is created first and destroyed last.
-     UNDER THE HOOD: Deletion runs the creation sequence in reverse for a reason: the sandbox owns the network namespace, so tearing it down first would strand containers with a namespace that is going away, and the CNI DEL — which must run to release the pod's IP — is bound to sandbox teardown. Get this wrong and you leak IPAM reservations, which is I9's third fault and a real node-level outage mode: a node that refuses new pods because a subnet full of addresses is held by pods that no longer exist. It is also why a terminating pod's grace period is spent on containers, with the sandbox removed only afterwards. -->
-
 <h5>Why it matters</h5>
-<p>TODO plain-English hook.</p>
+<p>Deletion runs creation backwards, and the rule to keep is one sentence: <strong>the sandbox is
+created first and destroyed last.</strong> Getting it wrong leaks IP addresses, which is a node-level
+outage that arrives hours later as "this node refuses new pods" with no obvious cause.</p>
 
 <h5>The concept</h5>
-<p>TODO. Absorb and expand the "under the hood" note above.</p>
+<p>The correct order is: stop each container, remove each container, stop the sandbox, remove the
+sandbox. The reason is ownership. The sandbox owns the network namespace, so tearing it down while
+containers are still joined to it would strand them in a namespace that is going away. And the CNI
+<code>DEL</code> — the call that returns the pod's IP to the IPAM pool — is bound to sandbox
+teardown, so the sandbox must outlive everything that used its network.</p>
+
+<p>This is also why a terminating pod's <code>terminationGracePeriodSeconds</code> is spent on
+containers: the grace period is the timeout on <code>StopContainer</code>, and the sandbox is
+removed only after every container has gone.</p>
+
+<p>The proto is unusually explicit about the idempotency requirements here, and about who forcibly
+terminates what.</p>
 
 <div class="specref">
-<p>TODO what the spec actually says.</p>
-<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
-<cite>TODO spec, version — <a href="TODO">file</a></cite>
+<p>Both teardown calls, verbatim — note that both are required to be idempotent, and that
+<code>RemovePodSandbox</code> is permitted to forcibly kill containers:</p>
+<blockquote>// RemovePodSandbox removes the sandbox. If there are any running containers<br>
+// in the sandbox, they must be forcibly terminated and removed.<br>
+// This call is idempotent, and must not return an error if the sandbox has<br>
+// already been removed.<br>
+rpc RemovePodSandbox(RemovePodSandboxRequest) returns (RemovePodSandboxResponse) {}</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
 </div>
 
 <h5>Lab</h5>
 <ol class="lab">
-<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
-<pre class="cmd">TODO</pre>
-<pre class="out">TODO captured output</pre></li>
+<li>Do it wrong first: remove the sandbox while a container is still running.
+<pre class="cmd">sudo crictl rmp "$POD"</pre>
+<pre class="out">time="..." level=fatal msg="pod sandbox
+  \"ab4b4d921a5df79db10787b73e9415dd68e197dcea76b7b2b8a6d6ffbe955aac\"
+  <b>is running, please stop it first</b>"</pre>
+<p>Refused — the API defends the ordering. This is the same shape of guard as
+<a href="i7.html#cp-i7-6">I7.6</a>'s "cannot delete a non stopped container".</p></li>
+
+<li>Force it, and check what the runtime cleaned up on your behalf.
+<pre class="cmd">sudo crictl rmp -f "$POD"
+sudo crictl ps -a; sudo crictl pods
+sudo ls /var/run/netns/
+sudo iptables -t nat -S CNI-HOSTPORT-DNAT | grep -c 18080</pre>
+<pre class="out">Removed sandbox ab4b4d921a5df79db10787b73e9415dd68e197dcea76b7b2b8a6d6ffbe955aac
+CONTAINER   IMAGE   CREATED   STATE   NAME   ATTEMPT   POD ID   POD   NAMESPACE
+POD ID      CREATED   STATE   NAME   NAMESPACE   ATTEMPT   RUNTIME
+
+<b>0</b></pre>
+<p>The container went with it, the pinned network namespace under
+<code>/var/run/netns/</code> is gone, and the DNAT rule the portmap plugin installed has been
+removed. That last one <em>is</em> the CNI <code>DEL</code>, and it is what returns the address.</p></li>
+
+<li>Now the correct sequence, which is what the kubelet actually does.
+<pre class="cmd">sudo crictl stop "$CTR"   # StopContainer, honours the grace period
+sudo crictl rm   "$CTR"   # RemoveContainer
+sudo crictl stopp "$POD"  # StopPodSandbox — this is where CNI DEL runs
+sudo crictl rmp   "$POD"  # RemovePodSandbox</pre>
+<pre class="out">7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19
+7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19
+d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e
+d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e</pre></li>
+
+<li>Read the exit code a stopped container leaves behind. <code>crictl stop</code> sends SIGTERM
+first, so the number is B2.8's arithmetic again.
+<pre class="cmd">sudo crictl inspect "$CTR" | jq -c '.status|{state,exitCode,reason,startedAt,finishedAt}'</pre>
+<pre class="out">{"state":"CONTAINER_EXITED","exitCode":<b>143</b>,"reason":"Error",
+ "startedAt":"2026-07-30T14:22:25.433535276+06:00",
+ "finishedAt":"2026-07-30T14:22:26.468856876+06:00"}</pre>
+<p><code>143 = 128 + 15</code>: SIGTERM. A container that ignored SIGTERM and was killed after the
+grace period would read 137 instead, and that difference is the fastest way to tell "shut down
+cleanly" from "was executed".</p></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
-<p>TODO what the reader can now do.</p>
+<p>You can tear a pod down in the correct order from memory, name which step runs CNI
+<code>DEL</code>, and say what leaks if that step is skipped.</p>
 
 <h5 class="gotcha">Gotchas</h5>
 <ul>
-<li><strong>TODO.</strong></li>
+<li><strong>Leaked IPAM reservations are a delayed, node-level outage.</strong> Each skipped CNI
+<code>DEL</code> holds one address in the host-local IPAM store forever. Nothing complains until the
+subnet is full, at which point every new pod on that node fails to get an IP and the pods holding
+the addresses no longer exist. This is I9's third fault, and it is real.</li>
+<li><strong>The grace period is spent on containers, not on the sandbox.</strong> A pod that takes
+forever to terminate is a container ignoring SIGTERM. The sandbox teardown is fast.</li>
+<li><strong>Both teardown calls must be idempotent, so a "successful" delete proves
+nothing.</strong> Calling <code>StopPodSandbox</code> on an already-stopped sandbox returns success
+by design. Verify with <code>crictl pods</code>, not with the exit status.</li>
 </ul>
 
 <div class="k8s-link">
-<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+<p>The stuck-Terminating pod is <a href="w6.html#cp-6-18">W6.18 — the quiet failures: not-Ready
+pods, stuck Terminating, init crashes</a>, and the exit-code reading is
+<a href="w6.html#cp-6-16">W6.16</a>. The graceful-shutdown contract a container has to honour was
+built in <a href="b2.html#cp-b2-16">B2.16 — the graceful-shutdown pattern, end to end</a>.</p>
 </div>
 
-<p class="docs-links"><b>Docs:</b> TODO.</p>
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>pod termination</em> — the "Pod
+lifecycle" page's termination section describes this sequence from the API's side, including where
+the grace period is spent.</p>
 </article>
 </div><!-- /g-the-call-sequence -->
 
