@@ -1666,24 +1666,99 @@ done</pre>
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>A Dockerfile has nine instructions: <code>FROM</code>, <code>ENV</code>, <code>LABEL</code>, <code>WORKDIR</code>, <code>RUN</code>, <code>COPY</code>, <code>USER</code>, <code>EXPOSE</code>, <code>CMD</code>. How many layers does the resulting image have, and how many <code>history</code> entries?
+<details class="reveal"><summary>Answer</summary><p>Four layers — the base, <code>WORKDIR</code>, <code>RUN</code> and <code>COPY</code> — and ten history entries, because <code>alpine</code> contributes two of its own. <code>WORKDIR</code> is the one people get wrong: it goes through the filesystem-snapshot path, so it consumes a <code>diff_id</code> slot and is never marked <code>empty_layer</code>. The check is always the same arithmetic: history entries minus empty ones equals layers, so 10 − 6 = 4.</p></details></li>
+
+<li>You point <code>WORKDIR</code> at <code>/tmp</code>, which already exists in the base image. Does that produce a layer, and if so what is in it?
+<details class="reveal"><summary>Answer</summary><p>Yes — and this is the sharper version of the same trap. The step still takes a slot; the diff simply comes out empty, so the slot holds the <strong>empty layer</strong>: 1024 zero bytes (two tar terminator blocks), <code>diff_id sha256:5f70bf18a086…</code>, compressing to the 32-byte blob <code>sha256:4f4fb700ef54…</code>. Two such steps dedupe to one blob, because content addressing does not care that they came from different instructions.</p></details></li>
+
+<li>Your build directory holds a 100 MB file that no instruction references. Your Dockerfile says <code>COPY app.txt /app.txt</code>. How much does the context transfer cost?
+<details class="reveal"><summary>Answer</summary><p>38 bytes, measured. BuildKit resolves the graph first and transfers only the paths the graph references, so the 100 MB file is never sent. The widely repeated claim that "the whole context is uploaded" was true of the old Docker daemon, which tarred the directory up front, and is false here. Change one line to <code>COPY . /src/</code> and the same directory transfers 104.89 MB — the cost is a property of your instructions, not of your directory.</p></details></li>
+
+<li>So if the context is transferred lazily, why is <code>.dockerignore</code> still a security control rather than just a speed tweak?
+<details class="reveal"><summary>Answer</summary><p>Because <code>COPY . .</code> is extremely common and it widens the graph's reference to everything — at which point a <code>.env</code> or a private key is both transferred <em>and</em> baked into a layer that gets pushed to a registry, where <a href="#cp-i6-11">I6.11</a>'s two commands recover it. <code>.dockerignore</code> is enforced while the client builds its file list, upstream of what the graph can ask for, so the exclusion holds even for <code>COPY . .</code>. Read it like a firewall rule.</p></details></li>
+
+<li>Name the three inputs to a step's cache key, and explain why a cache miss can never have a hit below it.
+<details class="reveal"><summary>Answer</summary><p>The parsed instruction, the identity of the filesystem it starts from (the chain ID of <a href="i4.html#cp-i4-12">I4.12</a>), and — for <code>COPY</code>/<code>ADD</code> — the content of the files being copied. Because each key contains the parent's identity, one miss changes every descendant's parent and therefore every descendant's key. That single fact is the whole justification for copying your dependency manifest before your source, rather than a rule to memorise.</p></details></li>
+
+<li>Which of these break the cache: adding a comment, editing an uncopied file in the context, <code>touch</code>ing a copied file, <code>chmod +x</code> on a copied file?
+<details class="reveal"><summary>Answer</summary><p>Only the last. Comments never become graph vertices, so they are invisible. A file nothing references is in no key. <code>touch</code> does not matter because content is hashed rather than mtime — that <em>was</em> different on older builders, so it is a real behavioural change and not a myth. <code>chmod +x</code> does bust it, because mode is part of what a layer records.</p></details></li>
+
+<li>A <code>RUN</code> downloads a 100 MB file and the next <code>RUN</code> deletes it. What does the image cost, and where is the file?
+<details class="reveal"><summary>Answer</summary><p>Measured: 108,536,725 bytes in three layers, against 3,646,907 in two when the same work is chained with <code>&amp;&amp;</code> — a factor of thirty. The file is still in the second layer, entirely intact, and the third layer is 77 bytes holding one <code>.wh.big.bin</code> entry. Two <code>curl</code>-and-<code>tar</code> commands recover all 104,857,600 bytes from the registry, which is why this is a disclosure problem and not only a size problem.</p></details></li>
+
+<li>Why is a multi-stage build a categorically stronger guarantee than deleting a secret in a later step?
+<details class="reveal"><summary>Answer</summary><p>Because the discarded stage's layers are never referenced by the final manifest — they are not in <code>rootfs.diff_ids</code>, never pushed, never pullable. There is nothing to extract because there is nothing there, whereas a whiteout only hides bytes that remain fetchable. Measured on the same program: 261.9 MB single-stage against 8.598 MB multi-stage. The cost is auditability: the final image's <code>created_by</code> reads <code>COPY /hello /usr/local/bin/hello</code> with the <code>--from=build</code> stripped, so nothing records that a compiler was ever involved.</p></details></li>
+
+<li>You pass a token as <code>--build-arg</code> and the <code>RUN</code> writes nothing to disk. Is the token in the image?
+<details class="reveal"><summary>Answer</summary><p>Yes, twice, and in the one place nobody scans. The only added layer is the 32-byte empty blob, so the filesystem genuinely contains nothing — but <code>history</code> holds both <code>ARG GITHUB_TOKEN=ghp_…</code> and, inlined into the <code>RUN</code> entry, <code>RUN |1 GITHUB_TOKEN=ghp_… /bin/sh -c …</code>. One <code>curl</code> and one <code>jq</code> against the registry prints it. This is not a bug: <code>created_by</code> is specified as "the command which created the layer", and the arg is part of that command — which is exactly why the secret mount had to be invented.</p></details></li>
+
+<li>What does <code>--no-cache</code> do to a <code>--mount=type=cache</code> directory?
+<details class="reveal"><summary>Answer</summary><p>It empties it, permanently. Measured: four accumulated lines dropped to one, and the next ordinary build saw two rather than five — destroyed, not shadowed. So the common habit of adding <code>--no-cache</code> "to get a clean build" also throws away every package cache in the Dockerfile. Related surprise: cache mounts are keyed by their target path by default, so two unrelated projects mounting <code>/root/.cache/pip</code> share one cache unless you give them an explicit <code>id=</code>.</p></details></li>
+
+<li>How much slower is an emulated arm64 build than a native amd64 one?
+<details class="reveal"><summary>Answer</summary><p>There is no single number, and insisting on one is the mistake. On one machine, one build, identical steps: 4.1× for an interpreter-bound loop (0.8 s against 3.3 s) and 1.6× for a hashing step. The case that matters is not a multiple at all — an emulated <code>apk add build-base</code> did not finish in 520 seconds where the native install takes about twenty. The real failure mode is a job timeout, not a slowdown, which is why the good strategy is to compile natively and <code>COPY --from</code> the artefact so almost no foreign code runs.</p></details></li>
+
+<li>You build with <code>buildctl</code>, then <code>nerdctl run</code> the image and get a connection-refused error against a registry. What happened?
+<details class="reveal"><summary>Answer</summary><p>The image is on the machine, in a different containerd namespace — <code>nerdctl</code> uses <code>default</code>, <code>buildkitd</code>'s containerd worker writes to <code>buildkit</code>. Not finding it locally, <code>nerdctl</code> concluded it was remote and tried to <em>pull</em> it, so the error names your mirror instead of the real problem. "Not there" and "not in the namespace you are looking in" are indistinguishable from the message; <code>ctr -n buildkit images ls</code> settles it. Same trap as <a href="i5.html#cp-i5-13">I5.13</a>'s two non-interchangeable <code>config_path</code> settings.</p></details></li>
+
+<li>Which single Dockerfile instruction genuinely needs container machinery, and why does that matter?
+<details class="reveal"><summary>Answer</summary><p><code>RUN</code>, because it executes someone's code against a filesystem. <code>FROM</code>, <code>COPY</code>, <code>ENV</code>, <code>CMD</code>, computing layers, writing the config and pushing are all just tar files, JSON and HTTP — no namespaces, no mounts, no daemon, no root. That is why <a href="#cp-i6-9">I6.9</a> can build a working image with four shell tools, why Kaniko and rootless Buildah exist, and why building images inside a cluster without mounting the node's container socket is possible at all.</p></details></li>
+
+<li>An image works on the machine that built it and fails everywhere else, and the build exited 0. Where do you look first?
+<details class="reveal"><summary>Answer</summary><p>At the two images' layer sizes, not at their behaviour — you have a working and a failing artefact from one Dockerfile, which is the ideal position. In the drill the failing image's third layer is <code>sha256:4f4fb700ef54…</code>, the empty layer, where the working one has 154 bytes: the step produced nothing. An empty layer where a step should have produced output is a readable signature that names the guilty instruction. The cause was <code>|| true</code> converting "the file is missing" into "this step succeeded".</p></details></li>
+
+<li>You need to know which layer makes a 412 MB public image big. What do you download?
+<details class="reveal"><summary>Answer</summary><p>Two small JSON documents — the manifest for layer sizes and the config for <code>history</code> — and no layers at all. Filter <code>history</code> to entries without <code>empty_layer</code>, zip against <code>layers</code> by position, sort descending. On <code>python:3.13</code> that identifies one <code>apt-get install</code> holding 236,258,363 of 412,660,988 bytes. Check the correspondence first (12 entries − 5 empty = 7 layers), and remember <code>created_by</code> is unvalidated free-form text: one of those layers reports <code># debian.sh --arch 'amd64' …</code>, which is not a Dockerfile instruction at all.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>You sort instructions into layer-producing and config-amending by asking whether the step goes through the snapshot path, so <code>WORKDIR</code> no longer surprises you, and you check any image's classification with two <code>jq</code> expressions.</li>
+<li>You can say what a build context actually transfers and demonstrate it with two builds differing by one line, and you treat <code>.dockerignore</code> as a secrecy control rather than a cache hint.</li>
+<li>You derived the cache key rather than memorising rules, so the copy-manifest-then-install ordering is a consequence you can re-derive, and you can name the offending line in a slow build log.</li>
+<li>You price a <code>RUN rm</code> before writing it, and you reach for a discarded stage or a secret mount instead of trusting a deletion.</li>
+<li>You build multi-platform images knowing what emulation costs for your workload, and you recognise <code>exec format error</code> as a missing index.</li>
+<li>You can drive <code>buildkitd</code> directly, send one build to a runtime, a directory, a tarball or a registry, and diagnose "I built it but the tool cannot find it" as a namespace question.</li>
+<li>You have built a working image with <code>tar</code>, <code>sha256sum</code> and <code>curl</code>, and written a program that does it from a Dockerfile — so unprivileged in-cluster builders are no longer mysterious.</li>
+<li>You can audit any image in any registry for its bulk and for two independent kinds of leaked credential, and you know that "we deleted it in the next layer" is a description of the bug.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="../beginner.html#b5">B5 built overlayfs, copy-up and whiteouts by hand — the layer machinery this module spends its bytes on →</a></div>
 
-<nav class="pager"><a href="i5.html">← I5</a><a href="../intermediate.html#i7">I7 · TODO →</a></nav>
+<nav class="pager"><a href="i5.html">← I5 · Registries</a><a href="../intermediate.html#i7">I7 · Runtime architecture →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+Authored against <strong>OCI image-spec v1.1.1</strong> (2025-03-03, still current as of 2026-07-30)
+on Ubuntu 24.04 / kernel 6.8.0, with <strong>BuildKit v0.32.0</strong> (2026-07-29),
+<strong>containerd 2.3.3</strong>, <strong>nerdctl 2.3.5</strong>, <strong>runc 1.5.1</strong>,
+<strong>skopeo 1.13.3</strong>, <strong>jq 1.7</strong> and <strong>registry:2</strong>, with
+QEMU emulation registered via <code>tonistiigi/binfmt</code>. There is deliberately no Docker
+on that machine. Every command and every line of output on this page came from a live run on
+2026-07-30.
+<br><br>
+Version-sensitive findings from that run, in case they age: <code>WORKDIR</code> produces a layer
+unconditionally, even on a directory that already exists, where it yields the empty layer
+(<code>diff_id sha256:5f70bf18a086…</code>, 1024 zero bytes, compressing to the 32-byte blob
+<code>sha256:4f4fb700ef54…</code>) — so the common "config-amending" classification of it is wrong.
+BuildKit transfers the build context <em>lazily</em>: 101 MB on disk moved 38 B when nothing
+referenced it, and 104.89 MB once <code>COPY . .</code> did, so the "whole context is uploaded"
+warning applies to the legacy Docker builder and not to this one. A Dockerfile comment does not
+invalidate the cache, and neither does <code>touch</code> with unchanged content, though
+<code>chmod</code> does. <code>--no-cache</code> <em>empties</em> <code>type=cache</code> mounts
+rather than merely re-running steps, and those mounts are keyed by target path unless given an
+explicit <code>id=</code>. Secret mounts work with BuildKit 0.32's builtin frontend with no
+<code>#&nbsp;syntax</code> directive. A <code>--build-arg</code> appears <em>twice</em> in
+<code>history</code> — as its own <code>ARG</code> entry and inlined into the <code>RUN</code>
+entry via the <code>|1</code> prefix. Emulation cost 4.1× on an interpreter-bound loop and 1.6× on
+a hashing step, while an emulated <code>apk add build-base</code> did not complete in 520 s.
+<code>nerdctl build</code> and <code>buildctl</code> produce identical manifest digests but write to
+<em>different</em> containerd namespaces (<code>default</code> versus <code>buildkit</code>), and the
+resulting "image not found" surfaces as a registry connection error. <code>registry:2</code>'s blob
+upload <code>Location</code> is an absolute URL that already carries a query string, so the digest
+must be appended with <code>&amp;</code>.
 </footer>
 </main>
 </div>
