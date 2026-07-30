@@ -326,6 +326,235 @@ app.txt</pre>
 
 <p class="docs-links"><b>Docs:</b> No OCI spec covers this — search the Docker docs for <em>"build context"</em> and <em>".dockerignore file"</em>, and BuildKit's repo for the session-based transfer if you want the mechanism. On the Kubernetes side, search for <em>"pre-pulled images"</em> and <em>"image pull policy"</em>, which is where image size stops being your problem and becomes the node's.</p>
 </article>
+<article class="lesson" id="cp-i6-3" data-id="i6-3">
+<div class="lesson-head"><span class="cp-id">I6.3</span><h4>Deriving the cache key by experiment</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Build caching is the difference between a nine-minute CI run and a nine-second one, and almost nobody can state the rule it follows. The result is cargo-cult Dockerfiles: instructions shuffled by superstition, <code>--no-cache</code> added because "the cache was being weird". The rule is small and you can derive it from seven builds. Do that once and you will never guess again — and you will be able to read a slow build log and name the offending line.</p>
+
+<h5>The concept</h5>
+<p>Every step in a build gets a <strong>cache key</strong>. Before running the step, the builder computes that key and looks for a previous result with the same one; if it finds it, the step is skipped and its stored output is reused, which the log reports as <code>CACHED</code>. The key is built from two things:</p>
+<ul>
+<li><strong>What this step is</strong> — the parsed instruction, not the raw source line.</li>
+<li><strong>What it is built on</strong> — the identity of the filesystem it starts from, which is the chain ID from <a href="i4.html#cp-i4-12">I4.12</a>, i.e. a hash over every layer beneath it in order.</li>
+</ul>
+<p>That second half is why <strong>the cache is a chain, not a set</strong>. A step's key contains its parent's identity, so once any step misses, every step after it has a different parent and therefore a different key and therefore misses too — however unrelated its own instruction is. There is no such thing as a cache hit below a cache miss. Internalise that one sentence and the ordering rule becomes obvious rather than memorised.</p>
+<p>For <code>COPY</code> and <code>ADD</code> there is a third input: the <strong>content</strong> of the files being copied, hashed. Not their timestamps, not their names — the bytes. So a <code>COPY</code> of an unchanged file hits the cache even if you have touched, moved or rewritten it in place with identical content, and misses the moment a single byte differs.</p>
+<p>Now put those three facts together and the most valuable ordering rule in the ecosystem falls out with no memorisation at all. <strong>Copy your dependency manifest, install dependencies, then copy your source.</strong> The install step's key depends on the manifest's content and nothing else, so editing application code leaves it hit and skips the slowest step in the build. Do it the other way — <code>COPY . .</code> above the install — and the copy's key contains the hash of your source, so a one-character edit misses, and the chain rule makes the install below it miss too. Every commit reinstalls the world. That is the single most common cause of slow CI, and it is this module's first drill fault (<a href="#cp-i6-13">I6.13</a>).</p>
+<p>Two things the lab will show that the folklore gets wrong. <strong>Comments do not affect the cache key</strong> — the key is computed from the parsed graph, and a comment never becomes a node in it, so you can annotate a Dockerfile freely. And <strong><code>touch</code> does not bust a <code>COPY</code></strong>, because content is hashed rather than mtime; that <em>was</em> true of older builders and is a real behavioural difference, not a myth about nothing.</p>
+
+<div class="specref">
+<p>Again, no OCI spec — caching is entirely a builder concern, and the OCI specs deliberately describe only the artefact, not its production. But the spec does explain, at unusual length for a standards document, why the second input to a cache key has to be a hash of the <em>whole stack</em> rather than of the layer immediately below. Read it as the argument that a single layer digest cannot identify the filesystem a step starts from:</p>
+<blockquote>Let's say we have layers A, B, C, ordered from bottom to top, where A is the base and C is the top. Defining <code>|</code> as a binary application operator, the root filesystem may be <code>A|B|C</code>. While it is implied that <code>C</code> is only useful when applied to <code>A|B</code>, the identifier <code>C</code> is insufficient to identify this result […]<br><br>This means that if an attacker can define <code>x</code>, relying on <code>C</code> provides no guarantee that the layers were applied in any order.<br><br>The <code>ChainID</code> addresses this problem by being defined as a compound hash.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md#layer-chainid">config.md § Layer ChainID</a></cite>
+<p>So the chain ID of <a href="i4.html#cp-i4-12">I4.12</a> exists to answer exactly the question a cache key needs answered — <em>which stack am I standing on?</em> — and the cache key is a construction on top of it. The cache key is not in any spec; the identity it depends on is, and this is why.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the smallest Dockerfile that has the ordering rule in it: a manifest, an install that depends on the manifest, and source copied afterwards.
+<pre class="cmd">mkdir -p ~/i6/cache &amp;&amp; cd ~/i6/cache
+echo "flask==3.0.0" &gt; requirements.txt
+echo "print(1)" &gt; src.py
+echo "notes" &gt; README.md
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM alpine:3.21
+COPY requirements.txt /app/
+RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+COPY src.py /app/
+EOF</pre></li>
+
+<li>Define one shell function so all seven runs are directly comparable, then take the cold baseline. Nothing should be cached the first time.
+<pre class="cmd">show(){ sudo nerdctl build --progress=plain -t i6/cache:x . 2&gt;&amp;1 \
+        | grep -E "^#[0-9]+ \[[0-9]/4\]|CACHED"; }
+show</pre>
+<pre class="out">#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d8...
+#5 CACHED
+#6 [2/4] COPY requirements.txt /app/
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#8 [4/4] COPY src.py /app/</pre>
+<p><code>FROM</code> is already cached — the base image was pulled earlier. The other three ran.</p></li>
+
+<li>Rebuild with nothing changed at all, to confirm the cache works before you start trying to break it.
+<pre class="cmd">show</pre>
+<pre class="out">#6 [2/4] COPY requirements.txt /app/
+#6 <b>CACHED</b>
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#7 <b>CACHED</b>
+#8 [4/4] COPY src.py /app/
+#8 <b>CACHED</b></pre></li>
+
+<li>Change 1 — add a comment. This is the change people are most nervous about; find out whether the nervousness is warranted.
+<pre class="cmd">sed -i '1i # a harmless comment' Dockerfile
+show</pre>
+<pre class="out">#6 [2/4] COPY requirements.txt /app/
+#6 <b>CACHED</b>
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#7 <b>CACHED</b>
+#8 [4/4] COPY src.py /app/
+#8 <b>CACHED</b></pre>
+<p>All three still hit. Comments are invisible to the cache, because the key is computed from the parsed graph and a comment never becomes a node in it. Annotate freely.</p></li>
+
+<li>Change 2 — edit a file that is in the context but that no instruction copies.
+<pre class="cmd">echo "more notes" &gt;&gt; README.md
+show</pre>
+<pre class="out">#6 [2/4] COPY requirements.txt /app/
+#6 <b>CACHED</b>
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#7 <b>CACHED</b>
+#8 [4/4] COPY src.py /app/
+#8 <b>CACHED</b></pre>
+<p>All hit — and this is <a href="#cp-i6-2">I6.2</a>'s lesson from the other side. A file nothing references is not in any cache key any more than it is in the transfer.</p></li>
+
+<li>Change 3 — <code>touch</code> a copied file without changing a byte of it. Older builders considered the mtime; this one hashes content.
+<pre class="cmd">touch src.py
+show</pre>
+<pre class="out">#6 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#6 <b>CACHED</b>
+#7 [2/4] COPY requirements.txt /app/
+#7 <b>CACHED</b>
+#8 [4/4] COPY src.py /app/
+#8 <b>CACHED</b></pre>
+<p>Still all cached: content, not mtime. And notice the ordering — <code>#6</code> is now the <code>RUN</code> that is <code>[3/4]</code> in the Dockerfile, printed <em>before</em> the <code>COPY</code> that is <code>[2/4]</code>. The <code>#n</code> are graph vertices and the <code>[n/4]</code> are source lines, and they need not agree. You have just seen the DAG of <a href="#cp-i6-6">I6.6</a> three checkpoints early.</p></li>
+
+<li>Change 4 — edit the source file, which is copied <em>last</em>. This is the every-commit case, and the whole point of the ordering.
+<pre class="cmd">echo "print(2)" &gt;&gt; src.py
+show</pre>
+<pre class="out">#6 [2/4] COPY requirements.txt /app/
+#6 <b>CACHED</b>
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#7 <b>CACHED</b>
+#8 [4/4] COPY src.py /app/</pre>
+<p>The manifest copy and the install both hit; only the final copy reran. In a real project that is the difference between re-resolving every dependency and doing nothing at all.</p></li>
+
+<li>Change 5 — edit the manifest, which is copied <em>first</em>. Watch the chain rule take out everything below it.
+<pre class="cmd">echo "requests==2.32.0" &gt;&gt; requirements.txt
+show</pre>
+<pre class="out">#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d8...
+#5 CACHED
+#6 [2/4] COPY requirements.txt /app/
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" &gt; /app/installed
+#8 [4/4] COPY src.py /app/</pre>
+<p>Three misses from one edit. The <code>COPY</code> missed on content; the <code>RUN</code> missed because its parent changed, not because its instruction did; the final <code>COPY</code> missed for the same reason, even though <code>src.py</code> is untouched. That is the chain, and it is the correct behaviour — a dependency change really may change what the install produces.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state the cache key's three inputs from memory, explain why a cache miss cannot have hits below it, and justify the copy-manifest-then-install-then-copy-source ordering as a consequence rather than a rule to remember. Shown a build log where an install step reran, you can name the line that caused it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The cache lives in the builder, not in your image.</strong> A fresh CI runner starts with nothing, so a Dockerfile perfectly ordered for your laptop can still rebuild everything in CI. That is what registry-backed cache export exists for, and it is why "it's fast locally" is not evidence about your pipeline.</li>
+<li><strong><code>RUN</code> keys do not know what the command <em>did</em>.</strong> <code>RUN apt-get update</code> has one key forever, so a cached layer can contain a six-month-old package index while the instruction looks current — the classic stale-apt-cache trap, and the reason <code>update</code> and <code>install</code> belong in the same <code>RUN</code>. The cache is honest about instruction text and knows nothing about the internet.</li>
+<li><strong>Content hashing includes file mode and ownership, not just bytes.</strong> A <code>chmod +x</code> on a copied file is a cache miss even though the content is identical — correct, since the layer really is different, but surprising if you were told "content only".</li>
+<li><strong>A comment being free is not a licence to reorder freely.</strong> Adding a comment is invisible; moving an instruction is not, and <a href="#cp-i6-1">I6.1</a> is the reminder that <code>WORKDIR</code> counts as an instruction for this purpose.</li>
+<li><strong><code>--no-cache</code> is a diagnostic, not a fix.</strong> If you need it routinely, some step's key does not capture something it depends on — a fetch from a mutable URL, a floating tag, a clock. Find that step; disabling the cache everywhere hides it and costs you the whole build every time.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Nothing in Kubernetes reads a build cache — but the ordering rule this checkpoint derives is the same shape as the layer-sharing that makes image pulls cheap on a node. Because a chain ID identifies a whole stack, two images built from a shared prefix share those blobs in the node's content store, so the second pull moves only the layers below the divergence point; a Dockerfile ordered manifest-first produces exactly that shared prefix across your whole fleet, and one ordered <code>COPY . .</code>-first gives every build a unique chain from the second layer down. That is the difference between a rollout where most nodes fetch a few megabytes and one where they all fetch the world — the practical face of <a href="w6.html#cp-6-17">W6.17</a>'s pull-time troubles, and part of why <a href="w3.html#cp-3-2">W3.2</a>'s init containers are usually pinned to a base the cluster already has.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> No spec governs caching — search the Docker docs for <em>"cache invalidation"</em> and <em>"optimizing builds with cache"</em>, and BuildKit's docs for <em>"cache backends"</em> when you need the cache to survive a fresh CI runner. <code>layer.md § Applying Changesets</code> is the ordering guarantee everything here is built on.</p>
+</article>
+<article class="lesson" id="cp-i6-4" data-id="i6-4">
+<div class="lesson-head"><span class="cp-id">I6.4</span><h4>Deleting a file makes the image bigger</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is <a href="i4.html#cp-i4-11">I4.11</a>'s whiteout lesson arriving as a bill, and it is the checkpoint that changes how you write Dockerfiles for good. The instinct that a <code>RUN rm</code> reclaims space is completely wrong, in a way that costs real money in bandwidth and real minutes in pull time — and, far worse, in a way that means a secret you deleted is still shipped to everyone who pulls your image.</p>
+
+<h5>The concept</h5>
+<p>A layer is a <strong>diff</strong>, and diffs only add. Once a layer is written it is content-addressed (<a href="i4.html#cp-i4-1">I4.1</a>) and therefore frozen: its digest <em>is</em> its bytes, so nothing later in the build can reach back and remove anything from it. When a later step deletes a file, all it can do is record the deletion — a <code>.wh.&lt;name&gt;</code> entry in the new layer, exactly the encoding you took apart in <a href="i4.html#cp-i4-11">I4.11</a>.</p>
+<p>So a <code>RUN rm</code> of a 100 MB file does not make the image 100 MB smaller. It makes it slightly <em>larger</em>: the 100 MB is still there in the earlier layer, plus a new layer holding the whiteout. What changes is only what you see at runtime, because the overlay filesystem — the same one you built by hand in <a href="b5.html#cp-b5-15">B5.15</a> — reads the whiteout and hides the file from the merged view. Hidden, not gone. Every node that pulls the image still downloads all 100 MB of it.</p>
+<p>The fix is to never let the bytes become a sealed layer in the first place, which means doing the create and the delete <strong>inside one step</strong>, chained with <code>&amp;&amp;</code>. Then the snapshot taken at the end of that step never contained the file, so the diff never mentions it, and there is nothing to whiten out. This is the whole reason real Dockerfiles chain <code>apt-get update &amp;&amp; apt-get install &amp;&amp; rm -rf /var/lib/apt/lists/*</code> into one unreadable line: it is not style, it is the only way the cleanup does anything.</p>
+<p>Notice the tension with <a href="#cp-i6-3">I6.3</a>, because it is a genuine trade-off and not a solved problem. Chaining reduces size and reduces the number of cache checkpoints; splitting steps gives finer caching and permanent bloat. There is no setting that gives you both — which is why <a href="#cp-i6-5">I6.5</a>'s multi-stage builds matter so much: they let you be as wasteful as you like in a stage whose layers are then discarded wholesale rather than whitened out.</p>
+<p>And then the part that is not about size at all. Because the bytes are in a pushed, content-addressed blob, a credential written in one step and deleted in the next is <strong>in the image</strong> — fetchable with <code>curl</code> and <code>tar</code> by anyone who can pull it, with no running container and no exploit involved. <a href="#cp-i6-11">I6.11</a> is where you go and do it. That is why build-time secrets need the mechanism in <a href="#cp-i6-6">I6.6</a> rather than the discipline of remembering to delete.</p>
+
+<div class="specref">
+<p>The spec is explicit that a whiteout is an <em>instruction to the reader</em>, not a modification of anything. Note the last sentence in particular: it tells the consumer to remove the file from the extracted result, and says nothing about the layer that contains it, because the layer is immutable by construction.</p>
+<blockquote>Once a whiteout is applied, the whiteout itself MUST also be hidden.<br>Whiteout files MUST only apply to resources in lower/parent layers.<br>Files that are present in the same layer as a whiteout file can only be hidden by whiteout files in subsequent layers.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md#whiteouts">layer.md § Whiteouts</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write the same work two ways: 100 MB created then deleted in separate steps, and the identical work chained into one. Use incompressible random data so gzip cannot flatter either version.
+<pre class="cmd">mkdir -p ~/i6/wh &amp;&amp; cd ~/i6/wh
+cat &gt; Dockerfile.two &lt;&lt;'EOF'
+FROM alpine:3.21
+RUN dd if=/dev/urandom of=/big.bin bs=1M count=100 2&gt;/dev/null
+RUN rm /big.bin
+EOF
+cat &gt; Dockerfile.one &lt;&lt;'EOF'
+FROM alpine:3.21
+RUN dd if=/dev/urandom of=/big.bin bs=1M count=100 2&gt;/dev/null &amp;&amp; rm /big.bin
+EOF
+sudo nerdctl build --no-cache -q -f Dockerfile.two -t 127.0.0.1:5000/i6/two:v1 .
+sudo nerdctl build --no-cache -q -f Dockerfile.one -t 127.0.0.1:5000/i6/one:v1 .</pre></li>
+
+<li>Confirm both images behave identically at runtime — because that is why this bug survives review. The file is gone in both.
+<pre class="cmd">sudo nerdctl run --rm 127.0.0.1:5000/i6/two:v1 ls -l /big.bin</pre>
+<pre class="out">ls: /big.bin: <b>No such file or directory</b></pre></li>
+
+<li>Now ask what they cost.
+<pre class="cmd">sudo nerdctl images | grep -E "REPOSITORY|i6/(one|two)"</pre>
+<pre class="out">REPOSITORY               TAG   IMAGE ID       PLATFORM      SIZE       BLOB SIZE
+127.0.0.1:5000/i6/one    v1    8a27404f8cac   linux/amd64   <b>8.507MB</b>    3.648MB
+127.0.0.1:5000/i6/two    v1    e525cca652f7   linux/amd64   <b>113.4MB</b>    108.5MB</pre>
+<p>Same behaviour, 113.4 MB against 8.5 MB. The <code>rm</code> in <code>Dockerfile.two</code> reclaimed nothing.</p></li>
+
+<li>Push both to the local registry from <a href="i5.html#cp-i5-9">I5.9</a> and read the manifests, so the number is what actually crosses the network rather than a tool's summary.
+<pre class="cmd">for t in two one; do
+  sudo nerdctl push --insecure-registry 127.0.0.1:5000/i6/$t:v1 &gt;/dev/null 2&gt;&amp;1
+  M=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+      http://127.0.0.1:5000/v2/i6/$t/manifests/v1)
+  echo "--- i6/$t: $(echo "$M" | jq '[.layers[].size]|add') bytes, $(echo "$M" | jq '.layers|length') layers"
+  echo "$M" | jq -r '.layers[] | "      \(.size)  \(.digest)"'
+done</pre>
+<pre class="out">--- i6/two: <b>108536725</b> bytes, 3 layers
+      3646875  sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+      <b>104889773</b>  sha256:34d8078a5826b435abe3024113cffb5b8a77d1f3fe28221256663cb6e361af25
+      <b>77</b>  sha256:e5fc68998cee4e0f8f724d2ce4612a82c532034c57b4216dfb7fb22216ae51f1
+--- i6/one: <b>3646907</b> bytes, 2 layers
+      3646875  sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+      <b>32</b>  sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1</pre>
+<p>108.5 MB against 3.6 MB — a factor of thirty, for the same image. Two digests here should look familiar. The 77-byte third layer is the deletion; the 32-byte blob in <code>i6/one</code> is the empty layer from <a href="#cp-i6-1">I6.1</a>, because the chained step created and removed the file and so produced literally nothing.</p></li>
+
+<li>Open the 77-byte layer. This is the entire cost of "deleting" 100 MB.
+<pre class="cmd">curl -s http://127.0.0.1:5000/v2/i6/two/blobs/sha256:e5fc68998cee4e0f8f724d2ce4612a82c532034c57b4216dfb7fb22216ae51f1 \
+  | tar tvzf -</pre>
+<pre class="out">---------- 0/0               0 1970-01-01 06:00 <b>.wh.big.bin</b></pre>
+<p>One zero-length entry with a <code>.wh.</code> prefix, mode <code>----------</code>, epoch timestamp — the whiteout, exactly as <a href="i4.html#cp-i4-11">I4.11</a> described it and as <a href="b5.html#cp-b5-15">B5.15</a> made you create by hand.</p></li>
+
+<li>And now the uncomfortable half. Fetch the earlier layer straight from the registry and look for the file that was deleted.
+<pre class="cmd">B=sha256:34d8078a5826b435abe3024113cffb5b8a77d1f3fe28221256663cb6e361af25
+curl -s http://127.0.0.1:5000/v2/i6/two/blobs/$B | tar tvzf -
+curl -s http://127.0.0.1:5000/v2/i6/two/blobs/$B | tar xzOf - big.bin | head -c 16 | xxd</pre>
+<pre class="out">-rw-r--r-- 0/0       104857600 2026-07-30 08:50 <b>big.bin</b>
+
+00000000: 7300 1c3d ecf2 2f6e eb37 894c 75aa 6f67  s..=../n.7.Lu.og</pre>
+<p>All 104,857,600 bytes of it, readable with two ordinary commands. No container ran, no privilege was needed, nothing was exploited — the bytes are simply in a blob that the registry will hand to anyone allowed to pull. Substitute a private key for the random data and you have the incident in <a href="#cp-i6-11">I6.11</a>.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain why <code>RUN rm</code> increases image size, predict the layer count and rough size of both variants before building, identify a whiteout entry in a layer listing on sight, and recover a "deleted" file from a registry with <code>curl</code> and <code>tar</code>. You can also state the trade-off chaining costs you in cache granularity, rather than treating it as free.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The tool's <code>SIZE</code> column and what crosses the wire are different numbers, and both are honest.</strong> <code>nerdctl images</code> showed 113.4 MB (uncompressed, as unpacked on disk) while the manifest sums to 108.5 MB (compressed, as transferred). Compare like with like, and prefer the manifest when the question is "what does a pull cost".</li>
+<li><strong>There is no way to shrink a layer after the fact.</strong> Not <code>rm</code>, not <code>truncate</code>, not a later <code>chmod 000</code>. The only options are to not create the bytes in that step (chaining), to not keep the layer at all (<a href="#cp-i6-5">I6.5</a>), or to rebuild the image. Squashing tools exist and work by rebuilding, which is worth knowing so you recognise what they are actually doing.</li>
+<li><strong>Chaining trades size for cache granularity, and sometimes the trade is wrong.</strong> A single 400-line <code>RUN</code> is one cache entry: change anything in it and the whole thing reruns. Chain what must be cleaned up together; split what genuinely caches independently.</li>
+<li><strong>"We removed it in the next layer" and "we deleted the tag" are both non-answers to a leaked secret.</strong> The blob is content-addressed and may still be fetchable by digest even after the tag is gone, and any mirror or node that replicated it kept a copy — <a href="i5.html#cp-i5-3">I5.3</a> and <a href="i5.html#cp-i5-11">I5.11</a> are why. The only correct response is to treat it as disclosed and rotate.</li>
+<li><strong>A whiteout can hide a file the reader is entitled to see.</strong> The spec's rule that whiteouts apply only to lower layers is what stops a producer from claiming to delete something in its own layer — useful to know when you are reading someone else's image and wondering whether a listing is complete.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Every byte of that 108.5 MB is moved by the kubelet on every node the pod is scheduled to, on every pull that misses the node's content store. A DaemonSet across fifty nodes turns a careless <code>RUN rm</code> into fifty times the waste, and it is a routine contributor to the slow pulls and pull timeouts that present as <a href="w6.html#cp-6-17">W6.17</a>'s <code>ErrImagePull</code> and <code>ImagePullBackOff</code> under a cold cache or a rate limit (<a href="i5.html#cp-i5-6">I5.6</a>). The security half aims at <a href="w3.html#cp-3-23">W3.23</a>: a Secret in Kubernetes is at least a named object with RBAC on it and encryption-at-rest available, whereas a credential baked into a layer has no access control at all beyond "can pull this image" — which, for a public base image or a shared internal registry, is close to everyone.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>layer.md § Whiteouts</code> and <code>§ Applying Changesets</code> — the normative text for why deletion is additive. Search the Docker docs for <em>"minimize the number of layers"</em>, and note as you read it that the size argument and the caching argument point in opposite directions. On the Kubernetes side, search for <em>"images"</em> and <em>"image pull policy"</em> for what the node does with the bytes you produced.</p>
+</article>
 </div><!-- /g-semantics -->
 
 <div class="quiz" id="quiz">
