@@ -205,6 +205,329 @@ moment a pod's empty network namespace is handed to a plugin is
 SPEC.md at v1.3.0</a>. In the exam docs, search for <em>network plugins</em> to find where
 Kubernetes hands the whole subject to this contract and stops describing it.</p>
 </article>
+<article class="lesson" id="cp-i9-2" data-id="i9-2">
+<div class="lesson-head"><span class="cp-id">I9.2</span><h4>The six parameters — and doing RunPodSandbox's job by hand</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You are about to attach a network namespace to a bridge, allocate it an address and give it a
+default route, by typing the same six environment variables containerd sets. After this lesson, "the
+CNI plugin ran" is not an event you infer from logs — it is something you have done with your own
+hands, and can do again to test a theory during an incident.</p>
+
+<h5>The concept</h5>
+<p>Six environment variables carry everything the runtime tells the plugin about <em>this
+invocation</em>. Configuration on stdin describes the network; these describe the one attachment.</p>
+
+<table class="langpair">
+<thead><tr><th>Parameter</th><th>What it carries</th><th>Where it comes from in a real pod</th></tr></thead>
+<tbody>
+<tr><td><code>CNI_COMMAND</code></td><td>The operation: <code>ADD</code>, <code>DEL</code>, <code>CHECK</code>, <code>GC</code>, <code>VERSION</code> (and <code>STATUS</code>)</td><td>What containerd is trying to do</td></tr>
+<tr><td><code>CNI_CONTAINERID</code></td><td>An opaque unique string. The plugin's bookkeeping key.</td><td>The <strong>sandbox</strong> ID — not any app container</td></tr>
+<tr><td><code>CNI_NETNS</code></td><td>A path to the network namespace file</td><td><code>/var/run/netns/cni-&lt;uuid&gt;</code>, bind-mounted before the plugin runs</td></tr>
+<tr><td><code>CNI_IFNAME</code></td><td>The name the interface must have <em>inside</em> the namespace</td><td>Conventionally <code>eth0</code></td></tr>
+<tr><td><code>CNI_PATH</code></td><td>Colon-separated directories to search for other plugin binaries</td><td><code>/opt/cni/bin</code></td></tr>
+<tr><td><code>CNI_ARGS</code></td><td>Extra <code>KEY=VALUE;KEY=VALUE</code> pairs</td><td>Where anything Kubernetes-specific is smuggled through</td></tr>
+</tbody>
+</table>
+
+<p><strong>Notice what is missing.</strong> There is no pod name, no namespace, no labels, no service
+account, no owner reference. CNI knows nothing about Kubernetes and has no vocabulary for it. It is
+handed an opaque identifier, a path, and a name to use, and that is deliberate — it is why the same
+plugins work under containerd, CRI-O, Podman and a shell script.</p>
+
+<p><code>CNI_NETNS</code> is worth dwelling on. It is a <em>path</em>, not a name and not a PID,
+because a network namespace is kept alive by something holding a reference to it, and a bind-mounted
+file is the cheapest such thing. That is B6's mechanism exactly, and
+<a href="i8.html#cp-i8-7">I8.7</a> established the surprising part: for a pod, that bind mount exists
+<em>before</em> the pause container does, because CNI ADD runs first. The plugin is pointed at a
+namespace that no process has entered yet — so the familiar claim that the pause container "holds the
+pod's network namespace" is not what pins it.</p>
+
+<p><code>CNI_CONTAINERID</code> is the key everything else is filed under. IPAM reservations are
+recorded against it; so is the runtime's own cache of the result. This is why a runtime that passes a
+<em>different</em> ID on <code>DEL</code> than it did on <code>ADD</code> leaks an address on every
+pod, forever, with no error anywhere — the plugin dutifully looks for a reservation belonging to an ID
+that never existed, finds none, and reports success.</p>
+
+<p>And <code>CNI_ARGS</code> is where the tidy story gets a wrinkle that the lab is about to find.</p>
+
+<div class="specref">
+<p>The spec describes <code>CNI_NETNS</code> in terms of an abstraction, with the namespace path only
+as an example — because CNI is not Linux-only:</p>
+<blockquote>- `CNI_NETNS`: A reference to the container's "isolation domain". If using network namespaces, then a path to the network namespace (e.g. `/run/netns/[nsname]`)</blockquote>
+<cite>CNI spec 1.1.0, § Parameters — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make a network namespace and confirm how empty it is. This is the state a pod's netns is in when
+containerd calls the plugin.
+<pre class="cmd">sudo ip netns add i9pod1
+sudo ip netns exec i9pod1 ip -br addr</pre>
+<pre class="out"><b>lo               DOWN</b>           </pre>
+<p>One loopback interface, and it is <em>down</em>. Remember that; it is I9.11's whole subject.</p></li>
+<li>Write a network configuration. This is the JSON that goes on stdin — a bridge plugin with
+<code>host-local</code> doing the address management.
+<pre class="cmd">mkdir -p ~/i9
+cat &gt; ~/i9/i9bridge.json &lt;&lt;'EOF'
+{
+  "cniVersion": "1.1.0",
+  "name": "i9net",
+  "type": "bridge",
+  "bridge": "i9br0",
+  "isGateway": true,
+  "ipMasq": true,
+  "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+            "routes": [ { "dst": "0.0.0.0/0" } ] }
+}
+EOF</pre></li>
+<li>Now set all six parameters and run the plugin, passing the pod's name and namespace in
+<code>CNI_ARGS</code> the way Kubernetes does.
+<pre class="cmd">sudo env CNI_COMMAND=ADD CNI_CONTAINERID=i9-demo-container-0001 \
+  CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  CNI_ARGS="K8S_POD_NAME=demo;K8S_POD_NAMESPACE=default" \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json; echo "exit=$?"</pre>
+<pre class="out">{
+    "code": 999,
+    "msg": "<b>ARGS: unknown args [\"K8S_POD_NAME=demo\" \"K8S_POD_NAMESPACE=default\"]</b>"
+}exit=1</pre>
+<p>It refused. The reference <code>bridge</code> plugin <strong>rejects <code>CNI_ARGS</code> keys it
+does not recognise</strong>, and neither of those is one of its own. So the claim that anything
+Kubernetes-specific simply rides along in <code>CNI_ARGS</code> is not quite true — it rides along
+only because the runtime asks for leniency, with a key that does not appear in the spec at all.</p></li>
+<li>Add that key and run it again.
+<pre class="cmd">sudo env CNI_COMMAND=ADD CNI_CONTAINERID=i9-demo-container-0001 \
+  CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  CNI_ARGS="<b>IgnoreUnknown=true</b>;K8S_POD_NAME=demo;K8S_POD_NAMESPACE=default" \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json | jq .</pre>
+<pre class="out">{
+  "cniVersion": "1.1.0",
+  "interfaces": [
+    { "mac": "7e:bc:e6:fa:51:68", "name": "<b>i9br0</b>" },
+    { "mac": "82:46:94:c5:46:66", "name": "<b>veth6cc7674e</b>" },
+    { "mac": "0a:8b:2d:18:9e:d4", "name": "<b>eth0</b>", "sandbox": "/var/run/netns/i9pod1" }
+  ],
+  "ips": [
+    { "address": "<b>10.90.0.2/24</b>", "gateway": "10.90.0.1", "<b>interface": 2</b> }
+  ],
+  "routes": [ { "dst": "0.0.0.0/0" } ]
+}</pre>
+<p>Read the result carefully, because its shape matters later. <code>interfaces</code> is an ordered
+array — the bridge, the host-side veth, then the container's interface, which is the only one with a
+<code>sandbox</code> field. <code>ips[0].interface</code> is the <em>index</em> <code>2</code> into
+that array, which is how an address is bound to an interface without repeating its name. And
+<code>routes[0]</code> has no gateway of its own: the next hop comes from
+<code>ips[0].gateway</code>.</p>
+<p>I9.13 shows real containerd sending <code>IgnoreUnknown=1</code> for exactly this reason.</p></li>
+<li>Look at what actually changed, inside and out.
+<pre class="cmd">sudo ip netns exec i9pod1 ip -br addr
+sudo ip netns exec i9pod1 ip route
+ip -br link show i9br0</pre>
+<pre class="out"><b>lo               DOWN</b>
+eth0@if58        UP             10.90.0.2/24 fe80::88b:2dff:fe18:9ed4/64
+default via 10.90.0.1 dev eth0
+10.90.0.0/24 dev eth0 proto kernel scope link src 10.90.0.2
+i9br0            UP             7e:bc:e6:fa:51:68 &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; </pre>
+<p>A veth pair, an address, a default route and a bridge — B9.2 through B9.8, done by a program that
+was handed six environment variables. And <code>lo</code> is <em>still down</em>, even after a
+successful ADD.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name all six parameters and say what each is for, including why <code>CNI_NETNS</code> is
+a path rather than a PID. You can attach a namespace to a network by hand, and you can read a v1.1.0
+result — in particular, what <code>ips[0].interface</code> indexes.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>CNI_ARGS</code> is not a free-form bag.</strong> The reference plugins fail with
+code 999 on any key they do not know, so a runtime that wants to pass pod metadata through must send
+<code>IgnoreUnknown</code> — a convention, not a spec field. If you write a plugin that rejects
+unknown args without honouring it, you will break under every real runtime.</li>
+<li><strong>The container ID is the sandbox's, not the app container's.</strong> A pod with six
+containers involves exactly one CNI attachment, filed under the sandbox ID. Looking for a per-
+container reservation is looking for something that never existed.</li>
+<li><strong>A successful ADD leaves <code>lo</code> down.</strong> The interface plugin does not touch
+loopback; something else has to. I9.11 is about what happens when nothing does.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have just done by hand what <a href="w4.html#cp-4-2">W4.2 — build a pod network by hand</a>
+does inside a cluster, and what <a href="w4.html#cp-4-3">W4.3 — find a real pod's veth peer on the
+node</a> asks you to trace afterwards. The <code>cni-&lt;uuid&gt;</code> path you were pointed at is
+the one <a href="i8.html#cp-i8-5">I8.5</a> dissected; the primitives
+themselves are <a href="b9.html#cp-b9-2">B9.2 — a veth pair is a virtual patch cable</a> and
+<a href="b9.html#cp-b9-3">B9.3 — a bridge is a virtual switch</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the parameter list is § Parameters of
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a>; the
+<code>IgnoreUnknown</code> convention and the capability-args mechanism are in the neighbouring
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/CONVENTIONS.md">CONVENTIONS.md</a>,
+which is where anything not in the spec proper gets written down.</p>
+</article>
+<article class="lesson" id="cp-i9-3" data-id="i9-3">
+<div class="lesson-head"><span class="cp-id">I9.3</span><h4>Five operations, and the most-violated MUST in the spec</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>There is one sentence in the CNI specification that gets broken more than any other, and breaking
+it produces a symptom every Kubernetes operator has seen: a pod stuck in <code>Terminating</code>
+forever. The sentence is three lines long and it is about <code>DEL</code>. Learning it properly here
+means recognising that symptom instantly, and never writing the bug yourself.</p>
+
+<h5>The concept</h5>
+<p>Take the operation count from the spec's own words rather than from a blog post, because the
+counting is genuinely awkward. The spec says:</p>
+
+<div class="specref">
+<p>The operations, as the document itself enumerates them:</p>
+<blockquote>CNI defines 5 operations: `ADD`, `DEL`, `CHECK`, `GC`, and `VERSION`. These are passed to the plugin via the `CNI_COMMAND` environment variable.</blockquote>
+<cite>CNI spec 1.1.0, § CNI operations — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>…and then defines <code>STATUS</code> in a section of its own, alongside those five, with its own
+error codes. So there are five named in the sentence and six you can send. Say it that way; anyone
+who tells you flatly "CNI has six verbs" is quoting something the spec does not say, and anyone who
+says four is reading the older document at library tag <code>v1.1.0</code>.</p>
+</div>
+
+<table class="langpair">
+<thead><tr><th>Operation</th><th>Job</th><th>Requires</th><th>Output on success</th></tr></thead>
+<tbody>
+<tr><td><code>ADD</code></td><td>Create or adjust the interface</td><td>COMMAND, CONTAINERID, NETNS, IFNAME</td><td>A result object</td></tr>
+<tr><td><code>DEL</code></td><td>Remove it, or undo the modification</td><td>COMMAND, CONTAINERID, IFNAME — <strong>NETNS is optional</strong></td><td>Nothing</td></tr>
+<tr><td><code>CHECK</code></td><td>Confirm the attachment is still as promised</td><td>Same as ADD, plus <code>prevResult</code> on stdin</td><td>Nothing</td></tr>
+<tr><td><code>GC</code></td><td>Reclaim anything not in the list of live attachments</td><td>COMMAND, PATH</td><td>Nothing</td></tr>
+<tr><td><code>STATUS</code></td><td>Declare readiness to serve ADDs</td><td>Nothing but the config</td><td>Nothing</td></tr>
+<tr><td><code>VERSION</code></td><td>Report supported spec versions</td><td>Nothing but the config</td><td>A version object</td></tr>
+</tbody>
+</table>
+
+<p>Only <code>ADD</code>, <code>DEL</code>, <code>CHECK</code> and <code>VERSION</code> are expected of
+every plugin; <code>GC</code> and <code>STATUS</code> arrived in 1.1.0 and I9.14 measures how many
+plugins actually implement them. Note the third column: <strong><code>DEL</code> is the only
+operation for which <code>CNI_NETNS</code> is optional</strong>, and that is not an oversight. It is
+the spec conceding that teardown routinely happens after the namespace is gone.</p>
+
+<p>Which brings us to the sentence. A plugin author writes <code>ADD</code> first, tests it, writes
+<code>DEL</code>, and returns an error when the interface is missing, because "that shouldn't
+happen." It happens constantly:</p>
+
+<ul>
+<li>the runtime's call timed out and it retried, so <code>DEL</code> arrives twice;</li>
+<li>the node rebooted between <code>ADD</code> and <code>DEL</code>;</li>
+<li>the sandbox was torn down and the kubelet is reconciling again after a restart;</li>
+<li>the <code>ADD</code> itself failed halfway, and the runtime is calling <code>DEL</code> to clean
+up something that was never fully created.</li>
+</ul>
+
+<p>A <code>DEL</code> that returns an error tells the runtime the teardown failed. The runtime does
+the correct thing with that information: it retries, with backoff, forever. From the outside that is a
+pod in <code>Terminating</code> that never leaves, and the plugin's own logs — if it has any — say
+"interface not found," which reads like a diagnosis rather than the bug it is.</p>
+
+<p>So the rule for the project, and for any plugin you ever touch: <strong>write <code>DEL</code>
+first, and write it to succeed against an empty world.</strong></p>
+
+<div class="specref">
+<p>The requirement, and the best-effort principle behind it:</p>
+<blockquote>Plugins MUST accept multiple `DEL` calls for the same (`CNI_CONTAINERID`, `CNI_IFNAME`) pair, and return success if the interface in question, or any modifications added, are missing.</blockquote>
+<cite>CNI spec 1.1.0, § <code>DEL</code> — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+<p>And on the runtime's side, the obligation that makes it unavoidable:</p>
+<blockquote>The container runtime must ensure that _add_ is eventually followed by a corresponding _delete_. The only exception is in the event of catastrophic failure, such as node loss. A _delete_ must still be executed even if the _add_ fails.</blockquote>
+<cite>CNI spec 1.1.0, § Lifecycle &amp; Ordering</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start from the attachment I9.2 created, and look at the reservation it produced. This file is what
+<code>DEL</code> has to find.
+<pre class="cmd">sudo ls -l /var/lib/cni/networks/i9net/
+sudo cat /var/lib/cni/networks/i9net/10.90.0.2; echo</pre>
+<pre class="out">total 8
+-rw------- 1 root root 28 Jul 30 15:03 <b>10.90.0.2</b>
+-rw------- 1 root root  9 Jul 30 15:03 last_reserved_ip.0
+-rwxr-x--- 1 root root  0 Jul 30 15:03 lock
+<b>i9-demo-container-0001</b>
+eth0</pre>
+<p>The filename is the address; the contents are the container ID and the interface name — the
+<code>(CNI_CONTAINERID, CNI_IFNAME)</code> pair the spec keys idempotency on.</p></li>
+<li>Tear it down for real. Note that success is <em>silent</em>: a correct <code>DEL</code> prints
+nothing at all.
+<pre class="cmd">sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+  CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json; echo "exit=$?"
+sudo ip netns exec i9pod1 ip -br addr
+sudo ls /var/lib/cni/networks/i9net/</pre>
+<pre class="out"><b>exit=0</b>
+lo               DOWN
+<b>last_reserved_ip.0  lock</b></pre>
+<p>The interface is gone from the namespace and the address file is gone from the store. But
+<code>last_reserved_ip.0</code> survived — hold that thought until I9.10.</p></li>
+<li>Now break the rule four different ways and watch all four succeed. Each line is a real situation
+a runtime produces.
+<pre class="cmd"># the identical call again: nothing left to delete
+sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+  CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json; echo "exit=$?"
+
+# a container ID that was never ADDed at all
+sudo env CNI_COMMAND=DEL CNI_CONTAINERID=never-existed-at-all \
+  CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json; echo "exit=$?"
+
+# the netns path no longer exists — the node rebooted mid-life
+sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+  CNI_NETNS=/var/run/netns/deleted-by-a-reboot CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json; echo "exit=$?"
+
+# CNI_NETNS omitted entirely, which the spec explicitly permits on DEL
+sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+  /opt/cni/bin/bridge &lt; ~/i9/i9bridge.json; echo "exit=$?"</pre>
+<pre class="out"><b>exit=0
+exit=0
+exit=0
+exit=0</b></pre>
+<p>Four calls that a naive implementation would have failed, and the reference plugin returns success
+for every one of them without a word of complaint. That is what conformance looks like here: not
+detecting the anomaly, but refusing to make it the runtime's problem.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can quote the operation count the way the spec words it, name which parameters
+<code>DEL</code> can do without, and explain the causal chain from an erroring <code>DEL</code> to a
+pod stuck in <code>Terminating</code>. You can also produce four distinct situations in which
+<code>DEL</code> is called with nothing left to delete.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A silent <code>DEL</code> is a successful <code>DEL</code>.</strong> If you are looking for
+confirmation in the output, there isn't any — check the exit status. Plugins that print "removed
+interface eth0" on stdout are corrupting the result channel, which is I9.4's fault.</li>
+<li><strong>Idempotency is not the same as best-effort, and the spec asks for both.</strong>
+Idempotent means the second call succeeds. Best-effort means the <em>first</em> call keeps going after
+one step fails, cleaning up what it still can, rather than aborting halfway. A plugin that bails on
+the first missing resource is technically idempotent and still leaves garbage behind — which is
+exactly the leak I9.9 measures in the reference plugin.</li>
+<li><strong>"That shouldn't happen" is the whole bug.</strong> Every scenario in step 3 is routine.
+Design <code>DEL</code> for a world where nothing you expect to exist does.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The <code>Terminating</code>-forever symptom is triaged in
+<a href="w6.html#cp-6-11">W6.11 — the kubelet classics</a>, and a pod whose network teardown fails is
+one of the cases <a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose and read the
+signatures</a> plants. The idempotency requirement has the same shape as the one
+<a href="i8.html#cp-i8-11">I8.11 — teardown, in reverse, and what happens when you get it
+wrong</a> made about CRI: interfaces that expect to be retried must make retrying safe.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> read § <code>DEL</code> and § Lifecycle &amp; Ordering of
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a> together — the
+plugin's obligation and the runtime's are two halves of one argument. In the exam docs, search
+<em>pod termination</em> for the lifecycle the stuck state belongs to.</p>
+</article>
 </div><!-- /g-the-contract -->
 
 <div class="quiz" id="quiz">
