@@ -1374,6 +1374,171 @@ ps -o pid,comm -p "$(ps -o ppid= -p "$P" | tr -d ' ')"</pre>
 
 <p class="docs-links"><b>Docs:</b> the nerdctl README and its command reference for the Docker-compatibility surface; contrast any command with its <code>ctr</code> equivalent to see what convention was added. On the Kubernetes side, <code>crictl</code> is the CRI-level analogue — read its docs next to nerdctl's to see the two different clients over the one daemon.</p>
 </article>
+<article class="lesson" id="cp-i7-17" data-id="i7-17">
+<div class="lesson-head"><span class="cp-id">I7.17</span><h4>Do ctr run's whole job yourself</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You have driven every one of <code>ctr run</code>'s steps separately across this module. Assembling them into one script you wrote yourself is what turns "I read about containerd" into "I can operate containerd" — and it exposes, in a way reading never will, exactly where the friendly one-liner was hiding work. When you are done, <code>ctr run</code> holds no mysteries, because you have re-implemented it.</p>
+
+<h5>The concept</h5>
+<p><code>ctr run</code> is a convenience that folds six operations into one call. Unrolled, they are:</p>
+<div class="flow"><span>pull</span><em>→</em><span>read config</span><em>→</em><span>prepare snapshot</span><em>→</em><span>create container</span><em>→</em><span>create + start task</span><em>→</em><span>delete everything</span></div>
+<p>The ship script — <a href="../labs/intermediate/ctrpy.py"><code>labs/intermediate/ctrpy.py</code></a> — does each in turn, against your I5 registry, and cleans up every object it made so the box is left as it was found.</p>
+<p>The one honest compromise is stated in the script's own header, and it is the point of <a href="#cp-i7-8">I7.8</a>'s smart-client model made practical: <strong>containerd's real API is gRPC, and there is no maintained pure-Python client for it.</strong> Hand-rolling ttrpc against the <code>.proto</code> files is a project in itself and would teach you nothing about the <em>sequence</em>, which is what this exercise is for. So each step shells out to <code>ctr</code> and, in a comment, names the Go client method it stands in for — so that this file doubles as a call list if you ever write the real thing in Go:</p>
+<table class="langpair">
+<thead><tr><th>Step</th><th>The Go client call it stands in for</th></tr></thead>
+<tbody>
+<tr><td>pull</td><td><code>client.Pull(ctx, ref, client.WithPullUnpack)</code> — fetch <em>and</em> unpack, the difference between I7.9 and I7.10</td></tr>
+<tr><td>read config</td><td><code>image.Config(ctx)</code> then read the config blob — I4's <code>oci-inspect.py</code>, reused</td></tr>
+<tr><td>create container</td><td><code>client.NewContainer(ctx, id, WithNewSnapshot(...), WithNewSpec(oci.WithImageConfig(...)))</code></td></tr>
+<tr><td>create + start task</td><td><code>container.NewTask(...)</code>; <code>task.Start(ctx)</code>; <code>task.Wait(ctx)</code></td></tr>
+<tr><td>cleanup</td><td><code>task.Delete(ctx)</code>; <code>container.Delete(ctx, WithSnapshotCleanup)</code></td></tr>
+</tbody>
+</table>
+<p>Notice what <code>WithPullUnpack</code> and <code>WithNewSnapshot</code> encode: the unpack step is where layer tars become committed snapshots (I7.10), and the container-create step is where the <em>active</em> snapshot keyed by the container id appears (I7.11). The script does not hand-write <code>config.json</code> — <code>ctr container create</code> generates it from the image config exactly as it does for <code>ctr run</code>, which is why the container's process comes out of the image's <code>Cmd</code> with no spec-writing on your part.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the script's header and the five <code>step()</code> calls, then run it against your I5 registry.
+<pre class="cmd">python3 labs/intermediate/ctrpy.py 127.0.0.1:5000/demo/tiny:v1</pre>
+<pre class="out">[1] pull 127.0.0.1:5000/demo/tiny:v1 (content store + unpack into snapshots)
+Completed pull from OCI Registry (127.0.0.1:5000/demo/tiny:v1)	elapsed: 0.2 s	total:  3.5 Mi
+
+[2] read the image config from the content store (reuse of I4)
+    Entrypoint=None  <b>Cmd=['/bin/sh', '-c', 'cat /app/note /app/message.txt; echo GREETING=$GREETING']</b>
+    Env has 2 entries, WorkingDir=/
+
+[3] create the container (prepares the active snapshot + generates config.json)
+    active snapshot: <b>ctrpy-demo</b>
+
+[4] create + start the task, stream its output, wait for the exit code
+built without a builder
+greetings from tinybuild
+<b>GREETING=hello</b>
+
+<b>&gt;&gt;&gt; task exited 0</b>
+
+[5] clean up every object we made (task, container, snapshot)
+    done — box left as found</pre>
+<p>The output between step 4's banner and the exit line came from <em>inside the container</em> — the task's stdout streaming straight through, exactly as <code>ctr run</code> would show it.</p></li>
+
+<li>Prove it cleaned up after itself: no leaked objects in its namespace.
+<pre class="cmd">sudo ctr -n ctrpy container ls
+sudo ctr -n ctrpy snapshot ls | wc -l</pre>
+<pre class="out">CONTAINER    IMAGE    RUNTIME
+<b>1</b></pre>
+<p>Empty container list, and only the header line for snapshots — every object the run created is gone.</p></li>
+
+<li>Run it once more with the registry stopped, to see the failure land in the right place.
+<pre class="cmd">python3 labs/intermediate/ctrpy.py 127.0.0.1:5000/demo/tiny:v1</pre>
+<pre class="out">ctr: failed to resolve image: ... connect: connection refused
+[1] pull ...
+CalledProcessError: Command '[... 'images', 'pull', ...]' returned non-zero exit status 1.</pre>
+<p>The <code>finally:</code> block still ran cleanup — a partial run leaves nothing behind either, which is the property that makes the script safe to re-run.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can point at each of the six operations <code>ctr run</code> performs, name the Go client call behind it, and explain why the container's command came from the image without your writing a spec.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The task's output and the script's <code>step()</code> lines can interleave oddly</strong> unless you flush — the child streams uncaptured stdout while Python buffers its own. The script flushes on purpose; if you adapt it and lose that, the ordering will confuse you.</li>
+<li><strong>A single-arch push has no index.</strong> Your I5 <code>tiny:v1</code> is one platform, so its target descriptor <em>is</em> the manifest, not an index — the script handles both, but a copy-pasted "walk the index" loop that assumes an index will fail on it. This is I4.8's lesson landing in real code.</li>
+<li><strong>Cleanup order is not optional.</strong> The task must be killed and removed before the container, and the container delete must carry snapshot cleanup, or you leak the active snapshot (I7.6, I7.12). The script kills, waits, then deletes — copy that order.</li>
+<li><strong>It needs <code>sudo</code> for every call</strong>, because it is talking to the root-owned socket from I7.14. There is no way around that on a rootful containerd, and it is the whole reason rootless mode exists.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This script <em>is</em> what the kubelet does, minus the CRI layer I8 adds: pull, prepare, create sandbox, create container, start, watch. When <a href="w1.html#cp-1-20">W1.20</a> draws kubelet → containerd → shim → runc, every arrow after "kubelet" is a step in this file. The difference the kubelet adds — a pod sandbox created first, one shim grouping the pod's containers — is exactly the CRI-shaped gap this project leaves for the next module to fill.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the containerd Go client package (<code>github.com/containerd/containerd/v2/client</code>) for the real method signatures the script names; <code>ctr --help</code> for every subcommand it wraps. Read the script beside <a href="../labs/intermediate/pull.py"><code>pull.py</code></a> from I5 and <a href="../labs/intermediate/oci-inspect.py"><code>oci-inspect.py</code></a> from I4 — this project is those two, plus the run.</p>
+</article>
+<article class="lesson" id="cp-i7-18" data-id="i7-18">
+<div class="lesson-head"><span class="cp-id">I7.18</span><h4>Three faults that each look like a dead container</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Three faults that each look, at first, like a dead container — and each has a completely different cause, diagnosis and repair. Telling them apart from the evidence alone is the skill this whole module was building toward, and two of the three behave differently on containerd 2.x than the folklore (and this repo's own tracker) predicts. You will meet all three on real nodes.</p>
+
+<h5>The concept</h5>
+<p>Work each fault from evidence to repair. Do not read ahead to the next one until you can explain the current one to a colleague.</p>
+
+<h6>Fault 1 — containerd restarted under a running container</h6>
+<p>The scary-looking one that is actually a non-event. You proved the mechanism in <a href="#cp-i7-3">I7.3</a>: containerd is not the workload's parent, the shim is, and the shim survives. Restart the daemon and the workload's PID, start time and elapsed time are unchanged; containerd re-attaches from the state on disk.</p>
+<p>The three-sentence explanation to write out and keep:</p>
+<blockquote>Containerd isn't the parent of your container — a shim process is, and the shim's parent is init. Containerd only talks to that shim over a socket, and it writes down where the socket is, so when it comes back it just reconnects. Nothing ever signalled your process, so there was nothing for it to survive.</blockquote>
+
+<h6>Fault 2 — the shim was killed</h6>
+<p>This is where the tracker's premise — "the workload is orphaned and no longer reapable through the API" — is <strong>only true for a fraction of a second on containerd 2.x</strong>, and running it is the only way to see why.</p>
+<p>Kill the shim and poll the workload every 200&nbsp;ms. At +200&nbsp;ms it is exactly as predicted: alive, reparented to PID&nbsp;1, orphaned. But by +400&nbsp;ms it is <em>gone</em> — because containerd is watching the shim's ttrpc socket, sees it close, logs <code>shim disconnected</code> then <code>cleaning up dead shim</code>, and reaps the orphan for you. So the workload is not permanently unreapable; containerd's own shim-monitoring cleans it up within about two seconds.</p>
+<p>What actually leaks is the <strong>container record</strong>. containerd removes the task but not the container, so <code>ctr container ls</code> still shows it — and <em>that</em> is the thing you must remove by hand. The repair is <code>ctr container rm &lt;id&gt;</code>, and if the workload had lingered you would kill it by PID first. This also corrects the older folklore (and <a href="i3.html#cp-i3-14">I3.14</a>'s note about a SIGKILLed <em>runc</em> supervisor): a dead runc supervisor leaves a running container, but a dead <em>shim</em> does not, because containerd is actively monitoring the shim in a way nothing monitors a bare runc.</p>
+
+<h6>Fault 3 — a blob vanished</h6>
+<p>A layer you fetched is simply gone, and the cause is <a href="#cp-i7-13">I7.13</a>'s collector. The diagnosis lives entirely in two commands: <code>ctr content ls</code> shows the blob is no longer referenced, and <code>ctr leases ls</code> shows no lease was protecting it. The bytes left within about five seconds of becoming unreferenced, with no error and no log line you were watching. The repair is not to fix the deletion — the collector was right — but to hold a <strong>lease</strong> over the window where the blob is not yet attached to anything permanent, or to do the fetch as part of an operation (like a pull that creates an image record) that references it structurally.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Fault 2, with the timing that tells the real story. Start a container, kill its shim, watch the workload.
+<pre class="cmd">sudo ctr run -d docker.io/library/alpine:3.21 demo2 sleep 3600
+PID=$(sudo ctr task ls | grep '^demo2 ' | awk '{print $2}')
+SHIM=$(ps -o ppid= -p $PID | tr -d ' ')
+sudo kill -9 $SHIM
+for i in 1 2 3 4 5; do
+  echo "  +$((i*200))ms: state=$(ps -o stat= -p $PID 2>/dev/null | tr -d ' ' || echo GONE) ppid=$(ps -o ppid= -p $PID 2>/dev/null | tr -d ' ')"
+  sleep 0.2
+done</pre>
+<pre class="out">  +200ms: state=<b>Ss</b> ppid=<b>1</b>
+  +400ms: state=<b>GONE</b> ppid=
+  +600ms: state=GONE ppid=
+  +800ms: state=GONE ppid=
+  +1000ms: state=GONE ppid=</pre>
+<p>Orphaned to PID 1 for one tick, then reaped. Not "unreapable" — the opposite.</p></li>
+
+<li>Read containerd's own account of what it did.
+<pre class="cmd">sudo journalctl -u containerd --since '5 seconds ago' | grep -i 'shim\|dead'</pre>
+<pre class="out">... msg="shim disconnected" id=demo2 namespace=default
+... msg="cleaning up after shim disconnected" id=demo2 namespace=default
+... msg="<b>cleaning up dead shim</b>" id=demo2 namespace=default</pre></li>
+
+<li>Find the real leak — the container record — and clear it.
+<pre class="cmd">sudo ctr task ls | grep demo2 || echo "  no task (reaped)"
+sudo ctr container ls | grep demo2 &amp;&amp; echo "  <- container record leaked"
+sudo ctr container rm demo2
+sudo ctr container ls | grep demo2 || echo "  cleaned"</pre>
+<pre class="out">  no task (reaped)
+demo2   docker.io/library/alpine:3.21   io.containerd.runc.v2   <b>&lt;- container record leaked</b>
+  cleaned</pre></li>
+
+<li>Fault 3, in three commands: fetch, make unreferenced, watch it go.
+<pre class="cmd">sudo ctr content fetch docker.io/library/busybox:1.36 >/dev/null 2>&amp;1
+sudo ctr images rm docker.io/library/busybox:1.36
+sleep 5
+echo "referenced? $(sudo ctr content ls | grep -c 73aaf090f3d8)"
+echo "on disk?    $(sudo ls /var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/ | grep -c 73aaf090f3d8)"
+sudo ctr leases ls</pre>
+<pre class="out">referenced? <b>0</b>
+on disk?    <b>0</b>
+ID CREATED AT LABELS</pre>
+<p>Gone from the index and from the disk, and <code>ctr leases ls</code> confirms nothing was holding it. That empty lease list <em>is</em> the diagnosis.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given only <code>ctr</code> output, you can distinguish a restarted daemon (nothing wrong), a killed shim (task reaped, container record leaked) and a collected blob (unreferenced, no lease), and you can state the correct repair for each without guessing.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Fault 2's window is real but tiny.</strong> If you sleep two seconds before checking, you will conclude the workload "just died" and miss that it was briefly orphaned first. The 200&nbsp;ms poll is what makes the mechanism visible — a slower look tells a misleading story.</li>
+<li><strong>The tracker's "orphaned and unreapable" is 1.x-era.</strong> Do not carry that belief onto a 2.x node: containerd's shim monitoring reaps the orphan, and your actual job is the leaked container record, not a runaway process. Verify on your own version.</li>
+<li><strong>Fault 3 leaves no error to grep for.</strong> The deletion is correct behaviour, so nothing logs a warning. If you go looking for an error you will not find one — the evidence is the <em>absence</em> in <code>ctr content ls</code> plus the empty <code>ctr leases ls</code>, not any message.</li>
+<li><strong>Deleting files from the content store by hand is a fourth fault, not a repair.</strong> It produces a pull that succeeds (the metadata still references the blob) and a container that will not start (the bytes are gone) — the one from <a href="#cp-i7-9">I7.9</a>'s gotcha. Never treat the store as a directory to clean up manually; that is the collector's job.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Fault 1 is why <a href="w6.html#cp-6-11">W6.11's kubelet fault-hunting</a> lets you restart containerd mid-investigation without fear. Fault 2 is the node-level shape of a <a href="w6.html#cp-6-18">stuck-Terminating pod (W6.18)</a> — a leaked record that outlives its process. Fault 3 is the runtime half of the image-pull failures in <a href="w6.html#cp-6-17">W6.17</a>: "the layer was here and now it is gone" has a specific, diagnosable cause, and it is not the registry's fault.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>garbage-collection.md</code> (fault 3) and <code>runtime-v2.md</code> (the shim lifecycle behind fault 2); <code>journalctl</code> for reading containerd's own account of a shim death. On the Kubernetes side, search "restart kubelet" and "container runtime" to see how each fault surfaces one layer up.</p>
+</article>
 </div><!-- /g-the-process-tree -->
 
 <!-- ---------------- Objects ---------------- --><div class="grp" id="g-objects"><h3>Objects</h3>
@@ -1391,24 +1556,71 @@ ps -o pid,comm -p "$(ps -o ppid= -p "$P" | tr -d ' ')"</pre>
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>You run a container, then <code>ps -ef</code> shows no <code>runc</code> process anywhere. Is something wrong?
+<details class="reveal"><summary>Answer</summary><p>No — that is the healthy state. <code>runc create</code> and <code>runc start</code> both exit as soon as they have done their work (I3.5), so on a running node there are normally zero <code>runc</code> processes. What holds the container open is the shim, not <code>runc</code>. Several <em>stuck</em> <code>runc</code> processes would be the interesting case: a container wedged mid-creation.</p></details></li>
+
+<li>The shim is the workload's parent. What is the shim's parent, and why does the answer matter?
+<details class="reveal"><summary>Answer</summary><p><strong>PID 1 (systemd).</strong> containerd starts the shim detached, so it is immediately re-parented to init — and therefore containerd is an ancestor of nothing. That is exactly why restarting containerd kills no workloads (I7.3): the daemon is never in the process ancestry of the thing it manages.</p></details></li>
+
+<li>You <code>systemctl restart containerd</code> under a running container. What changes and what does not?
+<details class="reveal"><summary>Answer</summary><p>containerd's PID changes (it is a new process). The workload's PID, start time and elapsed time do <em>not</em> change — it was never signalled. The new containerd re-attaches to the shim by reading <code>init.pid</code> and the socket from <code>bootstrap.json</code> on disk. Measured on this box: containerd 2805 → 56260, workload steady at PID 54899 with 02:36 elapsed.</p></details></li>
+
+<li>On a fresh Kubernetes node, <code>ctr images ls</code> shows nothing. Is the node broken?
+<details class="reveal"><summary>Answer</summary><p>Almost certainly not — you are in the wrong containerd namespace. The CRI plugin puts everything in <code>k8s.io</code>; <code>ctr</code> defaults to <code>default</code>. Add <code>-n k8s.io</code>. And <code>ctr</code> will silently invent a namespace you mistype, returning an empty table with exit 0, so a typo produces the same symptom.</p></details></li>
+
+<li>You pull an image into a brand-new containerd namespace and the progress bar reports 3.5 MiB transferred. How many new blob files hit the disk?
+<details class="reveal"><summary>Answer</summary><p><strong>Zero</strong>, if the blobs were already present. Namespaces separate names and metadata, not bytes — the content store on disk has no namespace in its path. The "3.5 MiB" is the image's declared size, not bytes moved. Measured: 472 → 472 blob files, 34 new metadata rows.</p></details></li>
+
+<li>What is the difference between a containerd <em>container</em> and a <em>task</em>, and what leaks if you confuse them?
+<details class="reveal"><summary>Answer</summary><p>A container is metadata (spec, image ref, snapshot key); a task is a running process created from it. Deleting a task but forgetting the container leaves the container record referencing its active snapshot forever — a silent <em>disk</em> leak that <code>ctr task ls</code> cannot show you, because it lists tasks and there is no task. <code>ctr container ls</code> and <code>ctr snapshot ls</code> find it.</p></details></li>
+
+<li>An image's config lists one <code>diff_id</code>, and its container's snapshot shows a <code>PARENT</code> digest. Why are they identical here but not in general?
+<details class="reveal"><summary>Answer</summary><p>The snapshot's parent key is the layer's <strong>chain ID</strong> (I4.12), computed by the recursion <code>sha256("&lt;prev&gt; &lt;diff_id&gt;")</code>. For a single-layer image the recursion terminates immediately, so chain ID == the first <code>diff_id</code>. A multi-layer image's top chain ID is a hash of the whole stack and matches none of the individual <code>diff_id</code>s.</p></details></li>
+
+<li>You have three stores: content, snapshotter, metadata. If you could back up only one, which — and why?
+<details class="reveal"><summary>Answer</summary><p>The <strong>metadata store</strong> (<code>meta.db</code>, ~4.4 MB). Content is re-fetchable from the registry by digest, and committed snapshots are re-derivable from content — both are caches. The name-to-digest mappings and container records exist nowhere else. (Sharp edge: a running container's <em>active</em> snapshot is also unrecoverable, a second thing with no upstream.)</p></details></li>
+
+<li>You <code>ctr content fetch</code> a blob, then <code>ctr leases ls</code> to see the lease it created. It shows nothing. Bug?
+<details class="reveal"><summary>Answer</summary><p>No — the temporary lease was released the instant the fetch completed, exactly as designed. You cannot observe it after the fact. And the fetch actually created an <em>image record</em>, so the blob is referenced and safe anyway; it will not be collected until you delete the name. The tracker's "fetch without a lease and watch it vanish" does not reproduce for this reason.</p></details></li>
+
+<li>Why is write access to <code>/run/containerd/containerd.sock</code> equivalent to root on the node?
+<details class="reveal"><summary>Answer</summary><p>Because the runtime's job is to create processes with arbitrary uids, mounts and namespaces. Anyone who can ask for a container can ask for one that bind-mounts <code>/</code> and runs as uid 0 — demonstrated live by reading <code>/etc/shadow</code> through a container. It is not an exploit; it is the design, and it is why the socket must never be mounted into a workload.</p></details></li>
+
+<li>You kill a container's shim on a containerd 2.x node. Is the workload now an unreapable orphan?
+<details class="reveal"><summary>Answer</summary><p>Only for about 200 ms. The workload is briefly reparented to PID 1, but containerd is monitoring the shim's socket — it logs <code>shim disconnected</code> then <code>cleaning up dead shim</code> and reaps the orphan within ~2 s. What actually leaks is the <em>container record</em>, which you clear with <code>ctr container rm</code>. The "unreapable orphan" belief is 1.x-era.</p></details></li>
+
+<li>A layer blob was on the node a minute ago and is now gone, with no error logged. What happened, and how do you prove it?
+<details class="reveal"><summary>Answer</summary><p>The garbage collector reclaimed it after it became unreferenced (its image name was removed) — correct behaviour, so nothing logs a warning. The evidence is an <em>absence</em>: the digest is missing from <code>ctr content ls</code> and <code>ctr leases ls</code> is empty, proving nothing held it. A lease over the vulnerable window would have saved it.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>Drew the full process tree from <code>ctr run</code> to the workload, named every process, and explained why <code>runc</code> is not one of them and why the shim's parent is init.</li>
+<li>Proved that a containerd restart signals no workload, and can explain it to a colleague in three sentences.</li>
+<li>Separated containerd's nouns — namespaces (names, not bytes), containers vs tasks, images as names-to-digests, plugins as one binary's registered parts.</li>
+<li>Walked all three on-disk stores, matched a snapshot key to an I4 chain ID, read a container's writes out of its <code>upperdir</code>, and said which store cannot be rebuilt.</li>
+<li>Made a blob disappear on purpose, named the lease that would have saved it, and read the collector's timing from its configuration.</li>
+<li>Talked to containerd directly — proved socket access is node root, watched the event stream narrate a lifecycle, and re-implemented <code>ctr run</code> in Python.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="b6.html#cp-b6-1">Go deeper: the Linux namespaces the shim's container is built from (B6) →</a></div>
 
-<nav class="pager"><a href="i6.html">← I6</a><a href="../intermediate.html#i8">I8 · TODO →</a></nav>
+<nav class="pager"><a href="i6.html">← I6 · Building images</a><a href="../intermediate.html#i8">I8 · CRI →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+Authored against Ubuntu 24.04 (kernel 6.8.0) on the <code>sandbox</code> VM, verified live 2026-07-30 with <b>containerd 2.3.3</b>, <b>runc 1.5.1</b>, <b>nerdctl 2.3.5</b> and the I5 <code>registry:2</code> on <code>127.0.0.1:5000</code>.
+What the live runs corrected against the tracker and the folklore:
+the shim's parent is PID&nbsp;1, not containerd, and containerd has zero shim children;
+a 2.3.3 task dir has no <code>address</code> file (it is <code>bootstrap.json</code> + a ttrpc socket under <code>/run/containerd/s/</code>), and its <code>log</code> is a FIFO that hangs a <code>cat</code>;
+<code>containerd config default</code> emits <b>version = 4</b>, not the tracker's 3, and this box has <em>no</em> <code>/etc/containerd/config.toml</code> at all;
+a cross-namespace pull writes zero new blobs while reporting the image's size as "transferred";
+deleting a container errors only while its task is <em>running</em>, and a stopped task is removed together with its container;
+the GC demo does not reproduce as written — <code>ctr content fetch</code> creates a referenced image and its temporary lease is gone before you can list it, so you must delete the name to see a collection (which then happens in &lt;5&nbsp;s);
+and killing a shim on 2.x does <em>not</em> leave an unreapable orphan — containerd's shim monitoring reaps the workload within ~2&nbsp;s and only the container record leaks.
+Spec quotes are verbatim from OCI runtime-spec v1.3.0, image-spec v1.1.1, and containerd's <code>runtime-v2.md</code> / <code>namespaces.md</code> / <code>garbage-collection.md</code> / <code>PLUGINS.md</code> / <code>core/events/events.go</code>.
+Re-verify the version-sensitive facts before trusting them on a different containerd.
 </footer>
 </main>
 </div>
