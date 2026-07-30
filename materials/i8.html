@@ -1436,6 +1436,275 @@ the grace period is spent.</p>
 </article>
 </div><!-- /g-the-call-sequence -->
 
+<!-- ---------------- Operating it ---------------- --><div class="grp" id="g-operating-it"><h3>Operating it</h3>
+<article class="lesson" id="cp-i8-12" data-id="i8-12">
+<div class="lesson-head"><span class="cp-id">I8.12</span><h4>crictl as a reflex, and the things kubectl cannot show you</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>kubectl</code> shows you the cluster's intent and the kubelet's summary of reality.
+<strong><code>crictl</code> shows you the node's reality, with no API server in the path.</strong>
+When the API server is unreachable, when a node is <code>NotReady</code>, or when a pod's status
+summarises something that has already happened three times, <code>crictl</code> still answers. That
+is why it belongs in your CKA toolkit and not merely in your vocabulary.</p>
+
+<h5>The concept</h5>
+<p>The verb set is small and worth having in muscle memory: <code>pods</code>, <code>ps -a</code>,
+<code>inspect</code>, <code>inspectp</code>, <code>logs</code>, <code>exec</code>,
+<code>imagefsinfo</code>, <code>stats</code>. Most map one-to-one onto CRI calls, which is why the
+output shapes look like protobuf messages rather than like <code>kubectl</code>.</p>
+
+<p>Two things <code>crictl</code> sees that <code>kubectl</code> cannot. First, <strong>containers
+the kubelet has already replaced</strong> — <code>crictl ps -a</code> lists the corpses, with their
+exit codes, their timestamps and their log files intact, after <code>kubectl</code> has moved on to
+describing the replacement. Second, <strong>objects with no API representation at all</strong>: a
+sandbox created outside Kubernetes, or one left behind by a kubelet that died mid-teardown.</p>
+
+<p>The trap is the reverse direction. <code>crictl</code> talks to a runtime. It knows nothing about
+scheduling, admission, controllers, or the objects that caused what you are looking at. "Why is
+there no pod here" is never a <code>crictl</code> question.</p>
+
+<p>One mechanism is worth understanding properly, because it explains a filename, a column, and an
+error message all at once. CRI reserves a unique name per container built from
+<code>&lt;container&gt;_&lt;pod&gt;_&lt;namespace&gt;_&lt;uid&gt;_&lt;attempt&gt;</code>. The
+<code>attempt</code> field is what a restart increments — and it is the same number that appears in
+the log filename <code>0.log</code>, <code>1.log</code>, and the same number
+<code>kubectl</code> shows you as <code>RESTARTS</code>. One mechanism, three faces.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a container, stop it, and try to recreate it with the same metadata. The refusal names the
+mechanism.
+<pre class="cmd">sudo crictl stop --timeout 1 "$C1"
+sudo crictl create "$POD" container.json sandbox.json</pre>
+<pre class="out">failed to reserve container name <b>\"app_resize_i8_uid-resize_0\"</b>;
+check if another CreateContainer request is in progress</pre>
+<p>The trailing <code>_0</code> is the attempt. Bump it to 1 in the container config and the same
+create succeeds — which is precisely what the kubelet does on every restart.</p></li>
+
+<li>Now look at both containers. <code>ps</code> shows the live one; <code>ps -a</code> shows the
+one a kubelet would already have stopped talking about.
+<pre class="cmd">sudo crictl ps
+sudo crictl ps -a</pre>
+<pre class="out">CONTAINER       IMAGE                           CREATED        STATE     NAME  <b>ATTEMPT</b>  POD ID
+9926e4da31bd1   docker.io/library/alpine:3.21   1 second ago   Running   app   <b>1</b>        9c07f18abaa9d
+
+CONTAINER       IMAGE                           CREATED         STATE     NAME  ATTEMPT  POD ID
+9926e4da31bd1   docker.io/library/alpine:3.21   1 second ago    Running   app   <b>1</b>        9c07f18abaa9d
+a8c5b78d53012   docker.io/library/alpine:3.21   2 seconds ago   <b>Exited</b>    app   <b>0</b>        9c07f18abaa9d</pre></li>
+
+<li>The corpse still has everything you need to diagnose it.
+<pre class="cmd">sudo crictl inspect "$C1" | jq -c '.status|{state,exitCode,reason,startedAt,finishedAt}'
+sudo ls -l /var/log/pods/i8_resize_uid-resize/app/</pre>
+<pre class="out">{"state":"CONTAINER_EXITED","exitCode":<b>143</b>,"reason":"Error",
+ "startedAt":"2026-07-30T14:22:25.433535276+06:00",
+ "finishedAt":"2026-07-30T14:22:26.468856876+06:00"}
+
+-rw-r----- 1 root root 205 Jul 30 14:22 <b>0.log</b>
+-rw-r----- 1 root root  71 Jul 30 14:22 <b>1.log</b></pre>
+<p>Two attempts, two log files. <code>kubectl logs --previous</code> is reading <code>0.log</code>,
+and it can only reach back one attempt because that is all the kubelet retains a handle to.</p></li>
+
+<li>Look at something that exists in no API server anywhere.
+<pre class="cmd">sudo crictl pods</pre>
+<pre class="out">POD ID          CREATED         STATE   NAME     NAMESPACE   ATTEMPT   RUNTIME
+9c07f18abaa9d   2 seconds ago   Ready   resize   i8          0         (default)</pre>
+<p>You made this with <code>crictl runp</code>. No <code>kubectl</code> would ever list it, and a
+kubelet that found it would treat it as an orphan to garbage-collect.</p></li>
+
+<li>The remaining two verbs, and the reason the <code>POD</code> column has been saying
+<code>unknown</code> all module.
+<pre class="cmd">sudo crictl imagefsinfo | jq -c '.status.imageFilesystems[]'
+sudo crictl stats -o json | jq -c '.stats[]|{name:.attributes.metadata.name, mem:.memory.workingSetBytes.value}'
+sudo crictl ps -o json | jq -c '.containers[0].labels'</pre>
+<pre class="out">{"fsId":{"mountpoint":"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"},
+ "inodesUsed":{"value":"525"},"usedBytes":{"value":"9986048"}}
+{"name":"app","mem":"221184"}
+<b>{}</b></pre>
+<p>Empty labels. A real kubelet sets <code>io.kubernetes.pod.name</code>,
+<code>io.kubernetes.pod.namespace</code> and <code>io.kubernetes.pod.uid</code> on every container —
+and that is the <em>only</em> reason <code>crictl ps</code> can print a pod name. Nothing in CRI's
+message structure carries it down from the sandbox.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can find, on a node and without an API server, a container that has already been replaced —
+and read its exit code and its logs.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>crictl ps</code> hides exited containers by default.</strong> The one you want
+during a CrashLoopBackOff investigation is almost always in <code>ps -a</code>. Type the
+<code>-a</code> by reflex.</li>
+<li><strong>The POD column comes from labels the kubelet sets, not from CRI.</strong> On a node
+driven by hand, or by a broken client, it reads <code>unknown</code> and nothing is wrong.</li>
+<li><strong><code>crictl</code> answers nothing about scheduling or admission.</strong> If the
+question is "why is this pod not here", the runtime has no opinion — go back to the API server.</li>
+<li><strong><code>crictl stats</code> clears the screen by default</strong> (it emits terminal
+escape sequences). Use <code>-o json</code> when you want output you can pipe.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the toolkit behind <a href="w6.html#cp-6-2">W6.2 — where logs physically live: the
+fallback ladder for when kubectl can't help</a> and the lower rungs of
+<a href="w6.html#cp-6-10">W6.10 — the NotReady ladder</a>. The restart-count mechanism you just
+watched is what <a href="w6.html#cp-6-16">W6.16 — CrashLoopBackOff mastery</a> reads from the top.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>debugging kubernetes nodes with
+crictl</em> — that page is a verb-by-verb reference and is allowed during the exam, which makes it
+worth knowing exists.</p>
+</article>
+<article class="lesson" id="cp-i8-13" data-id="i8-13">
+<div class="lesson-head"><span class="cp-id">I8.13</span><h4>Decoding a raw CRI log file</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The workload calls <code>write(2)</code> on file descriptor 1. It has no idea it is being logged,
+no idea what a timestamp is, and no idea a pod exists. Everything <code>kubectl logs</code> shows
+you was invented on the way out — and the format it was invented in is four fields you can read with
+<code>awk</code> on a node where <code>kubectl</code> is unavailable.</p>
+
+<h5>The concept</h5>
+<p>Each line in a CRI log file is: <strong>an RFC 3339 timestamp, the stream name
+(<code>stdout</code> or <code>stderr</code>), a <code>P</code>/<code>F</code> tag, and the line
+itself</strong>, space-separated.</p>
+
+<p>The timestamp is <em>the runtime's</em>, taken when it read the bytes off the pipe — not the
+application's. If your app also prints its own timestamps, you will see two, and they will disagree
+by the pipe latency. The stream field is why <code>kubectl logs</code> can interleave stdout and
+stderr correctly even though the container wrote to two separate pipes.</p>
+
+<p>The <code>P</code>/<code>F</code> tag is the interesting one. <strong>P means partial, F means
+full</strong> — the end of a logical line. A single application line longer than the runtime's
+maximum arrives as several <code>P</code> records followed by one <code>F</code>, and it is the
+consumer's job to reassemble them. This exists because the runtime must bound its own memory: it
+cannot buffer an unbounded line before writing.</p>
+
+<p>Knowing who writes this format explains one hard rule: <strong>a container that logs to a file
+inside itself effectively has no logs.</strong> Nothing is reading that file. The pipeline starts at
+fd 1 and fd 2, and anything that does not go there does not exist as far as Kubernetes is
+concerned.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run a container that prints a short stdout line, a short stderr line, and one 20,000-byte line,
+then read the raw file.
+<pre class="cmd">sudo cut -c1-70 /var/log/pods/i8_logdemo_uid-logdemo/app/0.log | head -3</pre>
+<pre class="out">2026-07-30T14:00:45.887766897+06:00 <b>stdout F</b> short line on stdout
+2026-07-30T14:00:45.887946372+06:00 <b>stderr F</b> short line on stderr
+2026-07-30T14:00:46.508944247+06:00 <b>stdout P</b> xxxxxxxxxxxxxxxxxxxxxxxxx</pre></li>
+
+<li>Break it into fields, and measure each record's payload.
+<pre class="cmd">sudo awk '{printf "rec %d: ts=%s stream=%-6s tag=%s len=%d\n", NR, $1, $2, $3,
+  length($0)-length($1)-length($2)-length($3)-3}' /var/log/pods/i8_logdemo_uid-logdemo/app/0.log</pre>
+<pre class="out">rec 1: ts=2026-07-30T14:00:45.887766897+06:00 stream=stdout tag=F len=20
+rec 2: ts=2026-07-30T14:00:45.887946372+06:00 stream=stderr tag=F len=20
+rec 3: ts=2026-07-30T14:00:46.508944247+06:00 stream=stdout tag=<b>P</b> len=<b>16384</b>
+rec 4: ts=2026-07-30T14:00:46.508987428+06:00 stream=stdout tag=<b>F</b> len=<b>3616</b></pre>
+<p>16384 + 3616 = 20000. The split point is not arbitrary:</p>
+<pre class="cmd">sudo crictl info | jq '.config.maxContainerLogLineSize'</pre>
+<pre class="out"><b>16384</b></pre></li>
+
+<li>Confirm that a consumer reassembles them.
+<pre class="cmd">sudo crictl logs "$C" | awk '{print NR": "length($0)" bytes"}'</pre>
+<pre class="out">1: 20 bytes
+2: <b>20000 bytes</b></pre></li>
+
+<li>Prove the timestamp belongs to the runtime, not the application, and note the timezone.
+<pre class="cmd">sudo crictl exec -s "$C" date -u +%FT%T
+sudo tail -1 /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log | cut -d' ' -f1</pre>
+<pre class="out">2026-07-30T08:00:15
+2026-07-30T13:56:17.269677519<b>+06:00</b></pre>
+<p>The same instant, rendered differently: the container's <code>date -u</code> is UTC, the log
+record carries the node's local offset. Log shippers that assume UTC get this wrong.</p></li>
+
+<li>Confirm that exec output never reaches the log.
+<pre class="cmd">sudo crictl exec -s "$CTR" sh -c 'echo this-goes-nowhere; echo nor-this &gt;&amp;2'
+sudo wc -l /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log</pre>
+<pre class="out">this-goes-nowhere
+nor-this
+<b>1</b> /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log</pre>
+<p>Still one line. The log is fd 1 and 2 of the container's <em>init</em> process only.</p></li>
+
+<li>Look for the symlink farm that log shippers watch — and note that it is not here.
+<pre class="cmd">ls -l /var/log/containers/</pre>
+<pre class="out">ls: cannot access '/var/log/containers/': <b>No such file or directory</b></pre>
+<p>On a real node, <code>/var/log/containers/&lt;pod&gt;_&lt;ns&gt;_&lt;container&gt;-&lt;id&gt;.log</code>
+is a symlink to the file under <code>/var/log/pods/</code>. It is created by the <strong>kubelet</strong>,
+not the runtime — which is why it is absent on this box and why a DaemonSet log shipper watching that
+directory sees nothing when the kubelet is unhealthy, even though the runtime is writing logs
+normally.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Handed a raw <code>0.log</code> on a node with no working <code>kubectl</code>, you can read it,
+separate the two streams, and reassemble a long line by hand.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A long line arrives split, and a naive consumer treats each fragment as a
+message.</strong> If your log pipeline is mangling large JSON events into pieces, this is why:
+something is ignoring the <code>P</code>/<code>F</code> tag. The threshold here is 16384 bytes.</li>
+<li><strong>The timestamp is the runtime's, in the node's timezone.</strong> Correlating it with
+application-emitted timestamps means accounting for both an offset and a small delay.</li>
+<li><strong>Logs to a file inside the container do not exist.</strong> No amount of Kubernetes
+configuration recovers them; the application must write to stdout or stderr, or you need a sidecar
+that reads the file and does.</li>
+<li><strong><code>/var/log/containers/</code> is the kubelet's, <code>/var/log/pods/</code> is the
+runtime's.</strong> When only the symlinks are stale or missing, suspect the kubelet, not the
+runtime.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the ground floor of <a href="w6.html#cp-6-2">W6.2 — where logs physically live: the
+fallback ladder for when kubectl can't help</a>. The pipe the runtime is reading from is the one
+built in <a href="b2.html#cp-b2-5">B2.5 — how a process is really created: fork, then exec, then
+wait</a>, and the shim that holds it is <a href="i7.html#cp-i7-1">I7.1</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>logging architecture</em> — the
+node-level logging section describes this file layout and the rotation the kubelet performs on it.</p>
+</article>
+<article class="lesson" id="cp-i8-14" data-id="i8-14">
+<div class="lesson-head"><span class="cp-id">I8.14</span><h4>TODO headline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<!-- CHECKPOINT: containerd's CRI configuration properly in /etc/containerd/config.toml: the sandbox image, the cgroup driver (SystemdCgroup), and the runtimes map whose keys become Kubernetes RuntimeClass handlers. Change the cgroup driver to disagree with the kubelet on purpose, then put it back — you will meet the consequence in the drill.
+     UNDER THE HOOD: The cgroup driver is not a preference, it is a claim about who owns the cgroup tree. With systemd, the runtime asks systemd to create a scope/slice and lets it manage the hierarchy; with cgroupfs, the runtime writes the directories itself. When the kubelet and the runtime disagree, both succeed at their own half and you get two parallel trees: containers run, but the kubelet's accounting looks at cgroups nothing is charged to, so limits are enforced somewhere it is not reading and eviction decisions are made on fiction. Since systemd is PID 1 on essentially every production node, systemd on both sides is the only correct answer — and this remains one of the most common node misconfigurations in the field. -->
+
+<h5>Why it matters</h5>
+<p>TODO plain-English hook.</p>
+
+<h5>The concept</h5>
+<p>TODO. Absorb and expand the "under the hood" note above.</p>
+
+<div class="specref">
+<p>TODO what the spec actually says.</p>
+<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
+<cite>TODO spec, version — <a href="TODO">file</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
+<pre class="cmd">TODO</pre>
+<pre class="out">TODO captured output</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>TODO what the reader can now do.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>TODO.</strong></li>
+</ul>
+
+<div class="k8s-link">
+<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> TODO.</p>
+</article>
+</div><!-- /g-operating-it -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
