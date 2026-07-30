@@ -1,0 +1,98 @@
+# captured 2026-07-30T08:02:15Z on sandbox
+# --- snippet ---
+# CTR=$(cat ~/i8/CTR)
+# echo "### ExecSync — run it, collect the output, return. This is the probe path."
+# sudo crictl exec "$CTR" sh -c "echo probe ok; exit 0"; echo "  rc=$?"
+# sudo crictl exec "$CTR" sh -c "exit 7" 2>&1 | tail -1; echo "  (a non-zero probe surfaces as an error, not as output)"
+# echo
+# echo "### the streaming server the runtime hosts for Exec/Attach/PortForward"
+# sudo ss -ltnp | awk "NR==1||/containerd/"
+# echo "--- it is a plain HTTP server, not gRPC:"
+# curl -s -i http://127.0.0.1:44303/ | head -4
+# echo "--- and the URLs it serves are one-shot tokens:"
+# curl -s -i http://127.0.0.1:44303/exec/deadbeef | head -3
+# echo
+# echo "### drive it: crictl port-forward opens a tunnel into the SANDBOX netns"
+# sudo crictl exec -d "$CTR" sh -c "while true; do printf \"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello.\" | nc -l -p 80; done" 2>/dev/null
+# sleep 1
+# sudo crictl port-forward "$(cat ~/i8/POD)" 19090:80 &
+# sleep 2
+# echo "--- through the tunnel:"; curl -s http://127.0.0.1:19090/ ; echo
+# echo "--- who was listening on the stream server while it ran:"
+# sudo ss -tnp | awk "/44303/" | head -3
+# kill %1 2>/dev/null; wait 2>/dev/null
+# echo
+# echo "### an exec-ed process is a sibling of the workload, in the same namespaces"
+# sudo crictl exec "$CTR" sh -c "readlink /proc/self/ns/net; readlink /proc/self/ns/mnt"
+# AP=$(sudo ctr -n k8s.io tasks ls | awk -v c="$CTR" "\$1==c{print \$2}")
+# echo "workload:  $(sudo readlink /proc/$AP/ns/net)  $(sudo readlink /proc/$AP/ns/mnt)"
+# --- output ---
+### ExecSync — run it, collect the output, return. This is the probe path.
+probe ok
+  rc=0
+time="2026-07-30T14:02:15+06:00" level=fatal msg="execing command in container 7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19: command terminated with exit code 7"
+  (a non-zero probe surfaces as an error, not as output)
+
+### the streaming server the runtime hosts for Exec/Attach/PortForward
+State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                                
+LISTEN 0      4096       127.0.0.1:44303      0.0.0.0:*    users:(("containerd",pid=56260,fd=19))                
+--- it is a plain HTTP server, not gRPC:
+HTTP/1.1 404 Not Found
+Date: Thu, 30 Jul 2026 08:02:15 GMT
+Content-Length: 19
+Content-Type: text/plain; charset=utf-8
+--- and the URLs it serves are one-shot tokens:
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+
+### drive it: crictl port-forward opens a tunnel into the SANDBOX netns
+Incorrect Usage: flag provided but not defined: -d
+
+NAME:
+   crictl exec - Run a command in a running container
+
+USAGE:
+   crictl exec [command options] [CONTAINER-ID] COMMAND [ARG...]
+
+DESCRIPTION:
+   The CONTAINER-ID is only required if none of the following filter flags are set:
+   --image, --label, --last, --latest, --name, --pod, --state
+
+COMMANDS:
+   help, h  Shows a list of commands or help for one command
+
+OPTIONS:
+   --ignore-errors, -e                       Ignore errors during command execution (default: false)
+   --image value                             Exec command for all containers matching this container image filter
+   --interactive, -i                         Keep STDIN open (default: false)
+   --label value [ --label value ]           Exec command for all containers matching this key=value label filter
+   --last value, -n value                    Exec command for all last n containers, set to 0 for unlimited (default: 0)
+   --latest, -l                              Exec command for the most recently created container (default: false)
+   --name value                              Exec command for all containers matching this name filter regular expression pattern
+   --parallel, -x                            Run the command in parallel if multiple containers are selected (default: false)
+   --pod value, -p value                     Exec command for all containers matching this pod ID filter
+   --quiet, -q                               Do not print the container ID if multiple containers are selected (default: false)
+   --state value                             Exec command for all containers matching this container state filter
+   --sync, -s                                Run the command synchronously (default: false)
+   --timeout value                           Timeout in seconds (default: 0)
+   --tls-ca value                            Path to the streaming TLS CA certificate
+   --tls-cert value                          Path to the streaming TLS certificate
+   --tls-key value                           Path to the streaming TLS key
+   --tls-sni value, --tls-server-name value  Server name used in the TLS client to check server certificates against (default: "localhost")
+   --transport value, -r value               Transport protocol to use, one of: spdy|websocket (default: "spdy")
+   --tty, -t                                 Allocate a pseudo-TTY (default: false)
+   --help, -h                                show help
+Forwarding from 127.0.0.1:19090 -> 80
+Forwarding from [::1]:19090 -> 80
+--- through the tunnel:
+Handling connection for 19090
+E0730 14:02:18.893359   81400 portforward.go:522] "Unhandled Error" err="an error occurred forwarding 19090 -> 80: error forwarding port 80 to pod d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e, uid : failed to execute portforward in network namespace \"/var/run/netns/cni-abb45341-cb46-8219-6001-e86d4e60e888\": failed to connect to localhost:80 inside namespace \"d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e\", IPv4: dial tcp4 127.0.0.1:80: connect: connection refused IPv6 dial tcp6 [::1]:80: connect: connection refused " logger="UnhandledError"
+time="2026-07-30T14:02:18+06:00" level=fatal msg="port forward: lost connection to pod"
+
+--- who was listening on the stream server while it ran:
+
+### an exec-ed process is a sibling of the workload, in the same namespaces
+net:[4026532285]
+mnt:[4026532347]
+workload:  net:[4026532285]  mnt:[4026532347]

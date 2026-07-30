@@ -1,0 +1,45 @@
+# captured 2026-07-30T08:05:13Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# echo "### RunPodSandbox is what triggers CNI ADD. Take the CNI config away."
+# sudo mkdir -p /root/cni-backup
+# sudo mv /etc/cni/net.d/nerdctl-bridge.conflist /root/cni-backup/
+# sleep 6
+# echo "--- the runtime notices, and says so in its readiness:"
+# sudo crictl info | jq -c ".status.conditions[]|select(.type==\"NetworkReady\")"
+# sudo crictl info | jq -r ".lastCNILoadStatus"
+# echo
+# echo "--- and now RunPodSandbox fails, before any app container is considered:"
+# python3 -c "import json,sys; d=json.load(open(\"sb-resize.json\")); d[\"metadata\"][\"name\"]=\"nocni\"; d[\"metadata\"][\"uid\"]=\"uid-nocni\"; d[\"log_directory\"]=\"/var/log/pods/i8_nocni_uid-nocni\"; json.dump(d,open(\"sb-nocni.json\",\"w\"))"
+# sudo mkdir -p /var/log/pods/i8_nocni_uid-nocni/app
+# sudo crictl -t 60s runp sb-nocni.json 2>&1 | tail -2
+# echo
+# echo "--- there is no container, so there are no container logs to read:"
+# sudo crictl ps -a
+# echo
+# echo "### put it back"
+# sudo mv /root/cni-backup/nerdctl-bridge.conflist /etc/cni/net.d/
+# sleep 6
+# sudo crictl info | jq -c ".status.conditions[]|select(.type==\"NetworkReady\")"
+# sudo crictl -t 60s runp sb-nocni.json && echo "  sandbox created again"
+# sudo crictl pods
+# --- output ---
+### RunPodSandbox is what triggers CNI ADD. Take the CNI config away.
+--- the runtime notices, and says so in its readiness:
+{"message":"Network plugin returns error: cni plugin not initialized","reason":"NetworkPluginNotReady","status":false,"type":"NetworkReady"}
+cni config load failed: no network config found in /etc/cni/net.d: cni plugin not initialized: failed to load cni config
+
+--- and now RunPodSandbox fails, before any app container is considered:
+E0730 14:05:20.115010   84243 remote_runtime.go:237] "RunPodSandbox from runtime service failed" err="rpc error: code = Unknown desc = failed to setup network for sandbox \"5f231bdc20dcda43106f26382189490c1759dee9a773ffd8b94ded6cc3e1680a\": cni plugin not initialized"
+time="2026-07-30T14:05:20+06:00" level=fatal msg="run pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox \"5f231bdc20dcda43106f26382189490c1759dee9a773ffd8b94ded6cc3e1680a\": cni plugin not initialized"
+
+--- there is no container, so there are no container logs to read:
+CONTAINER           IMAGE                           CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+64616fd8f4f59       docker.io/library/alpine:3.21   27 seconds ago      Exited              app                 0                   0e676f6754658       unknown             unknown
+
+### put it back
+{"message":"Network plugin returns error: cni plugin not initialized","reason":"NetworkPluginNotReady","status":false,"type":"NetworkReady"}
+E0730 14:05:26.193636   84276 remote_runtime.go:237] "RunPodSandbox from runtime service failed" err="rpc error: code = Unknown desc = failed to setup network for sandbox \"076efff63cee215bb636a020a985c3064acf85e508f4d5255761b3b22d8cb0e3\": cni plugin not initialized"
+time="2026-07-30T14:05:26+06:00" level=fatal msg="run pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox \"076efff63cee215bb636a020a985c3064acf85e508f4d5255761b3b22d8cb0e3\": cni plugin not initialized"
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+0e676f6754658       33 seconds ago      Ready               resize              i8                  0                   (default)

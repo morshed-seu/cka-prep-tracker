@@ -1,0 +1,47 @@
+# captured 2026-07-30T08:21:24Z on sandbox
+# --- snippet ---
+# echo "### three ways the CRI client fails to connect"
+# echo
+# echo "--- A. the endpoint is wrong (nothing was ever there)"
+# sudo crictl --runtime-endpoint unix:///run/nosuch.sock ps 2>&1 | grep -o "dial unix[^\\\\]*"
+# echo
+# echo "--- B. the endpoint is right, containerd is stopped"
+# sudo systemctl stop containerd; sleep 2
+# sudo crictl ps 2>&1 | grep -o "dial unix[^\\\\]*"
+# echo "    ^ byte-identical to A. systemd removes the socket when the unit stops,"
+# echo "      so there is nothing in the error to tell the two apart."
+# sudo systemctl start containerd; sleep 4
+# echo
+# echo "--- C. the socket exists but does not speak CRI"
+# ls -l /run/systemd/private
+# sudo timeout 20 crictl --runtime-endpoint unix:///run/systemd/private ps 2>&1 | grep -o "code = [A-Za-z]*\|context deadline exceeded" | head -2
+# echo "    ^ the dial SUCCEEDS; the failure is in the gRPC handshake, not the connect."
+# echo
+# echo "### the discriminator, in one command each"
+# sudo systemctl stop containerd; sleep 2
+# echo "  systemctl is-active containerd  -> $(systemctl is-active containerd)      (B: the runtime is down)"
+# sudo systemctl start containerd; sleep 4
+# echo "  systemctl is-active containerd  -> $(systemctl is-active containerd)         (A or C: the runtime is fine, your endpoint is not)"
+# echo "  crictl config --get runtime-endpoint -> $(sudo crictl config --get runtime-endpoint 2>/dev/null)"
+# sudo crictl ps >/dev/null 2>&1 && echo "  and crictl works again"
+# --- output ---
+### three ways the CRI client fails to connect
+
+--- A. the endpoint is wrong (nothing was ever there)
+dial unix /run/nosuch.sock: connect: no such file or directory
+
+--- B. the endpoint is right, containerd is stopped
+dial unix /run/containerd/containerd.sock: connect: no such file or directory
+    ^ byte-identical to A. systemd removes the socket when the unit stops,
+      so there is nothing in the error to tell the two apart.
+
+--- C. the socket exists but does not speak CRI
+srwx------ 1 root root 0 Jul 28 10:37 /run/systemd/private
+code = Unavailable
+    ^ the dial SUCCEEDS; the failure is in the gRPC handshake, not the connect.
+
+### the discriminator, in one command each
+  systemctl is-active containerd  -> inactive      (B: the runtime is down)
+  systemctl is-active containerd  -> active         (A or C: the runtime is fine, your endpoint is not)
+  crictl config --get runtime-endpoint -> unix:///run/containerd/containerd.sock
+  and crictl works again

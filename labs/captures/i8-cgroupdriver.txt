@@ -1,0 +1,56 @@
+# captured 2026-07-30T08:07:57Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# echo "### this node has NO /etc/containerd/config.toml at all"
+# sudo ls -la /etc/containerd/
+# echo "--- so the live values come from the API, not from a file:"
+# sudo crictl info | jq -c ".config.containerd.runtimes.runc.options|{SystemdCgroup, BinaryName}"
+# echo
+# echo "### the default cgroup driver is cgroupfs, and the tree it builds is flat"
+# sudo crictl pods -q | head -1 | xargs -I{} sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/{}/config.json
+# echo
+# echo "### switch containerd to the systemd driver"
+# sudo mkdir -p /etc/containerd
+# containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+# sudo sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+# grep -n "SystemdCgroup" /etc/containerd/config.toml
+# sudo systemctl restart containerd; sleep 5
+# sudo crictl info | jq -c ".config.containerd.runtimes.runc.options|{SystemdCgroup}"
+# echo
+# echo "### the SAME sandbox config now produces a different cgroup path"
+# python3 -c "import json; d=json.load(open(\"sb-resize.json\")); d[\"metadata\"][\"name\"]=\"sysd\"; d[\"metadata\"][\"uid\"]=\"uid-sysd\"; d[\"log_directory\"]=\"/var/log/pods/i8_sysd_uid-sysd\"; d[\"linux\"][\"cgroup_parent\"]=\"kubepods-besteffort.slice\"; json.dump(d,open(\"sb-sysd.json\",\"w\"))"
+# sudo mkdir -p /var/log/pods/i8_sysd_uid-sysd/app
+# P=$(sudo crictl -t 60s runp sb-sysd.json) && echo "  pod=$P"
+# sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$P/config.json
+# echo "--- and systemd, not containerd, owns it:"
+# systemd-cgls --no-pager 2>/dev/null | grep -A2 "kubepods" | head -6
+# sudo systemctl list-units --type=scope --no-pager 2>/dev/null | grep -i cri | head -3
+# echo "$P" > ~/i8/SYSDPOD
+# --- output ---
+### this node has NO /etc/containerd/config.toml at all
+total 12
+drwxr-xr-x   3 root root 4096 Jul 28 17:39 .
+drwxr-xr-x 112 root root 4096 Jul 28 17:39 ..
+drwxr-xr-x   3 root root 4096 Jul 28 17:39 certs.d
+--- so the live values come from the API, not from a file:
+{"SystemdCgroup":false,"BinaryName":""}
+
+### the default cgroup driver is cgroupfs, and the tree it builds is flat
+/i8demo/0d57af6c3f36374c7d54301bb4930ce18382bf171c9d7f81e03bfc143eea14ef
+
+### switch containerd to the systemd driver
+88:            SystemdCgroup = true
+{"SystemdCgroup":true}
+
+### the SAME sandbox config now produces a different cgroup path
+  pod=bc1207b730cd5d92a0a6197afbe623d35a07686c30a75f1e89e3c9443de8abbf
+kubepods-besteffort.slice:cri-containerd:bc1207b730cd5d92a0a6197afbe623d35a07686c30a75f1e89e3c9443de8abbf
+--- and systemd, not containerd, owns it:
+│   │ ├─86217 grep -A2 kubepods
+│   │ └─86218 head -6
+│   └─session-1.scope
+--
+└─kubepods.slice
+  └─kubepods-besteffort.slice
+  UNIT                                                                                  LOAD   ACTIVE SUB     DESCRIPTION
+  cri-containerd-bc1207b730cd5d92a0a6197afbe623d35a07686c30a75f1e89e3c9443de8abbf.scope loaded active running libcontainer container bc1207b730cd5d92a0a6197afbe623d35a07686c30a75f1e89e3c9443de8abbf

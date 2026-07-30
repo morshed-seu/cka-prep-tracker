@@ -1,0 +1,43 @@
+# captured 2026-07-30T08:04:52Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# sudo mkdir -p /var/log/pods/i8_resize_uid-resize/app
+# P=$(sudo crictl -t 60s runp sb-resize.json)
+# C=$(sudo crictl create "$P" ctr-resize.json sb-resize.json); sudo crictl start "$C" >/dev/null; sleep 2
+# CG=/sys/fs/cgroup$(sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$C/config.json)
+# echo "### 20 MiB of tmpfs held resident inside a 64 MiB limit"
+# echo "  memory.max     = $(sudo cat $CG/memory.max)"
+# echo "  memory.current = $(sudo cat $CG/memory.current)"
+# echo
+# echo "### GROW the limit: takes effect instantly, nothing notices"
+# sudo crictl update --memory 134217728 "$C" >/dev/null
+# echo "  memory.max     = $(sudo cat $CG/memory.max)"
+# echo "  state          = $(sudo crictl inspect $C | jq -r .status.state)"
+# echo
+# echo "### SHRINK it below what is already charged"
+# sudo crictl update --memory 8388608 "$C"; echo "  UpdateContainerResources returned success"
+# sleep 2
+# echo "  state          = $(sudo crictl inspect $C | jq -r .status.state)"
+# sudo crictl inspect "$C" | jq -c ".status|{state,exitCode,reason,message}"
+# echo "--- the kernel s own record:"
+# sudo dmesg 2>/dev/null | tail -4
+# echo "$P" > ~/i8/RESIZEPOD
+# --- output ---
+### 20 MiB of tmpfs held resident inside a 64 MiB limit
+  memory.max     = 67108864
+  memory.current = 21250048
+
+### GROW the limit: takes effect instantly, nothing notices
+  memory.max     = 134217728
+  state          = CONTAINER_RUNNING
+
+### SHRINK it below what is already charged
+64616fd8f4f59026464e9938f73fdb5710d91466e24c573225738d34afa5c44d
+  UpdateContainerResources returned success
+  state          = CONTAINER_EXITED
+{"state":"CONTAINER_EXITED","exitCode":137,"reason":"OOMKilled","message":""}
+--- the kernel s own record:
+[188163.047504] thp_swpout_fallback 0
+[188163.047505] Tasks state (memory values in pages):
+[188163.047506] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[188163.047507] Out of memory and no killable processes...

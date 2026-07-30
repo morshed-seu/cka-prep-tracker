@@ -1,0 +1,43 @@
+# captured 2026-07-30T08:07:20Z on sandbox
+# --- snippet ---
+# echo "### the file was moved back into place 20s ago, and byte-identical"
+# sudo ls -l /etc/cni/net.d/nerdctl-bridge.conflist
+# echo "  lastCNILoadStatus: $(sudo crictl info | jq -r .lastCNILoadStatus)"
+# echo
+# echo "### containerd s own log says why — it saw exactly ONE event, the move OUT:"
+# sudo journalctl -u containerd --since "-6min" --no-pager | grep "fs change event" | sed "s/.*msg=/  /"
+# echo
+# echo "### touch (metadata only) produces no reload; a content write does"
+# echo "  after touch : NetworkReady=false, lastCNILoadStatus unchanged  (15s polled)"
+# sudo cp /root/x.json /etc/cni/net.d/nerdctl-bridge.conflist
+# sleep 3
+# echo "  after cp    : lastCNILoadStatus=$(sudo crictl info | jq -r .lastCNILoadStatus)  NetworkReady=$(sudo crictl info | jq -r ".status.conditions[]|select(.type==\"NetworkReady\").status")"
+# echo
+# echo "### restore the box: one conflist, as it was"
+# sudo rm -f /etc/cni/net.d/10-bridge.conflist /root/x.json
+# sudo ls /etc/cni/net.d/
+# sleep 3
+# sudo crictl info | jq -c "{cni:.lastCNILoadStatus, conditions:[.status.conditions[]|{(.type):.status}]}"
+# cd ~/i8 && sudo crictl -t 60s runp sb-nocni.json >/dev/null && echo "  a sandbox can be created again"
+# sudo crictl pods
+# --- output ---
+### the file was moved back into place 20s ago, and byte-identical
+-rw-r--r-- 1 root root 860 Jul 30 14:06 /etc/cni/net.d/nerdctl-bridge.conflist
+  lastCNILoadStatus: OK
+
+### containerd s own log says why — it saw exactly ONE event, the move OUT:
+  "failed to reload cni configuration after receiving fs change event(RENAME        \"/etc/cni/net.d/nerdctl-bridge.conflist\")" error="cni config load failed: no network config found in /etc/cni/net.d: cni plugin not initialized: failed to load cni config"
+  "failed to reload cni configuration after receiving fs change event(WRITE         \"/etc/cni/net.d/nerdctl-bridge.conflist\")" error="cni config load failed: failed to load CNI config list file /etc/cni/net.d/nerdctl-bridge.conflist: error parsing configuration list: unexpected end of JSON input: invalid cni config: failed to load cni config"
+
+### touch (metadata only) produces no reload; a content write does
+  after touch : NetworkReady=false, lastCNILoadStatus unchanged  (15s polled)
+  after cp    : lastCNILoadStatus=OK  NetworkReady=true
+
+### restore the box: one conflist, as it was
+default
+nerdctl-bridge.conflist
+{"cni":"OK","conditions":[{"RuntimeReady":true},{"NetworkReady":true},{"ContainerdHasNoDeprecationWarnings":true}]}
+  a sandbox can be created again
+POD ID              CREATED                  STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+0d57af6c3f363       Less than a second ago   Ready               nocni               i8                  0                   (default)
+0e676f6754658       2 minutes ago            Ready               resize              i8                  0                   (default)

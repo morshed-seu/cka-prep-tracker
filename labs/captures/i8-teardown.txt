@@ -1,0 +1,48 @@
+# captured 2026-07-30T08:04:24Z on sandbox
+# --- snippet ---
+# C=$(cat ~/i8/NETCTR); P=$(cat ~/i8/NETPOD)
+# CG=/sys/fs/cgroup$(sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$C/config.json)
+# echo "### shrink the limit BELOW what is already charged"
+# echo "  memory.current = $(sudo cat $CG/memory.current)"
+# sudo crictl update --memory 262144 "$C" >/dev/null 2>&1 && echo "  update accepted"
+# echo "  memory.max     = $(sudo cat $CG/memory.max)"
+# echo "  memory.current = $(sudo cat $CG/memory.current)   <- the kernel reclaimed instead of killing"
+# echo "  memory.events  :"; sudo cat $CG/memory.events | sed "s/^/    /"
+# echo "  state          = $(sudo crictl inspect $C | jq -r .status.state)"
+# sudo crictl update --memory 134217728 "$C" >/dev/null
+# echo
+# echo "### now tear down in the WRONG order: remove the sandbox while a container runs"
+# sudo crictl rmp "$P" 2>&1 | tail -2
+# echo
+# echo "### and with force"
+# sudo crictl rmp -f "$P" 2>&1 | tail -1
+# echo "--- what survived:"
+# sudo crictl ps -a; sudo crictl pods
+# echo "--- the netns the sandbox pinned:"
+# sudo ls /var/run/netns/
+# echo "--- the CNI DNAT rule it installed:"
+# sudo iptables -t nat -S CNI-HOSTPORT-DNAT | grep -c 18080 || echo 0
+# --- output ---
+### shrink the limit BELOW what is already charged
+  memory.current = 438272
+  update accepted
+cat: /sys/fs/cgroup/i8demo/236cca9942ba5a25c48f93057409a5742496c1c75dd589f838eadefc8d3f4fe5/memory.max: No such file or directory
+  memory.max     = 
+cat: /sys/fs/cgroup/i8demo/236cca9942ba5a25c48f93057409a5742496c1c75dd589f838eadefc8d3f4fe5/memory.current: No such file or directory
+  memory.current =    <- the kernel reclaimed instead of killing
+  memory.events  :
+cat: /sys/fs/cgroup/i8demo/236cca9942ba5a25c48f93057409a5742496c1c75dd589f838eadefc8d3f4fe5/memory.events: No such file or directory
+  state          = CONTAINER_EXITED
+
+### now tear down in the WRONG order: remove the sandbox while a container runs
+time="2026-07-30T14:04:24+06:00" level=fatal msg="pod sandbox \"ab4b4d921a5df79db10787b73e9415dd68e197dcea76b7b2b8a6d6ffbe955aac\" is running, please stop it first"
+
+### and with force
+Removed sandbox ab4b4d921a5df79db10787b73e9415dd68e197dcea76b7b2b8a6d6ffbe955aac
+--- what survived:
+CONTAINER           IMAGE               CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+--- the netns the sandbox pinned:
+--- the CNI DNAT rule it installed:
+0
+0

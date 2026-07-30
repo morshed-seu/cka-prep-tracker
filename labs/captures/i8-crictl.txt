@@ -1,0 +1,79 @@
+# captured 2026-07-30T08:22:24Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# sudo mkdir -p /var/log/pods/i8_resize_uid-resize/app
+# P=$(sudo crictl -t 60s runp sb-resize.json)
+# C1=$(sudo crictl create "$P" ctr-plain.json sb-resize.json); sudo crictl start "$C1" >/dev/null
+# sleep 1; sudo crictl stop --timeout 1 "$C1" >/dev/null
+# echo "### recreating the container with the SAME metadata is refused"
+# sudo crictl create "$P" ctr-plain.json sb-resize.json 2>&1 | grep -o "failed to reserve container name [^;]*"
+# echo "  the reserved name is <container>_<pod>_<namespace>_<uid>_<attempt>."
+# echo "  That last field is why a restart needs attempt+1 — and why the log file"
+# echo "  is called 1.log, and why the RESTARTS column exists. One mechanism, three faces."
+# echo
+# C2=$(sudo crictl create "$P" ctr-attempt1.json sb-resize.json); sudo crictl start "$C2" >/dev/null
+# sleep 1
+# echo "### crictl ps shows the live one; ps -a shows the corpse a kubelet already replaced"
+# sudo crictl ps
+# echo
+# sudo crictl ps -a
+# echo
+# echo "### the exited one still has its exit code, its reason and its timestamps"
+# sudo crictl inspect "$C1" | jq -c ".status|{state,exitCode,reason,startedAt,finishedAt}"
+# echo "  143 = 128 + 15: SIGTERM, exactly B2.8 arithmetic."
+# echo
+# echo "### two attempts, two log files"
+# sudo ls -l /var/log/pods/i8_resize_uid-resize/app/
+# echo
+# echo "### this pod exists in no API server anywhere — crictl runp made it"
+# sudo crictl pods
+# echo
+# echo "### the rest of the reflex kit"
+# echo "--- imagefsinfo: the SNAPSHOTTER dir, which is what actually fills a node (I7.12)"
+# sudo crictl imagefsinfo | jq -c ".status.imageFilesystems[]"
+# echo "--- stats"
+# sudo crictl stats -o json 2>/dev/null | jq -c ".stats[]|{name:.attributes.metadata.name, mem:.memory.workingSetBytes.value}"
+# echo "--- why the POD column says unknown:"
+# sudo crictl ps -o json | jq -c ".containers[0].labels"
+# echo "  a real kubelet sets io.kubernetes.pod.{name,namespace,uid} here; that is the"
+# echo "  ONLY reason crictl ps can print a pod name. Nothing in CRI structure carries it."
+# sudo crictl rmp -f $(sudo crictl pods -q) >/dev/null 2>&1
+# --- output ---
+### recreating the container with the SAME metadata is refused
+failed to reserve container name \"app_resize_i8_uid-resize_0\"
+failed to reserve container name \"app_resize_i8_uid-resize_0\"
+  the reserved name is <container>_<pod>_<namespace>_<uid>_<attempt>.
+  That last field is why a restart needs attempt+1 — and why the log file
+  is called 1.log, and why the RESTARTS column exists. One mechanism, three faces.
+
+### crictl ps shows the live one; ps -a shows the corpse a kubelet already replaced
+CONTAINER           IMAGE                           CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+9926e4da31bd1       docker.io/library/alpine:3.21   1 second ago        Running             app                 1                   9c07f18abaa9d       unknown             unknown
+
+CONTAINER           IMAGE                           CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+9926e4da31bd1       docker.io/library/alpine:3.21   1 second ago        Running             app                 1                   9c07f18abaa9d       unknown             unknown
+a8c5b78d53012       docker.io/library/alpine:3.21   2 seconds ago       Exited              app                 0                   9c07f18abaa9d       unknown             unknown
+
+### the exited one still has its exit code, its reason and its timestamps
+{"state":"CONTAINER_EXITED","exitCode":143,"reason":"Error","startedAt":"2026-07-30T14:22:25.433535276+06:00","finishedAt":"2026-07-30T14:22:26.468856876+06:00"}
+  143 = 128 + 15: SIGTERM, exactly B2.8 arithmetic.
+
+### two attempts, two log files
+total 8
+-rw-r----- 1 root root 205 Jul 30 14:22 0.log
+-rw-r----- 1 root root  71 Jul 30 14:22 1.log
+
+### this pod exists in no API server anywhere — crictl runp made it
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+9c07f18abaa9d       2 seconds ago       Ready               resize              i8                  0                   (default)
+
+### the rest of the reflex kit
+--- imagefsinfo: the SNAPSHOTTER dir, which is what actually fills a node (I7.12)
+{"fsId":{"mountpoint":"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"},"inodesUsed":{"value":"525"},"timestamp":"1785399743051488965","usedBytes":{"value":"9986048"}}
+--- stats
+{"name":"app","mem":"221184"}
+{"name":"app","mem":null}
+--- why the POD column says unknown:
+{}
+  a real kubelet sets io.kubernetes.pod.{name,namespace,uid} here; that is the
+  ONLY reason crictl ps can print a pod name. Nothing in CRI structure carries it.

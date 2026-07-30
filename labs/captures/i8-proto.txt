@@ -1,0 +1,132 @@
+# captured 2026-07-30T08:09:40Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# echo "=== StopPodSandbox / RemovePodSandbox / RemoveContainer ==="
+# grep -n -B6 "rpc StopPodSandbox\|rpc RemovePodSandbox\|rpc RemoveContainer" api.proto
+# echo
+# echo "=== PodSandboxConfig: log_directory + dns_config + port_mappings ==="
+# sed -n "/^message PodSandboxConfig/,/^}/p" api.proto | head -60
+# echo
+# echo "=== ContainerConfig.log_path ==="
+# grep -n -B12 "string log_path" api.proto | head -20
+# echo
+# echo "=== Status / conditions ==="
+# grep -n -B6 "rpc Status(" api.proto
+# echo
+# echo "=== the API version constant ==="
+# grep -n "const\|kubeAPIVersion\|version = " api.proto | head
+# --- output ---
+=== StopPodSandbox / RemovePodSandbox / RemoveContainer ===
+34-    // terminated.
+35-    // This call is idempotent, and must not return an error if all relevant
+36-    // resources have already been reclaimed. kubelet will call StopPodSandbox
+37-    // at least once before calling RemovePodSandbox. It will also attempt to
+38-    // reclaim resources eagerly, as soon as a sandbox is not needed. Hence,
+39-    // multiple StopPodSandbox calls are expected.
+40:    rpc StopPodSandbox(StopPodSandboxRequest) returns (StopPodSandboxResponse) {}
+41-    // RemovePodSandbox removes the sandbox. If there are any running containers
+42-    // in the sandbox, they must be forcibly terminated and removed.
+43-    // This call is idempotent, and must not return an error if the sandbox has
+44-    // already been removed.
+45:    rpc RemovePodSandbox(RemovePodSandboxRequest) returns (RemovePodSandboxResponse) {}
+--
+73-    // reached.
+74-    rpc StopContainer(StopContainerRequest) returns (StopContainerResponse) {}
+75-    // RemoveContainer removes the container. If the container is running, the
+76-    // container must be forcibly removed.
+77-    // This call is idempotent, and must not return an error if the container has
+78-    // already been removed.
+79:    rpc RemoveContainer(RemoveContainerRequest) returns (RemoveContainerResponse) {}
+
+=== PodSandboxConfig: log_directory + dns_config + port_mappings ===
+message PodSandboxConfig {
+    // Metadata of the sandbox. This information will uniquely identify the
+    // sandbox, and the runtime should leverage this to ensure correct
+    // operation. The runtime may also use this information to improve UX, such
+    // as by constructing a readable name.
+    PodSandboxMetadata metadata = 1;
+    // Hostname of the sandbox. Hostname could only be empty when the pod
+    // network namespace is NODE.
+    string hostname = 2;
+    // Path to the directory on the host in which container log files are
+    // stored.
+    // By default the log of a container going into the LogDirectory will be
+    // hooked up to STDOUT and STDERR. However, the LogDirectory may contain
+    // binary log files with structured logging data from the individual
+    // containers. For example, the files might be newline separated JSON
+    // structured logs, systemd-journald journal files, gRPC trace files, etc.
+    // E.g.,
+    //     PodSandboxConfig.LogDirectory = `/var/log/pods/<NAMESPACE>_<NAME>_<UID>/`
+    //     ContainerConfig.LogPath = `containerName/Instance#.log`
+    string log_directory = 3;
+    // DNS config for the sandbox.
+    DNSConfig dns_config = 4;
+    // Port mappings for the sandbox.
+    repeated PortMapping port_mappings = 5;
+    // Key-value pairs that may be used to scope and select individual resources.
+    map<string, string> labels = 6;
+    // Unstructured key-value map that may be set by the kubelet to store and
+    // retrieve arbitrary metadata. This will include any annotations set on a
+    // pod through the Kubernetes API.
+    //
+    // Annotations MUST NOT be altered by the runtime; the annotations stored
+    // here MUST be returned in the PodSandboxStatus associated with the pod
+    // this PodSandboxConfig creates.
+    //
+    // In general, in order to preserve a well-defined interface between the
+    // kubelet and the container runtime, annotations SHOULD NOT influence
+    // runtime behaviour.
+    //
+    // Annotations can also be useful for runtime authors to experiment with
+    // new features that are opaque to the Kubernetes APIs (both user-facing
+    // and the CRI). Whenever possible, however, runtime authors SHOULD
+    // consider proposing new typed fields for any new features instead.
+    map<string, string> annotations = 7;
+    // Optional configurations specific to Linux hosts.
+    LinuxPodSandboxConfig linux = 8;
+    // Optional configurations specific to Windows hosts.
+    WindowsPodSandboxConfig windows = 9;
+}
+
+=== ContainerConfig.log_path ===
+1289-    // here MUST be returned in the ContainerStatus associated with the container
+1290-    // this ContainerConfig creates.
+1291-    //
+1292-    // In general, in order to preserve a well-defined interface between the
+1293-    // kubelet and the container runtime, annotations SHOULD NOT influence
+1294-    // runtime behaviour.
+1295-    map<string, string> annotations = 10;
+1296-    // Path relative to PodSandboxConfig.LogDirectory for container to store
+1297-    // the log (STDOUT and STDERR) on the host.
+1298-    // E.g.,
+1299-    //     PodSandboxConfig.LogDirectory = `/var/log/pods/<NAMESPACE>_<NAME>_<UID>/`
+1300-    //     ContainerConfig.LogPath = `containerName/Instance#.log`
+1301:    string log_path = 11;
+--
+1542-    // current state.
+1543-    string message = 11;
+1544-    // Key-value pairs that may be used to scope and select individual resources.
+1545-    map<string,string> labels = 12;
+1546-    // Unstructured key-value map holding arbitrary metadata.
+1547-    // Annotations MUST NOT be altered by the runtime; the value of this field
+
+=== Status / conditions ===
+155-    rpc StreamPodSandboxStats(StreamPodSandboxStatsRequest) returns (stream StreamPodSandboxStatsResponse) {}
+156-
+157-    // UpdateRuntimeConfig updates the runtime configuration based on the given request.
+158-    rpc UpdateRuntimeConfig(UpdateRuntimeConfigRequest) returns (UpdateRuntimeConfigResponse) {}
+159-
+160-    // Status returns the status of the runtime.
+161:    rpc Status(StatusRequest) returns (StatusResponse) {}
+
+=== the API version constant ===
+270:    string version = 1;
+275:    string version = 1;
+280:    string runtime_version = 3;
+283:    string runtime_api_version = 4;
+564:// the runtime can construct a unique PodSandboxName based on the metadata.
+582:    // as by constructing a readable name.
+993:    // CpusetCpus constrains the allowed set of logical CPUs. Default: "" (not specified).
+995:    // CpusetMems constrains the allowed set of memory nodes. Default: "" (not specified).
+1224:// interface for better user experience. E.g., runtime can construct a unique
+1262:    // as by constructing a readable name.

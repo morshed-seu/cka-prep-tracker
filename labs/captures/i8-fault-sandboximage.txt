@@ -1,0 +1,54 @@
+# captured 2026-07-30T08:20:47Z on sandbox
+# --- snippet ---
+# echo "### the sandbox image is declared as a PINNED image, which is why GC never evicts it"
+# containerd config default | grep -A2 "pinned_images"
+# echo
+# echo "### point it at an image that does not exist"
+# sudo mkdir -p /etc/containerd
+# containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+# sudo sed -i "s|sandbox = .registry.k8s.io/pause:3.10.2.|sandbox = \x27registry.k8s.io/pause:9.9.9\x27|" /etc/containerd/config.toml
+# grep -A2 "pinned_images" /etc/containerd/config.toml
+# sudo systemctl restart containerd; sleep 5
+# echo
+# echo "### the node looks perfectly healthy"
+# sudo crictl info | jq -c "{conditions:[.status.conditions[]|{(.type):.status}]}"
+# sudo crictl images | head -3
+# echo
+# echo "### then every pod fails, with an error naming no user workload"
+# cd ~/i8 && sudo crictl -t 60s runp sb-resize.json 2>&1 | tail -2
+# echo
+# echo "### and only containerd s log says which image"
+# sudo journalctl -u containerd --since "-1min" --no-pager | grep -o "failed to pull image [^\\\\]*" | tail -2
+# echo
+# echo "### revert"
+# sudo rm -f /etc/containerd/config.toml
+# sudo systemctl restart containerd; sleep 5
+# sudo crictl -t 60s runp sb-resize.json >/dev/null && echo "  pods work again"
+# sudo crictl rmp -f $(sudo crictl pods -q) >/dev/null 2>&1; sudo crictl pods
+# --- output ---
+### the sandbox image is declared as a PINNED image, which is why GC never evicts it
+    [plugins.'io.containerd.cri.v1.images'.pinned_images]
+      sandbox = 'registry.k8s.io/pause:3.10.2'
+
+
+### point it at an image that does not exist
+    [plugins.'io.containerd.cri.v1.images'.pinned_images]
+      sandbox = 'registry.k8s.io/pause:9.9.9'
+
+
+### the node looks perfectly healthy
+{"conditions":[{"RuntimeReady":true},{"NetworkReady":true},{"ContainerdHasNoDeprecationWarnings":true}]}
+IMAGE                      TAG                 IMAGE ID            SIZE
+docker.io/library/alpine   3.21                2607caa980584       3.66MB
+registry.k8s.io/pause      3.10                873ed75102791       320kB
+
+### then every pod fails, with an error naming no user workload
+E0730 14:20:55.916236   92449 remote_runtime.go:237] "RunPodSandbox from runtime service failed" err="rpc error: code = NotFound desc = failed to pull image \"registry.k8s.io/pause:9.9.9\": failed to pull and unpack image \"registry.k8s.io/pause:9.9.9\": failed to resolve image: registry.k8s.io/pause:9.9.9: not found"
+time="2026-07-30T14:20:55+06:00" level=fatal msg="run pod sandbox: rpc error: code = NotFound desc = failed to pull image \"registry.k8s.io/pause:9.9.9\": failed to pull and unpack image \"registry.k8s.io/pause:9.9.9\": failed to resolve image: registry.k8s.io/pause:9.9.9: not found"
+
+### and only containerd s log says which image
+failed to pull image 
+
+### revert
+  pods work again
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME

@@ -1,0 +1,50 @@
+# captured 2026-07-30T08:00:45Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# sudo mkdir -p /var/log/pods/i8_logdemo_uid-logdemo/app
+# P=$(sudo crictl -t 60s runp sb-logdemo.json)
+# C=$(sudo crictl create "$P" ctr-logdemo.json sb-logdemo.json); sudo crictl start "$C" >/dev/null; sleep 1
+# L=/var/log/pods/i8_logdemo_uid-logdemo/app/0.log
+# echo "### the raw file, as the runtime writes it — first three records, first 70 columns"
+# sudo cut -c1-70 $L | head -3
+# echo
+# echo "### field by field"
+# sudo awk "{printf \"  rec %d: ts=%s stream=%-6s tag=%s len(line)=%d\n\", NR, \$1, \$2, \$3, length(\$0)-length(\$1)-length(\$2)-length(\$3)-3}" $L
+# echo
+# echo "### one 20000-byte application line arrived as P + P + F"
+# sudo awk "{print NR\": \"\$3}" $L
+# echo "--- split point:"; sudo crictl info | jq ".config.maxContainerLogLineSize"
+# echo
+# echo "### crictl logs reassembles them into one line again"
+# sudo crictl logs "$C" | awk "{print NR\": \"length(\$0)\" bytes\"}"
+# echo
+# echo "### the symlink farm log shippers watch is the KUBELET s doing, not the runtime s"
+# ls -l /var/log/containers/ 2>&1
+# echo "$P" >> ~/i8/EXTRA_PODS
+# --- output ---
+### the raw file, as the runtime writes it — first three records, first 70 columns
+2026-07-30T14:00:45.887766897+06:00 stdout F short line on stdout
+2026-07-30T14:00:45.887946372+06:00 stderr F short line on stderr
+2026-07-30T14:00:46.508944247+06:00 stdout P xxxxxxxxxxxxxxxxxxxxxxxxx
+
+### field by field
+  rec 1: ts=2026-07-30T14:00:45.887766897+06:00 stream=stdout tag=F len(line)=20
+  rec 2: ts=2026-07-30T14:00:45.887946372+06:00 stream=stderr tag=F len(line)=20
+  rec 3: ts=2026-07-30T14:00:46.508944247+06:00 stream=stdout tag=P len(line)=16384
+  rec 4: ts=2026-07-30T14:00:46.508987428+06:00 stream=stdout tag=F len(line)=3616
+
+### one 20000-byte application line arrived as P + P + F
+1: F
+2: F
+3: P
+4: F
+--- split point:
+16384
+
+### crictl logs reassembles them into one line again
+short line on stderr
+1: 20 bytes
+2: 20000 bytes
+
+### the symlink farm log shippers watch is the KUBELET s doing, not the runtime s
+ls: cannot access '/var/log/containers/': No such file or directory

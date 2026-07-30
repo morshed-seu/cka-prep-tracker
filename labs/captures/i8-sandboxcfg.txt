@@ -1,0 +1,89 @@
+# captured 2026-07-30T07:59:56Z on sandbox
+# --- snippet ---
+# POD=$(cat ~/i8/POD); CTR=$(cat ~/i8/CTR)
+# echo "### what dns_config became, on disk, outside any image"
+# SB=/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/$POD
+# sudo ls -l $SB
+# echo "--- resolv.conf the RUNTIME wrote:"
+# sudo cat $SB/resolv.conf
+# echo
+# echo "### and it is bind-mounted into the app container, not baked into alpine"
+# sudo jq -c ".mounts[]|select(.destination|test(\"resolv|hosts|hostname\"))" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR/config.json
+# echo "--- proof from inside:"
+# sudo crictl exec $CTR cat /etc/resolv.conf
+# echo
+# echo "### port_mappings became a CNI portmap rule"
+# sudo iptables -t nat -S 2>/dev/null | grep -i "18080\|CNI-HOSTPORT" | head -8
+# echo
+# echo "### cgroup_parent: the tree the runtime built"
+# sudo find /sys/fs/cgroup/i8demo -maxdepth 1 -type d 2>/dev/null
+# echo "--- app container cgroup path in its OCI config:"
+# sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR/config.json
+# echo "--- sandbox cgroup path:"
+# sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$POD/config.json
+# echo
+# echo "### log_directory + log_path became this file"
+# sudo find /var/log/pods -type f | head
+# echo "--- and the OCI/CRI record of it:"
+# sudo crictl inspect $CTR | jq ".status.logPath"
+# --- output ---
+### what dns_config became, on disk, outside any image
+total 12
+-rw-r--r-- 1 root root   8 Jul 30 13:56 hostname
+-rw-r--r-- 1 root root 541 Jul 30 13:56 hosts
+-rw-r--r-- 1 root root  98 Jul 30 13:56 resolv.conf
+--- resolv.conf the RUNTIME wrote:
+search i8.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+
+### and it is bind-mounted into the app container, not baked into alpine
+{"destination":"/etc/hostname","type":"bind","source":"/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e/hostname","options":["rbind","rprivate","rw"]}
+{"destination":"/etc/hosts","type":"bind","source":"/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e/hosts","options":["rbind","rprivate","rw"]}
+{"destination":"/etc/resolv.conf","type":"bind","source":"/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e/resolv.conf","options":["rbind","rprivate","rw"]}
+--- proof from inside:
+search i8.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+
+### port_mappings became a CNI portmap rule
+-N CNI-HOSTPORT-DNAT
+-N CNI-HOSTPORT-MASQ
+-N CNI-HOSTPORT-SETMARK
+-A PREROUTING -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT
+-A OUTPUT -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT
+-A POSTROUTING -m comment --comment "CNI portfwd requiring masquerade" -j CNI-HOSTPORT-MASQ
+-A CNI-DN-0fd1f35b30bf921e4a521 -s 10.4.0.0/24 -p tcp -m tcp --dport 18080 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-0fd1f35b30bf921e4a521 -s 127.0.0.1/32 -p tcp -m tcp --dport 18080 -j CNI-HOSTPORT-SETMARK
+
+### cgroup_parent: the tree the runtime built
+/sys/fs/cgroup/i8demo
+/sys/fs/cgroup/i8demo/2b09ebd4059c332c13232f4568fc7061b3cf39702be4a45644cd0cee391152f5
+/sys/fs/cgroup/i8demo/c2f7351e3fbce91359f412ba0368971b4ea83677af42b0bb61df7cdab5365bad
+/sys/fs/cgroup/i8demo/4984f52d36cc93380312b23ce02697e3a061de7463fc3ec211b1a3d78dd1fd27
+/sys/fs/cgroup/i8demo/7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19
+/sys/fs/cgroup/i8demo/2846b623011582bde49b508e7ab284c54173c4d343dda5940256caf10e9150fc
+/sys/fs/cgroup/i8demo/5665388861c718ee7934fcdfeaa5f9ecdc57bb4010deb8054be135cd1deeb8dd
+/sys/fs/cgroup/i8demo/37f40313c067a58cada73ee3a7793208f6de2f45011e942349d1b6901e90f340
+/sys/fs/cgroup/i8demo/e5841fbdade1a94b4ac19287fec2b5bb62548f527134e8a7078d0f501b80c8a0
+/sys/fs/cgroup/i8demo/975b2c766d9b5f23cdc783da1f79715f165b4a718f402042becf40352cffb506
+/sys/fs/cgroup/i8demo/8f16b4602590e97cc6eeb7c5708680e7eb752155cd0520a5250608997a778794
+/sys/fs/cgroup/i8demo/72949650f1cb3aee1f7f95a4834a3b358c57338e07096755d686c1f263c04316
+/sys/fs/cgroup/i8demo/e6f1e3ee1b94be208659c011147b130d1e3f8a64448d316933bbd9c976c25acf
+/sys/fs/cgroup/i8demo/26613c2b018c52d2b25d494d1b2b183edadd2403042f45514efd8b5963c10dfa
+/sys/fs/cgroup/i8demo/d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e
+--- app container cgroup path in its OCI config:
+/i8demo/7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19
+--- sandbox cgroup path:
+/i8demo/d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e
+
+### log_directory + log_path became this file
+/var/log/pods/i8_podpid_uid-podpid/app/0.log
+/var/log/pods/i8_camelpid_uid-camelpid/app/0.log
+/var/log/pods/i8_hostnet_uid-hostnet/app/0.log
+/var/log/pods/i8_pidtesta_uid-pidtesta/app/0.log
+/var/log/pods/i8_ctrpid_uid-ctrpid/app/0.log
+/var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log
+/var/log/pods/i8_pidtestb_uid-pidtestb/app/0.log
+--- and the OCI/CRI record of it:
+"/var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log"

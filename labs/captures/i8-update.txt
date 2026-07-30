@@ -1,0 +1,58 @@
+# captured 2026-07-30T08:03:58Z on sandbox
+# --- snippet ---
+# C=$(cat ~/i8/NETCTR)
+# CG=/sys/fs/cgroup$(sudo jq -r ".linux.cgroupsPath" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$C/config.json)
+# echo "### the cgroup the CRI plugin built for this container"
+# echo "$CG"
+# echo
+# echo "### before — what container.json asked for"
+# for f in memory.max cpu.max cpu.weight pids.max; do printf "  %-14s %s\n" "$f" "$(sudo cat $CG/$f)"; done
+# echo "--- and what the API reports:"
+# sudo crictl inspect "$C" | jq -c ".info.runtimeSpec.linux.resources|{memory,cpu}"
+# echo
+# echo "### UpdateContainerResources"
+# sudo crictl update --memory 134217728 --cpu-quota 50000 --cpu-share 512 "$C"
+# echo
+# echo "### after — the kernel files changed under a RUNNING process"
+# for f in memory.max cpu.max cpu.weight pids.max; do printf "  %-14s %s\n" "$f" "$(sudo cat $CG/$f)"; done
+# echo
+# echo "### does the bundle on disk know? (I3.11 asked the same of runc update)"
+# sudo jq -c ".linux.resources|{memory:.memory.limit, cpu:.cpu}" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$C/config.json
+# echo "--- but the CRI status does:"
+# sudo crictl inspect "$C" | jq -c ".info.runtimeSpec.linux.resources|{memory,cpu}"
+# echo
+# echo "### shrinking below what is already charged"
+# sudo cat $CG/memory.current
+# sudo crictl update --memory 1048576 "$C" 2>&1 | tail -2
+# sudo cat $CG/memory.max; sudo crictl inspect "$C" | jq -r ".status.state"
+# --- output ---
+### the cgroup the CRI plugin built for this container
+/sys/fs/cgroup/i8demo/236cca9942ba5a25c48f93057409a5742496c1c75dd589f838eadefc8d3f4fe5
+
+### before — what container.json asked for
+  memory.max     67108864
+  cpu.max        20000 100000
+  cpu.weight     100
+  pids.max       max
+--- and what the API reports:
+{"memory":{"limit":67108864,"swap":67108864},"cpu":{"period":100000,"quota":20000}}
+
+### UpdateContainerResources
+236cca9942ba5a25c48f93057409a5742496c1c75dd589f838eadefc8d3f4fe5
+
+### after — the kernel files changed under a RUNNING process
+  memory.max     134217728
+  cpu.max        50000 100000
+  cpu.weight     59
+  pids.max       max
+
+### does the bundle on disk know? (I3.11 asked the same of runc update)
+{"memory":67108864,"cpu":{"quota":20000,"period":100000}}
+--- but the CRI status does:
+{"memory":{"limit":134217728,"swap":134217728},"cpu":{"period":100000,"quota":50000,"shares":512}}
+
+### shrinking below what is already charged
+438272
+236cca9942ba5a25c48f93057409a5742496c1c75dd589f838eadefc8d3f4fe5
+1048576
+CONTAINER_RUNNING

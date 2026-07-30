@@ -1,0 +1,53 @@
+# captured 2026-07-30T07:57:08Z on sandbox
+# --- snippet ---
+# POD=$(cat ~/i8/POD); CTR=$(cat ~/i8/CTR)
+# PP=$(sudo ctr -n k8s.io tasks ls | awk -v p="$POD" "\$1==p{print \$2}")
+# AP=$(sudo ctr -n k8s.io tasks ls | awk -v c="$CTR" "\$1==c{print \$2}")
+# echo "### namespace inodes: pause (PID $PP) vs app (PID $AP)"
+# printf "%-8s %-26s %-26s %s\n" ns pause app same
+# for n in net ipc uts mnt pid cgroup user; do
+#   a=$(sudo readlink /proc/$PP/ns/$n); b=$(sudo readlink /proc/$AP/ns/$n)
+#   s=SHARED; [ "$a" = "$b" ] || s=private
+#   printf "%-8s %-26s %-26s %s\n" "$n" "$a" "$b" "$s"
+# done
+# echo
+# echo "### the OCI config the CRI plugin generated for the APP container"
+# BUNDLE=/run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR
+# sudo jq -c ".linux.namespaces[]" $BUNDLE/config.json
+# echo
+# echo "### ... and for the SANDBOX"
+# sudo jq -c ".linux.namespaces[]" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$POD/config.json
+# echo
+# echo "### the path in that field is a real file"
+# sudo ls -l /var/run/netns/ 2>/dev/null
+# sudo jq -r ".linux.namespaces[]|select(.type==\"network\").path" $BUNDLE/config.json
+# --- output ---
+### namespace inodes: pause (PID 73974) vs app (PID 74019)
+ns       pause                      app                        same
+net      net:[4026532285]           net:[4026532285]           SHARED
+ipc      ipc:[4026532345]           ipc:[4026532345]           SHARED
+uts      uts:[4026532344]           uts:[4026532344]           SHARED
+mnt      mnt:[4026532343]           mnt:[4026532347]           private
+pid      pid:[4026532346]           pid:[4026532346]           SHARED
+cgroup   cgroup:[4026531835]        cgroup:[4026532348]        private
+user     user:[4026531837]          user:[4026531837]          SHARED
+
+### the OCI config the CRI plugin generated for the APP container
+{"type":"pid","path":"/proc/73974/ns/pid"}
+{"type":"ipc","path":"/proc/73974/ns/ipc"}
+{"type":"uts","path":"/proc/73974/ns/uts"}
+{"type":"mount"}
+{"type":"network","path":"/proc/73974/ns/net"}
+{"type":"cgroup"}
+
+### ... and for the SANDBOX
+{"type":"pid"}
+{"type":"ipc"}
+{"type":"uts"}
+{"type":"mount"}
+{"type":"network","path":"/var/run/netns/cni-abb45341-cb46-8219-6001-e86d4e60e888"}
+
+### the path in that field is a real file
+total 0
+-r--r--r-- 1 root root 0 Jul 30 13:56 cni-abb45341-cb46-8219-6001-e86d4e60e888
+/proc/73974/ns/net

@@ -1,0 +1,65 @@
+# captured 2026-07-30T08:01:03Z on sandbox
+# --- snippet ---
+# echo "### one socket. the CRI client and the ctr client speak DIFFERENT gRPC services over it."
+# ls -l /run/containerd/containerd.sock
+# echo "--- crictl is told where to look:"
+# cat /etc/crictl.yaml
+# echo
+# echo "### the version handshake — client and server are different projects"
+# sudo crictl version
+# echo
+# echo "### CRI is not one service, it is two — and in containerd 2.x they are two plugins"
+# sudo ctr plugins ls | awk "NR==1 || /cri/"
+# echo
+# echo "### prove the split from the client side"
+# echo "--- RuntimeService:"; sudo crictl ps
+# echo "--- ImageService:";   sudo crictl images
+# echo
+# echo "### and the ImageService has its own filesystem accounting"
+# sudo crictl imagefsinfo | jq -c ".imageFilesystems[]?, .containerFilesystems[]?"
+# echo
+# echo "### the readiness the kubelet actually polls (Status())"
+# sudo crictl info | jq -c ".status.conditions[]"
+# --- output ---
+### one socket. the CRI client and the ctr client speak DIFFERENT gRPC services over it.
+srw-rw---- 1 root root 0 Jul 30 12:55 /run/containerd/containerd.sock
+--- crictl is told where to look:
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+
+### the version handshake — client and server are different projects
+Version:  0.1.0
+RuntimeName:  containerd
+RuntimeVersion:  v2.3.3
+RuntimeApiVersion:  v1
+
+### CRI is not one service, it is two — and in containerd 2.x they are two plugins
+TYPE                                      ID                       PLATFORMS      STATUS    
+io.containerd.cri.v1                      images                   -              ok        
+io.containerd.cri.v1                      runtime                  linux/amd64    ok        
+io.containerd.grpc.v1                     cri                      -              ok        
+
+### prove the split from the client side
+--- RuntimeService:
+CONTAINER           IMAGE                           CREATED              STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+493ad10d7dde1       docker.io/library/alpine:3.21   17 seconds ago       Running             app                 0                   83ff4e08aad49       unknown             unknown
+2b09ebd4059c3       docker.io/library/alpine:3.21   About a minute ago   Running             app                 0                   e5841fbdade1a       unknown             unknown
+8f16b4602590e       docker.io/library/alpine:3.21   About a minute ago   Running             app                 0                   4984f52d36cc9       unknown             unknown
+e6f1e3ee1b94b       docker.io/library/alpine:3.21   2 minutes ago        Running             app                 0                   975b2c766d9b5       unknown             unknown
+5665388861c71       docker.io/library/alpine:3.21   2 minutes ago        Running             app                 0                   37f40313c067a       unknown             unknown
+2846b62301158       docker.io/library/alpine:3.21   3 minutes ago        Running             app                 0                   c2f7351e3fbce       unknown             unknown
+72949650f1cb3       docker.io/library/alpine:3.21   3 minutes ago        Running             app                 0                   26613c2b018c5       unknown             unknown
+7eb9180e012e9       docker.io/library/alpine:3.21   4 minutes ago        Running             app                 0                   d703566d914ca       unknown             unknown
+--- ImageService:
+IMAGE                      TAG                 IMAGE ID            SIZE
+docker.io/library/alpine   3.21                2607caa980584       3.66MB
+registry.k8s.io/pause      3.10                873ed75102791       320kB
+registry.k8s.io/pause      3.10.2              4a83b15d3ecfe       321kB
+
+### and the ImageService has its own filesystem accounting
+
+### the readiness the kubelet actually polls (Status())
+{"message":"","reason":"","status":true,"type":"RuntimeReady"}
+{"message":"","reason":"","status":true,"type":"NetworkReady"}
+{"message":"","reason":"","status":true,"type":"ContainerdHasNoDeprecationWarnings"}

@@ -1,0 +1,47 @@
+# captured 2026-07-30T07:56:52Z on sandbox
+# --- snippet ---
+# POD=$(cat ~/i8/POD); CTR=$(cat ~/i8/CTR)
+# echo "### the sandbox is an ordinary containerd container, in the k8s.io namespace"
+# sudo ctr -n k8s.io containers ls
+# echo
+# echo "### its task"
+# sudo ctr -n k8s.io tasks ls
+# PP=$(sudo ctr -n k8s.io tasks ls | awk -v p="$POD" "\$1==p{print \$2}")
+# AP=$(sudo ctr -n k8s.io tasks ls | awk -v c="$CTR" "\$1==c{print \$2}")
+# echo "pause PID = $PP ; app PID = $AP"
+# echo
+# echo "### the whole program the pause container runs"
+# sudo tr "\\0" " " < /proc/$PP/cmdline; echo
+# grep -E "^Name|^Threads|^VmRSS" /proc/$PP/status
+# echo "--- blocked in:"
+# sudo cat /proc/$PP/wchan; echo
+# sudo cat /proc/$PP/stack 2>/dev/null | head -3
+# echo
+# echo "### the pause image is PINNED; the one you pull by hand is not"
+# sudo crictl images -o json | jq -c ".images[] | select(.repoTags[0]|test(\"pause\")) | {repoTags, pinned}"
+# --- output ---
+### the sandbox is an ordinary containerd container, in the k8s.io namespace
+CONTAINER                                                           IMAGE                            RUNTIME                  
+7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19    docker.io/library/alpine:3.21    io.containerd.runc.v2    
+d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e    registry.k8s.io/pause:3.10.2     io.containerd.runc.v2    
+
+### its task
+TASK                                                                PID      STATUS    
+d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e    73974    RUNNING
+7eb9180e012e924f96b8dbf633af6aace3ee50c0fcfd4d39ed02fcaa401e8c19    74019    RUNNING
+pause PID = 73974 ; app PID = 74019
+
+### the whole program the pause container runs
+/pause 
+Name:	pause
+VmRSS:	     624 kB
+Threads:	1
+--- blocked in:
+__do_sys_pause
+[<0>] __do_sys_pause+0x34/0x70
+[<0>] x64_sys_call+0x21cc/0x25a0
+[<0>] do_syscall_64+0x87/0x180
+
+### the pause image is PINNED; the one you pull by hand is not
+{"repoTags":["registry.k8s.io/pause:3.10"],"pinned":false}
+{"repoTags":["registry.k8s.io/pause:3.10.2"],"pinned":true}

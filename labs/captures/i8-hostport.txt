@@ -1,0 +1,50 @@
+# captured 2026-07-30T08:03:36Z on sandbox
+# --- snippet ---
+# POD=$(cat ~/i8/POD); NETPOD=$(cat ~/i8/NETPOD)
+# echo "### two sandboxes both asked for host_port 18080. CRI accepted both."
+# sudo crictl pods -o json | jq -r ".items[]|\"\(.metadata.name)  \(.id[0:12])\""
+# echo
+# echo "### the CNI portmap chains — first rule wins"
+# sudo iptables -t nat -S CNI-HOSTPORT-DNAT
+# echo
+# for c in $(sudo iptables -t nat -S CNI-HOSTPORT-DNAT | grep -o "CNI-DN-[a-f0-9]*" | sort -u); do
+#   echo "--- $c"; sudo iptables -t nat -S "$c" | grep DNAT
+# done
+# echo
+# echo "### so: demo (nothing listening on :80) = 10.4.0.x, netdemo (a real server) = $(sudo crictl inspectp $NETPOD | jq -r .status.network.ip)"
+# echo "--- curl the host port:"
+# curl -s --max-time 4 -o /dev/null -w "  http_code=%{http_code} exitcode=%{exitcode}\n" http://127.0.0.1:18080/ || echo "  curl failed"
+# echo
+# echo "### remove the first sandbox and the same host port starts working"
+# sudo crictl rmp -f "$POD" >/dev/null
+# sleep 1
+# curl -s --max-time 4 http://127.0.0.1:18080/; echo
+# sudo iptables -t nat -S CNI-HOSTPORT-DNAT
+# --- output ---
+### two sandboxes both asked for host_port 18080. CRI accepted both.
+netdemo  ab4b4d921a5d
+demo  d703566d914c
+
+### the CNI portmap chains — first rule wins
+-N CNI-HOSTPORT-DNAT
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90\"" -m multiport --dports 5000 -j CNI-DN-73464a7c6ba6b249e0425
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e\"" -m multiport --dports 18080 -j CNI-DN-0fd1f35b30bf921e4a521
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"ab4b4d921a5df79db10787b73e9415dd68e197dcea76b7b2b8a6d6ffbe955aac\"" -m multiport --dports 18080 -j CNI-DN-836d4ed6c5eae8b3c9148
+
+--- CNI-DN-0fd1f35b30bf921e4a521
+-A CNI-DN-0fd1f35b30bf921e4a521 -p tcp -m tcp --dport 18080 -j DNAT --to-destination 10.4.0.38:80
+--- CNI-DN-73464a7c6ba6b249e0425
+-A CNI-DN-73464a7c6ba6b249e0425 -d 127.0.0.1/32 -p tcp -m tcp --dport 5000 -j DNAT --to-destination 10.4.0.35:5000
+--- CNI-DN-836d4ed6c5eae8b3c9148
+-A CNI-DN-836d4ed6c5eae8b3c9148 -p tcp -m tcp --dport 18080 -j DNAT --to-destination 10.4.0.45:80
+
+### so: demo (nothing listening on :80) = 10.4.0.x, netdemo (a real server) = 10.4.0.45
+--- curl the host port:
+  http_code=000 exitcode=7
+  curl failed
+
+### remove the first sandbox and the same host port starts working
+hello-from-i
+-N CNI-HOSTPORT-DNAT
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90\"" -m multiport --dports 5000 -j CNI-DN-73464a7c6ba6b249e0425
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"ab4b4d921a5df79db10787b73e9415dd68e197dcea76b7b2b8a6d6ffbe955aac\"" -m multiport --dports 18080 -j CNI-DN-836d4ed6c5eae8b3c9148

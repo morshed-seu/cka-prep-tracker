@@ -1,0 +1,93 @@
+# captured 2026-07-30T08:19:32Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# sudo setsid ~/.venv-intermediate/bin/python ~/i8/toycri.py serve > ~/i8/toycri.log 2>&1 < /dev/null &
+# sleep 3
+# E="--runtime-endpoint unix:///run/toycri.sock --image-endpoint unix:///run/toycri.sock"
+# sudo rm -f /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log
+# echo "### crictl cannot tell it is not talking to containerd"
+# sudo crictl $E version
+# echo
+# echo "### 1. RunPodSandbox   2. CreateContainer   3. StartContainer"
+# P=$(sudo crictl $E -t 30s runp sandbox.json) && echo "  pod=$P"
+# C=$(sudo crictl $E create "$P" container.json sandbox.json) && echo "  ctr=$C"
+# sudo crictl $E start "$C" >/dev/null && echo "  started"
+# sleep 1
+# echo
+# echo "### 4. ListPodSandbox / ListContainers"
+# sudo crictl $E pods
+# sudo crictl $E ps
+# echo
+# echo "### 5. the log toycri wrote, in the CRI format I8.13 decodes"
+# sudo cat /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log
+# echo "--- crictl logs reading it back:"
+# sudo crictl $E logs "$C"
+# echo
+# echo "### 6. pause, and the app container joined to its namespaces"
+# PP=$(sudo runc --root /run/toycri/runc state "$P" | jq -r .pid)
+# AP=$(sudo runc --root /run/toycri/runc state "$C" | jq -r .pid)
+# printf "  %-8s %-22s %-22s\n" ns "pause=$PP" "app=$AP"
+# for n in net ipc uts pid mnt; do
+#   a=$(sudo readlink /proc/$PP/ns/$n); b=$(sudo readlink /proc/$AP/ns/$n)
+#   printf "  %-8s %-22s %-22s %s\n" $n "$a" "$b" "$( [ "$a" = "$b" ] && echo SHARED || echo private )"
+# done
+# echo "--- the field that does it, in the config.json toycri generated:"
+# sudo jq -c ".linux.namespaces" /var/lib/toycri/containers/$C/config.json
+# echo
+# echo "### 7. ExecSync really execs"
+# sudo crictl $E exec -s "$C" sh -c "hostname; ip -o addr show; echo rc-test"
+# echo
+# echo "### 8. teardown, in the order the proto requires"
+# sudo crictl $E stop "$C" >/dev/null; sudo crictl $E rm "$C" >/dev/null
+# sudo crictl $E stopp "$P" >/dev/null; sudo crictl $E rmp "$P" >/dev/null
+# sudo crictl $E pods; sudo crictl $E ps -a
+# echo "--- runc agrees nothing is left, and the shared rootfs survived:"
+# sudo runc --root /run/toycri/runc list
+# ls /var/lib/toycri/rootfs | tr "\n" " "; echo
+# --- output ---
+### crictl cannot tell it is not talking to containerd
+Version:  0.1.0
+RuntimeName:  toycri
+RuntimeVersion:  0.1.0
+RuntimeApiVersion:  v1
+
+### 1. RunPodSandbox   2. CreateContainer   3. StartContainer
+  pod=7acbf9d7798c486aa2a07f2d40bbbbe3bdd4da6152ce4d668ab624e01e24abe4
+  ctr=cad359920e444ce2b72009cb74a3b8cb179883ef59d14bf6a73187d33da92a1b
+  started
+
+### 4. ListPodSandbox / ListContainers
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+7acbf9d7798c4       1 second ago        Ready               demo                i8                  0                   toycri
+CONTAINER           IMAGE                           CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+cad359920e444       docker.io/library/alpine:3.21   1 second ago        Running             app                 0                   7acbf9d7798c4       unknown             unknown
+
+### 5. the log toycri wrote, in the CRI format I8.13 decodes
+2026-07-30T14:19:35.632283998+06:00 stdout F hello from inside the pod
+--- crictl logs reading it back:
+hello from inside the pod
+
+### 6. pause, and the app container joined to its namespaces
+  ns       pause=91429            app=91468             
+  net      net:[4026532349]       net:[4026532349]       SHARED
+  ipc      ipc:[4026532347]       ipc:[4026532347]       SHARED
+  uts      uts:[4026532346]       uts:[4026532346]       SHARED
+  pid      pid:[4026532348]       pid:[4026532348]       SHARED
+  mnt      mnt:[4026532345]       mnt:[4026532405]       private
+--- the field that does it, in the config.json toycri generated:
+[{"type":"ipc","path":"/proc/91429/ns/ipc"},{"type":"uts","path":"/proc/91429/ns/uts"},{"type":"network","path":"/proc/91429/ns/net"},{"type":"mount"},{"type":"pid","path":"/proc/91429/ns/pid"}]
+
+### 7. ExecSync really execs
+demo
+1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
+rc-test
+
+
+
+### 8. teardown, in the order the proto requires
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+CONTAINER           IMAGE               CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+--- runc agrees nothing is left, and the shared rootfs survived:
+ID          PID         STATUS      BUNDLE      CREATED     OWNER
+bin dev etc home lib media mnt opt proc root run sbin srv sys tmp usr var 

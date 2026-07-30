@@ -1,0 +1,40 @@
+# captured 2026-07-30T07:59:26Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# echo "### the PID-namespace switch is on the CONTAINER config, not the sandbox config"
+# echo
+# i=0
+# for m in 1 0; do
+#   i=$((i+1)); n=$( [ $i = 1 ] && echo a || echo b )
+#   sudo mkdir -p /var/log/pods/i8_pidtest${n}_uid-pidtest${n}/app
+#   P=$(sudo crictl -t 60s runp sb-pidtest$n.json)
+#   C=$(sudo crictl create "$P" ctr-nspid$m.json sb-pidtest$n.json); sudo crictl start "$C" >/dev/null
+#   PP=$(sudo ctr -n k8s.io tasks ls | awk -v x="$P" "\$1==x{print \$2}")
+#   AP=$(sudo ctr -n k8s.io tasks ls | awk -v x="$C" "\$1==x{print \$2}")
+#   echo "=== container security_context.namespace_options.pid = $m  ($( [ $m = 1 ] && echo CONTAINER || echo POD ))"
+#   echo "  pause pid ns : $(sudo readlink /proc/$PP/ns/pid)"
+#   echo "  app   pid ns : $(sudo readlink /proc/$AP/ns/pid)"
+#   echo "  app OCI      : $(sudo jq -c ".linux.namespaces[]|select(.type==\"pid\")" /run/containerd/io.containerd.runtime.v2.task/k8s.io/$C/config.json)"
+#   echo "  ps inside    :"; sudo crictl exec "$C" ps -o pid,comm 2>&1 | sed "s/^/    /"
+#   echo "$P" >> ~/i8/EXTRA_PODS
+# done
+# --- output ---
+### the PID-namespace switch is on the CONTAINER config, not the sandbox config
+
+=== container security_context.namespace_options.pid = 1  (CONTAINER)
+  pause pid ns : pid:[4026532607]
+  app   pid ns : pid:[4026532609]
+  app OCI      : {"type":"pid"}
+  ps inside    :
+    PID   COMMAND
+        1 sleep
+        7 ps
+=== container security_context.namespace_options.pid = 0  (POD)
+  pause pid ns : pid:[4026532672]
+  app   pid ns : pid:[4026532672]
+  app OCI      : {"type":"pid","path":"/proc/77929/ns/pid"}
+  ps inside    :
+    PID   COMMAND
+        1 pause
+        7 sleep
+       13 ps

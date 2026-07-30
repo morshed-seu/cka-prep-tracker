@@ -1,0 +1,45 @@
+# captured 2026-07-30T08:03:01Z on sandbox
+# --- snippet ---
+# cd ~/i8
+# sudo mkdir -p /var/log/pods/i8_netdemo_uid-netdemo/app
+# P=$(sudo crictl -t 60s runp sb-netdemo.json)
+# C=$(sudo crictl create "$P" ctr-netdemo.json sb-netdemo.json); sudo crictl start "$C" >/dev/null; sleep 1
+# echo "$P" > ~/i8/NETPOD; echo "$C" > ~/i8/NETCTR
+# IP=$(sudo crictl inspectp "$P" | jq -r ".status.network.ip")
+# echo "### the sandbox owns the IP: $IP"
+# echo
+# echo "### 1. port_mappings: reach it on the HOST port, via the CNI portmap chain"
+# curl -s --max-time 4 http://127.0.0.1:18080/; echo
+# echo
+# echo "### 2. PortForward: a tunnel into the SANDBOX netns, no Service involved"
+# sudo crictl port-forward "$P" 19090:80 > ~/i8/pf.log 2>&1 &
+# sleep 2; curl -s --max-time 4 http://127.0.0.1:19090/; echo
+# sleep 1; cat ~/i8/pf.log
+# kill %1 2>/dev/null
+# echo
+# echo "### 3. streaming Exec vs ExecSync — watch the stream server take a connection"
+# sudo crictl exec "$C" sleep 4 >/dev/null 2>&1 &
+# sleep 2; echo "--- default crictl exec (streaming):"; sudo ss -tn "( sport = :44303 or dport = :44303 )" | tail -n +2
+# wait %2 2>/dev/null; sleep 1
+# sudo crictl exec -s "$C" sleep 4 >/dev/null 2>&1 &
+# sleep 2; echo "--- crictl exec -s (ExecSync, one gRPC call):"; sudo ss -tn "( sport = :44303 or dport = :44303 )" | tail -n +2
+# echo "(blank means nothing touched the stream server)"
+# wait 2>/dev/null
+# --- output ---
+### the sandbox owns the IP: 10.4.0.45
+
+### 1. port_mappings: reach it on the HOST port, via the CNI portmap chain
+
+
+### 2. PortForward: a tunnel into the SANDBOX netns, no Service involved
+hello-from-i
+Forwarding from 127.0.0.1:19090 -> 80
+Forwarding from [::1]:19090 -> 80
+Handling connection for 19090
+
+### 3. streaming Exec vs ExecSync — watch the stream server take a connection
+--- default crictl exec (streaming):
+ESTAB 0      0          127.0.0.1:45252    127.0.0.1:44303       
+ESTAB 0      0          127.0.0.1:44303    127.0.0.1:45252       
+--- crictl exec -s (ExecSync, one gRPC call):
+(blank means nothing touched the stream server)

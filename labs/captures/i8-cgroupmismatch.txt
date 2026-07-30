@@ -1,0 +1,48 @@
+# captured 2026-07-30T08:08:21Z on sandbox
+# --- snippet ---
+# P=$(cat ~/i8/SYSDPOD)
+# echo "### the tree containerd (systemd driver) actually built"
+# sudo find /sys/fs/cgroup/kubepods.slice -maxdepth 2 -type d | head
+# echo "  memory.max there: $(sudo cat /sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/cri-containerd-$P.scope/memory.max 2>/dev/null)"
+# echo
+# echo "### the tree a cgroupfs-configured kubelet would look in"
+# sudo ls -d /sys/fs/cgroup/kubepods 2>&1
+# sudo ls -d /sys/fs/cgroup/kubepods/besteffort 2>&1
+# echo "  -> the accounting the kubelet reads is a directory that does not exist."
+# echo "     Containers run. Limits are enforced. Eviction decisions are made on nothing."
+# echo
+# echo "### both drivers can coexist on one node, which is why the failure is silent"
+# sudo find /sys/fs/cgroup -maxdepth 1 -name "kubepods*" -o -maxdepth 1 -name "i8demo"
+# echo
+# echo "### revert: remove the config and restart"
+# sudo crictl rmp -f $(sudo crictl pods -q) >/dev/null 2>&1
+# sudo rm -f /etc/containerd/config.toml
+# sudo systemctl restart containerd; sleep 5
+# sudo ls -la /etc/containerd/
+# sudo crictl info | jq -c "{SystemdCgroup:.config.containerd.runtimes.runc.options.SystemdCgroup, cni:.lastCNILoadStatus, conditions:[.status.conditions[]|{(.type):.status}]}"
+# sudo crictl pods; sudo crictl ps -a
+# --- output ---
+### the tree containerd (systemd driver) actually built
+/sys/fs/cgroup/kubepods.slice
+/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice
+/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/cri-containerd-bc1207b730cd5d92a0a6197afbe623d35a07686c30a75f1e89e3c9443de8abbf.scope
+  memory.max there: max
+
+### the tree a cgroupfs-configured kubelet would look in
+ls: cannot access '/sys/fs/cgroup/kubepods': No such file or directory
+ls: cannot access '/sys/fs/cgroup/kubepods/besteffort': No such file or directory
+  -> the accounting the kubelet reads is a directory that does not exist.
+     Containers run. Limits are enforced. Eviction decisions are made on nothing.
+
+### both drivers can coexist on one node, which is why the failure is silent
+/sys/fs/cgroup/i8demo
+/sys/fs/cgroup/kubepods.slice
+
+### revert: remove the config and restart
+total 12
+drwxr-xr-x   3 root root 4096 Jul 30 14:08 .
+drwxr-xr-x 112 root root 4096 Jul 28 17:39 ..
+drwxr-xr-x   3 root root 4096 Jul 28 17:39 certs.d
+{"SystemdCgroup":false,"cni":"OK","conditions":[{"RuntimeReady":true},{"NetworkReady":true},{"ContainerdHasNoDeprecationWarnings":true}]}
+POD ID              CREATED             STATE               NAME                NAMESPACE           ATTEMPT             RUNTIME
+CONTAINER           IMAGE               CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
