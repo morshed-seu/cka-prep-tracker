@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CRI from below: the two gRPC services the kubelet drives a node through, the pod sandbox, the call sequence for one pod, and a CRI server written in Python that crictl cannot tell from containerd.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I8 — CRI: the interface the kubelet speaks — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I8 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4 · The OCI image spec</a></li>
+    <li><a href="i5.html">I5 · The distribution spec</a></li>
+    <li><a href="i6.html">I6 · Building images</a></li>
+    <li><a href="i7.html">I7 · containerd, shims, snapshotters</a></li>
+    <li><a href="i8.html">I8 · CRI</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i8">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I8 — CRI: the interface the kubelet speaks</h1>
+  <p>The first of the three contracts Kubernetes drives a node through. By the end you can say exactly what the kubelet asks for, in what order, and what comes back — and you will have implemented enough of the server side to make <code>crictl</code> believe you are a container runtime.</p>
+  <p>Every module so far has been about a thing Kubernetes uses. This one is about a thing
+  Kubernetes <em>defines</em>. CRI is the first of three interfaces — CRI, CNI, CSI — where the
+  Kubernetes project stopped implementing and started specifying, and the shape it chose has
+  consequences you can see from a node's shell: why a pod has a pause container, why an app
+  container shares an IP but not a filesystem, why a broken network plugin produces pods with no
+  logs at all, and why <code>kubectl exec</code> can fail against a host that appears nowhere in
+  your kubeconfig. By the end you will have driven a whole pod through the interface by hand, and
+  then implemented the other side of it.</p>
+  <div class="weights">
+    <span>Checkpoints<b>16</b></span>
+    <span>Hours<b>~7</b></span>
+    <span>Prerequisites<b>I7</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>Why and what.</strong> Say what CRI replaced, state the contract in one sentence, and
+name its two services — then verify every clause of that sentence on a running node.</li>
+<li><strong>The sandbox model.</strong> Create a pod without Kubernetes, read the pause container
+off <code>/proc</code>, and find the single config field that makes containers in a pod share a
+network namespace.</li>
+<li><strong>The call sequence.</strong> Drive one pod's whole lifecycle in the kubelet's own order,
+including the two exec paths, in-place resource updates, and teardown.</li>
+<li><strong>Operating it.</strong> Make <code>crictl</code> a reflex, decode a raw CRI log file,
+and read the runtime's CRI configuration — including the cgroup driver, which is the single most
+common node misconfiguration in the field.</li>
+<li><strong>Project &amp; drill.</strong> Write a CRI server in Python that <code>crictl</code>
+drives end to end, then diagnose three faults that all present as "the node is broken".</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I7</strong> — CRI is a plugin inside the containerd you just took apart, so every call below lands on machinery you can already inspect from underneath.</p>
+<p><strong>Which machine.</strong> Everything below ran on the single intermediate VM,
+<code>sandbox</code> (Ubuntu 24.04, kernel 6.8.0), with <strong>containerd 2.3.3</strong>,
+<strong>runc 1.5.1</strong>, <strong>crictl v1.36.0</strong> and CNI plugins v1.9.1. There is no
+Kubernetes on it and no kubelet — which is the point: every call in this module is one you make
+yourself. Where a real kubelet would behave differently, that is said explicitly rather than
+glossed.</p>
+</div>
+
+<!-- ---------------- Why and what ---------------- --><div class="grp" id="g-why-and-what"><h3>Why and what</h3>
+<article class="lesson" id="cp-i8-1" data-id="i8-1">
+<div class="lesson-head"><span class="cp-id">I8.1</span><h4>What CRI replaced, and what its removal actually broke</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Kubernetes has to start containers, but Kubernetes does not start containers. Something else
+does, and the kubelet asks it to. <strong>CRI — the Container Runtime Interface — is the shape of
+that asking.</strong> Knowing why it exists in that shape explains most of what the rest of this
+module makes you look at, and it settles an argument the internet got badly wrong in 2021.</p>
+
+<h5>The concept</h5>
+<p>Before CRI, the kubelet contained the code for talking to each container runtime. Not a plugin,
+not a library it loaded at runtime — code compiled into the kubelet binary, one branch per runtime.
+Docker support lived in the kubelet. rkt support lived in the kubelet. If you wanted your runtime
+supported, you opened a pull request against Kubernetes and waited.</p>
+
+<p>Three things follow from that arrangement, and all three are bad. Every runtime's bugs became
+kubelet bugs, because the buggy code shipped inside the kubelet. Every runtime's release cadence
+became Kubernetes' release cadence, because a fix could only reach users in a Kubernetes release.
+And the set of supported runtimes was decided by whoever had commit rights to one repository.</p>
+
+<p>CRI inverts all three. The kubelet ships <em>one</em> client — a generated gRPC stub — and anyone
+may write a server. A runtime bug is now the runtime's bug, fixed on the runtime's schedule, in a
+package you upgrade on its own. The kubelet does not know or care what is on the other end of the
+socket as long as it answers <code>runtime.v1</code>.</p>
+
+<p><strong>dockershim</strong> was the last survivor of the old arrangement: the in-tree adapter
+that let the kubelet drive the Docker daemon, kept alive for years after CRI existed because so many
+clusters used it. It was removed in <strong>Kubernetes v1.24</strong>, and it is worth being precise
+about what that did, because the coverage at the time was not.</p>
+
+<ul>
+<li><strong>Images built with Docker were never affected.</strong> A <code>docker build</code>
+produces an OCI image — I4's subject, byte-for-byte the same artifact any other builder produces.
+Nothing about running it changed.</li>
+<li><strong>Using Docker on your laptop was never affected.</strong> The removal was about what runs
+on a <em>node</em>.</li>
+<li><strong>What broke</strong> was nodes whose container runtime <em>was</em> the Docker daemon.
+The fix was almost always to point the kubelet at containerd — which the Docker daemon had been
+using underneath the whole time. In most cases the same containerd, already installed, already
+running, already holding the same containers.</li>
+</ul>
+
+<p>That last point is the one worth carrying: the migration was mostly a change of address, not a
+change of machinery. The containerd you took apart in I7 is what Docker was driving all along.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Confirm the shape on your own box. There is no Docker here, no kubelet, and yet a full CRI
+runtime is listening — because CRI support is a property of containerd, not of Kubernetes.
+<pre class="cmd">which docker dockerd || echo "no docker on this machine"
+sudo crictl version</pre>
+<pre class="out">no docker on this machine
+Version:  0.1.0
+RuntimeName:  <b>containerd</b>
+RuntimeVersion:  <b>v2.3.3</b>
+RuntimeApiVersion:  <b>v1</b></pre></li>
+<li>Note what those four lines are. <code>Version</code> is the version of the <em>response
+message</em>, not of anything you installed. <code>RuntimeName</code> and
+<code>RuntimeVersion</code> are the server's, and they move on containerd's release schedule.
+<code>RuntimeApiVersion</code> is the contract, and it has been <code>v1</code> since Kubernetes
+1.23 — which is precisely the property that made removing dockershim survivable.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain, in one paragraph and without hedging, what dockershim's removal cost a real
+cluster, and name two things people believed it broke that it did not.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Kubernetes deprecated Docker" is a sentence that means nothing.</strong> Kubernetes
+removed a shim that let the kubelet drive the Docker daemon. It did not deprecate the image format
+(that is OCI, I4), the build tool (that is I6), or the registry protocol (that is I5). If someone
+tells you their Dockerfiles stopped working in v1.24, that is not what happened.</li>
+<li><strong>The compatibility rule is asymmetric.</strong> An <em>older</em> kubelet against a newer
+runtime is generally fine — the runtime implements everything the kubelet knows how to ask for. A
+<em>newer</em> kubelet against an older runtime is the combination that bites, because the kubelet
+may send fields the runtime never implemented and will silently ignore. Upgrade the runtime first,
+then the kubelet.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The advanced track walks the same path from the top down: <a href="w1.html#cp-1-20">W1.20 —
+Understand CRI: kubelet → containerd → shim → runc</a> is the picture this module fills in from
+underneath, and <a href="w1.html#cp-1-19">W1.19 — the kubelet's syncLoop and its three pod
+sources</a> is the loop that issues every call you are about to make by hand.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the contract itself is a file, not a web page — search for
+<code>cri-api</code> on GitHub and read <code>pkg/apis/runtime/v1/api.proto</code>. For the
+dockershim history, kubernetes.io's "Don't Panic: Kubernetes and Docker" blog post is still the
+clearest statement of what did and did not change.</p>
+</article>
+<article class="lesson" id="cp-i8-2" data-id="i8-2">
+<div class="lesson-head"><span class="cp-id">I8.2</span><h4>A gRPC service, on a unix socket, defined by runtime.v1</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Nine words describe the whole interface: <strong>a gRPC service, on a unix socket, defined by
+<code>runtime.v1</code></strong>. Each clause is checkable on a running node in one command, and
+each one has an operational consequence. Learning to verify the sentence clause by clause is what
+turns "the runtime is broken" into a specific question with a specific answer.</p>
+
+<h5>The concept</h5>
+<p><strong>gRPC</strong> is a remote-procedure-call system: you define messages and methods in a
+<code>.proto</code> file, a code generator turns that into client and server stubs, and calls travel
+as <strong>protobuf</strong> — a compact binary encoding — over HTTP/2. The important word is
+<em>generated</em>. The contract is not prose that two teams interpret; it is a machine-readable
+file both sides compile against. That is why CRI has stayed stable for years while the kubelet and
+containerd changed underneath it, and it is why you will be able to write a working CRI server in
+I8.15 without reading a single page of documentation about wire formats.</p>
+
+<p>A <strong>unix socket</strong> rather than a TCP port means the trust boundary is filesystem
+permissions. There is no authentication in CRI — none, at any layer. The socket is
+<code>srw-rw----&nbsp;root:root</code>, and that file mode is the entire access control, exactly as
+I7.14 found for containerd's own API. Anyone who can write to it can run any container, as root,
+with any bind mount, on that node.</p>
+
+<p>And <code>runtime.v1</code> is the protobuf package name — the versioned namespace the messages
+live in. It has been <code>v1</code> throughout, and the compatibility promise attached to it is
+what makes a kubelet and a runtime upgradeable independently.</p>
+
+<p>One detail on this box is worth pausing over: <strong>crictl and <code>ctr</code> use the same
+socket</strong>. They are not two daemons; they are two <em>gRPC services</em> registered on one
+listener. <code>ctr</code> speaks containerd's own native API (I7's subject), <code>crictl</code>
+speaks CRI, and both arrive at <code>/run/containerd/containerd.sock</code>. That is why an I7
+finding — that the socket is root on the node — transfers here unchanged, and why "containerd is up"
+and "CRI is working" are two different claims.</p>
+
+<div class="specref">
+<p>The contract's own words for the services it defines:</p>
+<blockquote>// Runtime service defines the public APIs for remote container runtimes<br>
+service RuntimeService {</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find the socket the kubelet would use, and read its mode. This is the whole security model.
+<pre class="cmd">ls -l /run/containerd/containerd.sock
+cat /etc/crictl.yaml</pre>
+<pre class="out"><b>srw-rw---- 1 root root 0 Jul 30 12:55 /run/containerd/containerd.sock</b>
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10</pre>
+<p>The <code>timeout: 10</code> matters more than it looks — you will meet it in I8.4, where a cold
+node's first pod takes longer than ten seconds and the resulting error names nothing useful.</p></li>
+<li>Confirm the API version, and notice that client and server are different projects at different
+versions.
+<pre class="cmd">crictl --version
+sudo crictl version</pre>
+<pre class="out">crictl version <b>v1.36.0</b>
+Version:  0.1.0
+RuntimeName:  containerd
+RuntimeVersion:  <b>v2.3.3</b>
+RuntimeApiVersion:  <b>v1</b></pre>
+<p>crictl 1.36 is versioned with Kubernetes; containerd 2.3.3 is not. Neither knows the other's
+version number, and neither needs to.</p></li>
+<li>Prove the "one socket, two services" claim by asking the same file a question in containerd's
+native dialect and then in CRI's.
+<pre class="cmd">sudo ctr version | head -2
+sudo crictl version | head -2</pre>
+<pre class="out">Client:
+  Version:  v2.3.3
+Version:  0.1.0
+RuntimeName:  containerd</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state the contract in one sentence and point at the evidence for each clause: the socket
+file and its mode, the <code>v1</code> in <code>crictl version</code>, and the fact that the client
+and server carry unrelated version numbers.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Write access to the CRI socket is root on the node, with no audit trail.</strong> There
+is no user, no token, no per-call authorisation — the socket mode is all of it. A pod that mounts
+this socket has escaped, which is the same warning as <a href="i7.html#cp-i7-14">I7.14</a> and worth
+repeating because CRI adds a second path to the same door.</li>
+<li><strong>"containerd is running" does not mean "CRI is answering".</strong> The CRI plugin can
+fail to load while the daemon stays up — you will make exactly that happen in I8.14. Check the
+service, not the process.</li>
+<li><strong>crictl's default timeout is 10 s and it is a client-side timeout.</strong> When it
+fires, the server is still working; you get <code>DeadlineExceeded</code> and the server gets a
+cancelled context. The real cause is in the runtime's log, not in crictl's output.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The kubelet is told this endpoint with <code>--container-runtime-endpoint</code>, which you can
+see on any node's kubelet command line — <a href="w1.html#cp-1-2">W1.2 — how each component actually
+runs on the node</a> shows where to look. The unix-socket-as-trust-boundary idea was built by hand
+in <a href="b9.html#cp-b9-18">B9.18 — talk over a socket, and why containerd.sock is
+root</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> in the exam docs, search <em>container runtimes</em> for the
+endpoint flags and the socket paths for containerd and CRI-O. For the contract itself, the
+<code>cri-api</code> repository's <code>api.proto</code> is the only authoritative source.</p>
+</article>
+<article class="lesson" id="cp-i8-3" data-id="i8-3">
+<div class="lesson-head"><span class="cp-id">I8.3</span><h4>Two services, not one — and why images are separate</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>CRI is usually drawn as one box. It is two: <strong>RuntimeService</strong> and
+<strong>ImageService</strong>. That split is not bookkeeping — it halves your search space during an
+incident, because "images pull but nothing starts" and "containers start but images fail" are
+failures of two different services with two different dependency sets.</p>
+
+<h5>The concept</h5>
+<p><strong>RuntimeService</strong> owns everything about running things: sandboxes, containers,
+exec, attach, port-forward, logs, stats, and the runtime's own health. <strong>ImageService</strong>
+owns everything about images: pull, list, status, remove, and filesystem usage.</p>
+
+<p>They are separate because they can genuinely be provided by different components, and the kubelet
+supports exactly that — <code>--image-service-endpoint</code> is a distinct flag from the runtime
+endpoint. But the more useful reason is the line the split draws. <strong>The image half is the half
+that talks to the network.</strong> It needs registry credentials, it is where pull secrets and
+digest pinning and registry mirrors live (all of I5), and it is subject to rate limits and DNS and
+TLS. The runtime half never opens a socket to the internet. When a node misbehaves, deciding which
+half you are looking at eliminates the other half's entire failure surface.</p>
+
+<p>On containerd 2.x the split is not a diagram — it is two plugins with two IDs, plus a third that
+registers both on the gRPC listener. You can see all three in the plugin table, which after I7.8 you
+already know is the honest source of truth on a machine with no config file.</p>
+
+<div class="specref">
+<p>The proto defines them as two services in one file:</p>
+<blockquote>// ImageService defines the public APIs for managing images.<br>
+service ImageService {</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Find the two services as two plugins. The third row is the gRPC registration that puts both on
+the socket.
+<pre class="cmd">sudo ctr plugins ls | awk 'NR==1 || /cri/'</pre>
+<pre class="out">TYPE                                      ID                       PLATFORMS      STATUS
+<b>io.containerd.cri.v1                      images                   -              ok</b>
+<b>io.containerd.cri.v1                      runtime                  linux/amd64    ok</b>
+io.containerd.grpc.v1                     cri                      -              ok</pre>
+<p>Note the platform column: the image plugin is platform-agnostic (it can hold an arm64 image on an
+amd64 node — I4.8's subject), while the runtime plugin is bound to <code>linux/amd64</code>, because
+running is where the architecture finally has to match.</p></li>
+<li>Query each service from the client side.
+<pre class="cmd">sudo crictl ps        # RuntimeService.ListContainers
+sudo crictl images    # ImageService.ListImages</pre>
+<pre class="out">CONTAINER   IMAGE   CREATED   STATE   NAME   ATTEMPT   POD ID   POD   NAMESPACE
+
+IMAGE                      TAG      IMAGE ID        SIZE
+docker.io/library/alpine   3.21     2607caa980584   3.66MB
+registry.k8s.io/pause      3.10     873ed75102791   320kB
+registry.k8s.io/pause      3.10.2   4a83b15d3ecfe   321kB</pre></li>
+<li>Ask the ImageService for its own filesystem accounting — a call the RuntimeService has no
+equivalent of, and the one the kubelet uses to decide the node has <code>DiskPressure</code>.
+<pre class="cmd">sudo crictl imagefsinfo | jq -c '.status.imageFilesystems[]'</pre>
+<pre class="out">{"fsId":{"mountpoint":"<b>/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs</b>"},
+ "inodesUsed":{"value":"525"},"timestamp":"1785399743051488965","usedBytes":{"value":"9986048"}}</pre>
+<p>The mountpoint is the <em>snapshotter</em> directory, not the content store. I7.12 measured why
+that is the number that matters: unpacked layers ran about three times the compressed size, so the
+snapshotter is what fills a node, and <code>crictl images</code> systematically understates it.</p></li>
+<li>Ask the runtime for its health. This is <code>Status()</code>, the call the kubelet polls to
+decide whether the node can accept pods at all.
+<pre class="cmd">sudo crictl info | jq -c '.status.conditions[]'</pre>
+<pre class="out">{"message":"","reason":"","status":true,"type":"<b>RuntimeReady</b>"}
+{"message":"","reason":"","status":true,"type":"<b>NetworkReady</b>"}
+{"message":"","reason":"","status":true,"type":"ContainerdHasNoDeprecationWarnings"}</pre>
+<p>Two of those three are in the spec; the third is containerd's own. <code>NetworkReady</code> is
+the one you will break deliberately in I8.7, and it is the condition behind a large share of real
+<code>NotReady</code> nodes.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a symptom — "every pod on this node is stuck pulling" versus "images are all present but
+nothing starts" — you can name which of the two services to investigate and, for the image half,
+list the external dependencies that the runtime half does not have.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>crictl imagefsinfo</code> reports the snapshotter, not the images.</strong> A node
+whose <code>crictl images</code> total looks modest can still be out of disk, because that total is
+compressed sizes and the snapshotter holds them unpacked. Believe <code>imagefsinfo</code> and
+<code>df</code>, not the image list.</li>
+<li><strong>The two endpoints usually point at the same socket, so people forget they are
+separable.</strong> They still fail separately: a registry outage takes the ImageService down while
+the RuntimeService keeps every running container alive, which is exactly why existing pods survive a
+registry outage and new ones do not.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The image half is where <a href="w6.html#cp-6-17">W6.17 — image failures: ErrImagePull,
+ImagePullBackOff, and the three root causes</a> lives; the runtime half is
+<a href="w6.html#cp-6-11">W6.11 — the kubelet classics</a>. The snapshotter-versus-content-store
+distinction behind <code>imagefsinfo</code> was measured in
+<a href="i7.html#cp-i7-12">I7.12 — the third store, and the only one with no upstream</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>node-pressure eviction</em> to see
+how <code>imagefsinfo</code> feeds <code>DiskPressure</code>, and for <em>images</em> to find the
+pull-policy and pull-secret behaviour that lives entirely on the ImageService side.</p>
+</article>
+</div><!-- /g-why-and-what -->
+
+
+
+
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i7.html">← I7</a><a href="../intermediate.html#i9">I9 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
