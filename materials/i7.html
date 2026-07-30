@@ -777,6 +777,411 @@ cat: /etc/containerd/config.toml: <b>No such file or directory</b></pre></li>
 
 <p class="docs-links"><b>Docs:</b> containerd's <code>PLUGINS.md</code> for the registry model and <code>docs/cri/config.md</code> for the CRI keys. Then <code>containerd config --help</code> — note <code>default</code> versus <code>dump</code>, which answer different questions.</p>
 </article>
+<article class="lesson" id="cp-i7-9" data-id="i7-9">
+<div class="lesson-head"><span class="cp-id">I7.9</span><h4>The content store, which you already built once</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>You built this store already. In <a href="i5.html#cp-i5-14">I5.14</a> <code>pull.py</code> saved each downloaded blob to a file named after its digest, and you verified the download by hashing the file and comparing. containerd's content store is that same idea with an API bolted on and nothing else added — so the first time you look at it, you should recognise it. What you gain here is the ability to answer "are the bytes actually on this node?" without trusting any tool's opinion.</p>
+
+<h5>The concept</h5>
+<p>The content store lives at <code>/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/</code>, and it holds every blob containerd knows about — manifests, indexes, configs and layer tars, all mixed together, all named by their digest with no <code>sha256:</code> prefix and no extension. It is <strong>content-addressed</strong>: the name is derived from the bytes, so writing the same blob twice is a no-op and corruption is detectable with one command.</p>
+<p>Look at what is <em>not</em> in that path: there is no namespace in it. This is the physical fact behind <a href="#cp-i7-5">I7.5</a>'s measurement — the bytes are shared by the whole daemon, while which namespace may <em>see</em> a given blob is recorded in the metadata store (<a href="#cp-i7-12">I7.12</a>).</p>
+<p>The files are mode <code>0444</code>. Nothing, including containerd, rewrites a blob in place; a blob is written once under a temporary ingest name and moved into position when its hash has been verified. That is why the warehouse analogy holds — you never modify a part, you only stock a new part number.</p>
+<p>And that leads to the result worth doing by hand: <strong>two interfaces, one store, and they can disagree.</strong> <code>ls</code> shows you every blob physically present. <code>ctr content ls</code> shows you every blob <em>your namespace has a reference to</em>. So a file can sit in the directory, hash correctly, and still make <code>ctr content get</code> answer <code>not found</code> — because you asked the index, and the index is per-namespace.</p>
+
+<div class="specref">
+<p>The image spec defines the digest as the identity of the content, which is the property the whole store rests on:</p>
+<blockquote>The digest property of a Descriptor acts as a content identifier, enabling content addressability. It uniquely identifies content by taking a collision-resistant hash of the bytes.</blockquote>
+<cite>OCI Image Specification v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md">descriptor.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Walk into the store and look at what is there.
+<pre class="cmd">C=/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256
+sudo ls -l $C | head -3
+echo "total blobs: $(sudo ls $C | wc -l)"</pre>
+<pre class="out">-r--r--r-- 1 root root      4506 Jul 30 09:40 001018ffa2ebcefd1fa45052e6530ce9a94a783e9ce741932143b4fae5ebfa19
+-r--r--r-- 1 root root       856 Jul 30 09:41 00156ab3e4201cf940aee7c18cd0f4ee6bb1fa25bef2e8c59f4737d0010c2388
+-r--r--r-- 1 root root       241 Jul 30 13:06 00a8244824574ba1053b28fa1b747ab02a5ea09e73ed3a014eba4e748825dfe3
+total blobs: <b>472</b></pre>
+<p>Note the mode: <code>-r--r--r--</code>. Read-only, to everyone, including root's better judgement.</p></li>
+
+<li>Prove the filename is the hash. This is the integrity check, available on any node, with no tooling.
+<pre class="cmd">D=$(sudo ctr images ls | grep 'library/alpine:3.21 ' | awk '{print $3}')
+echo "digest: $D"
+sudo sha256sum $C/${D#sha256:}</pre>
+<pre class="out">digest: sha256:<b>48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>
+<b>48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</b>  /var/lib/.../blobs/sha256/48b0309ca019d8...</pre></li>
+
+<li>Now the same blob through the API. Two interfaces, one store.
+<pre class="cmd">sudo ctr content get $D | head -c 90; echo</pre>
+<pre class="out">{"manifests":[{"annotations":{"com.docker.official-images.bashbrew.arch":"amd64","org.open</pre></li>
+
+<li>Now make them disagree. Take the <em>first</em> file in the directory — one this namespace has no reference to — and ask the API for it.
+<pre class="cmd">F=$(sudo ls $C | head -1)
+sudo sha256sum $C/$F | cut -c1-64
+sudo ctr content get sha256:$F</pre>
+<pre class="out">001018ffa2ebcefd1fa45052e6530ce9a94a783e9ce741932143b4fae5ebfa19
+ctr: content digest sha256:001018ffa2eb...: <b>not found</b></pre>
+<p>The bytes are on the disk. The hash is correct. And the API says the blob does not exist — because it belongs to another namespace (I6's <code>buildkit</code>, in this case).</p></li>
+
+<li>Confirm the path has no namespace in it.
+<pre class="cmd">echo "$C" | grep -o 'default\|k8s.io' || echo "no namespace in the path"</pre>
+<pre class="out">no namespace in the path</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a digest from anywhere — a manifest, an error message, a registry — you can say in one command whether that blob is physically present on this node, and separately whether your namespace can see it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ctr content ls</code> is not a directory listing.</strong> It is a namespaced index, and 183 versus 472 is a normal gap on a box that has built images. Never conclude "the layer is missing" from <code>ctr content ls</code> alone; check the file.</li>
+<li><strong>Do not delete files from this directory by hand.</strong> The metadata store still references them, and you have manufactured the exact fault in <a href="#cp-i7-18">I7.18</a> — where the symptom is a pull that succeeds and a container that will not start. Use the collector (<a href="#cp-i7-13">I7.13</a>).</li>
+<li><strong>The digest here has no algorithm prefix</strong>, but everything else on the track uses <code>sha256:</code>. Strip it going in, add it coming out — <code>${D#sha256:}</code>.</li>
+<li><strong>Layer blobs are compressed.</strong> <code>ctr content get</code> on a layer digest sends a gzip stream to your terminal. Pipe it to <code>tar tz</code> if you want to see what is inside, exactly as in <a href="i4.html#cp-i4-9">I4.9</a>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>When <a href="w6.html#cp-6-17">W6.17</a> makes you separate <code>ErrImagePull</code> from <code>ImagePullBackOff</code> from a container that starts and immediately dies, this directory is where "did the bytes arrive?" is answered definitively. On a node with a full <code>/var</code>, it is also usually the second-largest thing on the disk — the largest being the snapshotter you meet next.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>content-flow.md</code> for the ingest path and why blobs are written under a temporary name first; the OCI image spec's <code>descriptor.md</code> for digest semantics. Then <code>sha256sum(1)</code>, which is the whole verification story.</p>
+</article>
+<article class="lesson" id="cp-i7-10" data-id="i7-10">
+<div class="lesson-head"><span class="cp-id">I7.10</span><h4>From tar files to something you can mount</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>The content store holds tar files. A container needs a mounted filesystem. Something has to turn one into the other, and that something — the snapshotter — is both the largest consumer of disk on a container host and the piece people understand least. It is also the exact place where I4's chain IDs and B5's overlay stack turn out to be the same subject, which is a satisfying moment worth having deliberately.</p>
+
+<h5>The concept</h5>
+<p>A <strong>snapshotter</strong> takes the layer tars from the content store and produces something you can mount. In the room-prep analogy: the flat-pack kit arrives as boxes, and the prep crew stacks B5's transparent sheets into a room you can actually walk into.</p>
+<p>Every snapshot has a <strong>key</strong>, a <strong>parent</strong> and a <strong>kind</strong>. The parents chain upward to a root, which is exactly the layer ordering from I4 — and here is the join: <strong>the key of a committed snapshot is I4's chain ID</strong>. In <a href="i4.html#cp-i4-12">I4.12</a> you computed <code>sha256("&lt;prev&gt; &lt;diff_id&gt;")</code> by hand and found it reproduced containerd's snapshot key. This is that key, in the wild.</p>
+<p>For a single-layer image the recursion has no work to do, so the chain ID <em>is</em> the first <code>diff_id</code> — which makes <code>alpine:3.21</code> the cleanest possible demonstration: the value in the image config's <code>rootfs.diff_ids[0]</code> and the value in the snapshot's <code>PARENT</code> column are character-for-character identical.</p>
+<p>Physically, each snapshot is a numbered directory under <code>/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/&lt;n&gt;/</code>, containing an <code>fs</code> directory (the content) and, for active snapshots, a <code>work</code> directory (overlayfs's scratch space, exactly as in <a href="b5.html#cp-b5-13">B5.13</a>). The number is a local counter with no relationship to the digest — the mapping from chain ID to directory number lives in the snapshotter's own small database.</p>
+<p>Two numbers from this box are worth internalising, because they invert most people's intuition: the content store is <strong>691 MB</strong> and the snapshotter is <strong>2.2 GB</strong>. The unpacked form is roughly three times the compressed form, and it is the snapshotter — not the images you can list — that fills a node's disk.</p>
+
+<div class="specref">
+<p>Snapshots are containerd's own construction, not an OCI concept. What the image spec does guarantee is the ordering the chain depends on:</p>
+<blockquote>An array of layer content hashes (<code>DiffIDs</code>), in order from first to last.</blockquote>
+<p>and that layers are combined rather than merely unpacked:</p>
+<blockquote>Layer Changesets of media type <code>application/vnd.oci.image.layer.v1.tar</code> are <em>applied</em>, rather than simply extracted as tar archives.</blockquote>
+<p>Chain IDs are a containerd construction on top of exactly that ordering — nothing in the OCI specifications mentions them, which is why you had to derive one by hand in I4 rather than look it up.</p>
+<cite>OCI Image Specification v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md">config.md</a>, <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md">layer.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>List the snapshots and read the three columns.
+<pre class="cmd">sudo ctr snapshot ls | head -4
+echo "total: $(sudo ctr snapshot ls | tail -n +2 | wc -l)"</pre>
+<pre class="out">KEY                                                                  PARENT                                                               KIND
+demo                                                                 sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb   <b>Active</b>
+sha256:01d51a501d9d104bad1db0c7abf53e6a53ca654aefc302a9228abbf98b8dbbf5  sha256:5a7e76502fb437817286d06ceed8defbd1f491b90a35c6df967eaf7134c0905b   <b>Committed</b>
+total: <b>63</b></pre>
+<p>The container's snapshot is keyed by its <em>name</em>; every other key is a digest.</p></li>
+
+<li>Look at the tree. Shared parents are shared layers — this is deduplication made visible.
+<pre class="cmd">sudo ctr snapshot tree | head -8</pre>
+<pre class="out"> sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+  \_ <b>demo</b>
+  \_ sha256:21b466d472bb93c8cdfd149f0fd4785a14a148aa4ce110dfa297a90e2fa55792
+    \_ sha256:591f648dcf10426cb229a213766db1dbd19c6f16ed1d3ea44903492a512f0035
+  \_ sha256:22e1cc0e73f09dad27510cc30e673a3c719283d8d0cd264d567c9a6abdd683d0
+    \_ sha256:41faab0c045b953269f2df9a674c12744fe1947095b83060e37c88aa01a93beb</pre>
+<p>One alpine base with many children — every image I6 built from alpine hangs off this single node.</p></li>
+
+<li>Now the join to I4. Walk index → manifest → config and print the <code>diff_ids</code>.
+<pre class="cmd">D=$(sudo ctr images ls | grep 'library/alpine:3.21 ' | awk '{print $3}')
+M=$(sudo ctr content get $D | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest')
+CFG=$(sudo ctr content get $M | jq -r .config.digest)
+sudo ctr content get $CFG | jq -r '.rootfs.diff_ids[]'</pre>
+<pre class="out">sha256:<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b></pre></li>
+
+<li>Compare against the snapshot's parent key.
+<pre class="cmd">sudo ctr snapshot ls | grep '^demo ' | awk '{print $2}'</pre>
+<pre class="out">sha256:<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b></pre>
+<p>Identical. One layer, so the chain-ID recursion terminates immediately at the <code>diff_id</code>.</p></li>
+
+<li>Find the physical directories, and weigh the two stores against each other.
+<pre class="cmd">sudo ls /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/
+echo "snapshot dirs: $(sudo ls /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/ | wc -l)"
+sudo du -sh /var/lib/containerd/io.containerd.content.v1.content \
+            /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs</pre>
+<pre class="out">metadata.db
+snapshots
+snapshot dirs: <b>164</b>
+<b>691M</b>	/var/lib/containerd/io.containerd.content.v1.content
+<b>2.2G</b>	/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs</pre>
+<p>Note that the snapshotter keeps a <code>metadata.db</code> of its own, separate from the daemon's — the chain-ID-to-directory-number mapping lives in it.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can take an image name, derive its chain ID from the config's <code>diff_ids</code>, find the matching snapshot key, and point at the directory on disk where those files physically are.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Snapshot directory numbers mean nothing.</strong> They are a local counter. The same image on two nodes gets different numbers, and the number is not derivable from any digest — you must look it up, which is what <code>ctr snapshot mounts</code> in <a href="#cp-i7-11">I7.11</a> is for.</li>
+<li><strong>Chain ID is not layer digest and not <code>diff_id</code>.</strong> Three different hashes describe one layer: the <code>digest</code> (compressed, what the registry stores), the <code>diff_id</code> (uncompressed, what the config lists), and the chain ID (this layer plus all its ancestors). Only the single-layer case makes any two of them equal — which is why the neat match above is a demonstration, not a rule.</li>
+<li><strong>Chain IDs are not in the OCI spec.</strong> Do not go looking; they are containerd's construction, and another runtime is free to key its snapshots differently.</li>
+<li><strong>Counting images tells you nothing about disk.</strong> The snapshotter is the big consumer, its contents are unpacked, and shared layers mean the sum of image sizes wildly overstates the total. Use <code>du</code> on the two directories.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>DiskPressure</code> in <a href="w6.html#cp-6-12">W6.12's node Conditions</a> is almost always this directory, and the kubelet's image garbage collection targets it — which is why "I deleted some images and the node is still under pressure" is such a common report. Removing the image name does not remove the snapshot; see <a href="#cp-i7-13">I7.13</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>snapshotters/README.md</code> for the snapshotter interface and the active/committed model; the OCI image spec's <code>layer.md</code> for layer ordering. Then re-read <a href="b5.html#cp-b5-13">B5.13</a> — you built this with <code>mount -t overlay</code> by hand.</p>
+</article>
+<article class="lesson" id="cp-i7-11" data-id="i7-11">
+<div class="lesson-head"><span class="cp-id">I7.11</span><h4>Active and committed, and where your writes physically go</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>"Where does a container's writable layer physically live?" is a question with a real answer, and being able to walk to that directory on the host — and read a file the container wrote a second ago — settles a lot of arguments about how containers work. It is also, immediately, an operational capability: you can retrieve a file from a container that has no shell, no <code>tar</code>, and is too broken to exec into.</p>
+
+<h5>The concept</h5>
+<p>Snapshots come in two kinds, and the distinction is the whole design:</p>
+<ul>
+<li><strong>Committed</strong> — finished, immutable, shareable. Every image layer is a committed snapshot, which is why fifty containers from one image cost one copy of it.</li>
+<li><strong>Active</strong> — a scratch layer being written to. Every running container has exactly one, keyed by the container's name rather than a digest.</li>
+</ul>
+<p>Map that onto B5 and there is nothing new to learn: committed snapshots are <code>lowerdir</code>, the active snapshot is <code>upperdir</code>, and the container's root filesystem is the overlay mount of the two. <code>ctr snapshot mounts</code> will print you the exact <code>mount</code> command, and it is the same command you typed by hand in <a href="b5.html#cp-b5-13">B5.13</a>.</p>
+<p>On this box the counts are <strong>2 active, 56 committed</strong> — two running containers, and every image layer they and everything else were built from.</p>
+<p>The consequence people find surprising: a file written inside a container appears immediately in the active snapshot's <code>fs</code> directory on the host, as an ordinary file, readable with <code>cat</code>. There is no copy step and no export. The container was never writing anywhere else — <code>upperdir</code> <em>is</em> where writes land, and the container's view is just that directory stacked on top of read-only ones.</p>
+<p>Equally: the committed parent never changes. Write to a file that exists in a lower layer and overlayfs copies it up first (<a href="b5.html#cp-b5-14">B5.14</a>); the lower layer's copy is untouched, which is what makes it safe to share.</p>
+
+<div class="specref">
+<p>The snapshotter interface names the two kinds and the transition between them explicitly:</p>
+<blockquote>A snapshot represents a filesystem state. Every snapshot has a parent, where the empty parent is represented by the empty string. A diff can be taken between a parent and its snapshot to generate a classic layer.</blockquote>
+<cite>containerd snapshotter interface — <a href="https://github.com/containerd/containerd/blob/main/core/snapshots/snapshotter.go">core/snapshots/snapshotter.go</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Count the two kinds.
+<pre class="cmd">sudo ctr snapshot ls | awk 'NR>1{print $3}' | sort | uniq -c</pre>
+<pre class="out">      2 <b>Active</b>
+     56 <b>Committed</b></pre></li>
+
+<li>Ask for the running container's mount string. This is the lesson in one command.
+<pre class="cmd">sudo ctr snapshot mounts /tmp/x demo</pre>
+<pre class="out">mount -t overlay overlay /tmp/x -o \
+  workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<b>343</b>/work,\
+  <b>upperdir</b>=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<b>343</b>/fs,\
+  <b>lowerdir</b>=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<b>5</b>/fs,\
+  index=off</pre>
+<p>Snapshot 343 is the container's writable layer; snapshot 5 is alpine's single committed layer. <code>ctr</code> prints the command rather than running it — the path you pass is where it <em>would</em> mount.</p></li>
+
+<li>Look inside the writable layer before touching anything.
+<pre class="cmd">UP=$(sudo ctr snapshot mounts /tmp/x demo | tr ',' '\n' | grep '^upperdir=' | cut -d= -f2)
+echo "upperdir = $UP"
+sudo ls -A $UP</pre>
+<pre class="out">upperdir = /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/343/fs</pre>
+<p>Empty. The container has written nothing yet.</p></li>
+
+<li>Write a file <em>inside</em> the container, then look again from the host.
+<pre class="cmd">sudo ctr task exec --exec-id e1 demo sh -c 'echo hello-from-i7 &gt; /marker.txt'
+sudo ls -A $UP
+sudo cat $UP/marker.txt</pre>
+<pre class="out">marker.txt
+<b>hello-from-i7</b></pre>
+<p>No export, no copy, no container tooling — just a file on the host, written a moment ago from inside a namespace.</p></li>
+
+<li>Confirm the committed parent was not touched.
+<pre class="cmd">LOW=$(sudo ctr snapshot mounts /tmp/x demo | tr ',' '\n' | grep '^lowerdir=' | cut -d= -f2)
+sudo ls $LOW/marker.txt</pre>
+<pre class="out">ls: cannot access '/var/lib/.../snapshots/5/fs/marker.txt': <b>No such file or directory</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can locate any running container's writable layer from its name alone, read a file out of it from the host, and explain why the same base layer can back a hundred containers safely.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The active snapshot is deleted with the container.</strong> Everything in <code>upperdir</code> goes when the container record goes — which is the whole point of a container being ephemeral, and the reason logs and data belong on a volume. Retrieve before you delete.</li>
+<li><strong>Reading is safe; writing is not.</strong> Adding a file to <code>upperdir</code> from the host while the container runs produces undefined behaviour — overlayfs caches, and the kernel documentation is explicit that lower and upper directories must not be modified underneath a live mount.</li>
+<li><strong>A deleted file is not absent from <code>upperdir</code>.</strong> It is a character device with major/minor 0/0 — the whiteout from <a href="i4.html#cp-i4-11">I4.11</a>. If you are hunting for "what did this container change", <code>ls -l</code> and look for <code>c</code> in the mode.</li>
+<li><strong><code>ctr snapshot mounts</code> does not mount anything.</strong> It prints a command. The path argument is a placeholder, so passing a real directory does not populate it — a genuine surprise the first time.</li>
+<li><strong>Multi-layer images have several <code>lowerdir</code> entries</strong>, colon-separated and in reverse order — nearest layer first. alpine's single layer hides that; a <code>python:3.13</code> container will show seven.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism behind the "get the file out of a broken pod" move that <a href="w6.html#cp-6-3">W6.3</a> reaches for <code>kubectl debug</code> to solve — on a node you can ssh to, the file is simply sitting in the pod container's <code>upperdir</code>. It is also why <code>emptyDir</code> and the writable layer have such different durability stories, and why <a href="w6.html#cp-6-12">W6.12's DiskPressure</a> can be caused by one pod writing logs to its own root filesystem.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the kernel's <code>Documentation/filesystems/overlayfs.rst</code> for <code>upperdir</code>/<code>lowerdir</code>/<code>workdir</code> and the warning about modifying them underneath a mount; containerd's snapshotter interface for active versus committed. Then <a href="b5.html#cp-b5-13">B5.13</a>, which is the same mount by hand.</p>
+</article>
+<article class="lesson" id="cp-i7-12" data-id="i7-12">
+<div class="lesson-head"><span class="cp-id">I7.12</span><h4>The third store, and the only one with no upstream</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>There is a third store, it is one file, it is tiny, and it is the only one of the three that cannot be rebuilt. Knowing which of your stores are derivable and which is authoritative is what turns "the node's container state is corrupt" from a panic into a decision — and it is a question a good interviewer will ask you.</p>
+
+<h5>The concept</h5>
+<p>containerd's <strong>metadata store</strong> is a single <a href="https://github.com/etcd-io/bbolt">bbolt</a> file at <code>/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db</code>. bbolt is an embedded key/value database — the same one <code>etcd</code> is built on, which you met in <a href="w1.html#cp-1-10">W1.10</a>. One file, memory-mapped, with buckets nested by namespace.</p>
+<p>It holds everything that is a <em>name</em> or a <em>relationship</em> rather than a byte:</p>
+<ul>
+<li>image names and the digest each points at</li>
+<li>container records — spec, snapshot key, labels</li>
+<li>which namespace may see which blob and which snapshot</li>
+<li>leases and their expiry</li>
+</ul>
+<p>On this box it is <strong>4.4 MB</strong> against the content store's 691 MB and the snapshotter's 2.2 GB — roughly a thousandth of the data, and by far the most valuable thousandth.</p>
+<p>Now the exam-style question the checkpoint sets, which is worth answering carefully because the naive answer is wrong in an interesting way:</p>
+<table class="langpair">
+<thead><tr><th>Store</th><th>Rebuildable?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>content</td><td><strong>Yes</strong>, from the registry</td><td>Every blob is content-addressed and re-fetchable by digest. Costs bandwidth, loses nothing.</td></tr>
+<tr><td>snapshotter</td><td><strong>Yes</strong>, from the content store</td><td>Committed snapshots are unpacked layer tars — pure derivation. <em>Active</em> snapshots are not: they are the containers' writable layers, and those are gone.</td></tr>
+<tr><td>metadata</td><td><strong>No</strong></td><td>The mapping from names to digests, and the container records themselves, exist nowhere else. There is no upstream to re-fetch a container record from.</td></tr>
+</tbody>
+</table>
+<p>So the answer is "content and snapshots are caches; the metadata store is the source of truth" — with the sharp edge that a running container's writable layer is also unrecoverable, which is a second, independent reason not to treat any of this as disposable.</p>
+<p>One more file to notice: the snapshotter keeps <strong>its own</strong> small <code>metadata.db</code> at <code>io.containerd.snapshotter.v1.overlayfs/metadata.db</code> — 512 KB here — mapping chain IDs to those numbered directories from <a href="#cp-i7-10">I7.10</a>. Two bbolt databases, different jobs, and losing either produces a different mess.</p>
+
+<div class="specref">
+<p>containerd's own garbage-collection documentation states the daemon's posture toward this data plainly, and it is stricter than most people expect:</p>
+<blockquote>The client is responsible for ensuring that all resources which are created are either used or held by a lease at all times, else they will be considered eligible for removal.</blockquote>
+<blockquote>The <code>containerd</code> daemon has strict resource management and will garbage collect any unused resource.</blockquote>
+<cite>containerd Garbage Collection — <a href="https://github.com/containerd/containerd/blob/main/docs/garbage-collection.md">docs/garbage-collection.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Weigh all three stores against each other.
+<pre class="cmd">sudo du -sh /var/lib/containerd/io.containerd.content.v1.content \
+            /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs \
+            /var/lib/containerd/io.containerd.metadata.v1.bolt</pre>
+<pre class="out"><b>691M</b>	/var/lib/containerd/io.containerd.content.v1.content
+<b>2.2G</b>	/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+<b>4.4M</b>	/var/lib/containerd/io.containerd.metadata.v1.bolt</pre></li>
+
+<li>Look at the metadata store. It is one file.
+<pre class="cmd">sudo ls -l /var/lib/containerd/io.containerd.metadata.v1.bolt/
+sudo file /var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db</pre>
+<pre class="out">-rw-r--r-- 1 root root <b>8388608</b> Jul 30 13:12 meta.db
+.../meta.db: <b>data</b></pre>
+<p>8 MiB allocated, 4.4 MB in use — bbolt grows in pages. <code>file</code> has no idea what it is looking at.</p></li>
+
+<li>Prove that names live in it, without a bbolt tool.
+<pre class="cmd">sudo strings /var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db | grep -c alpine
+sudo strings /var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db | grep -m3 'docker.io/library/alpine'</pre>
+<pre class="out"><b>118</b>
+docker.io/library/alpine-derived:1
+docker.io/library/alpine:3.21
+docker.io/library/alpine:3.22</pre>
+<p>Image names, in plain text, in the only file that knows them.</p></li>
+
+<li>Find the snapshotter's separate database.
+<pre class="cmd">sudo ls -l /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/metadata.db</pre>
+<pre class="out">-rw------- 1 root root <b>524288</b> Jul 30 13:12 /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/metadata.db</pre></li>
+
+<li>Answer the question for yourself before reading the table again: if you could back up exactly one of these three directories, which would it be?</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name all three stores, state their relative sizes, and say without hesitating which one has no upstream to be rebuilt from — and why a running container's writable layer is a second thing with no upstream.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Never copy <code>meta.db</code> while containerd is running.</strong> It is memory-mapped and written in place; a <code>cp</code> of a live bbolt file gives you a torn database. Stop the daemon, or do not bother.</li>
+<li><strong>Deleting <code>meta.db</code> does not give you a clean node.</strong> It gives you a node whose content store and snapshotter are full of data nothing references — and since containerd cannot see them, its collector cannot free them either. You have made a leak, not a reset.</li>
+<li><strong>"It is only 4 MB" is exactly backwards.</strong> Small does not mean unimportant; it means dense. Every image name and container record on the node is in there.</li>
+<li><strong><code>strings</code> is a demonstration, not a tool.</strong> Do not build anything on grepping a bbolt file. If you genuinely need to read it, stop containerd and use a bbolt CLI.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the same storage engine as etcd's, and the same reasoning applies at both layers: in <a href="w1.html#cp-1-10">W1.10</a> you learned etcd's MVCC, compaction and defrag because etcd is the cluster's only irreplaceable store. <code>meta.db</code> is the <em>node's</em> irreplaceable store — and unlike etcd, nobody backs it up, which is fine precisely because a node is meant to be replaceable. That equivalence is worth holding onto: it is why draining and rebuilding a node is a routine operation and restoring etcd is not.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>content-flow.md</code> for how the three stores relate; the bbolt README for the single-file, single-writer model. Then <code>du(1)</code> — the only tool needed to answer "what is filling this node".</p>
+</article>
+<article class="lesson" id="cp-i7-13" data-id="i7-13">
+<div class="lesson-head"><span class="cp-id">I7.13</span><h4>The collector that deletes what nothing references</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>containerd deletes things you did not ask it to delete. That sounds alarming and is actually the correct design, but it produces a genuinely confusing failure the first time you meet it: a blob you fetched a minute ago is simply gone, with no error and no log line you were watching. Understanding the collector — and the one mechanism that holds it off — is what makes the runtime's disk behaviour predictable.</p>
+
+<h5>The concept</h5>
+<p>containerd's rule is unusually strict: <strong>anything not referenced is eligible for deletion, immediately.</strong> There is no grace period by default and no "recently used" heuristic. If nothing points at a blob or a snapshot, it goes.</p>
+<p>References come from two places. Some are structural — a container references its snapshot, an image references its target digest. Others are the <code>containerd.io/gc.ref.content.*</code> labels you already saw in <a href="#cp-i7-7">I7.7</a>, which the <em>client</em> writes because only the client knows that a manifest points at a config and some layers. The daemon just follows labels.</p>
+<p>A <strong>lease</strong> is the escape hatch: a resource that references other resources, so they cannot be collected while it lives. It exists for the window between "I have downloaded this blob" and "I have attached it to something permanent" — during which the blob is, by the rule above, garbage. <code>ctr leases create</code> makes one, and it carries a <code>containerd.io/gc.expire</code> label set 24 hours out, so a client that dies mid-operation cannot leak forever.</p>
+<p>How fast is "immediately"? The collector is a plugin with knobs, and the defaults explain the behaviour exactly: <code>deletion_threshold = 0</code> (any deletion schedules a collection), <code>mutation_threshold = 100</code> (or every hundred writes), <code>schedule_delay = '0s'</code>. Measured on this box, an unreferenced blob was gone in <strong>under five seconds</strong>.</p>
+<p><strong>Two corrections to the usual demonstration</strong>, both found by running it. First, <code>ctr content fetch</code> does not leave you with an unreferenced blob — it <em>creates an image record</em>, so the blob is referenced and perfectly safe. To watch a collection you must delete the name afterwards. Second, <code>ctr leases ls</code> immediately after a fetch shows <strong>nothing</strong>: the temporary lease the operation used was released when it completed, exactly as designed. You cannot catch it by looking afterwards.</p>
+<p>And an honest limitation: <code>ctr leases</code> offers only <code>list</code>, <code>create</code> and <code>delete</code>. There is no flag to perform a fetch <em>under</em> a lease you made — that requires the client library, where <code>client.WithLease(ctx)</code> puts the lease on the context and every call made with it is covered. This is a good early example of the smart-client model from <a href="#cp-i7-8">I7.8</a>: the interesting behaviour lives in the client, and <code>ctr</code> is only one client.</p>
+
+<div class="specref">
+<p>The documentation defines a lease as precisely the "I am not finished with this yet" signal:</p>
+<blockquote>Leases are needed to inform the <code>containerd</code> daemon that a resource may be used in the future after the client completes an operation, even though it currently is not seen as utilized.</blockquote>
+<p>and confirms the 24-hour default you will see in the <code>gc.expire</code> label:</p>
+<blockquote>This will create a lease which will defer its own deletion and have a default expiry of 24 hours (in case the process dies before defer).</blockquote>
+<cite>containerd Garbage Collection — <a href="https://github.com/containerd/containerd/blob/main/docs/garbage-collection.md">docs/garbage-collection.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Fetch a blob and check for the lease the tracker says you will find.
+<pre class="cmd">sudo ctr content fetch docker.io/library/busybox:1.36
+sudo ctr leases ls</pre>
+<pre class="out">elapsed: 8.9 s    total:  2.0 Mi (232.9 KiB/s)
+ID CREATED AT LABELS</pre>
+<p>Empty. The lease existed during the fetch and was released when it finished.</p></li>
+
+<li>Notice what the fetch actually left behind — a referenced image, not a loose blob.
+<pre class="cmd">sudo ctr images ls | grep busybox
+sudo ctr content ls -q | wc -l</pre>
+<pre class="out">docker.io/library/busybox:1.36   application/vnd.oci.image.index.v1+json   sha256:73aaf090f3d8...   2.1 MiB
+<b>219</b></pre></li>
+
+<li>Now make the blobs unreferenced by deleting the name, and poll.
+<pre class="cmd">sudo ctr images rm docker.io/library/busybox:1.36
+for i in 1 2 3; do sleep 5; echo "  t+$((i*5))s: $(sudo ctr content ls -q | wc -l) blobs"; done</pre>
+<pre class="out">docker.io/library/busybox:1.36
+  t+5s: <b>183</b> blobs
+  t+10s: 183 blobs
+  t+15s: 183 blobs</pre>
+<p>Thirty-six blobs collected inside the first five seconds.</p></li>
+
+<li>Confirm the bytes left the disk too, not just the index.
+<pre class="cmd">sudo ls /var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/ | grep -c 73aaf090f3d8</pre>
+<pre class="out"><b>0</b></pre></li>
+
+<li>Create a lease deliberately and read the expiry containerd gives you.
+<pre class="cmd">sudo ctr leases create
+sudo ctr leases ls</pre>
+<pre class="out">611641239-Pyvv
+ID             CREATED AT                  LABELS
+611641239-Pyvv 2026-07-30T13:13:35+06:00   <b>containerd.io/gc.expire=2026-07-31T13:13:35+06:00</b></pre>
+<p>Exactly 24 hours, as documented. Delete it with <code>ctr leases rm 611641239-Pyvv</code> when you are done.</p></li>
+
+<li>See where the collector's behaviour is configured.
+<pre class="cmd">sudo containerd config default | grep -A6 "gc.v1.scheduler"</pre>
+<pre class="out">  [plugins.'io.containerd.gc.v1.scheduler']
+    pause_threshold = 0.02
+    <b>deletion_threshold = 0</b>
+    <b>mutation_threshold = 100</b>
+    <b>schedule_delay = '0s'</b>
+    startup_delay = '100ms'</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can make a blob disappear on purpose, explain in one sentence why it went, name the label that would have saved it, and predict the collector's timing from its configuration rather than from folklore.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The tracker's premise for this checkpoint does not reproduce.</strong> <code>ctr content fetch</code> leaves a referenced image, and the lease it used is gone before you can list it. Delete the image name to see a collection — and do not expect to observe a temporary lease after the fact.</li>
+<li><strong>There is no explicit "run the collector now" command in <code>ctr</code>.</strong> You trigger it by causing a deletion, then wait. With <code>schedule_delay = '0s'</code> the wait is seconds, not the thirty often quoted.</li>
+<li><strong>Deleting a lease can delete data instantly.</strong> A lease is the only thing holding some resources; removing it makes them unreferenced, and unreferenced means eligible now. Read <code>ctr leases ls</code> before <code>ctr leases rm</code>.</li>
+<li><strong>An expired lease is not a deleted lease</strong> until the collector runs, so <code>ctr leases ls</code> can briefly show a lease whose <code>gc.expire</code> is in the past. Do not treat its presence as protection.</li>
+<li><strong>Do not turn the collector off to "be safe".</strong> Raising the thresholds on a busy node trades a confusing deletion for a full disk, which is a much worse incident and much harder to diagnose after the fact.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This collector is <em>not</em> the kubelet's image garbage collection — they are two independent mechanisms with two sets of thresholds, and confusing them wastes a lot of time on a <code>DiskPressure</code> node from <a href="w6.html#cp-6-12">W6.12</a>. The kubelet decides which images are unused <em>by Kubernetes</em> and asks CRI to remove them; containerd's collector then reclaims whatever that left unreferenced. An image can be gone from <code>crictl images</code> while its blobs are still on disk for a few seconds, and both tools are telling the truth.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>garbage-collection.md</code> — read the <code>gc.ref</code> label table and the lease section together, they only make sense as a pair. Then <code>ctr leases --help</code>, and on the Kubernetes side search for "garbage collection" to find the kubelet's separate <code>imageGCHighThresholdPercent</code>.</p>
+</article>
 </div><!-- /g-the-process-tree -->
 
 <!-- ---------------- Objects ---------------- --><div class="grp" id="g-objects"><h3>Objects</h3>
