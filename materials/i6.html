@@ -952,6 +952,259 @@ application/vnd.oci.image.manifest.v1+json</pre>
 </article>
 </div><!-- /g-doing-it-properly -->
 
+<!-- ---------------- Building without Docker ---------------- --><div class="grp" id="g-building-without-docker"><h3>Building without Docker</h3>
+<article class="lesson" id="cp-i6-8" data-id="i6-8">
+<div class="lesson-head"><span class="cp-id">I6.8</span><h4>Under the friendly tool: frontend, exporter, and where the result lands</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><code>nerdctl build</code> and <code>docker build</code> present a build as one atomic thing: Dockerfile in, image in your local image list, done. That framing hides two decisions that turn out to matter enormously — <em>who parses the Dockerfile</em>, and <em>where the result is written</em> — and it is the reason people are surprised that BuildKit can build an image on a machine with no container runtime at all. Driving <code>buildctl</code> once makes both decisions explicit, and one of them will explain a "but I just built it" failure you have already met.</p>
+
+<h5>The concept</h5>
+<p>BuildKit does not natively understand Dockerfiles. Its own language is <abbr title="low-level build definition — BuildKit's internal graph format">LLB</abbr>, the graph from <a href="#cp-i6-6">I6.6</a>, and everything in front of and behind that graph is pluggable:</p>
+<ul>
+<li>A <strong>frontend</strong> turns some build definition into LLB. The Dockerfile frontend is called <code>dockerfile.v0</code>, and — this is the part that surprises people — it is itself distributed as a container image, which is why a Dockerfile can start with <code>#&nbsp;syntax=docker/dockerfile:1</code> and get parser features newer than your builder.</li>
+<li>An <strong>exporter</strong> decides what happens to the solved result: write it into a container runtime's image store, write an OCI layout to a tarball, push it straight to a registry, or just dump the resulting <em>filesystem</em> into a directory with no image involved at all.</li>
+</ul>
+<p>That decomposition is why alternative build definitions exist, and why the same builder can produce an image on a machine with no runtime — which is exactly what you want in CI, where "build and push" should not require a daemon that can start containers. It is also why <a href="#cp-i6-9">I6.9</a> is possible at all: if the exporter is the only thing that knows about images, then producing an image is just writing files in the right shape.</p>
+<p>The lab below builds one Dockerfile four ways and gets <strong>the same manifest digest every time</strong> — <code>sha256:05f3b7aaf28e…</code> from <code>nerdctl build</code>, from <code>buildctl</code> with the image exporter, and from the OCI-tarball exporter. That is the strongest possible statement that <code>nerdctl build</code> is a thin client over the same <code>buildkitd</code>: same graph, same bytes, three destinations.</p>
+<p>And then the detail worth the whole checkpoint. The two tools wrote that identical image into <strong>different containerd namespaces</strong> — <code>nerdctl</code> into <code>default</code>, <code>buildctl</code> into <code>buildkit</code> — so <code>nerdctl run</code> could not find the <code>buildctl</code>-built image and tried to <em>pull</em> it from a registry instead. The image existed, on the same machine, in the same content store, under a name that resolved to nothing. If you remember one thing from this checkpoint, make it that: <strong>"the image is not there" and "the image is not in the namespace you are looking in" produce the same error message.</strong> It is the same class of confusion as <a href="i5.html#cp-i5-13">I5.13</a>'s two non-interchangeable <code>config_path</code> settings, and for the same underlying reason.</p>
+
+<div class="specref">
+<p>No spec governs builders, frontends or exporters — but the OCI <em>image layout</em> is a spec, and it is what the <code>oci</code> exporter emits. That is the seam that makes the pluggability useful: an exporter that writes a standard layout produces something every other tool can read without knowing what built it.</p>
+<blockquote>The OCI Image Layout is the directory structure for OCI content-addressable blobs and location-addressable references (refs). […] This layout MAY be used in a variety of different transport mechanisms: archive formats (e.g. tar, zip), shared filesystem environments (e.g. nfs), or networked file fetching (e.g. http, ftp, rsync).</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/image-layout.md">image-layout.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>One Dockerfile, deliberately trivial, so that every difference you see comes from the tooling rather than the build.
+<pre class="cmd">mkdir -p ~/i6/bc &amp;&amp; cd ~/i6/bc
+printf 'FROM alpine:3.21\nRUN echo built-by-buildctl &gt; /who\nCMD ["cat","/who"]\n' &gt; Dockerfile
+sudo nerdctl build --no-cache -q -t i6/bc:nerdctl .</pre>
+<pre class="out">sha256:<b>05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f</b></pre></li>
+
+<li>Now the same build with nothing hidden. Note that every part of what <code>nerdctl</code> did implicitly is now a flag you have to write: which frontend, where the context is, where the dockerfile is, and what to do with the result.
+<pre class="cmd">sudo buildctl build --frontend dockerfile.v0 \
+  --local context=. --local dockerfile=. \
+  --output type=image,name=docker.io/i6/bc:buildctl</pre>
+<pre class="out">#6 exporting to image
+#6 exporting layers done
+#6 exporting manifest sha256:<b>05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f</b> done
+#6 exporting config sha256:521bd851b8a99f7cff465ea70815703e8ac45da7e23b05d01575e8f0b3c8765b done
+#6 naming to docker.io/i6/bc:buildctl done
+#6 DONE 0.0s</pre>
+<p>The same manifest digest as step 1, to the last hex digit. <code>nerdctl build</code> added no bytes of its own — it asked the same daemon the same question.</p></li>
+
+<li>Try to run the <code>buildctl</code>-built image the obvious way. This is the failure worth having.
+<pre class="cmd">sudo nerdctl run --rm i6/bc:buildctl</pre>
+<pre class="out">FATA[0000] failed to resolve image: failed to do request:
+Head "https://localhost:5001/v2/i6/bc/manifests/buildctl<b>?ns=docker.io</b>":
+dial tcp [::1]:5001: connect: <b>connection refused</b></pre>
+<p>Read that carefully, because almost nothing about it is what it appears to be. <code>nerdctl</code> did not say "no such image" — it concluded the image was not local and went to <em>pull</em> it, through the mirror configured back in <a href="i5.html#cp-i5-13">I5.13</a> (hence <code>localhost:5001</code> and the <code>?ns=docker.io</code> parameter), which is not running. The image is on this machine. It is just not where <code>nerdctl</code> looked.</p></li>
+
+<li>Find it. Both images exist, in two different containerd namespaces.
+<pre class="cmd">for ns in default buildkit; do
+  echo "--- containerd namespace: $ns"
+  sudo ctr -n $ns images ls name~=i6/bc | awk 'NR==1||/i6\/bc/{print "    " $1, $3}'
+done</pre>
+<pre class="out">--- containerd namespace: default
+    REF DIGEST
+    docker.io/i6/bc:nerdctl <b>sha256:05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f</b>
+--- containerd namespace: buildkit
+    REF DIGEST
+    docker.io/i6/bc:buildctl <b>sha256:05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f</b></pre>
+<p>Identical digests, different namespaces. <code>nerdctl</code> defaults to <code>default</code>; <code>buildkitd</code>'s containerd worker writes into <code>buildkit</code>. Neither is wrong, and the error message names neither.</p></li>
+
+<li>Now change only the exporter, and watch the result stop being an image at all. <code>type=local</code> writes the solved <em>filesystem</em> to a directory.
+<pre class="cmd">sudo buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+  --output type=local,dest=out
+sudo ls out
+sudo cat out/who</pre>
+<pre class="out">#6 copying files 7.86MB 0.1s done
+#6 DONE 0.1s
+
+bin
+dev
+etc
+...
+usr
+var
+<b>who</b>
+
+built-by-buildctl</pre>
+<p>A plain directory tree — no manifest, no config, no layers. Useful more often than you would guess: extracting a compiled artefact, or generating files with a Dockerfile and taking only the output.</p></li>
+
+<li>And <code>type=oci</code>, which writes the standard layout from <a href="i4.html#cp-i4-5">I4.5</a> into a tarball — no runtime, no image store, no registry.
+<pre class="cmd">sudo buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+  --output type=oci,dest=img.tar
+sudo tar tf img.tar</pre>
+<pre class="out">blobs/
+blobs/sha256/
+blobs/sha256/<b>05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f</b>
+blobs/sha256/521bd851b8a99f7cff465ea70815703e8ac45da7e23b05d01575e8f0b3c8765b
+blobs/sha256/897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+blobs/sha256/deb2b065d05e0a7e198e2fa4cdf396467892f9042be71529dde0f7aec9860e9f
+<b>index.json</b>
+<b>oci-layout</b></pre>
+<p><code>blobs/sha256/</code>, <code>index.json</code>, <code>oci-layout</code> — exactly the three things <a href="i4.html#cp-i4-5">I4.5</a> taught you to expect, and the manifest blob's filename is that same digest again.</p></li>
+
+<li>Confirm the tarball's <code>index.json</code> is the real thing rather than something tool-specific.
+<pre class="cmd">sudo tar xOf img.tar index.json | jq .</pre>
+<pre class="out">{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:<b>05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f</b>",
+      "size": 669,
+      "annotations": { "org.opencontainers.image.created": "2026-07-30T03:26:40Z" },
+      "platform": { "architecture": "amd64", "os": "linux" }
+    }
+  ]
+}</pre>
+<p>Four destinations, one digest. The build and the delivery are genuinely separate concerns, and that is the whole point of the checkpoint.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can build a Dockerfile with <code>buildctl</code> from first principles, naming the frontend and the exporter explicitly, and you can send one build to a runtime, a directory, a tarball or a registry without changing the Dockerfile. You can also diagnose "I built it but the tool cannot find it" as a namespace question rather than a build failure.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"Image not found" from <code>nerdctl</code> may mean "not in this namespace", and the error will talk about the network instead.</strong> It falls through to a pull, so what you see is a DNS or connection failure against a registry — pointing you at exactly the wrong subsystem. Check <code>ctr -n buildkit images ls</code> before you debug your mirror.</li>
+<li><strong><code>--local context=.</code> and <code>--local dockerfile=.</code> are two separate mounts, and forgetting the second is the usual first error.</strong> They are separate because they genuinely can differ — a Dockerfile from one place and a context from another is a normal thing to want, and <code>nerdctl</code>'s single <code>.</code> hides that they were ever distinct.</li>
+<li><strong>The Dockerfile frontend is a container image, so parsing can be newer than your builder.</strong> That is what <code>#&nbsp;syntax=docker/dockerfile:1</code> selects, and it means a Dockerfile using a new feature can work on an old <code>buildkitd</code> — and that a build can fail because the frontend image could not be pulled, which looks nothing like a syntax error.</li>
+<li><strong><code>type=local</code> exports the filesystem of the final stage, not an image, and it drops the config entirely.</strong> No <code>Cmd</code>, no <code>Env</code>, no layer boundaries — just files. If you export a whole base image this way you get every file merged flat, which is rarely what you wanted.</li>
+<li><strong>Same digest is not the same reproducibility claim.</strong> These four builds matched because they ran the same graph on the same machine minutes apart; a build with a timestamp, a network fetch or a package index in it will not match itself tomorrow. Reproducible builds are a separate discipline, and <code>SOURCE_DATE_EPOCH</code> is where it starts.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the checkpoint that explains how images get built <em>inside</em> a cluster without the thing everybody rightly refuses: mounting the node's container socket into a pod. If a build needs no runtime — only a frontend, a solver and an exporter that writes to a registry — then a build pod needs no access to the node's containerd at all, which is why Kaniko, Buildah and BuildKit-as-a-pod exist and why <a href="w7.html#cp-7-9">W7.9</a>'s ServiceAccount-scoped credentials are enough for a CI job. The namespace confusion has a Kubernetes cousin too: containerd's namespaces are why <a href="i5.html#cp-i5-13">I5.13</a> insists that <code>ctr</code> proving a pull works proves nothing about the kubelet, which uses the <code>k8s.io</code> namespace and a different config path entirely.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>image-layout.md</code> for what the <code>oci</code> exporter writes. Search the BuildKit docs for <em>"exporters"</em> and <em>"frontends"</em>, and its README for the <code>buildctl build</code> flag list. For the namespace question, <code>ctr namespaces ls</code> and the containerd docs on namespaces.</p>
+</article>
+<article class="lesson" id="cp-i6-9" data-id="i6-9">
+<div class="lesson-head"><span class="cp-id">I6.9</span><h4>An image by hand: tar, sha256sum and curl</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the checkpoint where images stop being a black box permanently. You are going to produce a working container image — one a real runtime pulls and runs — using no builder, no daemon, no Docker and no privileged operation of any kind. Four shell tools. When it runs, you will have proved to yourself that everything in I4, I5 and I6 was not an abstraction over something deeper: that <em>was</em> the deeper thing.</p>
+
+<h5>The concept</h5>
+<p>Look at what an image actually requires, from <a href="i4.html#cp-i4-3">I4.3</a>: a layer (a tar file), a config (a JSON document), a manifest (a JSON document pointing at both by digest), and optionally an index. Then look at what <a href="i5.html#cp-i5-9">I5.9</a> says publishing requires: PUT the blobs, then PUT the manifest.</p>
+<p>There is <strong>no privileged operation anywhere in that list.</strong> No namespaces, no mounts, no cgroups, no daemon, no root. Because — and this is the sentence worth carrying out of the module — <em>building an image is not running a container</em>. It is writing tar files and JSON documents and computing hashes. Running a container needs the kernel machinery of B6, B7 and I2; producing the artefact that will later be run needs none of it.</p>
+<p>That realisation is what the entire unprivileged, daemonless build ecosystem stands on. Kaniko, Buildah in rootless mode, <code>ko</code>, <code>apko</code>, Nix's container output, Bazel's rules — none of them are clever workarounds for a missing daemon. They are the straightforward consequence of noticing that the format has no privileged requirements. It is also why building images inside a Kubernetes cluster without mounting the node's container socket is possible at all, which is the practical thing this checkpoint buys you.</p>
+<p>There is exactly one step that genuinely does need a container: executing a <code>RUN</code> instruction, because that means running someone's code against a filesystem. Everything else — <code>FROM</code>, <code>COPY</code>, <code>ENV</code>, <code>CMD</code>, computing layers, writing the config, pushing — is file manipulation. That single exception is what the mini project in <a href="#cp-i6-12">I6.12</a> hands to <code>runc</code>, and it is why <code>tinybuild.py</code> can be a short program rather than a build system.</p>
+<p>One practical note before you start. The image below has <strong>no base layer at all</strong> — one layer, containing one statically linked binary. That is deliberate: a static binary needs no loader, no libc and no <code>/etc</code>, so the smallest correct image really is one file, and nothing distracts from the format. It is also, exactly, what <code>FROM scratch</code> means.</p>
+
+<div class="specref">
+<p>Two requirements make the hand-built config valid, and they are the only ones you must not get wrong. <code>diff_ids</code> holds the hashes of the <em>uncompressed</em> layers while the manifest's descriptors hold the digests of what was actually transferred — <a href="i4.html#cp-i4-10">I4.10</a>'s two hashes, now something you have to compute separately rather than merely observe.</p>
+<blockquote><strong>rootfs</strong> <em>object</em>, REQUIRED<br><br>The rootfs key references the layer content addresses used by the image. This makes the image config hash depend on the filesystem hash.<br><br>- <strong>type</strong> <em>string</em>, REQUIRED<br>&nbsp;&nbsp;MUST be set to <code>layers</code>. Implementations MUST generate an error if they encounter a unknown value while verifying or unpacking an image.<br>- <strong>diff_ids</strong> <em>array of strings</em>, REQUIRED<br>&nbsp;&nbsp;An array of layer content hashes (<code>DiffIDs</code>), in order from first to last.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/config.md#properties">config.md § Properties</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Get one statically linked binary to be the entire contents of your image. Borrow it from the builder stage of <a href="#cp-i6-5">I6.5</a> — this is also a small demonstration of why <code>--target</code> is useful.
+<pre class="cmd">mkdir -p ~/i6/hand/rootfs &amp;&amp; cd ~/i6/hand
+sudo nerdctl run --rm i6/ms:builder cat /hello &gt; rootfs/hello
+chmod 755 rootfs/hello
+file rootfs/hello</pre>
+<pre class="out">rootfs/hello: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), <b>statically linked</b>,
+BuildID[sha1]=24235c1064a789cca874f225ce74ae7b0561c9e6, with debug_info, not stripped</pre>
+<p><code>statically linked</code> is the load-bearing word: this binary needs nothing else in the filesystem.</p></li>
+
+<li>Make the layer, and compute both of its hashes. <code>--numeric-owner</code> keeps your local user database out of the tar, which matters because the tar's bytes are its identity.
+<pre class="cmd">tar --numeric-owner --format=gnu -C rootfs -cf layer.tar .
+DIFFID=sha256:$(sha256sum layer.tar | cut -d' ' -f1)
+gzip -n -9 -c layer.tar &gt; layer.tar.gz
+LDIG=sha256:$(sha256sum layer.tar.gz | cut -d' ' -f1)
+LSIZE=$(stat -c%s layer.tar.gz)
+echo "  diff_id (uncompressed) $DIFFID"
+echo "  digest  (compressed)   $LDIG  ($LSIZE bytes)"</pre>
+<pre class="out">  diff_id (uncompressed) sha256:<b>bbb206bc33f564a1eb01c8e9d68670f438a21cd37503838777e5db7cba09c8bc</b>
+  digest  (compressed)   sha256:<b>8f767fc55d3cd41430d8ffff6b3a104f7c15d8ba727b496245984ca1feb1d72d</b>  (26521 bytes)</pre>
+<p>Two hashes of one layer, and they go in two different documents. The <code>-n</code> on <code>gzip</code> suppresses the timestamp in the gzip header — without it the digest changes every second, which is a reproducibility trap you have now avoided by accident.</p></li>
+
+<li>Write the config. This is the whole document — everything else in a real config is optional.
+<pre class="cmd">cat &gt; config.json &lt;&lt;EOF
+{"architecture":"amd64","os":"linux",
+ "config":{"Cmd":["/hello"]},
+ "rootfs":{"type":"layers","diff_ids":["$DIFFID"]},
+ "history":[{"created":"2026-07-30T00:00:00Z","created_by":"tar, jq and sha256sum"}]}
+EOF
+CDIG=sha256:$(sha256sum config.json | cut -d' ' -f1)
+CSIZE=$(stat -c%s config.json)
+echo "  config digest $CDIG ($CSIZE bytes)"</pre>
+<pre class="out">  config digest sha256:<b>e080c46f52f25ba78080132cbc88c3a419719ab6c18c647367615f2795966845</b> (270 bytes)</pre>
+<p>270 bytes. Note the config's digest depends on <code>diff_ids</code>, so it could not have been written before the layer existed — the spec's line about the config hash depending on the filesystem hash, felt rather than read.</p></li>
+
+<li>Write the manifest, which is nothing but two descriptors — <a href="i4.html#cp-i4-2">I4.2</a>'s only pointer type, now hand-assembled. Media type, digest and size, three times over.
+<pre class="cmd">cat &gt; manifest.json &lt;&lt;EOF
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+ "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"$CDIG","size":$CSIZE},
+ "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"$LDIG","size":$LSIZE}]}
+EOF
+sha256sum manifest.json | cut -d' ' -f1</pre>
+<pre class="out"><b>6947d3817d0f75f1c99a6ee4bbfde5a265e68a68227c1369e1ff0760827573f3</b></pre></li>
+
+<li>Push the blobs, in <a href="i5.html#cp-i5-9">I5.9</a>'s order — content before the thing that references it. Watch the <code>Location</code> handling, because it is where this goes wrong the first time.
+<pre class="cmd">REG=http://127.0.0.1:5000; REPO=i6/hand
+for pair in "layer.tar.gz:$LDIG" "config.json:$CDIG"; do
+  f=${pair%%:*}; d=${pair#*:}
+  LOC=$(curl -s -o /dev/null -D - -X POST "$REG/v2/$REPO/blobs/uploads/" \
+        | tr -d '\r' | grep -i '^location:' | cut -d' ' -f2)
+  code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$LOC&amp;digest=$d" \
+         -H "Content-Type: application/octet-stream" --data-binary "@$f")
+  echo "  PUT $f -&gt; $code"
+done</pre>
+<pre class="out">  PUT layer.tar.gz -&gt; <b>201</b>
+  PUT config.json -&gt; <b>201</b></pre>
+<p>Two things about that <code>LOC</code>. <code>registry:2</code> returns an <strong>absolute</strong> URL, so prefixing <code>$REG</code> to it produces <code>http://…http://…</code> and <code>curl</code> exits 3 with a malformed-URL error that says nothing about registries. And the URL already carries a <code>?_state=</code> query, which is why the digest is appended with <code>&amp;</code> and not <code>?</code>.</p></li>
+
+<li>Then the manifest, last.
+<pre class="cmd">curl -s -o /dev/null -w "  PUT manifest -&gt; %{http_code}\n" -X PUT "$REG/v2/$REPO/manifests/v1" \
+  -H "Content-Type: application/vnd.oci.image.manifest.v1+json" --data-binary @manifest.json</pre>
+<pre class="out">  PUT manifest -&gt; <b>201</b></pre></li>
+
+<li>And now the only test that matters. Does a real runtime — one that knows nothing about how this was made — pull and run it?
+<pre class="cmd">sudo nerdctl pull --insecure-registry 127.0.0.1:5000/i6/hand:v1
+sudo nerdctl run --rm --insecure-registry 127.0.0.1:5000/i6/hand:v1</pre>
+<pre class="out">application/vnd.oci.image.manifest.v1+json sha256:6947d3817d0f75f1c99a6ee4bbfde5a265e68a68227c1369e1ff0760827573f3
+Completed pull from OCI Registry (127.0.0.1:5000/i6/hand:v1)	elapsed: 0.1 s	total:  26.6 K
+
+<b>hello from a statically linked binary</b></pre></li>
+
+<li>Finally, look at it the way you would look at anyone's image. There is nothing to distinguish it.
+<pre class="cmd">sudo nerdctl images | grep -E "REPOSITORY|i6/hand"</pre>
+<pre class="out">REPOSITORY                TAG   IMAGE ID       PLATFORM      SIZE       BLOB SIZE
+127.0.0.1:5000/i6/hand    v1    6947d3817d0f   linux/amd64   <b>81.92kB</b>    <b>27.2kB</b></pre>
+<p>A 27 KB image, made by <code>tar</code>, <code>sha256sum</code>, <code>cat</code> and <code>curl</code>.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have pushed a working image built with no builder, and a real runtime ran it. You can state which single Dockerfile instruction genuinely needs container machinery and why the others do not, and you can explain what Kaniko and Buildah-rootless are actually exploiting.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The two hashes are not interchangeable and swapping them fails late.</strong> Put the compressed digest in <code>diff_ids</code> and the push succeeds, the manifest validates, and the <em>pull</em> fails when the client decompresses a layer and gets a hash the config did not promise. Both documents are well-formed; the error arrives at the consumer.</li>
+<li><strong><code>gzip</code> without <code>-n</code> embeds a timestamp, so your layer digest changes every time you build the same bytes.</strong> Harmless here, fatal to any caching or reproducibility claim, and a common source of "why did the digest change when nothing changed".</li>
+<li><strong><code>registry:2</code>'s upload <code>Location</code> is absolute and already has a query string.</strong> Prefixing your registry URL yields a malformed URL, and appending <code>?digest=</code> instead of <code>&amp;digest=</code> yields an equally confusing failure. The spec permits either form of <code>Location</code>, so a client must handle both — the kind of detail <a href="i5.html#cp-i5-10">I5.10</a>'s hand-rolled upload exists to teach.</li>
+<li><strong>No index means no platform negotiation, and no client will warn you.</strong> This image is amd64 because its config says so; run it on arm64 and you get <code>exec format error</code>, exactly <a href="#cp-i6-7">I6.7</a>'s failure. Adding an index is one more small JSON document.</li>
+<li><strong>A dynamically linked binary in a one-layer image fails in a way that looks like the binary is missing.</strong> The kernel cannot find the loader, so you get "no such file or directory" for a file that is demonstrably there. This is the single most common <code>FROM scratch</code> mistake, and the reason step 1 checks for <code>statically linked</code>.</li>
+<li><strong><code>history</code> is optional and yours is a fiction.</strong> "tar, jq and sha256sum" is a perfectly legal <code>created_by</code>. Keep that in mind for <a href="#cp-i6-10">I6.10</a>: an image's audit trail is whatever its producer chose to write.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The kubelet cannot tell the difference. It resolves your tag, fetches the manifest, pulls the blobs, verifies the digests and hands the result to containerd exactly as for an image from Docker Hub — because the contract is the artefact, not the process, which is the thesis of this whole track. Practically, this is the checkpoint that unblocks in-cluster builds: a pod that needs no privilege, no container socket and no daemon to produce images is a pod you can actually run under a reasonable policy, and it only needs registry credentials of the kind <a href="w7.html#cp-7-9">W7.9</a> wires to a ServiceAccount. It should also mildly alarm you: <em>anyone</em> who can push to a repository can publish an image whose <code>history</code> claims anything at all, which is the gap that image signing and provenance attestations exist to close, and why <a href="w3.html#cp-3-6">W3.6</a>'s advice to pin a digest is worth more than trusting a tag.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>config.md § Properties</code> for the minimum valid config, <code>manifest.md</code> for the descriptors, and <code>image-layout.md</code> if you would rather write a directory than push. On the distribution side, <code>spec.md § Pushing a blob monolithically</code> for the two-request upload you just performed by hand.</p>
+</article>
+</div><!-- /g-building-without-docker -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
