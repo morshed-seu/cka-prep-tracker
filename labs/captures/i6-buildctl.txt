@@ -1,0 +1,43 @@
+# captured 2026-07-30T03:25:39Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/bc; mkdir -p ~/i6/bc; cd ~/i6/bc
+# printf "FROM alpine:3.21\nRUN echo built-by-buildctl > /who\nCMD [\"cat\",\"/who\"]\n" > Dockerfile
+# echo "=== 1. nerdctl build — the friendly form ==="
+# sudo nerdctl build --no-cache -q -t i6/bc:nerdctl . 2>&1 | tail -1
+# echo
+# echo "=== 2. buildctl, exporter type=image into containerd ==="
+# sudo buildctl build --frontend dockerfile.v0 \
+#   --local context=. --local dockerfile=. \
+#   --output type=image,name=docker.io/i6/bc:buildctl 2>&1 | tail -6
+# echo
+# echo "=== both are ordinary images ==="
+# sudo nerdctl run --rm i6/bc:nerdctl
+# sudo nerdctl run --rm i6/bc:buildctl
+# echo
+# echo "=== 3. exporter type=local — the FILESYSTEM, not an image ==="
+# sudo buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+#   --output type=local,dest=/home/ubuntu/i6/bc/out 2>&1 | tail -2
+# ls /home/ubuntu/i6/bc/out; cat /home/ubuntu/i6/bc/out/who
+# echo
+# echo "=== 4. exporter type=oci — an OCI layout tarball, touching no runtime ==="
+# sudo buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+#   --output type=oci,dest=/home/ubuntu/i6/bc/img.tar 2>&1 | tail -2
+# tar tf /home/ubuntu/i6/bc/img.tar | head -8
+# 
+# --- output ---
+=== 1. nerdctl build — the friendly form ===
+sha256:05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f
+
+=== 2. buildctl, exporter type=image into containerd ===
+#6 exporting to image
+#6 exporting layers done
+#6 exporting manifest sha256:05f3b7aaf28e1d4aa690c36f6cd226aae12ed6e37d84b8a137f55312cda0590f done
+#6 exporting config sha256:521bd851b8a99f7cff465ea70815703e8ac45da7e23b05d01575e8f0b3c8765b done
+#6 naming to docker.io/i6/bc:buildctl done
+#6 DONE 0.0s
+
+=== both are ordinary images ===
+built-by-buildctl
+time="2026-07-30T09:25:44+06:00" level=fatal msg="failed to resolve image: failed to do request: Head \"https://localhost:5001/v2/i6/bc/manifests/buildctl?ns=docker.io\": dial tcp [::1]:5001: connect: connection refused"

@@ -1,0 +1,49 @@
+# captured 2026-07-30T02:50:23Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/wh
+# cat > Dockerfile.two <<EOF
+# FROM alpine:3.21
+# RUN dd if=/dev/urandom of=/big.bin bs=1M count=100 2>/dev/null
+# RUN rm /big.bin
+# EOF
+# cat > Dockerfile.one <<EOF
+# FROM alpine:3.21
+# RUN dd if=/dev/urandom of=/big.bin bs=1M count=100 2>/dev/null && rm /big.bin
+# EOF
+# sudo nerdctl build --no-cache -q -f Dockerfile.two -t 127.0.0.1:5000/i6/two:v1 . 2>&1 | tail -1
+# sudo nerdctl build --no-cache -q -f Dockerfile.one -t 127.0.0.1:5000/i6/one:v1 . 2>&1 | tail -1
+# echo "=== is /big.bin there at runtime? ==="
+# sudo nerdctl run --rm 127.0.0.1:5000/i6/two:v1 ls -l /big.bin 2>&1 | tail -1
+# echo
+# echo "=== what nerdctl images reports ==="
+# sudo nerdctl images | grep -E "REPOSITORY|i6/(one|two)"
+# echo
+# echo "=== what actually goes over the wire ==="
+# for t in two one; do
+#   sudo nerdctl push --insecure-registry 127.0.0.1:5000/i6/$t:v1 >/dev/null 2>&1
+#   M=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" http://127.0.0.1:5000/v2/i6/$t/manifests/v1)
+#   echo "--- i6/$t: $(echo "$M" | jq "[.layers[].size]|add") bytes, $(echo "$M" | jq ".layers|length") layers"
+#   echo "$M" | jq -r ".layers[] | \"      \(.size)  \(.digest)\""
+# done
+# 
+# --- output ---
+sha256:e525cca652f729b04c5b1c9e0c0f20eb3e5dd0357cc72da1c1e7f036406046b5
+sha256:8a27404f8cac8f3d8dabbe00463d4d6375fc5e22940a3350549082005e0dedf7
+=== is /big.bin there at runtime? ===
+ls: /big.bin: No such file or directory
+
+=== what nerdctl images reports ===
+REPOSITORY               TAG       IMAGE ID        CREATED                   PLATFORM         SIZE       BLOB SIZE
+127.0.0.1:5000/i6/one    v1        8a27404f8cac    Less than a second ago    linux/amd64      8.507MB    3.648MB
+127.0.0.1:5000/i6/two    v1        e525cca652f7    2 seconds ago             linux/amd64      113.4MB    108.5MB
+
+=== what actually goes over the wire ===
+--- i6/two: 108536725 bytes, 3 layers
+      3646875  sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+      104889773  sha256:34d8078a5826b435abe3024113cffb5b8a77d1f3fe28221256663cb6e361af25
+      77  sha256:e5fc68998cee4e0f8f724d2ce4612a82c532034c57b4216dfb7fb22216ae51f1
+--- i6/one: 3646907 bytes, 2 layers
+      3646875  sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+      32  sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1

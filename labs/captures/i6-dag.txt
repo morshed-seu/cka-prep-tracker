@@ -1,0 +1,43 @@
+# captured 2026-07-30T03:06:47Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/dag; mkdir -p ~/i6/dag; cd ~/i6/dag
+# cat > Dockerfile <<EOF
+# FROM alpine:3.21 AS a
+# RUN echo a-start; sleep 6; echo a-done
+# 
+# FROM alpine:3.21 AS b
+# RUN echo b-start; sleep 6; echo b-done
+# 
+# FROM alpine:3.21
+# COPY --from=a /etc/alpine-release /a
+# COPY --from=b /etc/alpine-release /b
+# EOF
+# echo "=== two independent 6-second stages; how long does the build take? ==="
+# time sudo nerdctl build --no-cache --progress=plain -t i6/dag:v1 . 2>&1 | grep -E "a-start|a-done|b-start|b-done"
+# echo
+# echo "=== --target a: does stage b run at all? ==="
+# time sudo nerdctl build --no-cache --progress=plain --target a -t i6/dag:onlya . 2>&1 | grep -E "a-start|a-done|b-start|b-done"
+# 
+# --- output ---
+=== two independent 6-second stages; how long does the build take? ===
+#5 [a 2/2] RUN echo a-start; sleep 6; echo a-done
+#5 0.178 a-start
+#5 6.178 a-done
+#6 [b 2/2] RUN echo b-start; sleep 6; echo b-done
+#6 0.167 b-start
+#6 6.170 b-done
+
+real	0m7.666s
+user	0m0.158s
+sys	0m0.125s
+
+=== --target a: does stage b run at all? ===
+#5 [a 2/2] RUN echo a-start; sleep 6; echo a-done
+#5 0.155 a-start
+#5 6.158 a-done
+
+real	0m7.382s
+user	0m0.152s
+sys	0m0.121s

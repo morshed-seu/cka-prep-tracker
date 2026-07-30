@@ -1,0 +1,31 @@
+# captured 2026-07-30T03:08:05Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/mnt
+# cat > Dockerfile.d <<EOF
+# FROM alpine:3.21
+# ARG N
+# RUN --mount=type=cache,target=/pkgcache \
+#     echo "run \$N" >> /pkgcache/log; echo "cache mount holds: \$(wc -l < /pkgcache/log) line(s) -> \$(tr "\n" " " < /pkgcache/log)"
+# EOF
+# echo "### vary the step key with a build-arg instead of --no-cache, so the step reruns but the cache is not purged"
+# for i in 1 2 3; do
+#   sudo nerdctl build --progress=plain --build-arg N=$i -f Dockerfile.d -t i6/cm2:v$i . 2>&1 | grep "cache mount holds"
+# done
+# echo
+# echo "### now one --no-cache build, same Dockerfile"
+# sudo nerdctl build --no-cache --progress=plain --build-arg N=99 -f Dockerfile.d -t i6/cm2:v99 . 2>&1 | grep "cache mount holds"
+# 
+# --- output ---
+### vary the step key with a build-arg instead of --no-cache, so the step reruns but the cache is not purged
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 1" >> /pkgcache/log; echo "cache mount holds: $(wc -l < /pkgcache/log) line(s) -> $(tr "n" " " < /pkgcache/log)"
+#5 0.110 cache mount holds: 2 line(s) -> a line run 1 
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 2" >> /pkgcache/log; echo "cache mount holds: $(wc -l < /pkgcache/log) line(s) -> $(tr "n" " " < /pkgcache/log)"
+#5 0.114 cache mount holds: 3 line(s) -> a line run 1 run 2 
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 3" >> /pkgcache/log; echo "cache mount holds: $(wc -l < /pkgcache/log) line(s) -> $(tr "n" " " < /pkgcache/log)"
+#5 0.090 cache mount holds: 4 line(s) -> a line run 1 run 2 run 3 
+
+### now one --no-cache build, same Dockerfile
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 99" >> /pkgcache/log; echo "cache mount holds: $(wc -l < /pkgcache/log) line(s) -> $(tr "n" " " < /pkgcache/log)"
+#5 0.123 cache mount holds: 1 line(s) -> run 99 

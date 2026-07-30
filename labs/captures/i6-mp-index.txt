@@ -1,0 +1,52 @@
+# captured 2026-07-30T03:23:31Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# echo "=== what did --platform=linux/amd64,linux/arm64 actually push? ==="
+# curl -s -H "Accept: application/vnd.oci.image.index.v1+json" \
+#   http://127.0.0.1:5000/v2/i6/mp/manifests/v1 | jq "{mediaType, entries: (.manifests|length), manifests: [.manifests[] | {mediaType, digest, platform}]}"
+# echo
+# echo "=== compare with the single-platform image from I6.4: no index at all ==="
+# curl -s -o /dev/null -w "index Accept -> %{http_code}\n" -H "Accept: application/vnd.oci.image.index.v1+json" \
+#   http://127.0.0.1:5000/v2/i6/one/manifests/v1
+# curl -s -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json" \
+#   http://127.0.0.1:5000/v2/i6/one/manifests/v1 | jq -r .mediaType
+# echo
+# echo "=== and each arch really is that arch ==="
+# for d in $(curl -s -H "Accept: application/vnd.oci.image.index.v1+json" http://127.0.0.1:5000/v2/i6/mp/manifests/v1 | jq -r ".manifests[].digest"); do
+#   C=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" http://127.0.0.1:5000/v2/i6/mp/manifests/$d | jq -r .config.digest)
+#   curl -s http://127.0.0.1:5000/v2/i6/mp/blobs/$C | jq -r "\"  \(.architecture)\t\(.variant // \"-\")\t\(.os)\""
+# done
+# 
+# --- output ---
+=== what did --platform=linux/amd64,linux/arm64 actually push? ===
+{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "entries": 2,
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:a08e2b09e471a4ac01b1eb8c00e272211134e8c11b02fa73675c9e226a34423f",
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:d385c3b8eaedefe4389a0e14347061b04ece90064e60ab9b403f383f94a4c808",
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    }
+  ]
+}
+
+=== compare with the single-platform image from I6.4: no index at all ===
+index Accept -> 404
+application/vnd.oci.image.manifest.v1+json
+
+=== and each arch really is that arch ===
+  amd64	-	linux
+  arm64	-	linux

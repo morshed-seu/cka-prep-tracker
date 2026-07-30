@@ -1,0 +1,53 @@
+# captured 2026-07-30T03:41:49Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/d2; mkdir -p ~/i6/d2; cd ~/i6/d2
+# echo "listen_port = 8080" > app.conf     # untracked on the developers machine
+# echo "print(1)" > main.py
+# cat > Dockerfile <<"EOF"
+# FROM alpine:3.21
+# COPY . /src/
+# RUN cp /src/app.conf /etc/app.conf 2>/dev/null || true
+# RUN rm -rf /src
+# CMD ["sh","-c","cat /etc/app.conf"]
+# EOF
+# echo "### the developer builds and runs it. works."
+# sudo nerdctl build --no-cache -q -t i6/d2:dev . >/dev/null 2>&1
+# sudo nerdctl run --rm i6/d2:dev
+# echo
+# echo "### CI checks out the repo. app.conf was never committed, so it is not in the context."
+# echo "app.conf" > .dockerignore
+# echo "--- does the BUILD fail?"
+# sudo nerdctl build --no-cache -q -t i6/d2:ci . 2>&1 | tail -1
+# echo "--- so the build is green. now run the image CI produced:"
+# sudo nerdctl run --rm i6/d2:ci 2>&1 | tail -2
+# echo
+# echo "### the diagnosis: compare what the two images contain"
+# for t in dev ci; do
+#   M=$(sudo ctr -n default images ls name==docker.io/i6/d2:$t | awk "NR==2{print \$3}")
+#   echo "--- i6/d2:$t"
+#   sudo ctr -n default content get "$M" | jq -r ".layers[] | \"      \(.size)  \(.digest[0:26])\""
+# done
+# 
+# --- output ---
+### the developer builds and runs it. works.
+listen_port = 8080
+
+### CI checks out the repo. app.conf was never committed, so it is not in the context.
+--- does the BUILD fail?
+sha256:6d1b93f0485804ab1ec53d7c4c172e8ea6bf5e41b29dadf6509341c022478308
+--- so the build is green. now run the image CI produced:
+cat: can't open '/etc/app.conf': No such file or directory
+
+### the diagnosis: compare what the two images contain
+--- i6/d2:dev
+      3646875  sha256:897d797d2723cf0e318
+      313  sha256:1b2680a982310a7273b
+      154  sha256:3e938fcc04564db4ea7
+      73  sha256:68739a056a6e973756a
+--- i6/d2:ci
+      3646875  sha256:897d797d2723cf0e318
+      312  sha256:40a44b27ab6332b1c82
+      32  sha256:4f4fb700ef54461cfa0
+      73  sha256:68739a056a6e973756a

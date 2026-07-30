@@ -1,0 +1,49 @@
+# captured 2026-07-30T03:01:36Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/ms; mkdir -p ~/i6/ms; cd ~/i6/ms
+# cat > hello.c <<EOF
+# #include <stdio.h>
+# int main(void){ puts("hello from a statically linked binary"); return 0; }
+# EOF
+# cat > Dockerfile <<EOF
+# FROM alpine:3.21 AS build
+# RUN apk add --no-cache build-base
+# COPY hello.c /src/hello.c
+# RUN gcc -static -o /hello /src/hello.c
+# 
+# FROM alpine:3.21
+# COPY --from=build /hello /usr/local/bin/hello
+# CMD ["hello"]
+# EOF
+# cat > Dockerfile.single <<EOF
+# FROM alpine:3.21
+# RUN apk add --no-cache build-base
+# COPY hello.c /src/hello.c
+# RUN gcc -static -o /usr/local/bin/hello /src/hello.c
+# CMD ["hello"]
+# EOF
+# echo "=== single-stage build ==="
+# sudo nerdctl build --no-cache -q -f Dockerfile.single -t i6/ms:single . 2>&1 | tail -1
+# echo "=== multi-stage build ==="
+# sudo nerdctl build --no-cache -q -t i6/ms:multi . 2>&1 | tail -1
+# echo
+# echo "=== both work? ==="
+# sudo nerdctl run --rm i6/ms:single; sudo nerdctl run --rm i6/ms:multi
+# echo
+# sudo nerdctl images | grep -E "REPOSITORY|i6/ms"
+# 
+# --- output ---
+=== single-stage build ===
+sha256:3a00e392baee152ff60c64b44412e47cb038fec4effade4296228e4270a35104
+=== multi-stage build ===
+sha256:be6ec5d18778d49a7afc27c468dee2cb1ab3922e6309a010fb09255eabb11e07
+
+=== both work? ===
+hello from a statically linked binary
+hello from a statically linked binary
+
+REPOSITORY               TAG       IMAGE ID        CREATED           PLATFORM         SIZE       BLOB SIZE
+i6/ms                    multi     be6ec5d18778    1 second ago      linux/amd64      8.598MB    3.676MB
+i6/ms                    single    3a00e392baee    2 minutes ago     linux/amd64      261.9MB    90.51MB

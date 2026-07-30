@@ -1,0 +1,44 @@
+# captured 2026-07-30T03:06:07Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/ms
+# for t in single multi; do
+#   M=$(sudo ctr -n default images ls name==docker.io/i6/ms:$t | awk "NR==2{print \$3}")
+#   C=$(sudo ctr -n default content get "$M" | jq -r .config.digest)
+#   echo "=== i6/ms:$t ==="
+#   sudo ctr -n default content get "$C" | jq -r "\"layers: \(.rootfs.diff_ids|length)\", (.history[]|\"  \(if .empty_layer then \"EMPTY\" else \"LAYER\" end) \(.created_by)\")"
+# done
+# echo
+# echo "=== is the compiler in the final image? ==="
+# sudo nerdctl run --rm i6/ms:multi sh -c "which gcc || echo no gcc in the multi-stage image"
+# sudo nerdctl run --rm i6/ms:single sh -c "which gcc"
+# echo
+# echo "=== --target build: stop at the first stage and get a shell in it ==="
+# sudo nerdctl build --target build -q -t i6/ms:builder . 2>&1 | tail -1
+# sudo nerdctl run --rm i6/ms:builder sh -c "gcc --version | head -1; ls -l /hello"
+# 
+# --- output ---
+=== i6/ms:single ===
+layers: 4
+  LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+  EMPTY CMD ["/bin/sh"]
+  LAYER RUN /bin/sh -c apk add --no-cache build-base # buildkit
+  LAYER COPY hello.c /src/hello.c # buildkit
+  LAYER RUN /bin/sh -c gcc -static -o /usr/local/bin/hello /src/hello.c # buildkit
+  EMPTY CMD ["hello"]
+=== i6/ms:multi ===
+layers: 2
+  LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+  EMPTY CMD ["/bin/sh"]
+  LAYER COPY /hello /usr/local/bin/hello # buildkit
+  EMPTY CMD ["hello"]
+
+=== is the compiler in the final image? ===
+no gcc in the multi-stage image
+/usr/bin/gcc
+
+=== --target build: stop at the first stage and get a shell in it ===
+sha256:5e2e1508189419ecac62fb35952f23832d610473284d81effcfaeeefdcaa4636
+gcc (Alpine 14.2.0) 14.2.0
+-rwxr-xr-x    1 root     root         76488 Jul 30 03:05 /hello

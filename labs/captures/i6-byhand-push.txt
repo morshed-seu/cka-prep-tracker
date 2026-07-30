@@ -1,0 +1,45 @@
+# captured 2026-07-30T03:28:19Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/hand
+# REG=http://127.0.0.1:5000; REPO=i6/hand
+# LDIG=sha256:$(sha256sum layer.tar.gz | cut -d" " -f1)
+# CDIG=sha256:$(sha256sum config.json  | cut -d" " -f1)
+# echo "=== 4. blobs first — I5.9s order ==="
+# for pair in "layer.tar.gz:$LDIG" "config.json:$CDIG"; do
+#   f=${pair%%:*}; d=${pair#*:}
+#   LOC=$(curl -s -o /dev/null -D - -X POST "$REG/v2/$REPO/blobs/uploads/" | tr -d "\r" | grep -i "^location:" | cut -d" " -f2)
+#   code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$LOC&digest=$d" \
+#         -H "Content-Type: application/octet-stream" --data-binary "@$f")
+#   echo "  PUT $f -> $code"
+# done
+# echo
+# echo "=== 5. the manifest LAST ==="
+# curl -s -o /dev/null -w "  PUT manifest -> %{http_code}\n" -X PUT "$REG/v2/$REPO/manifests/v1" \
+#   -H "Content-Type: application/vnd.oci.image.manifest.v1+json" --data-binary @manifest.json
+# echo
+# echo "=== 6. does a real runtime accept an image made by tar, jq and sha256sum? ==="
+# sudo nerdctl rmi 127.0.0.1:5000/i6/hand:v1 >/dev/null 2>&1 || true
+# sudo nerdctl pull --insecure-registry 127.0.0.1:5000/i6/hand:v1 2>&1 | tail -2
+# echo "--- run it:"
+# sudo nerdctl run --rm --insecure-registry 127.0.0.1:5000/i6/hand:v1
+# echo
+# sudo nerdctl images | grep -E "REPOSITORY|i6/hand"
+# 
+# --- output ---
+=== 4. blobs first — I5.9s order ===
+  PUT layer.tar.gz -> 201
+  PUT config.json -> 201
+
+=== 5. the manifest LAST ===
+  PUT manifest -> 201
+
+=== 6. does a real runtime accept an image made by tar, jq and sha256sum? ===
+application/vnd.oci.image.manifest.v1+json sha256:6947d3817d0f75f1c99a6ee4bbfde5a265e68a68227c1369e1ff0760827573f3
+Completed pull from OCI Registry (127.0.0.1:5000/i6/hand:v1)	elapsed: 0.1 s	total:  26.6 K	(205.6 KiB/s)	
+--- run it:
+hello from a statically linked binary
+
+REPOSITORY                TAG        IMAGE ID        CREATED                   PLATFORM         SIZE       BLOB SIZE
+127.0.0.1:5000/i6/hand    v1         6947d3817d0f    Less than a second ago    linux/amd64      81.92kB    27.2kB

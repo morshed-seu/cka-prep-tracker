@@ -1,0 +1,52 @@
+# captured 2026-07-30T03:27:22Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/hand; mkdir -p ~/i6/hand/rootfs; cd ~/i6/hand
+# sudo nerdctl run --rm i6/ms:builder cat /hello > rootfs/hello
+# chmod 755 rootfs/hello
+# file rootfs/hello 2>/dev/null || ls -l rootfs/hello
+# echo
+# echo "=== 1. the layer: a tar of the rootfs. two hashes, per I4.10 ==="
+# tar --numeric-owner --format=gnu -C rootfs -cf layer.tar .
+# DIFFID=sha256:$(sha256sum layer.tar | cut -d" " -f1)
+# gzip -n -9 -c layer.tar > layer.tar.gz
+# LDIG=sha256:$(sha256sum layer.tar.gz | cut -d" " -f1)
+# LSIZE=$(stat -c%s layer.tar.gz)
+# echo "  diff_id (uncompressed) $DIFFID"
+# echo "  digest  (compressed)   $LDIG  ($LSIZE bytes)"
+# echo
+# echo "=== 2. the config blob ==="
+# cat > config.json <<EOF
+# {"architecture":"amd64","os":"linux",
+#  "config":{"Cmd":["/hello"]},
+#  "rootfs":{"type":"layers","diff_ids":["$DIFFID"]},
+#  "history":[{"created":"2026-07-30T00:00:00Z","created_by":"tar, jq and sha256sum"}]}
+# EOF
+# CDIG=sha256:$(sha256sum config.json | cut -d" " -f1)
+# CSIZE=$(stat -c%s config.json)
+# echo "  config digest $CDIG ($CSIZE bytes)"
+# echo
+# echo "=== 3. the manifest ==="
+# cat > manifest.json <<EOF
+# {"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+#  "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"$CDIG","size":$CSIZE},
+#  "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"$LDIG","size":$LSIZE}]}
+# EOF
+# MDIG=sha256:$(sha256sum manifest.json | cut -d" " -f1)
+# echo "  manifest digest $MDIG"
+# cat manifest.json | jq -c .
+# 
+# --- output ---
+rootfs/hello: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=24235c1064a789cca874f225ce74ae7b0561c9e6, with debug_info, not stripped
+
+=== 1. the layer: a tar of the rootfs. two hashes, per I4.10 ===
+  diff_id (uncompressed) sha256:bbb206bc33f564a1eb01c8e9d68670f438a21cd37503838777e5db7cba09c8bc
+  digest  (compressed)   sha256:8f767fc55d3cd41430d8ffff6b3a104f7c15d8ba727b496245984ca1feb1d72d  (26521 bytes)
+
+=== 2. the config blob ===
+  config digest sha256:e080c46f52f25ba78080132cbc88c3a419719ab6c18c647367615f2795966845 (270 bytes)
+
+=== 3. the manifest ===
+  manifest digest sha256:6947d3817d0f75f1c99a6ee4bbfde5a265e68a68227c1369e1ff0760827573f3
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:e080c46f52f25ba78080132cbc88c3a419719ab6c18c647367615f2795966845","size":270},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:8f767fc55d3cd41430d8ffff6b3a104f7c15d8ba727b496245984ca1feb1d72d","size":26521}]}

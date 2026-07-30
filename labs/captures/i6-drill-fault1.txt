@@ -1,0 +1,54 @@
+# captured 2026-07-30T03:40:27Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/d1; mkdir -p ~/i6/d1/src; cd ~/i6/d1
+# echo "flask==3.0.0" > requirements.txt
+# echo "print(1)" > src/app.py
+# cat > Dockerfile <<"EOF"
+# FROM alpine:3.21
+# WORKDIR /app
+# COPY . .
+# RUN echo "resolving $(cat requirements.txt)..." && sleep 4 && touch /app/.installed
+# EOF
+# show(){ sudo nerdctl build --progress=plain -t i6/d1:x . 2>&1 | grep -E "^#[0-9]+ \[[0-9]/[0-9]\]|CACHED|^real"; }
+# echo "### build 1 (cold)"; time show
+# echo; echo "### build 2, nothing changed"; time show
+# echo; echo "### build 3, one character of application code changed"
+# echo "print(2)" >> src/app.py; time show
+# 
+# --- output ---
+### build 1 (cold)
+#4 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#5 [2/4] WORKDIR /app
+#5 CACHED
+#7 [3/4] COPY . .
+#8 [4/4] RUN echo "resolving $(cat requirements.txt)..." && sleep 4 && touch /app/.installed
+
+real	0m6.999s
+user	0m0.137s
+sys	0m0.104s
+
+### build 2, nothing changed
+#4 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [2/4] WORKDIR /app
+#6 CACHED
+#7 [3/4] COPY . .
+#7 CACHED
+#8 [4/4] RUN echo "resolving $(cat requirements.txt)..." && sleep 4 && touch /app/.installed
+#8 CACHED
+
+real	0m1.218s
+user	0m0.137s
+sys	0m0.124s
+
+### build 3, one character of application code changed
+#4 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [2/4] WORKDIR /app
+#6 CACHED
+#7 [3/4] COPY . .
+#8 [4/4] RUN echo "resolving $(cat requirements.txt)..." && sleep 4 && touch /app/.installed
+
+real	0m5.600s
+user	0m0.153s
+sys	0m0.121s

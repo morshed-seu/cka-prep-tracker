@@ -1,0 +1,61 @@
+# captured 2026-07-30T02:46:08Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/sem
+# CFG=$(sudo ctr -n default images ls -q name==docker.io/i6/sem:v1 >/dev/null; sudo ctr -n default content get sha256:b9a853b375fa01e63f81fd0e98bfa41d9ca13824b493b40798cf35ea7821316a | jq -r .config.digest)
+# echo "config blob: $CFG"
+# sudo ctr -n default content get "$CFG" > /tmp/x.json 2>/dev/null || sudo ctr -n default content get "$CFG" | cat > ~/cfg.json
+# sudo ctr -n default content get "$CFG" | jq "{diff_ids: .rootfs.diff_ids, n_layers: (.rootfs.diff_ids|length), n_history: (.history|length)}"
+# echo
+# echo "=== history: which entries are empty_layer? ==="
+# sudo ctr -n default content get "$CFG" | jq -r ".history[] | \"\(if .empty_layer then \"EMPTY \" else \"LAYER \" end)\(.created_by)\""
+# echo
+# echo "=== the config those ENV/USER/EXPOSE lines amended ==="
+# sudo ctr -n default content get "$CFG" | jq "{Env: .config.Env, User: .config.User, WorkingDir: .config.WorkingDir, ExposedPorts: .config.ExposedPorts, Cmd: .config.Cmd, Labels: .config.Labels}"
+# 
+# --- output ---
+config blob: sha256:8cefdab31739267905615e229753b0ae5efd2d5f9738b91f485a0a07982bf036
+{
+  "diff_ids": [
+    "sha256:7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb",
+    "sha256:93f14390034820f7bb7cf9146afee4cb8a6a81a08f4ffc8267cd063da4ac1387",
+    "sha256:5a9c39c22707a8d379d49b4ece3966b91a5a4b8cc774ee6cb068a6c4561be3fb",
+    "sha256:7f0f320fc8be8419a4746177fe815ea310d97d8355e39d915c8a4ece95313895"
+  ],
+  "n_layers": 4,
+  "n_history": 10
+}
+
+=== history: which entries are empty_layer? ===
+LAYER ADD alpine-minirootfs-3.21.7-x86_64.tar.gz / # buildkit
+EMPTY CMD ["/bin/sh"]
+EMPTY ENV FOO=bar
+EMPTY LABEL org.opencontainers.image.title=i6-semantics
+LAYER WORKDIR /app
+LAYER RUN /bin/sh -c echo hello > /app/one # buildkit
+LAYER COPY two.txt /app/two.txt # buildkit
+EMPTY USER nobody
+EMPTY EXPOSE [8080/tcp]
+EMPTY CMD ["/bin/sh" "-c" "cat /app/one /app/two.txt"]
+
+=== the config those ENV/USER/EXPOSE lines amended ===
+{
+  "Env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "FOO=bar"
+  ],
+  "User": "nobody",
+  "WorkingDir": "/app",
+  "ExposedPorts": {
+    "8080/tcp": {}
+  },
+  "Cmd": [
+    "/bin/sh",
+    "-c",
+    "cat /app/one /app/two.txt"
+  ],
+  "Labels": {
+    "org.opencontainers.image.title": "i6-semantics"
+  }
+}

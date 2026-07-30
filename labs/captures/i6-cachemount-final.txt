@@ -1,0 +1,33 @@
+# captured 2026-07-30T03:08:38Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/cm; mkdir -p ~/i6/cm; cd ~/i6/cm
+# cat > Dockerfile <<"EOF"
+# FROM alpine:3.21
+# ARG N
+# RUN --mount=type=cache,target=/pkgcache \
+#     echo "run $N" >> /pkgcache/log && echo "cache mount holds $(wc -l < /pkgcache/log) line(s)"
+# EOF
+# b(){ sudo nerdctl build $2 --progress=plain --build-arg N=$1 -t i6/cm3:v$1 . 2>&1 | grep "cache mount holds"; }
+# echo "### three ordinary builds, each with a different build-arg so the step reruns"
+# b 1; b 2; b 3
+# echo "### one build with --no-cache"
+# b 99 --no-cache
+# echo "### then an ordinary build again — were the first three lines purged, or only hidden?"
+# b 4
+# 
+# --- output ---
+### three ordinary builds, each with a different build-arg so the step reruns
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 1" >> /pkgcache/log && echo "cache mount holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.091 cache mount holds 2 line(s)
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 2" >> /pkgcache/log && echo "cache mount holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.132 cache mount holds 3 line(s)
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 3" >> /pkgcache/log && echo "cache mount holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.115 cache mount holds 4 line(s)
+### one build with --no-cache
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 99" >> /pkgcache/log && echo "cache mount holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.120 cache mount holds 1 line(s)
+### then an ordinary build again — were the first three lines purged, or only hidden?
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "run 4" >> /pkgcache/log && echo "cache mount holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.105 cache mount holds 2 line(s)

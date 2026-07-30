@@ -1,0 +1,36 @@
+# captured 2026-07-30T03:07:44Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/mnt
+# cat > Dockerfile.c <<EOF
+# FROM alpine:3.21
+# RUN --mount=type=cache,target=/pkgcache \
+#     echo "a line" >> /pkgcache/log; echo "cache mount now holds \$(wc -l < /pkgcache/log) line(s)"
+# EOF
+# for i in 1 2 3; do
+#   echo "=== build $i ==="
+#   sudo nerdctl build --no-cache --progress=plain -f Dockerfile.c -t i6/cm:v$i . 2>&1 | grep "cache mount now holds"
+# done
+# echo
+# echo "=== what the cache mount costs the image ==="
+# M=$(sudo ctr -n default images ls name==docker.io/i6/cm:v3 | awk "NR==2{print \$3}")
+# C=$(sudo ctr -n default content get "$M" | jq -r .config.digest)
+# sudo ctr -n default content get "$C" | jq -r "\"layers: \(.rootfs.diff_ids|length)\", .rootfs.diff_ids[-1]"
+# sudo nerdctl run --rm i6/cm:v3 ls /pkgcache 2>&1 | tail -1
+# 
+# --- output ---
+=== build 1 ===
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "a line" >> /pkgcache/log; echo "cache mount now holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.110 cache mount now holds 1 line(s)
+=== build 2 ===
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "a line" >> /pkgcache/log; echo "cache mount now holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.134 cache mount now holds 1 line(s)
+=== build 3 ===
+#5 [stage-0 2/2] RUN --mount=type=cache,target=/pkgcache     echo "a line" >> /pkgcache/log; echo "cache mount now holds $(wc -l < /pkgcache/log) line(s)"
+#5 0.165 cache mount now holds 1 line(s)
+
+=== what the cache mount costs the image ===
+layers: 2
+sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+ls: /pkgcache: No such file or directory

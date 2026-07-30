@@ -1,0 +1,86 @@
+# captured 2026-07-30T02:49:17Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/cache; mkdir -p ~/i6/cache; cd ~/i6/cache
+# echo "flask==3.0.0" > requirements.txt
+# echo "print(1)" > src.py
+# echo "notes" > README.md
+# cat > Dockerfile <<EOF
+# FROM alpine:3.21
+# COPY requirements.txt /app/
+# RUN echo "installed from \$(cat /app/requirements.txt)" > /app/installed
+# COPY src.py /app/
+# EOF
+# show(){ sudo nerdctl build --progress=plain -t i6/cache:x . 2>&1 | grep -E "^#[0-9]+ \[[0-9]/4\]|CACHED" | sed "s/ *$//"; }
+# echo "=== 1. baseline (cold) ==="; show
+# echo; echo "=== 2. rebuild, nothing changed ==="; show
+# echo; echo "=== 3. added a comment to the Dockerfile ==="
+# sed -i "1i # a harmless comment" Dockerfile; show
+# echo; echo "=== 4. edited README.md — in the context, copied by nothing ==="
+# echo "more notes" >> README.md; show
+# echo; echo "=== 5. touched src.py, content unchanged ==="
+# touch src.py; show
+# echo; echo "=== 6. edited src.py (the LAST copy) ==="
+# echo "print(2)" >> src.py; show
+# echo; echo "=== 7. edited requirements.txt (the FIRST copy) ==="
+# echo "requests==2.32.0" >> requirements.txt; show
+# 
+# --- output ---
+=== 1. baseline (cold) ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#5 CACHED
+#6 [2/4] COPY requirements.txt /app/
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#8 [4/4] COPY src.py /app/
+
+=== 2. rebuild, nothing changed ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [2/4] COPY requirements.txt /app/
+#6 CACHED
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#7 CACHED
+#8 [4/4] COPY src.py /app/
+#8 CACHED
+
+=== 3. added a comment to the Dockerfile ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [2/4] COPY requirements.txt /app/
+#6 CACHED
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#7 CACHED
+#8 [4/4] COPY src.py /app/
+#8 CACHED
+
+=== 4. edited README.md — in the context, copied by nothing ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [2/4] COPY requirements.txt /app/
+#6 CACHED
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#7 CACHED
+#8 [4/4] COPY src.py /app/
+#8 CACHED
+
+=== 5. touched src.py, content unchanged ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#6 CACHED
+#7 [2/4] COPY requirements.txt /app/
+#7 CACHED
+#8 [4/4] COPY src.py /app/
+#8 CACHED
+
+=== 6. edited src.py (the LAST copy) ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#6 [2/4] COPY requirements.txt /app/
+#6 CACHED
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#7 CACHED
+#8 [4/4] COPY src.py /app/
+
+=== 7. edited requirements.txt (the FIRST copy) ===
+#5 [1/4] FROM docker.io/library/alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+#5 CACHED
+#6 [2/4] COPY requirements.txt /app/
+#7 [3/4] RUN echo "installed from $(cat /app/requirements.txt)" > /app/installed
+#8 [4/4] COPY src.py /app/

@@ -1,0 +1,39 @@
+# captured 2026-07-30T03:07:19Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# rm -rf ~/i6/mnt; mkdir -p ~/i6/mnt; cd ~/i6/mnt
+# cat > Dockerfile <<EOF
+# FROM alpine:3.21
+# RUN --mount=type=cache,target=/pkgcache \
+#     echo "build at \$(date +%s)" >> /pkgcache/log && wc -l < /pkgcache/log > /runs
+# RUN --mount=type=secret,id=tok \
+#     sha256sum /run/secrets/tok && wc -c < /run/secrets/tok
+# EOF
+# echo "supersecret-token-value" > tok.txt
+# echo "=== build 1 ==="
+# sudo nerdctl build --no-cache --progress=plain --secret id=tok,src=tok.txt -t i6/mnt:v1 . 2>&1 | grep -E "^#[0-9]+ [0-9]" | head -6
+# echo "=== build 2 (cache mount should still hold build 1s line) ==="
+# sudo nerdctl build --no-cache --progress=plain --secret id=tok,src=tok.txt -t i6/mnt:v2 . 2>&1 | grep -E "^#[0-9]+ [0-9]" | head -6
+# echo
+# echo "=== the secret sha, for comparison ==="
+# sha256sum tok.txt
+# echo
+# echo "=== is either mount in the image? ==="
+# sudo nerdctl run --rm i6/mnt:v2 sh -c "cat /runs; ls -la /pkgcache /run/secrets 2>&1 | tail -2"
+# 
+# --- output ---
+=== build 1 ===
+#6 0.128 742edcb40dde760800ab8f9042417ae3b791f3e46389a10f1ca37c65159bf9dd  /run/secrets/tok
+#6 0.128 24
+=== build 2 (cache mount should still hold build 1s line) ===
+#6 0.134 742edcb40dde760800ab8f9042417ae3b791f3e46389a10f1ca37c65159bf9dd  /run/secrets/tok
+#6 0.135 24
+
+=== the secret sha, for comparison ===
+742edcb40dde760800ab8f9042417ae3b791f3e46389a10f1ca37c65159bf9dd  tok.txt
+
+=== is either mount in the image? ===
+1
+ls: /pkgcache: No such file or directory
+ls: /run/secrets: No such file or directory

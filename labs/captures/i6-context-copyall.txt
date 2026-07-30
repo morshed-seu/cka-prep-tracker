@@ -1,0 +1,57 @@
+# captured 2026-07-30T02:48:26Z on sandbox
+# --- snippet ---
+# 
+# set -e
+# cd ~/i6/ctx; rm -f .dockerignore
+# printf "FROM alpine:3.21\nCOPY . /src/\n" > Dockerfile
+# echo "=== COPY . . with no .dockerignore — now how much moves? ==="
+# time sudo nerdctl build --no-cache --progress=plain -t i6/ctx:all . 2>&1 | grep -E "transferring context|load build context|DONE 
+# " | head -6
+# echo
+# echo "=== and what landed in the image? ==="
+# sudo nerdctl run --rm i6/ctx:all ls -la /src/ 2>&1 | tail -8
+# echo "--- the .env the developer never meant to ship: ---"
+# sudo nerdctl run --rm i6/ctx:all cat /src/.env
+# echo
+# echo "=== same build WITH .dockerignore ==="
+# printf "junk.bin\n.env\n.git\n" > .dockerignore
+# time sudo nerdctl build --no-cache --progress=plain -t i6/ctx:ign . 2>&1 | grep -E "transferring context" | head -4
+# sudo nerdctl run --rm i6/ctx:ign ls -a /src/
+# 
+# --- output ---
+=== COPY . . with no .dockerignore — now how much moves? ===
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 67B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.21
+#2 DONE 0.4s
+
+real	0m5.679s
+user	0m0.819s
+sys	0m0.476s
+
+=== and what landed in the image? ===
+total 102424
+drwxr-xr-x    3 root     root          4096 Jul 30 02:48 .
+drwxr-xr-x    1 root     root          4096 Jul 30 02:48 ..
+-rw-rw-r--    1 root     root            63 Jul 30 02:48 .env
+drwxrwxr-x    2 root     root          4096 Jul 30 02:48 .git
+-rw-rw-r--    1 root     root            30 Jul 30 02:48 Dockerfile
+-rw-rw-r--    1 root     root             4 Jul 30 02:48 app.txt
+-rw-rw-r--    1 root     root     104857600 Jul 30 02:48 junk.bin
+--- the .env the developer never meant to ship: ---
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY
+
+=== same build WITH .dockerignore ===
+#3 transferring context: 59B done
+#4 transferring context: 114B 0.0s done
+
+real	0m0.887s
+user	0m0.065s
+sys	0m0.050s
+.
+..
+.dockerignore
+Dockerfile
+app.txt
