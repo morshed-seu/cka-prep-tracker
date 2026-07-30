@@ -1803,6 +1803,199 @@ lives.</p>
 </article>
 </div><!-- /g-operating-it -->
 
+<!-- ---------------- Project & drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson" id="cp-i8-15" data-id="i8-15">
+<div class="lesson-head"><span class="cp-id">I8.15</span><h4>Mini project — toycri.py, a CRI server crictl cannot tell from containerd</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Every module in this track ends by making you build the thing you have been reading about,
+because implementing an interface is the only way to find out which parts of it are load-bearing.
+Here the payoff is unusually direct: <code>crictl</code> is a real client, and when it drives your
+Python server through a whole pod lifecycle without complaint, you have proved you understand the
+contract rather than merely recognising it.</p>
+
+<h5>The concept</h5>
+<p><code>labs/intermediate/toycri.py</code> is one file that implements enough of
+<code>runtime.v1</code> for <code>crictl</code> to work: the handshake (<code>Version</code>,
+<code>Status</code>), the sandbox calls, the container calls, <code>ExecSync</code>, and a minimal
+<code>ImageService</code>.</p>
+
+<p>Nothing under the gRPC layer is new. The bundle is I2's — a <code>config.json</code> and a
+rootfs. The runtime is I3's runc. The rootfs is unpacked from a real image with I4's layer-is-a-tar
+rule and I5's <code>skopeo copy</code>. The namespace-joining is the field you read in I8.5, written
+by your own code. The log records are the format you decoded in I8.13, produced by a
+thirty-line function. The whole server is a translation layer, which is exactly what a real one
+is.</p>
+
+<p>Two things it does <em>not</em> do, both stated in the file rather than hidden. There is no CNI,
+so every sandbox gets an empty network namespace with a dead loopback (B9.1) — I9 is where that gets
+fixed. And state is in memory, so restarting the server loses the records while the processes keep
+running, which is <a href="i7.html#cp-i7-3">I7.3</a> in reverse and a good demonstration of why real
+runtimes have a metadata store.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Compile the protobufs. The proto has <strong>no imports</strong>, so this is a single command
+with no dependency hunting.
+<pre class="cmd">~/.venv-intermediate/bin/pip install -q grpcio-tools
+cd labs/intermediate
+curl -sSLO https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto
+~/.venv-intermediate/bin/python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. api.proto
+ls api_pb2*.py</pre>
+<pre class="out">api_pb2.py  api_pb2_grpc.py</pre></li>
+
+<li>Build a rootfs from a real image, then start the server.
+<pre class="cmd">sudo ./toycri.py prepare-rootfs docker://docker.io/library/alpine:3.21
+sudo ./toycri.py serve</pre>
+<pre class="out">rootfs ready at /var/lib/toycri/rootfs (17 files)
+toycri listening on unix:///run/toycri.sock  (crictl --runtime-endpoint unix:///run/toycri.sock)</pre>
+<p>Note where the rootfs went. It cannot live under <code>/run</code>: that is a tmpfs mounted
+<strong><code>noexec</code></strong> on Ubuntu, and a rootfs unpacked there fails with
+<code>exec: "/bin/sh": permission denied</code> — which reads like a file-mode problem and is not
+one. Runtime state goes in <code>/run</code>, anything executable goes in <code>/var/lib</code>, and
+that is precisely why containerd splits <code>/run/containerd</code> from
+<code>/var/lib/containerd</code>.</p></li>
+
+<li>Point crictl at it. The handshake is the first proof.
+<pre class="cmd">E="--runtime-endpoint unix:///run/toycri.sock --image-endpoint unix:///run/toycri.sock"
+sudo crictl $E version</pre>
+<pre class="out">Version:  0.1.0
+RuntimeName:  <b>toycri</b>
+RuntimeVersion:  0.1.0
+RuntimeApiVersion:  <b>v1</b></pre></li>
+
+<li>Run the same four verbs from I8.8 against it, with the same config files.
+<pre class="cmd">P=$(sudo crictl $E -t 30s runp sandbox.json)
+C=$(sudo crictl $E create "$P" container.json sandbox.json)
+sudo crictl $E start "$C"
+sudo crictl $E pods
+sudo crictl $E ps</pre>
+<pre class="out">POD ID          CREATED        STATE   NAME   NAMESPACE   ATTEMPT   RUNTIME
+7acbf9d7798c4   1 second ago   <b>Ready</b>   demo   i8          0         <b>toycri</b>
+
+CONTAINER       IMAGE                           CREATED        STATE     NAME  ATTEMPT  POD ID
+cad359920e444   docker.io/library/alpine:3.21   1 second ago   <b>Running</b>   app   0        7acbf9d7798c4</pre></li>
+
+<li>Confirm the log path works end to end: your <code>pump()</code> wrote the record, and
+<code>crictl logs</code> read it back.
+<pre class="cmd">sudo cat /var/log/pods/i8_demo_i8-demo-uid-0001/app/0.log
+sudo crictl $E logs "$C"</pre>
+<pre class="out">2026-07-30T14:19:35.632283998+06:00 <b>stdout F</b> hello from inside the pod
+hello from inside the pod</pre></li>
+
+<li>Check the mechanism you cared about most — the namespace join, done by your own code.
+<pre class="cmd">sudo jq -c '.linux.namespaces' /var/lib/toycri/containers/$C/config.json
+for n in net ipc uts pid mnt; do
+  a=$(sudo readlink /proc/$PP/ns/$n); b=$(sudo readlink /proc/$AP/ns/$n)
+  printf '%-6s %-20s %-20s %s\n' "$n" "$a" "$b" "$([ "$a" = "$b" ] &amp;&amp; echo SHARED || echo private)"
+done</pre>
+<pre class="out">[{"type":"ipc","<b>path":"/proc/91429/ns/ipc"</b>},{"type":"uts","path":"/proc/91429/ns/uts"},
+ {"type":"network","<b>path":"/proc/91429/ns/net"</b>},{"type":"mount"},
+ {"type":"pid","path":"/proc/91429/ns/pid"}]
+
+net    net:[4026532349]     net:[4026532349]     <b>SHARED</b>
+ipc    ipc:[4026532347]     ipc:[4026532347]     <b>SHARED</b>
+uts    uts:[4026532346]     uts:[4026532346]     <b>SHARED</b>
+pid    pid:[4026532348]     pid:[4026532348]     SHARED
+mnt    mnt:[4026532345]     mnt:[4026532405]     <b>private</b></pre></li>
+
+<li><code>ExecSync</code> really execs — and the empty network is the honest consequence of having
+no CNI.
+<pre class="cmd">sudo crictl $E exec -s "$C" sh -c 'hostname; ip -o addr show'</pre>
+<pre class="out"><b>demo</b>
+1: lo    inet <b>127.0.0.1/8</b> scope host lo
+1: lo    inet6 ::1/128 scope host</pre>
+<p>The hostname came from the sandbox config; the loopback-only interface is B9.1's empty network
+namespace. A pod on this runtime cannot talk to anything, and that gap is the exact size of I9.</p></li>
+
+<li>Tear it down in the order the proto requires, and confirm runc agrees.
+<pre class="cmd">sudo crictl $E stop "$C"; sudo crictl $E rm "$C"
+sudo crictl $E stopp "$P"; sudo crictl $E rmp "$P"
+sudo crictl $E pods; sudo crictl $E ps -a
+sudo runc --root /run/toycri/runc list</pre>
+<pre class="out">POD ID   CREATED   STATE   NAME   NAMESPACE   ATTEMPT   RUNTIME
+CONTAINER   IMAGE   CREATED   STATE   NAME   ATTEMPT   POD ID   POD   NAMESPACE
+ID   PID   STATUS   BUNDLE   CREATED   OWNER</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p><code>crictl runp</code>, <code>crictl ps</code>, <code>crictl logs</code> and
+<code>crictl exec -s</code> all work against your socket, and you can point at the line in your own
+code that makes the pod's containers share a network namespace.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A detached container inherits your process's stdout, so
+<code>subprocess.run(capture_output=True)</code> on <code>runc create</code> hangs forever.</strong>
+It waits for an EOF that arrives only when the container dies. This is the same trap that makes
+<code>multipass exec</code> hang, and it is why <code>runc_spawn()</code> redirects to a file. It is
+also why a real shim <em>owns</em> the container's stdio rather than borrowing its parent's.</li>
+<li><strong>An <code>rm -rf</code> of a bundle whose rootfs is still bind-mounted deletes the shared
+source.</strong> A bind mount is the same inodes under a second name (B5.11), so
+<code>shutil.rmtree</code> walks straight through it. The fix in <code>_cleanup_bundle()</code> is
+to unmount, <em>verify</em> with <code>os.path.ismount</code>, and refuse to recurse otherwise —
+plus a read-only bind, which turns the accident into an error instead of a data loss. This comment
+exists because it happened.</li>
+<li><strong>Streaming <code>Exec</code>, <code>Attach</code> and <code>PortForward</code> are not
+implemented, deliberately.</strong> They require standing up a second HTTP server and an SPDY
+upgrade. <code>ExecSync</code> is the one that fits in a paragraph, so it is the one that works —
+and <code>crictl exec</code> without <code>-s</code> fails against toycri with
+<code>code = Unimplemented desc = Method not implemented!</code>, which is itself a demonstration of
+I8.9's point that the two are different calls.</li>
+</ul>
+
+<div class="k8s-link">
+<p>What you have written is the layer <a href="w1.html#cp-1-20">W1.20 — kubelet → containerd → shim
+→ runc</a> draws as a single arrow. The next module replaces the "no CNI" simplification with a real
+implementation of the network side; the beginner-track ancestor of both is
+<a href="b9.html#cp-b9-19">B9.19 — mini project: CNI v0.1, in two scripts</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the only reference this project needs is
+<code>api.proto</code> itself. Read the messages you implement; the field comments are the
+specification.</p>
+</article>
+<article class="lesson" id="cp-i8-16" data-id="i8-16">
+<div class="lesson-head"><span class="cp-id">I8.16</span><h4>TODO headline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<!-- CHECKPOINT: drill. Three faults. A cgroup-driver mismatch — everything starts, then pods are evicted or restart for no visible reason, and the only evidence is two cgroup trees. A missing or unpullable sandbox image, which fails every pod on the node with an error naming no user workload. And a wrong &#45;&#45;runtime-endpoint, whose connection error is routinely mistaken for "containerd is down" — learn to tell the two apart in one command.
+     UNDER THE HOOD: (none) -->
+
+<h5>Why it matters</h5>
+<p>TODO plain-English hook.</p>
+
+<h5>The concept</h5>
+<p>TODO. Absorb and expand the "under the hood" note above.</p>
+
+<div class="specref">
+<p>TODO what the spec actually says.</p>
+<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
+<cite>TODO spec, version — <a href="TODO">file</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
+<pre class="cmd">TODO</pre>
+<pre class="out">TODO captured output</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>TODO what the reader can now do.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>TODO.</strong></li>
+</ul>
+
+<div class="k8s-link">
+<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> TODO.</p>
+</article>
+</div><!-- /g-project-drill -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
