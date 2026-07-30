@@ -1,0 +1,61 @@
+# captured 2026-07-30T09:13:15Z on sandbox
+# --- snippet ---
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# count() { sudo iptables -t nat -S POSTROUTING | grep -c i9net || true; }
+# echo "=== baseline ==="
+# echo "  POSTROUTING rules naming i9net: $(count)"
+# echo
+# echo "=== case 1: clean ADD, clean DEL ==="
+# sudo ip netns add i9pod1
+# sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -r ".ips[0].address" | sed "s/^/  address  /"
+# echo "  after ADD: $(count)"
+# sudo iptables -t nat -S POSTROUTING | grep i9net | sed "s/^/    /"
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "  del exit=$?"
+# echo "  after DEL: $(count)"
+# sudo ls /var/lib/cni/networks/i9net/ | tr "\n" " " | sed "s/^/  ipam store: /"; echo
+# echo
+# echo "=== case 2: ADD, destroy eth0 from inside the namespace, then DEL ==="
+# sudo ip netns del i9pod1; sudo ip netns add i9pod1
+# sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -r ".ips[0].address" | sed "s/^/  address  /"
+# echo "  after ADD: $(count)"
+# sudo ip netns exec i9pod1 ip link del eth0
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "  del exit=$?"
+# echo "  after DEL: $(count)"
+# sudo iptables -t nat -S POSTROUTING | grep i9net | sed "s/^/    LEAKED /"
+# sudo ls /var/lib/cni/networks/i9net/ | tr "\n" " " | sed "s/^/  ipam store: /"; echo
+# echo
+# echo "=== case 3: ADD, then delete the whole namespace, then DEL ==="
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null
+# sudo ip netns add i9pod1
+# sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -r ".ips[0].address" | sed "s/^/  address  /"
+# sudo ip netns del i9pod1
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "  del exit=$?"
+# echo "  after DEL: $(count)"
+# sudo iptables -t nat -S POSTROUTING | grep i9net | sed "s/^/    LEAKED /"
+# sudo ls /var/lib/cni/networks/i9net/ | tr "\n" " " | sed "s/^/  ipam store: /"; echo
+# --- output ---
+=== baseline ===
+  POSTROUTING rules naming i9net: 0
+
+=== case 1: clean ADD, clean DEL ===
+  address  10.90.0.2/24
+  after ADD: 1
+    -A POSTROUTING -s 10.90.0.2/32 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j CNI-5ee93e7c626f981e7589e5a5
+  del exit=0
+  after DEL: 0
+  ipam store: last_reserved_ip.0 lock 
+
+=== case 2: ADD, destroy eth0 from inside the namespace, then DEL ===
+  address  10.90.0.3/24
+  after ADD: 1
+  del exit=0
+  after DEL: 1
+    LEAKED -A POSTROUTING -s 10.90.0.3/32 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j CNI-5ee93e7c626f981e7589e5a5
+  ipam store: last_reserved_ip.0 lock 
+
+=== case 3: ADD, then delete the whole namespace, then DEL ===
+  address  10.90.0.2/24
+  del exit=0
+  after DEL: 1
+    LEAKED -A POSTROUTING -s 10.90.0.2/32 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j CNI-5ee93e7c626f981e7589e5a5
+  ipam store: last_reserved_ip.0 lock 

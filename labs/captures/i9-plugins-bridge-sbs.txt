@@ -1,0 +1,95 @@
+# captured 2026-07-30T09:11:02Z on sandbox
+# --- snippet ---
+# chmod +x ~/i9/net-up.sh
+# echo "=== A. net-up.sh: the beginner-track script, one bridge, three namespaces ==="
+# sudo ~/i9/net-up.sh up 1
+# echo
+# echo "--- the NAT rule it wrote ---"
+# sudo iptables -t nat -S POSTROUTING | grep 10.20.0
+# echo "--- sysctls it set on the host veth ---"
+# for k in accept_ra disable_ipv6; do
+#   printf "  veth1 %-14s %s\n" "$k" "$(sudo cat /proc/sys/net/ipv6/conf/veth1/$k 2>&1)"
+# done
+# printf "  cni0  %-14s %s\n" hairpin "$(sudo cat /sys/class/net/veth1/brport/hairpin_mode 2>&1)"
+# echo
+# echo "=== B. now the reference bridge plugin, same job ==="
+# rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-i9net.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+#     { "type": "bridge", "bridge": "i9br0", "isGateway": true, "ipMasq": true,
+#       "hairpinMode": true,
+#       "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } } ] }
+# EOF
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# sudo -E cnitool add i9net /var/run/netns/i9pod1 >/dev/null
+# hostveth=$(ip -o link show type veth | awk -F: "{print \$2}" | tr -d " " | cut -d@ -f1 | grep -v vethec411300 | grep -v veth1 | head -1)
+# echo "host-side veth = $hostveth"
+# echo
+# echo "--- the NAT rules IT wrote ---"
+# sudo iptables -t nat -S | grep -E "CNI-|10.90.0" | sed "s/^/  /"
+# echo
+# echo "--- sysctls it set on the host veth ---"
+# for k in accept_ra disable_ipv6 accept_ra_defrtr; do
+#   printf "  %s %-18s %s\n" "$hostveth" "$k" "$(sudo cat /proc/sys/net/ipv6/conf/$hostveth/$k 2>&1)"
+# done
+# printf "  %s %-18s %s\n" "$hostveth" hairpin_mode "$(sudo cat /sys/class/net/$hostveth/brport/hairpin_mode)"
+# printf "  %s %-18s %s\n" i9br0 "ip_forward(global)" "$(cat /proc/sys/net/ipv4/ip_forward)"
+# echo
+# echo "--- and inside the namespace ---"
+# sudo ip netns exec i9pod1 ip -br addr
+# sudo ip netns exec i9pod1 cat /proc/sys/net/ipv4/conf/eth0/arp_notify 2>&1 | sed "s/^/  arp_notify /"
+# --- output ---
+=== A. net-up.sh: the beginner-track script, one bridge, three namespaces ===
+bridge cni0 = 10.20.0.1/24, egress via ens3
+  pod1 = 10.20.0.2
+
+--- the NAT rule it wrote ---
+-A POSTROUTING -s 10.20.0.0/24 -o ens3 -j MASQUERADE
+--- sysctls it set on the host veth ---
+  veth1 accept_ra      1
+  veth1 disable_ipv6   0
+  cni0  hairpin        0
+
+=== B. now the reference bridge plugin, same job ===
+host-side veth = vethb3b8ec40
+
+--- the NAT rules IT wrote ---
+  -N CNI-5ee93e7c626f981e7589e5a5
+  -N CNI-73464a7c6ba6b249e0425faf
+  -N CNI-DN-73464a7c6ba6b249e0425
+  -N CNI-DN-e1934a5559f4338ad545c
+  -N CNI-HOSTPORT-DNAT
+  -N CNI-HOSTPORT-MASQ
+  -N CNI-HOSTPORT-SETMARK
+  -A PREROUTING -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT
+  -A OUTPUT -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT
+  -A POSTROUTING -m comment --comment "CNI portfwd requiring masquerade" -j CNI-HOSTPORT-MASQ
+  -A POSTROUTING -s 10.4.0.35/32 -m comment --comment "name: \"bridge\" id: \"default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90\"" -j CNI-73464a7c6ba6b249e0425faf
+  -A POSTROUTING -s 10.90.0.2/32 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j CNI-5ee93e7c626f981e7589e5a5
+  -A POSTROUTING -s 10.90.0.3/32 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j CNI-5ee93e7c626f981e7589e5a5
+  -A CNI-5ee93e7c626f981e7589e5a5 -d 10.90.0.0/24 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j ACCEPT
+  -A CNI-5ee93e7c626f981e7589e5a5 ! -d 224.0.0.0/4 -m comment --comment "name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -j MASQUERADE
+  -A CNI-73464a7c6ba6b249e0425faf -d 10.4.0.0/24 -m comment --comment "name: \"bridge\" id: \"default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90\"" -j ACCEPT
+  -A CNI-73464a7c6ba6b249e0425faf ! -d 224.0.0.0/4 -m comment --comment "name: \"bridge\" id: \"default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90\"" -j MASQUERADE
+  -A CNI-DN-73464a7c6ba6b249e0425 -s 10.4.0.0/24 -d 127.0.0.1/32 -p tcp -m tcp --dport 5000 -j CNI-HOSTPORT-SETMARK
+  -A CNI-DN-73464a7c6ba6b249e0425 -s 127.0.0.1/32 -d 127.0.0.1/32 -p tcp -m tcp --dport 5000 -j CNI-HOSTPORT-SETMARK
+  -A CNI-DN-73464a7c6ba6b249e0425 -d 127.0.0.1/32 -p tcp -m tcp --dport 5000 -j DNAT --to-destination 10.4.0.35:5000
+  -A CNI-DN-e1934a5559f4338ad545c -s 127.0.0.1/32 -p tcp -m tcp --dport 18099 -j CNI-HOSTPORT-SETMARK
+  -A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"bridge\" id: \"default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90\"" -m multiport --dports 5000 -j CNI-DN-73464a7c6ba6b249e0425
+  -A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"i9chain\" id: \"cnitool-c3af9ea7303b56406479\"" -m multiport --dports 18099 -j CNI-DN-e1934a5559f4338ad545c
+  -A CNI-HOSTPORT-MASQ -m mark --mark 0x2000/0x2000 -j MASQUERADE
+  -A CNI-HOSTPORT-SETMARK -m comment --comment "CNI portfwd masquerade mark" -j MARK --set-xmark 0x2000/0x2000
+
+--- sysctls it set on the host veth ---
+  vethb3b8ec40 accept_ra          0
+  vethb3b8ec40 disable_ipv6       0
+  vethb3b8ec40 accept_ra_defrtr   1
+  vethb3b8ec40 hairpin_mode       1
+  i9br0 ip_forward(global) 1
+
+--- and inside the namespace ---
+lo               DOWN           
+eth0@if102       UP             10.90.0.3/24 fe80::ac53:5fff:fe23:fa65/64 
+  arp_notify 1

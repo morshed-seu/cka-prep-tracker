@@ -1,0 +1,67 @@
+# captured 2026-07-30T09:04:52Z on sandbox
+# --- snippet ---
+# echo "=== state before: any leftover veths in the host netns? ==="
+# ip -br link show type veth
+# echo
+# echo "=== 1. a failed ADD: valid JSON, but IPAM has nothing to give ==="
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=leak-demo CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/e-tiny.json
+# echo "exit=$?"
+# echo
+# echo "=== 2. what did that failed ADD leave behind? ==="
+# ip -br link show type veth
+# ip -br link show i9tiny0 2>&1
+# sudo ip netns exec i9pod1 ip -br link
+# echo
+# echo "=== 3. the spec says code 7 for this. The spec example even uses this message: ==="
+# echo "    { \"code\": 7, \"msg\": \"Invalid Configuration\","
+# echo "      \"details\": \"Network 192.168.0.0/31 too small to allocate from.\" }"
+# echo "    the plugin returned 999."
+# echo
+# echo "=== 4. separately: the delegated IPAM binary genuinely not on CNI_PATH ==="
+# sudo ip netns add i9pod2 2>/dev/null || true
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=nopath-demo CNI_NETNS=/var/run/netns/i9pod2 \
+#   CNI_IFNAME=eth0 CNI_PATH=/nonexistent /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== 5. cleanup of what leaked ==="
+# sudo ip link del i9tiny0 2>/dev/null && echo "deleted i9tiny0" || echo "no i9tiny0 to delete"
+# for v in $(ip -o link show type veth | awk -F: "{print \$2}" | tr -d " " | cut -d@ -f1); do
+#   case "$v" in vethec411300) echo "keeping $v (the registry container)";; *) sudo ip link del "$v" && echo "deleted $v";; esac
+# done
+# ip -br link show type veth
+# --- output ---
+=== state before: any leftover veths in the host netns? ===
+vethec411300@if2 UP             92:b3:f1:38:84:5d <BROADCAST,MULTICAST,UP,LOWER_UP> 
+veth3d890aac@if3 DOWN           16:0d:25:c9:f6:ab <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+
+=== 1. a failed ADD: valid JSON, but IPAM has nothing to give ===
+{
+    "code": 999,
+    "msg": "container veth name (\"eth0\") peer provided (\"vethcff53319\") already exists"
+}exit=1
+
+=== 2. what did that failed ADD leave behind? ===
+vethec411300@if2 UP             92:b3:f1:38:84:5d <BROADCAST,MULTICAST,UP,LOWER_UP> 
+veth3d890aac@if3 DOWN           16:0d:25:c9:f6:ab <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+i9tiny0          DOWN           36:af:16:88:58:c7 <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+lo               DOWN           00:00:00:00:00:00 <LOOPBACK> 
+eth0@if60        DOWN           42:d5:14:f4:76:f8 <BROADCAST,MULTICAST> 
+
+=== 3. the spec says code 7 for this. The spec example even uses this message: ===
+    { "code": 7, "msg": "Invalid Configuration",
+      "details": "Network 192.168.0.0/31 too small to allocate from." }
+    the plugin returned 999.
+
+=== 4. separately: the delegated IPAM binary genuinely not on CNI_PATH ===
+{
+    "code": 999,
+    "msg": "failed to find plugin \"host-local\" in path [/nonexistent]"
+}exit=1
+
+=== 5. cleanup of what leaked ===
+deleted i9tiny0
+keeping vethec411300 (the registry container)
+deleted veth3d890aac
+deleted veth877b3e31
+vethec411300@if2 UP             92:b3:f1:38:84:5d <BROADCAST,MULTICAST,UP,LOWER_UP> 

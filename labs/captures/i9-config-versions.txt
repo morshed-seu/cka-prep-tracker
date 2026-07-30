@@ -1,0 +1,100 @@
+# captured 2026-07-30T09:10:13Z on sandbox
+# --- snippet ---
+# echo "=== A. supportedVersions of four plugins, side by side ==="
+# for p in bridge host-local portmap loopback dhcp i9-dump; do
+#   v=$(echo "{\"cniVersion\":\"1.1.0\",\"name\":\"x\",\"type\":\"$p\"}" | sudo env CNI_COMMAND=VERSION /opt/cni/bin/$p 2>&1 | jq -c ".supportedVersions" 2>/dev/null)
+#   printf "  %-12s %s\n" "$p" "$v"
+# done
+# echo
+# echo "=== B. the same ADD asked for at four different cniVersions ==="
+# for ver in 0.2.0 0.3.1 0.4.0 1.1.0; do
+#   sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+#   cat > ~/i9/v.json <<EOF
+# { "cniVersion": "$ver", "name": "i9ver", "type": "bridge", "bridge": "i9chain0",
+#   "isGateway": true, "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#   "routes": [ { "dst": "0.0.0.0/0" } ] } }
+# EOF
+#   echo "--- cniVersion $ver ---"
+#   sudo env CNI_COMMAND=ADD CNI_CONTAINERID=ver-$ver CNI_NETNS=/var/run/netns/i9pod1 \
+#     CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/v.json | jq -c "keys"
+#   sudo env CNI_COMMAND=DEL CNI_CONTAINERID=ver-$ver CNI_NETNS=/var/run/netns/i9pod1 \
+#     CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/v.json
+# done
+# echo
+# echo "=== C. the 0.2.0 result in full — the flat ip4 form 1.x replaced ==="
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# cat > ~/i9/v.json <<EOF
+# { "cniVersion": "0.2.0", "name": "i9ver", "type": "bridge", "bridge": "i9chain0",
+#   "isGateway": true, "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#   "routes": [ { "dst": "0.0.0.0/0" } ] } }
+# EOF
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=flat CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/v.json | jq .
+# sudo env CNI_COMMAND=DEL CNI_CONTAINERID=flat CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/v.json
+# echo
+# echo "=== D. ask for a version no plugin supports ==="
+# sed -i "s/0.2.0/1.5.0/" ~/i9/v.json
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=nope CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/v.json
+# echo "exit=$?"
+# echo
+# echo "=== E. the 1.1 cniVersions array: offer a set, let the runtime pick the highest ==="
+# rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-multi.conflist <<EOF
+# { "cniVersions": [ "0.3.1", "1.0.0", "1.1.0" ], "name": "i9multi", "plugins": [
+#   { "type": "bridge", "bridge": "i9chain0", "isGateway": true,
+#     "ipam": { "type": "host-local", "subnet": "10.92.0.0/24" } },
+#   { "type": "i9-dump" } ] }
+# EOF
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# sudo truncate -s0 /var/log/i9-dump.log
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add i9multi /var/run/netns/i9pod1 | jq -c "{cniVersion}"
+# echo "   ^ i9-dump advertises up to 1.1.0, bridge up to 1.1.0, so 1.1.0 was chosen"
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del i9multi /var/run/netns/i9pod1
+# ~/i9/reset.sh
+# --- output ---
+=== A. supportedVersions of four plugins, side by side ===
+  bridge       ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  host-local   ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  portmap      ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  loopback     ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  dhcp         ["0.1.0","0.2.0","0.3.0","0.3.1","0.4.0","1.0.0","1.1.0"]
+  i9-dump      ["0.3.1","0.4.0","1.0.0","1.1.0"]
+
+=== B. the same ADD asked for at four different cniVersions ===
+--- cniVersion 0.2.0 ---
+["cniVersion","dns","ip4"]
+--- cniVersion 0.3.1 ---
+["cniVersion","dns","interfaces","ips","routes"]
+--- cniVersion 0.4.0 ---
+["cniVersion","dns","interfaces","ips","routes"]
+--- cniVersion 1.1.0 ---
+["cniVersion","interfaces","ips","routes"]
+
+=== C. the 0.2.0 result in full — the flat ip4 form 1.x replaced ===
+{
+  "cniVersion": "0.2.0",
+  "ip4": {
+    "ip": "10.92.0.6/24",
+    "gateway": "10.92.0.1",
+    "routes": [
+      {
+        "dst": "0.0.0.0/0"
+      }
+    ]
+  },
+  "dns": {}
+}
+
+=== D. ask for a version no plugin supports ===
+{
+    "code": 1,
+    "msg": "incompatible CNI versions",
+    "details": "config is \"1.5.0\", plugin supports [\"0.1.0\" \"0.2.0\" \"0.3.0\" \"0.3.1\" \"0.4.0\" \"1.0.0\" \"1.1.0\"]"
+}exit=1
+
+=== E. the 1.1 cniVersions array: offer a set, let the runtime pick the highest ===
+{"cniVersion":"1.1.0"}
+   ^ i9-dump advertises up to 1.1.0, bridge up to 1.1.0, so 1.1.0 was chosen
+reset done

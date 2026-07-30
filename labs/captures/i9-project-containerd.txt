@@ -1,0 +1,119 @@
+# captured 2026-07-30T12:50:48Z on sandbox
+# --- snippet ---
+# for p in $(sudo crictl pods -q); do sudo crictl rmp -f "$p" >/dev/null 2>&1; done
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# sudo rm -rf /var/lib/cni/minibridge
+# echo "=== A. install minibridge as this nodes CNI ==="
+# sudo install -m0755 ~/i9/cni-minibridge /opt/cni/bin/minibridge
+# sudo tee /etc/cni/net.d/00-minibridge.conflist >/dev/null <<EOF
+# {
+#   "cniVersion": "1.1.0",
+#   "name": "minibridge",
+#   "plugins": [
+#     { "type": "minibridge", "bridge": "mbr0", "ipMasq": true, "mtu": 1450,
+#       "ipam": { "subnet": "10.99.0.0/24" } },
+#     { "type": "portmap", "capabilities": { "portMappings": true } }
+#   ]
+# }
+# EOF
+# sudo ls /etc/cni/net.d/ | sed "s/^/    /"
+# sleep 3
+# sudo crictl info | jq -c "{NetworkReady: (.status.conditions[]|select(.type==\"NetworkReady\")|.status)}" | sed "s/^/    /"
+# echo
+# echo "=== B. a real sandbox, with a hostPort ==="
+# cat > ~/i9/pod-mb.json <<EOF
+# { "metadata": { "name": "mb-pod", "namespace": "i9", "uid": "mb-uid-1", "attempt": 0 },
+#   "log_directory": "/tmp",
+#   "port_mappings": [ { "protocol": 0, "container_port": 80, "host_port": 18099 } ],
+#   "linux": {} }
+# EOF
+# sudo crictl runp ~/i9/pod-mb.json 2>/dev/null > ~/i9/mbpod
+# POD=$(cat ~/i9/mbpod)
+# echo "    sandbox = $POD"
+# echo
+# echo "=== C. the address containerd got back from OUR bash plugin ==="
+# sudo crictl inspectp "$POD" | jq -c "{ip: .status.network.ip}" | sed "s/^/    /"
+# sudo crictl inspectp "$POD" | jq -r ".info.runtimeSpec.linux.namespaces[]|select(.type==\"network\")|.path" | sed "s/^/    netns: /"
+# echo "    our reservation store:"
+# for f in $(sudo ls /var/lib/cni/minibridge/minibridge | grep "^10\."); do
+#   printf "      %-11s %s\n" "$f" "$(sudo cat /var/lib/cni/minibridge/minibridge/$f | tr -d "\r" | tr "\n" "/")"
+# done
+# echo "    our masquerade rule:"
+# sudo iptables -t nat -S POSTROUTING | grep minibridge | sed "s/^/      /"
+# echo "    portmap, chained onto our result, DNATing to the address we allocated:"
+# sudo iptables -t nat -S | grep "18099 -j DNAT" | sed "s/^/      /"
+# echo
+# echo "=== D. a container in that sandbox, serving on port 80 ==="
+# echo "    (alpine 3.21 busybox has nc and wget but NOT httpd)"
+# cat > ~/i9/ctr-mb.json <<EOF
+# { "metadata": { "name": "web" }, "image": { "image": "docker.io/library/alpine:3.21" },
+#   "command": [ "sh", "-c",
+#     "while :; do printf \"HTTP/1.1 200 OK\\r\\nContent-Length: 11\\r\\nConnection: close\\r\\n\\r\\nminibridge\\n\" | nc -l -p 80; done" ],
+#   "log_path": "web.0.log", "linux": {} }
+# EOF
+# CID=$(sudo crictl create "$POD" ~/i9/ctr-mb.json ~/i9/pod-mb.json 2>/dev/null)
+# sudo crictl start "$CID" >/dev/null 2>&1
+# sleep 3
+# sudo crictl ps | sed "s/^/    /"
+# echo
+# echo "=== E. reach it from the host: through portmap, into our veth ==="
+# curl -s --max-time 5 http://127.0.0.1:18099/ | sed "s/^/    body: /"
+# curl -s --max-time 5 -o /dev/null -w "    HTTP %{http_code} from 127.0.0.1:18099\n" http://127.0.0.1:18099/
+# echo
+# echo "=== F. and the pod reaches the internet through our masquerade rule ==="
+# sudo crictl exec "$CID" ping -c2 -W2 1.1.1.1 2>&1 | tail -2 | sed "s/^/    /"
+# echo "    its address and route, from inside the container:"
+# sudo crictl exec "$CID" ip addr show eth0 2>&1 | grep -E "inet |mtu" | sed "s/^/      /"
+# sudo crictl exec "$CID" ip route 2>&1 | sed "s/^/      /"
+# echo
+# echo "=== G. teardown, and nothing left behind ==="
+# sudo crictl rmp -f "$POD" >/dev/null 2>&1 && echo "    sandbox removed"
+# echo "    reservations: $(sudo ls /var/lib/cni/minibridge/minibridge | grep -c "^10\." || true)"
+# echo "    masq rules:   $(sudo iptables -t nat -S POSTROUTING | grep -c minibridge || true)"
+# echo "    18099 rules:  $(sudo iptables -t nat -S | grep -c 18099 || true)"
+# echo "    the bridge:   $(ip -br link show mbr0 2>/dev/null | awk "{print \$1, \$2}") — a plugin never deletes it"
+# sudo rm -f /etc/cni/net.d/00-minibridge.conflist
+# --- output ---
+=== A. install minibridge as this nodes CNI ===
+    00-minibridge.conflist
+    default
+    nerdctl-bridge.conflist
+    {"NetworkReady":true}
+
+=== B. a real sandbox, with a hostPort ===
+    sandbox = e633bae7e4d7fc19e043ed3e8afc863627f9e47de1eb0f2ab6daf59af21eca23
+
+=== C. the address containerd got back from OUR bash plugin ===
+    {"ip":"10.99.0.2"}
+    netns: /var/run/netns/cni-7508b3a2-b672-a4eb-50d1-a50e185224e1
+    our reservation store:
+      10.99.0.2   e633bae7e4d7fc19e043ed3e8afc863627f9e47de1eb0f2ab6daf59af21eca23/eth0/
+    our masquerade rule:
+      -A POSTROUTING -s 10.99.0.2/32 ! -d 10.99.0.0/24 -m comment --comment "minibridge:minibridge" -j MASQUERADE
+    portmap, chained onto our result, DNATing to the address we allocated:
+      -A CNI-DN-ea643b49e5004c0b1edcb -p tcp -m tcp --dport 18099 -j DNAT --to-destination 10.99.0.2:80
+
+=== D. a container in that sandbox, serving on port 80 ===
+    (alpine 3.21 busybox has nc and wget but NOT httpd)
+    CONTAINER           IMAGE                           CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+    1f57abc43e768       docker.io/library/alpine:3.21   3 seconds ago       Running             web                 0                   e633bae7e4d7f       unknown             unknown
+
+=== E. reach it from the host: through portmap, into our veth ===
+    body: minibridge
+    HTTP 200 from 127.0.0.1:18099
+
+=== F. and the pod reaches the internet through our masquerade rule ===
+    2 packets transmitted, 2 packets received, 0% packet loss
+    round-trip min/avg/max = 21.145/22.072/23.000 ms
+    its address and route, from inside the container:
+      2: eth0@if65: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1450 qdisc noqueue state UP qlen 1000
+          inet 10.99.0.2/24 scope global eth0
+      default via 10.99.0.1 dev eth0 
+      10.99.0.0/24 dev eth0 scope link  src 10.99.0.2 
+
+=== G. teardown, and nothing left behind ===
+    sandbox removed
+    reservations: 0
+    masq rules:   0
+    18099 rules:  0
+    the bridge:   mbr0 DOWN — a plugin never deletes it

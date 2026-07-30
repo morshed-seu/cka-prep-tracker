@@ -1,0 +1,93 @@
+# captured 2026-07-30T09:03:41Z on sandbox
+# --- snippet ---
+# mkdir -p ~/i9
+# cat > ~/i9/i9bridge.json <<EOF
+# {
+#   "cniVersion": "1.1.0",
+#   "name": "i9net",
+#   "type": "bridge",
+#   "bridge": "i9br0",
+#   "isGateway": true,
+#   "ipMasq": true,
+#   "ipam": { "type": "host-local", "subnet": "10.90.0.0/24", "routes": [ { "dst": "0.0.0.0/0" } ] }
+# }
+# EOF
+# sudo ip netns add i9pod1 2>/dev/null || true
+# echo "=== 1. the namespace holds one DOWN loopback and nothing else ==="
+# sudo ip netns exec i9pod1 ip -br addr
+# echo
+# echo "=== 2. first attempt: pass the pod name in CNI_ARGS the way Kubernetes does ==="
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=i9-demo-container-0001 \
+#   CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   CNI_ARGS="K8S_POD_NAME=demo;K8S_POD_NAMESPACE=default" \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== 3. same call with IgnoreUnknown=true, which is what the real runtime sends ==="
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=i9-demo-container-0001 \
+#   CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   CNI_ARGS="IgnoreUnknown=true;K8S_POD_NAME=demo;K8S_POD_NAMESPACE=default" \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json > ~/i9/add-result.json
+# echo "exit=$?"
+# jq . ~/i9/add-result.json
+# echo
+# echo "=== 4. inside the namespace afterwards ==="
+# sudo ip netns exec i9pod1 ip -br addr
+# sudo ip netns exec i9pod1 ip route
+# echo
+# echo "=== 5. and on the host ==="
+# ip -br link show i9br0
+# ip -br link show type veth
+# --- output ---
+=== 1. the namespace holds one DOWN loopback and nothing else ===
+lo               DOWN           
+
+=== 2. first attempt: pass the pod name in CNI_ARGS the way Kubernetes does ===
+{
+    "code": 999,
+    "msg": "ARGS: unknown args [\"K8S_POD_NAME=demo\" \"K8S_POD_NAMESPACE=default\"]"
+}exit=1
+
+=== 3. same call with IgnoreUnknown=true, which is what the real runtime sends ===
+exit=0
+{
+  "cniVersion": "1.1.0",
+  "interfaces": [
+    {
+      "mac": "7e:bc:e6:fa:51:68",
+      "name": "i9br0"
+    },
+    {
+      "mac": "82:46:94:c5:46:66",
+      "name": "veth6cc7674e"
+    },
+    {
+      "mac": "0a:8b:2d:18:9e:d4",
+      "name": "eth0",
+      "sandbox": "/var/run/netns/i9pod1"
+    }
+  ],
+  "ips": [
+    {
+      "address": "10.90.0.2/24",
+      "gateway": "10.90.0.1",
+      "interface": 2
+    }
+  ],
+  "routes": [
+    {
+      "dst": "0.0.0.0/0"
+    }
+  ]
+}
+
+=== 4. inside the namespace afterwards ===
+lo               DOWN           
+eth0@if58        UP             10.90.0.2/24 fe80::88b:2dff:fe18:9ed4/64 
+default via 10.90.0.1 dev eth0 
+10.90.0.0/24 dev eth0 proto kernel scope link src 10.90.0.2 
+
+=== 5. and on the host ===
+i9br0            UP             7e:bc:e6:fa:51:68 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+vethec411300@if2 UP             92:b3:f1:38:84:5d <BROADCAST,MULTICAST,UP,LOWER_UP> 
+veth6cc7674e@if2 UP             82:46:94:c5:46:66 <BROADCAST,MULTICAST,UP,LOWER_UP> 

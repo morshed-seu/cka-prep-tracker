@@ -1,0 +1,76 @@
+# captured 2026-07-30T12:52:59Z on sandbox
+# --- snippet ---
+# bash ~/i9/drill.sh
+# --- output ---
+############ FAULT 1 — a plugin that writes a diagnostic to stdout ############
+  planted: echo "mb-broken: starting up, about to read the config"
+
+--- the symptom, from the operator's side ---
+    time="2026-07-30T18:53:02+06:00" level=warning msg="cgroup_parent is not set. Use `runtime-config` to get the runtime cgroup driver"
+    E0730 18:53:02.943347   17662 remote_runtime.go:237] "RunPodSandbox from runtime service failed" err="rpc error: code = Unknown desc = failed to setup network for sandbox \"9af9907d12c3fb6dcb9532381853c7d35768d6f8703171891135969110b20546\": plugin type=\"mb-broken\" failed (add): failed to unmarshal raw result: invalid character 'm' looking for beginning of value"
+    time="2026-07-30T18:53:02+06:00" level=fatal msg="run pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox \"9af9907d12c3fb6dcb9532381853c7d35768d6f8703171891135969110b20546\": plugin type=\"mb-broken\" failed (add): failed to unmarshal raw result: invalid character 'm' looking for beginning of value"
+
+--- what the plugin actually printed ---
+    mb-broken: starting up, about to read the config
+    {"cniVersion":"1.1.0","interfaces":[{"name":"mbr0","mac":"12:f8:ff:63:cb:88"},{"name":"mb2c765965182","mac":"06:6a:b6:99:10:a8"},{"name":"eth0","mac":"ee:d1:25:66:5c:07","sandbox":"/var/run/netns/i9pod1"}],"ips":[{"address":"10.97.0.2/24","gateway":"10.97.0.1","interface":2}],"routes":[{"dst":"0.0.0.0/0","gw":"10.97.0.1"}],"dns":{}}
+    ^ a line of prose, then the JSON. Valid neither as text nor as a result.
+
+--- and containerd's own words for it ---
+    Jul 30 18:52:24 sandbox containerd[731]: time="2026-07-30T18:52:24.591351951+06:00" level=error msg="RunPodSandbox for name:\"fault3c\"  uid:\"uid-fault3c\"  namespace:\"i9\" failed, error" error="rpc error: code = Unknown desc = failed to setup network for sandbox \"631ea8da007fe65f4ec637ccbfb7c8cb407fd0ec696bc1c6237ea4778c9269a1\": plugin type=\"mb-broken\" failed (add): failed to unmarshal raw result: invalid character 'm' looking for beginning of value"
+    Jul 30 18:53:02 sandbox containerd[731]: time="2026-07-30T18:53:02.943066531+06:00" level=error msg="RunPodSandbox for name:\"fault1\"  uid:\"uid-fault1\"  namespace:\"i9\" failed, error" error="rpc error: code = Unknown desc = failed to setup network for sandbox \"9af9907d12c3fb6dcb9532381853c7d35768d6f8703171891135969110b20546\": plugin type=\"mb-broken\" failed (add): failed to unmarshal raw result: invalid character 'm' looking for beginning of value"
+
+############ FAULT 2 — IPAM exhaustion from DELs that never ran ############
+--- fill the /29 with reservations whose holders are long gone ---
+    running pods on this node: 0
+    reservations held:         5
+
+--- a new pod is scheduled here ---
+    time="2026-07-30T18:53:06+06:00" level=warning msg="cgroup_parent is not set. Use `runtime-config` to get the runtime cgroup driver"
+    E0730 18:53:06.383488   18038 remote_runtime.go:237] "RunPodSandbox from runtime service failed" err="rpc error: code = Unknown desc = failed to setup network for sandbox \"63d80a856140023dbbf10b2e48fedbc4d1898e875013ba7d3e2c11edf8e1f6af\": plugin type=\"minibridge\" failed (add): Invalid network config; no IP addresses available in 10.99.0.0/29 — 5 reservations held"
+    time="2026-07-30T18:53:06+06:00" level=fatal msg="run pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox \"63d80a856140023dbbf10b2e48fedbc4d1898e875013ba7d3e2c11edf8e1f6af\": plugin type=\"minibridge\" failed (add): Invalid network config; no IP addresses available in 10.99.0.0/29 — 5 reservations held"
+
+--- nothing in that names a file. The evidence is one ls: ---
+    total 20
+    -rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.2
+    -rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.3
+    -rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.4
+    -rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.5
+    -rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.6
+    -rw------- 1 root root  0 Jul 30 18:53 lock
+
+--- the fix a v1.1 runtime should be able to make: GC ---
+    minibridge: gc: reclaiming 10.99.0.2 held by pod-deleted-in-january-2/eth0
+    minibridge: gc: reclaiming 10.99.0.3 held by pod-deleted-in-january-3/eth0
+    minibridge: gc: reclaiming 10.99.0.4 held by pod-deleted-in-january-4/eth0
+    minibridge: gc: reclaiming 10.99.0.5 held by pod-deleted-in-january-5/eth0
+    minibridge: gc: reclaiming 10.99.0.6 held by pod-deleted-in-january-6/eth0
+    minibridge: gc: reclaimed 5 reservation(s)
+    reservations after GC: 0
+--- and now the pod schedules ---
+    time="2026-07-30T18:53:06+06:00" level=warning msg="cgroup_parent is not set. Use `runtime-config` to get the runtime cgroup driver"
+    468de4954f39cb46bf253bdde8fbfb20e1702dfc766f76b979cece7277496818
+    {"ip":"10.99.0.2"}
+
+############ FAULT 3 — two conf files, and the wrong one wins ############
+--- the operator's existing network ---
+    confDir: /etc/cni/net.d
+    pod address: {"ip":"10.50.0.2"}
+
+--- they add a new network, numbered HIGHER so it 'takes precedence' ---
+      00-newnet.conflist
+      05-production.conflist
+      nerdctl-bridge.conflist
+    pod address: {"ip":"10.60.0.2"}
+    ^ 00- sorts first, so every new pod silently moved networks.
+      maxConfNum is 1: containerd loads ONE conf, the lexically first.
+
+--- and the same file renamed so it is NOT a live config ---
+      00-newnet.conflist.disabled
+      05-production.conflist
+      default
+      nerdctl-bridge.conflist
+    pod address: {"ip":"10.50.0.3"}
+    ^ back on production. The extension decides, not the sort order:
+      libcni matches .conflist exactly, so .conflist.disabled is inert.
+
+all three faults cleaned up

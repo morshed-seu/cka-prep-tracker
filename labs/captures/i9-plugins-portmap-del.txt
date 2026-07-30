@@ -1,0 +1,53 @@
+# captured 2026-07-30T12:33:38Z on sandbox
+# --- snippet ---
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# c(){ sudo iptables -t nat -S | grep -c 18080 || true; }
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# echo "baseline rules naming 18080: $(c)"
+# echo
+# echo "=== case 1: DEL with no CAP_ARGS in the environment ==="
+# sudo ip netns add i9pod1
+# sudo -E env CAP_ARGS="{\"portMappings\":[{\"hostPort\":18080,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9net /var/run/netns/i9pod1 >/dev/null
+# echo "  after ADD: $(c)"
+# echo "  the cached attachment libcni wrote:"
+# sudo ls /var/lib/cni/results/ | grep i9net | sed "s/^/    /"
+# sudo jq -c "{capabilityArgs: .capabilityArgs, cniArgs: .cniArgs}" /var/lib/cni/results/i9net-* 2>/dev/null | sed "s/^/    /"
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "  del exit=$?"
+# echo "  after DEL: $(c)"
+# echo
+# echo "=== case 2: same, but CAP_ARGS present on the DEL too ==="
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# sudo ip netns add i9pod1
+# sudo -E env CAP_ARGS="{\"portMappings\":[{\"hostPort\":18080,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9net /var/run/netns/i9pod1 >/dev/null
+# echo "  after ADD: $(c)"
+# sudo -E env CAP_ARGS="{\"portMappings\":[{\"hostPort\":18080,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool del i9net /var/run/netns/i9pod1; echo "  del exit=$?"
+# echo "  after DEL: $(c)"
+# echo
+# echo "=== case 3: what does the cache file actually contain? ==="
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# sudo ip netns add i9pod1
+# sudo -E env CAP_ARGS="{\"portMappings\":[{\"hostPort\":18080,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9net /var/run/netns/i9pod1 >/dev/null
+# sudo cat /var/lib/cni/results/i9net-* | jq "{kind, containerId, ifName, cniArgs, capabilityArgs, configKeys: (.config|type)}"
+# sudo -E cnitool del i9net /var/run/netns/i9pod1 >/dev/null 2>&1
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# --- output ---
+baseline rules naming 18080: 0
+
+=== case 1: DEL with no CAP_ARGS in the environment ===
+  after ADD: 4
+  the cached attachment libcni wrote:
+    i9net-cnitool-c3af9ea7303b56406479-eth0
+  del exit=0
+  after DEL: 4
+
+=== case 2: same, but CAP_ARGS present on the DEL too ===
+  after ADD: 4
+  del exit=0
+  after DEL: 0
+
+=== case 3: what does the cache file actually contain? ===
+cat: '/var/lib/cni/results/i9net-*': No such file or directory

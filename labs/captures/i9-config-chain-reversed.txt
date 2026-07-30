@@ -1,0 +1,75 @@
+# captured 2026-07-30T09:08:42Z on sandbox
+# --- snippet ---
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del i9chain /var/run/netns/i9pod1 2>/dev/null
+# rm -f ~/i9/net.d/* /tmp/i9-dump.log
+# cat > ~/i9/net.d/10-chain.conflist <<EOF
+# {
+#   "cniVersion": "1.1.0",
+#   "name": "i9chain",
+#   "plugins": [
+#     { "type": "portmap", "capabilities": { "portMappings": true } },
+#     { "type": "bridge", "bridge": "i9chain0", "isGateway": true, "ipMasq": true,
+#       "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } }
+#   ]
+# }
+# EOF
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# echo "=== portmap first, bridge second ==="
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin \
+#   CAP_ARGS="{\"portMappings\":[{\"hostPort\":18099,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9chain /var/run/netns/i9pod1
+# echo "exit=$?"
+# echo
+# echo "=== and with no port mapping supplied at all, portmap first ==="
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add i9chain /var/run/netns/i9pod1
+# echo "exit=$?"
+# echo
+# echo "=== DEL runs the chain in REVERSE, so bridge is torn down before portmap ==="
+# rm -f ~/i9/net.d/* /tmp/i9-dump.log
+# cat > ~/i9/net.d/10-chain.conflist <<EOF
+# {
+#   "cniVersion": "1.1.0",
+#   "name": "i9chain",
+#   "plugins": [
+#     { "type": "bridge", "bridge": "i9chain0", "isGateway": true, "ipMasq": true,
+#       "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } },
+#     { "type": "i9-dump" }
+#   ]
+# }
+# EOF
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add i9chain /var/run/netns/i9pod1 >/dev/null
+# rm -f /tmp/i9-dump.log
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del i9chain /var/run/netns/i9pod1
+# echo "exit=$?"
+# echo "--- what i9-dump was handed on DEL ---"
+# grep -A4 "CNI_COMMAND=DEL" /tmp/i9-dump.log | head -8
+# echo "--- and the prevResult it got on DEL, from the cache ---"
+# sed -n "/--- stdin ---/,\$p" /tmp/i9-dump.log | jq -c "{keys: (keys), prevIps: (.prevResult.ips)}"
+# --- output ---
+rm: cannot remove '/tmp/i9-dump.log': Operation not permitted
+=== portmap first, bridge second ===
+plugin type="portmap" failed (add): must be called as chained plugin
+exit=1
+
+=== and with no port mapping supplied at all, portmap first ===
+plugin type="portmap" failed (add): must be called as chained plugin
+exit=1
+
+=== DEL runs the chain in REVERSE, so bridge is torn down before portmap ===
+rm: cannot remove '/tmp/i9-dump.log': Operation not permitted
+rm: cannot remove '/tmp/i9-dump.log': Operation not permitted
+exit=0
+--- what i9-dump was handed on DEL ---
+=== 09:08:42 CNI_COMMAND=DEL CNI_IFNAME=eth0
+--- environment parameters ---
+CNI_ARGS=
+CNI_COMMAND=DEL
+CNI_CONTAINERID=cnitool-c3af9ea7303b56406479
+CNI_IFNAME=eth0
+CNI_NETNS=/var/run/netns/i9pod1
+CNI_PATH=/opt/cni/bin
+--- and the prevResult it got on DEL, from the cache ---
+jq: parse error: Invalid numeric literal at line 1, column 4

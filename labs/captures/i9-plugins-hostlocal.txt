@@ -1,0 +1,63 @@
+# captured 2026-07-30T09:13:40Z on sandbox
+# --- snippet ---
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null
+# echo "=== A. three attachments, and the store after each ==="
+# for i in 1 2 3; do
+#   sudo ip netns add i9pod$i
+#   sudo -E cnitool add i9net /var/run/netns/i9pod$i | jq -r ".ips[0].address" | sed "s/^/  i9pod$i -> /"
+# done
+# echo
+# sudo ls -l /var/lib/cni/networks/i9net/
+# echo
+# echo "=== B. what is IN each file ==="
+# for f in /var/lib/cni/networks/i9net/10.90.0.*; do
+#   echo "--- $f"; sudo cat "$f" | sed "s/^/    /"
+# done
+# echo "--- last_reserved_ip.0"; sudo cat /var/lib/cni/networks/i9net/last_reserved_ip.0 | sed "s/^/    /"
+# echo
+# echo "=== C. delete the middle one; note which address the NEXT add gets ==="
+# sudo -E cnitool del i9net /var/run/netns/i9pod2
+# sudo ip netns del i9pod2
+# sudo ls /var/lib/cni/networks/i9net/ | tr "\n" " "; echo
+# sudo ip netns add i9pod4
+# sudo -E cnitool add i9net /var/run/netns/i9pod4 | jq -r ".ips[0].address" | sed "s/^/  i9pod4 -> /"
+# echo "  ^ not .3 — allocation walks forward from last_reserved_ip, it does not backfill"
+# echo
+# echo "=== D. a stale reservation, planted by hand, for a container that does not exist ==="
+# sudo sh -c "printf \"a-pod-that-died-in-january\neth0\n\" > /var/lib/cni/networks/i9net/10.90.0.6"
+# sudo ls /var/lib/cni/networks/i9net/ | tr "\n" " "; echo
+# sudo ip netns add i9pod5
+# sudo -E cnitool add i9net /var/run/netns/i9pod5 | jq -r ".ips[0].address" | sed "s/^/  i9pod5 -> /"
+# echo "  ^ .6 was skipped: a file is a reservation, whatever wrote it"
+# --- output ---
+=== A. three attachments, and the store after each ===
+  i9pod1 -> 10.90.0.2/24
+  i9pod2 -> 10.90.0.3/24
+  i9pod3 -> 10.90.0.4/24
+
+total 16
+-rw------- 1 root root 34 Jul 30 15:13 10.90.0.2
+-rw------- 1 root root 34 Jul 30 15:13 10.90.0.3
+-rw------- 1 root root 34 Jul 30 15:13 10.90.0.4
+-rw------- 1 root root  9 Jul 30 15:13 last_reserved_ip.0
+-rwxr-x--- 1 root root  0 Jul 30 15:13 lock
+
+=== B. what is IN each file ===
+--- /var/lib/cni/networks/i9net/10.90.0.2
+    cnitool-c3af9ea7303b56406479
+    eth0--- /var/lib/cni/networks/i9net/10.90.0.3
+    cnitool-6c80ef25d4a4145c2395
+    eth0--- /var/lib/cni/networks/i9net/10.90.0.4
+    cnitool-68353ca9f9dcdd34474f
+    eth0--- last_reserved_ip.0
+    10.90.0.4
+=== C. delete the middle one; note which address the NEXT add gets ===
+10.90.0.2 10.90.0.4 last_reserved_ip.0 lock 
+  i9pod4 -> 10.90.0.5/24
+  ^ not .3 — allocation walks forward from last_reserved_ip, it does not backfill
+
+=== D. a stale reservation, planted by hand, for a container that does not exist ===
+10.90.0.2 10.90.0.4 10.90.0.5 10.90.0.6 last_reserved_ip.0 lock 
+  i9pod5 -> 10.90.0.7/24
+  ^ .6 was skipped: a file is a reservation, whatever wrote it

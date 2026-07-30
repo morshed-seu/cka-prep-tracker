@@ -1,0 +1,103 @@
+# captured 2026-07-30T12:36:33Z on sandbox
+# --- snippet ---
+# echo "=== A. the paths are containerds configuration, not the specs ==="
+# sudo crictl info | jq ".config.cni"
+# echo
+# echo "    maxConfNum: 1 is the setting that makes lexical order decisive —"
+# echo "    containerd loads exactly ONE conf, and it is the first one by name."
+# echo
+# echo "=== B. what the node has before we touch it ==="
+# sudo ls /etc/cni/net.d/ | sed "s/^/    /"
+# echo
+# echo "=== C. install a conflist that sorts FIRST, with i9-dump in the chain ==="
+# sudo tee /etc/cni/net.d/00-i9net.conflist >/dev/null <<EOF
+# { "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+#     { "type": "bridge", "bridge": "i9br0", "isGateway": true, "ipMasq": true, "hairpinMode": true,
+#       "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } },
+#     { "type": "i9-dump" },
+#     { "type": "portmap", "capabilities": { "portMappings": true } } ] }
+# EOF
+# sudo ls /etc/cni/net.d/ | sed "s/^/    /"
+# sleep 3
+# sudo crictl info | jq -c "{NetworkReady: (.status.conditions[]|select(.type==\"NetworkReady\")|.status)}"
+# echo
+# echo "=== D. a real sandbox — no kubelet, no Kubernetes, anywhere ==="
+# sudo truncate -s0 /var/log/i9-dump.log
+# cat > ~/i9/pod.json <<EOF
+# { "metadata": { "name": "i9-cni-pod", "namespace": "i9", "uid": "i9-cni-uid-1", "attempt": 0 },
+#   "log_directory": "/tmp", "linux": {} }
+# EOF
+# sudo crictl runp ~/i9/pod.json 2>/dev/null > ~/i9/podid
+# POD=$(cat ~/i9/podid)
+# echo "  sandbox id = $POD"
+# echo
+# echo "=== E. its address, and the netns CNI was pointed at ==="
+# sudo crictl inspectp "$POD" | jq -c "{ip: .status.network.ip}" | sed "s/^/    /"
+# sudo crictl inspectp "$POD" | jq -r ".info.runtimeSpec.linux.namespaces[]|select(.type==\"network\")|.path" | sed "s/^/    netns: /"
+# echo "  the host-local reservation, and who holds it:"
+# for f in /var/lib/cni/networks/i9net/10.*; do printf "    %s = %s\n" "$(basename "$f")" "$(sudo head -1 "$f")"; done
+# echo "    ^ that container ID is the SANDBOX id — CNI never sees an app container"
+# echo
+# echo "=== F. i9-dump: what containerd sent, in containerds own words ==="
+# sudo sed -n "1,12p" /var/log/i9-dump.log | sed "s/^/    /"
+# echo
+# echo "=== G. teardown releases the reservation ==="
+# sudo crictl rmp -f "$POD" >/dev/null 2>&1 && echo "  removed"
+# sudo ls /var/lib/cni/networks/i9net/ 2>/dev/null | tr "\n" " " | sed "s/^/  store now: /"; echo
+# sudo rm -f /etc/cni/net.d/00-i9net.conflist
+# --- output ---
+=== A. the paths are containerds configuration, not the specs ===
+{
+  "binDir": "",
+  "binDirs": [
+    "/opt/cni/bin"
+  ],
+  "confDir": "/etc/cni/net.d",
+  "confTemplate": "",
+  "ipPref": "",
+  "maxConfNum": 1,
+  "setupSerially": false,
+  "useInternalLoopback": false
+}
+
+    maxConfNum: 1 is the setting that makes lexical order decisive —
+    containerd loads exactly ONE conf, and it is the first one by name.
+
+=== B. what the node has before we touch it ===
+    default
+    nerdctl-bridge.conflist
+
+=== C. install a conflist that sorts FIRST, with i9-dump in the chain ===
+    00-i9net.conflist
+    default
+    nerdctl-bridge.conflist
+{"NetworkReady":true}
+
+=== D. a real sandbox — no kubelet, no Kubernetes, anywhere ===
+  sandbox id = 74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2
+
+=== E. its address, and the netns CNI was pointed at ===
+    {"ip":"10.90.0.2"}
+    netns: /var/run/netns/cni-6469b5d5-0b73-2ec5-d0fb-79f12d30eff3
+  the host-local reservation, and who holds it:
+    10.90.0.2 = 74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2
+    ^ that container ID is the SANDBOX id — CNI never sees an app container
+
+=== F. i9-dump: what containerd sent, in containerds own words ===
+    === 12:36:37 CNI_COMMAND=ADD CNI_IFNAME=eth0
+    --- environment parameters ---
+    CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=i9;K8S_POD_NAME=i9-cni-pod;K8S_POD_INFRA_CONTAINER_ID=74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2;K8S_POD_UID=i9-cni-uid-1
+    CNI_COMMAND=ADD
+    CNI_CONTAINERID=74e611f01486d69d44ba8d6f87215cfc5e7f99ce791207f18cb77f30bc2447c2
+    CNI_IFNAME=eth0
+    CNI_NETNS=/var/run/netns/cni-6469b5d5-0b73-2ec5-d0fb-79f12d30eff3
+    CNI_PATH=/opt/cni/bin
+    --- stdin ---
+    {
+      "cniVersion": "1.1.0",
+      "name": "i9net",
+
+=== G. teardown releases the reservation ===
+  removed
+  store now: last_reserved_ip.0 lock 

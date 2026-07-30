@@ -1,0 +1,66 @@
+# captured 2026-07-30T09:14:25Z on sandbox
+# --- snippet ---
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# echo "=== the network is a /29: .0 network, .1 gateway, .7 broadcast -> five usable ==="
+# echo
+# echo "=== A. attach five, then ask for a sixth ==="
+# for i in 1 2 3 4 5 6; do
+#   sudo ip netns add i9pod$i
+#   r=$(sudo -E cnitool add i9net /var/run/netns/i9pod$i 2>&1)
+#   a=$(echo "$r" | jq -r ".ips[0].address" 2>/dev/null)
+#   if [ -n "$a" ] && [ "$a" != null ]; then echo "  i9pod$i -> $a"
+#   else echo "  i9pod$i -> FAILED:"; echo "$r" | sed "s/^/      /"; fi
+# done
+# echo
+# echo "=== B. the field scenario: every pod gone, no DEL ever ran ==="
+# echo "    (a node reboot, a kubelet crash, a DEL that timed out and was not retried)"
+# for i in 1 2 3 4 5 6; do sudo ip netns del i9pod$i 2>/dev/null; done
+# for v in $(ip -o link show type veth | awk -F": " "{print \$2}" | cut -d@ -f1); do
+#   [ "$v" = vethec411300 ] || sudo ip link del "$v" 2>/dev/null
+# done
+# echo "  network namespaces on the node now:"
+# n=$(ip netns list | wc -l); echo "    $n"
+# echo "  reservations the store still holds:"
+# sudo ls /var/lib/cni/networks/i9net/ | grep "^10\." | sed "s/^/    /"
+# echo
+# echo "  a new pod arrives:"
+# sudo ip netns add i9pod9
+# sudo -E cnitool add i9net /var/run/netns/i9pod9 2>&1 | sed "s/^/    /"
+# echo
+# echo "=== C. nothing in that message names a file, a directory, or a plugin ==="
+# echo
+# echo "=== D. the field repair: delete the reservations whose holders are gone ==="
+# sudo rm -f /var/lib/cni/networks/i9net/10.90.0.3 /var/lib/cni/networks/i9net/10.90.0.4
+# sudo ip netns del i9pod9; sudo ip netns add i9pod9
+# sudo -E cnitool add i9net /var/run/netns/i9pod9 2>&1 | jq -r ".ips[0].address" | sed "s/^/    i9pod9 -> /"
+# --- output ---
+=== the network is a /29: .0 network, .1 gateway, .7 broadcast -> five usable ===
+
+=== A. attach five, then ask for a sixth ===
+  i9pod1 -> 10.90.0.2/29
+  i9pod2 -> 10.90.0.3/29
+  i9pod3 -> 10.90.0.4/29
+  i9pod4 -> 10.90.0.5/29
+  i9pod5 -> 10.90.0.6/29
+  i9pod6 -> FAILED:
+      plugin type="bridge" failed (add): failed to allocate for range 0: no IP addresses available in range set: 10.90.0.1-10.90.0.6
+
+=== B. the field scenario: every pod gone, no DEL ever ran ===
+    (a node reboot, a kubelet crash, a DEL that timed out and was not retried)
+  network namespaces on the node now:
+    0
+  reservations the store still holds:
+    10.90.0.2
+    10.90.0.3
+    10.90.0.4
+    10.90.0.5
+    10.90.0.6
+
+  a new pod arrives:
+    plugin type="bridge" failed (add): failed to allocate for range 0: no IP addresses available in range set: 10.90.0.1-10.90.0.6
+
+=== C. nothing in that message names a file, a directory, or a plugin ===
+
+=== D. the field repair: delete the reservations whose holders are gone ===
+    i9pod9 -> 10.90.0.3/29

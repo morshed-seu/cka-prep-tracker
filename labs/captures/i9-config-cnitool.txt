@@ -1,0 +1,60 @@
+# captured 2026-07-30T09:10:32Z on sandbox
+# --- snippet ---
+# rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-i9net.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+#     { "type": "bridge", "bridge": "i9br0", "isGateway": true, "ipMasq": true,
+#       "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } },
+#     { "type": "portmap", "capabilities": { "portMappings": true } } ] }
+# EOF
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# echo "=== cnitool add ==="
+# sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -c "{ips: [.ips[].address]}"
+# echo
+# echo "=== cnitool check — the happy path is silent ==="
+# sudo -E cnitool check i9net /var/run/netns/i9pod1
+# echo "exit=$?"
+# echo
+# echo "=== it really reaches the internet (the whole point of ipMasq) ==="
+# sudo ip netns exec i9pod1 ping -c1 -W2 1.1.1.1 | tail -2
+# echo
+# echo "=== now break it behind cnitool s back: delete the veth from inside ==="
+# sudo ip netns exec i9pod1 ip link del eth0
+# sudo ip netns exec i9pod1 ip -br addr
+# echo "--- cnitool check again ---"
+# sudo -E cnitool check i9net /var/run/netns/i9pod1
+# echo "exit=$?"
+# echo
+# echo "=== cnitool del, then del again ==="
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "first  exit=$?"
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "second exit=$?"
+# echo
+# echo "=== cnitool check on something that was never added ==="
+# sudo -E cnitool check i9net /var/run/netns/i9pod1
+# echo "exit=$?"
+# --- output ---
+=== cnitool add ===
+{"ips":["10.90.0.2/24"]}
+
+=== cnitool check — the happy path is silent ===
+exit=0
+
+=== it really reaches the internet (the whole point of ipMasq) ===
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 239.498/239.498/239.498/0.000 ms
+
+=== now break it behind cnitool s back: delete the veth from inside ===
+lo               DOWN           
+--- cnitool check again ---
+Interface name eth0 not found
+exit=1
+
+=== cnitool del, then del again ===
+first  exit=0
+second exit=0
+
+=== cnitool check on something that was never added ===
+host-local: Failed to find address added by container cnitool-c3af9ea7303b56406479
+exit=1

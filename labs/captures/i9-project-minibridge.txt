@@ -1,0 +1,94 @@
+# captured 2026-07-30T12:48:00Z on sandbox
+# --- snippet ---
+# sudo install -m0755 ~/i9/cni-minibridge /opt/cni/bin/minibridge && bash ~/i9/mbtest.sh
+# --- output ---
+=== A. ADD, and the result it printed ===
+{
+  "cniVersion": "1.1.0",
+  "interfaces": [
+    {
+      "mac": "12:f8:ff:63:cb:88",
+      "name": "mbr0"
+    },
+    {
+      "mac": "12:a5:08:d3:9a:9d",
+      "name": "mb5c4aa8f9f77"
+    },
+    {
+      "mac": "26:74:b4:81:b1:f6",
+      "name": "eth0",
+      "sandbox": "/var/run/netns/i9pod1"
+    }
+  ],
+  "ips": [
+    {
+      "address": "10.99.0.2/24",
+      "gateway": "10.99.0.1",
+      "interface": 2
+    }
+  ],
+  "routes": [
+    {
+      "dst": "0.0.0.0/0",
+      "gw": "10.99.0.1"
+    }
+  ]
+}
+
+=== B. what is actually there now ===
+    lo               DOWN           
+    eth0@if57        UP             10.99.0.2/24 fe80::2474:b4ff:fe81:b1f6/64 
+    default via 10.99.0.1 dev eth0 
+    10.99.0.0/24 dev eth0 proto kernel scope link src 10.99.0.2 
+    mbr0             UP             12:f8:ff:63:cb:88 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+    MTU honoured: 1450 on the bridge, 1450 in the pod
+    reservation:
+      10.99.0.2   cnitool-c3af9ea7303b56406479/eth0/
+    masquerade rules: 1
+
+=== C. it actually works: egress, and a second pod on the same bridge ===
+    3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+    rtt min/avg/max/mdev = 6.944/8.991/10.221/1.457 ms
+    pod2 got 10.99.0.3/24
+    3 packets transmitted, 3 received, 0% packet loss, time 2064ms
+    rtt min/avg/max/mdev = 0.041/0.074/0.104/0.025 ms
+
+=== D. CHECK passes, then catches a break ===
+    check exit=0
+address mismatch; prevResult says 10.99.0.2/24, namespace has 
+    check exit=1 (address removed behind its back)
+    check exit=0 (restored)
+
+=== E. STATUS: ready now, code 50 when the pool is gone ===
+    exit=0 with a /24
+{"cniVersion":"1.1.0","code":50,"msg":"The plugin is not available","details":"no IP addresses available in 10.98.0.0/30"}
+    exit=1 with a full /30
+
+=== F. DEL is idempotent, and does NOT leak the masquerade rule ===
+    before: masq rules = 2, reservations = 2
+    del exit=0
+    del again exit=0
+    after:  masq rules = 1, reservations = 1
+
+=== G. the case the reference plugin leaks: namespace destroyed first ===
+    pod3 got 10.99.0.2/24
+    masq rules now: 2
+    del exit=0
+    masq rules after: 1   <-- bridge leaks here; minibridge does not
+
+=== H. GC reclaims what a missed DEL left behind ===
+    reservations before GC:
+      10.99.0.3
+      10.99.0.50
+      10.99.0.51
+minibridge: gc: reclaiming 10.99.0.50 held by a-pod-that-died/eth0
+minibridge: gc: reclaiming 10.99.0.51 held by another-dead-pod/eth0
+minibridge: gc: reclaimed 2 reservation(s)
+    gc exit=0
+    reservations after GC:
+      10.99.0.3
+
+=== I. and cnitool gc, which passes no list at all ===
+minibridge: gc: reclaimed 0 reservation(s)
+    exit=0
+    reservations after: 0

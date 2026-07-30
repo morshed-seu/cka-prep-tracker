@@ -1,0 +1,82 @@
+# captured 2026-07-30T09:04:27Z on sandbox
+# --- snippet ---
+# run() { echo "--- $1 ---"; shift; }
+# echo "=== A. cniVersion the plugin does not support ==="
+# echo "{\"cniVersion\":\"9.9.9\",\"name\":\"i9net\",\"type\":\"bridge\"}" > ~/i9/e-badver.json
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e1 CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/e-badver.json
+# echo "exit=$?"
+# echo
+# echo "=== B. stdin that is not JSON at all ==="
+# echo "this is not json" > ~/i9/e-notjson.json
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e2 CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/e-notjson.json
+# echo "exit=$?"
+# echo
+# echo "=== C. valid JSON, invalid network config: a /31 with nothing to allocate ==="
+# echo "{\"cniVersion\":\"1.1.0\",\"name\":\"i9tiny\",\"type\":\"bridge\",\"bridge\":\"i9tiny0\",\"ipam\":{\"type\":\"host-local\",\"subnet\":\"192.168.0.0/31\"}}" > ~/i9/e-tiny.json
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e3 CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/e-tiny.json
+# echo "exit=$?"
+# echo
+# echo "=== D. a required environment parameter missing ==="
+# sudo env CNI_COMMAND=ADD CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== E. an unknown CNI_COMMAND ==="
+# sudo env CNI_COMMAND=FLY CNI_CONTAINERID=e5 CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== F. the delegated IPAM plugin is not on CNI_PATH ==="
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e6 CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/nonexistent /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== G. does any of that go to stderr instead of stdout? ==="
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=e7 CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/bridge < ~/i9/e-badver.json \
+#   2>/dev/null | wc -c
+# echo "^ bytes on stdout with stderr discarded"
+# --- output ---
+=== A. cniVersion the plugin does not support ===
+{
+    "code": 1,
+    "msg": "incompatible CNI versions",
+    "details": "config is \"9.9.9\", plugin supports [\"0.1.0\" \"0.2.0\" \"0.3.0\" \"0.3.1\" \"0.4.0\" \"1.0.0\" \"1.1.0\"]"
+}exit=1
+
+=== B. stdin that is not JSON at all ===
+{
+    "code": 6,
+    "msg": "error unmarshall network config: invalid character 'h' in literal true (expecting 'r')"
+}exit=1
+
+=== C. valid JSON, invalid network config: a /31 with nothing to allocate ===
+{
+    "code": 999,
+    "msg": "invalid range set 0: Network 192.168.0.0/31 too small to allocate from"
+}exit=1
+
+=== D. a required environment parameter missing ===
+{
+    "code": 4,
+    "msg": "required env variables [CNI_CONTAINERID] missing"
+}exit=1
+
+=== E. an unknown CNI_COMMAND ===
+{
+    "code": 4,
+    "msg": "unknown CNI_COMMAND: FLY"
+}exit=1
+
+=== F. the delegated IPAM plugin is not on CNI_PATH ===
+{
+    "code": 999,
+    "msg": "container veth name (\"eth0\") peer provided (\"veth8db05962\") already exists"
+}exit=1
+
+=== G. does any of that go to stderr instead of stdout? ===
+184
+^ bytes on stdout with stderr discarded

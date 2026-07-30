@@ -1,0 +1,70 @@
+# captured 2026-07-30T09:07:05Z on sandbox
+# --- snippet ---
+# mklist() { cat > "$1" <<EOF
+# { "cniVersion": "1.1.0", "name": "$2", "plugins": [
+#   { "type": "bridge", "bridge": "$3", "isGateway": true,
+#     "ipam": { "type": "host-local", "subnet": "$4" } } ] }
+# EOF
+# }
+# mkconf() { cat > "$1" <<EOF
+# { "cniVersion": "1.1.0", "name": "$2", "type": "bridge", "bridge": "$3",
+#   "isGateway": true, "ipam": { "type": "host-local", "subnet": "$4" } }
+# EOF
+# }
+# probe() {
+#   sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+#   a=$(sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add ordertest /var/run/netns/i9pod1 2>&1 | jq -r ".ips[0].address" 2>/dev/null)
+#   sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del ordertest /var/run/netns/i9pod1 2>/dev/null
+#   echo "$a"
+# }
+# echo "=== A. lexical order among .conflist files: 05 vs 10, both named ordertest ==="
+# rm -f ~/i9/net.d/*; mklist ~/i9/net.d/05-a.conflist ordertest i9ord5 10.91.5.0/24
+# mklist ~/i9/net.d/10-b.conflist ordertest i9ord10 10.91.10.0/24
+# echo "  -> $(probe)   (10.91.5.x = 05 won)"
+# echo
+# echo "=== B. same, but only the LATER file carries the name we ask for ==="
+# rm -f ~/i9/net.d/*; mklist ~/i9/net.d/05-a.conflist somethingelse i9ord5 10.91.5.0/24
+# mklist ~/i9/net.d/10-b.conflist ordertest i9ord10 10.91.10.0/24
+# echo "  -> $(probe)   (10.91.10.x = the NAME decided, not the sort order)"
+# echo
+# echo "=== C. a .conf that sorts FIRST against a .conflist that sorts LAST ==="
+# rm -f ~/i9/net.d/*; mkconf ~/i9/net.d/01-single.conf ordertest i9ord5 10.91.5.0/24
+# mklist ~/i9/net.d/99-list.conflist ordertest i9ord10 10.91.10.0/24
+# echo "  -> $(probe)   (10.91.10.x = every .conflist outranks every .conf)"
+# echo
+# echo "=== D. a .conf alone, with no .conflist anywhere ==="
+# rm -f ~/i9/net.d/*; mkconf ~/i9/net.d/01-single.conf ordertest i9ord5 10.91.5.0/24
+# echo "  -> $(probe)   (the deprecated single-plugin form still works, up-converted)"
+# echo
+# echo "=== E. which extensions are considered at all? ==="
+# for ext in conflist conf json conflist.orig conflist.bak conflist.disabled yaml; do
+#   rm -f ~/i9/net.d/*
+#   mklist ~/i9/net.d/01-probe.$ext ordertest i9ord5 10.91.5.0/24
+#   mklist ~/i9/net.d/99-fallback.conflist ordertest i9ord10 10.91.10.0/24
+#   a=$(probe)
+#   case "$a" in 10.91.5.*) v="considered";; 10.91.10.*) v="never read";; *) v="?? [$a]";; esac
+#   printf "  01-probe.%-18s %s\n" "$ext" "$v"
+# done
+# ~/i9/reset.sh
+# --- output ---
+=== A. lexical order among .conflist files: 05 vs 10, both named ordertest ===
+  -> 10.91.5.2/24   (10.91.5.x = 05 won)
+
+=== B. same, but only the LATER file carries the name we ask for ===
+  -> 10.91.10.2/24   (10.91.10.x = the NAME decided, not the sort order)
+
+=== C. a .conf that sorts FIRST against a .conflist that sorts LAST ===
+  -> 10.91.10.3/24   (10.91.10.x = every .conflist outranks every .conf)
+
+=== D. a .conf alone, with no .conflist anywhere ===
+  -> 10.91.5.2/24   (the deprecated single-plugin form still works, up-converted)
+
+=== E. which extensions are considered at all? ===
+  01-probe.conflist           considered
+  01-probe.conf               never read
+  01-probe.json               never read
+  01-probe.conflist.orig      never read
+  01-probe.conflist.bak       never read
+  01-probe.conflist.disabled  never read
+  01-probe.yaml               never read
+reset done

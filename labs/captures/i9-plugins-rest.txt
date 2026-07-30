@@ -1,0 +1,122 @@
+# captured 2026-07-30T09:14:52Z on sandbox
+# --- snippet ---
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# echo "=== A. loopback: what a fresh namespace actually has ==="
+# sudo ip netns add i9pod1
+# sudo ip netns exec i9pod1 ip -br addr
+# echo "  can anything talk to itself in there?"
+# sudo ip netns exec i9pod1 ping -c1 -W1 127.0.0.1 2>&1 | tail -2 | sed "s/^/    /"
+# echo
+# echo "=== B. run the loopback plugin by hand ==="
+# echo "{\"cniVersion\":\"1.1.0\",\"name\":\"lo\",\"type\":\"loopback\"}" > ~/i9/lo.json
+# sudo env CNI_COMMAND=ADD CNI_CONTAINERID=lo-demo CNI_NETNS=/var/run/netns/i9pod1 \
+#   CNI_IFNAME=lo CNI_PATH=/opt/cni/bin /opt/cni/bin/loopback < ~/i9/lo.json
+# echo "  result on stdout: [$(sudo env CNI_COMMAND=ADD CNI_CONTAINERID=lo2 CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=lo CNI_PATH=/opt/cni/bin /opt/cni/bin/loopback < ~/i9/lo.json)]"
+# sudo ip netns exec i9pod1 ip -br addr
+# sudo ip netns exec i9pod1 ping -c1 -W1 127.0.0.1 2>&1 | tail -2 | sed "s/^/    /"
+# echo
+# echo "=== C. and note which interface name it was given ==="
+# echo "  CNI_IFNAME=lo, not eth0 — the runtime calls loopback as its own attachment"
+# echo
+# echo "=== D. static IPAM: no store, no state, the address is in the config ==="
+# rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-static.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+#     { "type": "bridge", "bridge": "i9br0", "isGateway": true,
+#       "ipam": { "type": "static",
+#                 "addresses": [ { "address": "10.90.0.77/24", "gateway": "10.90.0.1" } ] } } ] }
+# EOF
+# sudo ip netns del i9pod1; sudo ip netns add i9pod1
+# sudo -E cnitool add i9net /var/run/netns/i9pod1 | jq -c ".ips"
+# echo "  is there a reservation directory for it?"
+# sudo ls /var/lib/cni/networks/ | sed "s/^/    /"
+# echo "  ask twice for the same address, in two namespaces:"
+# sudo ip netns add i9pod2
+# sudo -E cnitool add i9net /var/run/netns/i9pod2 | jq -c ".ips"
+# echo "  ^ static has no idea the address is already in use"
+# echo
+# echo "=== E. macvlan and ipvlan, on the real uplink ==="
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# UP=$(ip -o route get 1.1.1.1 | awk "{for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}")
+# echo "  uplink = $UP, its MAC = $(cat /sys/class/net/$UP/address)"
+# for kind in macvlan ipvlan; do
+#   rm -f ~/i9/net.d/*
+#   cat > ~/i9/net.d/10-$kind.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+#     { "type": "$kind", "master": "$UP",
+#       "ipam": { "type": "static", "addresses": [ { "address": "10.75.158.222/24" } ] } } ] }
+# EOF
+#   sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+#   sudo -E cnitool add i9net /var/run/netns/i9pod1 >/dev/null 2>&1
+#   echo "  --- $kind ---"
+#   sudo ip netns exec i9pod1 ip -d -br link show eth0 2>&1 | sed "s/^/      /"
+#   sudo -E cnitool del i9net /var/run/netns/i9pod1 2>/dev/null
+# done
+# --- output ---
+=== A. loopback: what a fresh namespace actually has ===
+lo               DOWN           
+  can anything talk to itself in there?
+    ping: connect: Network is unreachable
+
+=== B. run the loopback plugin by hand ===
+{
+    "cniVersion": "1.1.0",
+    "interfaces": [
+        {
+            "mac": "00:00:00:00:00:00",
+            "name": "lo",
+            "sandbox": "/var/run/netns/i9pod1"
+        }
+    ],
+    "ips": [
+        {
+            "address": "127.0.0.1/8",
+            "interface": 0
+        },
+        {
+            "address": "::1/128",
+            "interface": 0
+        }
+    ]
+}  result on stdout: [{
+    "cniVersion": "1.1.0",
+    "interfaces": [
+        {
+            "mac": "00:00:00:00:00:00",
+            "name": "lo",
+            "sandbox": "/var/run/netns/i9pod1"
+        }
+    ],
+    "ips": [
+        {
+            "address": "127.0.0.1/8",
+            "interface": 0
+        },
+        {
+            "address": "::1/128",
+            "interface": 0
+        }
+    ]
+}]
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+    1 packets transmitted, 1 received, 0% packet loss, time 0ms
+    rtt min/avg/max/mdev = 0.049/0.049/0.049/0.000 ms
+
+=== C. and note which interface name it was given ===
+  CNI_IFNAME=lo, not eth0 — the runtime calls loopback as its own attachment
+
+=== D. static IPAM: no store, no state, the address is in the config ===
+[{"address":"10.90.0.77/24","gateway":"10.90.0.1","interface":2}]
+  is there a reservation directory for it?
+    bridge
+  ask twice for the same address, in two namespaces:
+[{"address":"10.90.0.77/24","gateway":"10.90.0.1","interface":2}]
+  ^ static has no idea the address is already in use
+
+=== E. macvlan and ipvlan, on the real uplink ===
+  uplink = ens3, its MAC = 52:54:00:99:27:6a
+  --- macvlan ---
+      eth0@if2         UP             82:59:10:fe:90:c3 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+  --- ipvlan ---
+      eth0@if2         UNKNOWN        52:54:00:99:27:6a <BROADCAST,MULTICAST,UP,LOWER_UP> 

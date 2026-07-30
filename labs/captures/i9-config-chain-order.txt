@@ -1,0 +1,102 @@
+# captured 2026-07-30T09:09:35Z on sandbox
+# --- snippet ---
+# L=/var/log/i9-dump.log
+# echo "=== A. portmap placed FIRST in the chain ==="
+# rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-chain.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9chain", "plugins": [
+#     { "type": "portmap", "capabilities": { "portMappings": true } },
+#     { "type": "bridge", "bridge": "i9chain0", "isGateway": true, "ipMasq": true,
+#       "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } } ] }
+# EOF
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin \
+#   CAP_ARGS="{\"portMappings\":[{\"hostPort\":18099,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9chain /var/run/netns/i9pod1
+# echo "exit=$?"
+# echo
+# echo "=== B. correct order, and what DEL hands the chained plugin ==="
+# rm -f ~/i9/net.d/*; sudo truncate -s0 $L
+# cat > ~/i9/net.d/10-chain.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9chain", "plugins": [
+#     { "type": "bridge", "bridge": "i9chain0", "isGateway": true, "ipMasq": true,
+#       "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } },
+#     { "type": "i9-dump" } ] }
+# EOF
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add i9chain /var/run/netns/i9pod1 >/dev/null
+# echo "added. the runtime cached the final result here:"
+# sudo ls /var/lib/cni/results/
+# echo
+# sudo truncate -s0 $L
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del i9chain /var/run/netns/i9pod1
+# echo "del exit=$?"
+# echo "--- i9-dump s log for the DEL call ---"
+# sudo cat $L
+# echo
+# echo "=== C. run DEL again with the cache now gone ==="
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del i9chain /var/run/netns/i9pod1
+# echo "exit=$?"
+# sudo ls /var/lib/cni/results/ 2>&1
+# --- output ---
+=== A. portmap placed FIRST in the chain ===
+plugin type="portmap" failed (add): must be called as chained plugin
+exit=1
+
+=== B. correct order, and what DEL hands the chained plugin ===
+added. the runtime cached the final result here:
+bridge-default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90-eth0
+i9chain-cnitool-c3af9ea7303b56406479-eth0
+
+del exit=0
+--- i9-dump s log for the DEL call ---
+=== 09:09:36 CNI_COMMAND=DEL CNI_IFNAME=eth0
+--- environment parameters ---
+CNI_ARGS=
+CNI_COMMAND=DEL
+CNI_CONTAINERID=cnitool-c3af9ea7303b56406479
+CNI_IFNAME=eth0
+CNI_NETNS=/var/run/netns/i9pod1
+CNI_PATH=/opt/cni/bin
+--- stdin ---
+{
+  "cniVersion": "1.1.0",
+  "name": "i9chain",
+  "prevResult": {
+    "cniVersion": "1.1.0",
+    "interfaces": [
+      {
+        "mac": "9a:d3:a5:68:b2:ac",
+        "name": "i9chain0"
+      },
+      {
+        "mac": "b2:45:64:ef:92:ad",
+        "name": "veth27ff2b85"
+      },
+      {
+        "mac": "42:8d:1b:b8:40:7d",
+        "name": "eth0",
+        "sandbox": "/var/run/netns/i9pod1"
+      }
+    ],
+    "ips": [
+      {
+        "address": "10.92.0.4/24",
+        "gateway": "10.92.0.1",
+        "interface": 2
+      }
+    ],
+    "routes": [
+      {
+        "dst": "0.0.0.0/0"
+      }
+    ]
+  },
+  "type": "i9-dump"
+}
+
+=== C. run DEL again with the cache now gone ===
+exit=0
+bridge-default-4ee7220537f0424439eb34d7183dd06fd9e2aa054788bca9d3917ed57e4b2e90-eth0

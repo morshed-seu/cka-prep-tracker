@@ -1,0 +1,72 @@
+# captured 2026-07-30T12:32:36Z on sandbox
+# --- snippet ---
+# export NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin
+# sudo KEEP_VETH=vethec411300 ~/i9/i9-reset.sh >/dev/null 2>&1
+# rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-full.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "i9net", "plugins": [
+#     { "type": "bridge", "bridge": "i9br0", "isGateway": true, "ipMasq": true, "hairpinMode": true,
+#       "ipam": { "type": "host-local", "subnet": "10.90.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } },
+#     { "type": "portmap", "capabilities": { "portMappings": true } },
+#     { "type": "bandwidth", "ingressRate": 8000000, "ingressBurst": 1000000,
+#       "egressRate": 4000000, "egressBurst": 1000000 },
+#     { "type": "tuning", "sysctl": { "net.ipv4.conf.eth0.arp_filter": "1" } } ] }
+# EOF
+# sudo ip netns add i9pod1
+# sudo -E env CAP_ARGS="{\"portMappings\":[{\"hostPort\":18080,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9net /var/run/netns/i9pod1 > ~/i9/full-result.json
+# IP=$(jq -r ".ips[0].address" ~/i9/full-result.json | cut -d/ -f1)
+# HV=$(jq -r ".interfaces[1].name" ~/i9/full-result.json)
+# echo "pod address = $IP , host-side veth = $HV"
+# echo
+# echo "=== portmap: the DNAT rule, and it is B9 s rule ==="
+# sudo iptables -t nat -S | grep -E "18080" | sed "s/^/  /"
+# echo
+# echo "=== bandwidth: a tc qdisc on the HOST side of the veth ==="
+# sudo tc qdisc show dev "$HV" | sed "s/^/  /"
+# echo "  the ifb device it created to shape the other direction:"
+# ip -o link show type ifb | awk -F": " "{print \$2}" | sed "s/^/  /"
+# for d in $(ip -o link show type ifb | awk -F": " "{print \$2}"); do sudo tc qdisc show dev "$d" | sed "s/^/  /"; done
+# echo
+# echo "=== tuning: the sysctl, set INSIDE the namespace only ==="
+# printf "  in namespace  net.ipv4.conf.eth0.arp_filter = %s\n" "$(sudo ip netns exec i9pod1 cat /proc/sys/net/ipv4/conf/eth0/arp_filter)"
+# printf "  on the host   net.ipv4.conf.ens3.arp_filter = %s\n" "$(cat /proc/sys/net/ipv4/conf/ens3/arp_filter)"
+# echo
+# echo "=== the mapping really works ==="
+# sudo ip netns exec i9pod1 sh -c "echo i9 > /tmp/index.html; cd /tmp && setsid python3 -m http.server 80 >/dev/null 2>&1 < /dev/null &"
+# sleep 3
+# curl -s --max-time 4 -o /dev/null -w "  curl http://127.0.0.1:18080/  ->  HTTP %{http_code}\n" http://127.0.0.1:18080/
+# echo
+# echo "=== teardown: what each chained plugin removed ==="
+# sudo -E cnitool del i9net /var/run/netns/i9pod1; echo "  del exit=$?"
+# echo "  nat rules naming 18080 after DEL: $(sudo iptables -t nat -S | grep -c 18080 || true)"
+# echo "  ifb devices after DEL: $(ip -o link show type ifb | wc -l)"
+# sudo ip netns del i9pod1 2>/dev/null
+# --- output ---
+pod address = 10.90.0.2 , host-side veth = vethcf4c7083
+
+=== portmap: the DNAT rule, and it is B9 s rule ===
+  -A CNI-DN-5ee93e7c626f981e7589e -s 10.90.0.0/24 -p tcp -m tcp --dport 18080 -j CNI-HOSTPORT-SETMARK
+  -A CNI-DN-5ee93e7c626f981e7589e -s 127.0.0.1/32 -p tcp -m tcp --dport 18080 -j CNI-HOSTPORT-SETMARK
+  -A CNI-DN-5ee93e7c626f981e7589e -p tcp -m tcp --dport 18080 -j DNAT --to-destination 10.90.0.2:80
+  -A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"i9net\" id: \"cnitool-c3af9ea7303b56406479\"" -m multiport --dports 18080 -j CNI-DN-5ee93e7c626f981e7589e
+
+=== bandwidth: a tc qdisc on the HOST side of the veth ===
+  qdisc tbf 1: root refcnt 3 rate 8Mbit burst 125000b lat 25ms 
+  qdisc ingress ffff: parent ffff:fff1 ---------------- 
+  the ifb device it created to shape the other direction:
+  bwp5ee93e7c626f
+  qdisc tbf 1: root refcnt 2 rate 4Mbit burst 125000b lat 25ms 
+
+=== tuning: the sysctl, set INSIDE the namespace only ===
+  in namespace  net.ipv4.conf.eth0.arp_filter = 1
+  on the host   net.ipv4.conf.ens3.arp_filter = 0
+
+=== the mapping really works ===
+  curl http://127.0.0.1:18080/  ->  HTTP 200
+
+=== teardown: what each chained plugin removed ===
+  del exit=0
+  nat rules naming 18080 after DEL: 4
+  ifb devices after DEL: 0

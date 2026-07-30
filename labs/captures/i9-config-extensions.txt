@@ -1,0 +1,59 @@
+# captured 2026-07-30T09:06:08Z on sandbox
+# --- snippet ---
+# rm -f ~/i9/net.d/*
+# mk() { cat > "$1" <<EOF
+# { "cniVersion": "1.1.0", "name": "ordertest", "plugins": [
+#   { "type": "bridge", "bridge": "$2", "isGateway": true,
+#     "ipam": { "type": "host-local", "subnet": "$3" } } ] }
+# EOF
+# }
+# mk ~/i9/net.d/10-ordertest.conflist i9ord10 10.91.10.0/24
+# mk ~/i9/net.d/05-ordertest.conflist.orig i9ord5 10.91.5.0/24
+# ls ~/i9/net.d/
+# echo
+# echo "=== 05 sorts first, but its extension is .orig — is it a live config? ==="
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add ordertest /var/run/netns/i9pod1 | jq -c ".ips"
+# echo "   ^ 10.91.10.x = the .conflist won; the .orig was never read"
+# echo
+# echo "=== rename it to .conf (the single-plugin form) and try again ==="
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del ordertest /var/run/netns/i9pod1
+# mv ~/i9/net.d/05-ordertest.conflist.orig ~/i9/net.d/05-ordertest.conf
+# ls ~/i9/net.d/
+# sudo ip netns del i9pod1; sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add ordertest /var/run/netns/i9pod1 2>&1 | tail -3
+# echo
+# echo "=== which extensions does libcni actually consider? ==="
+# for ext in conf conflist json conflist.orig conflist.bak yaml; do
+#   rm -f ~/i9/net.d/*
+#   mk ~/i9/net.d/01-probe.$ext i9ord5 10.91.5.0/24
+#   mk ~/i9/net.d/99-fallback.conflist i9ord10 10.91.10.0/24
+#   sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+#   got=$(sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add ordertest /var/run/netns/i9pod1 2>&1 | jq -r ".ips[0].address" 2>/dev/null)
+#   sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del ordertest /var/run/netns/i9pod1 2>/dev/null
+#   case "$got" in 10.91.5.*) verdict="LOADED  (01-probe won)";; 10.91.10.*) verdict="ignored (99-fallback won)";; *) verdict="?? $got";; esac
+#   printf "  .%-16s %s\n" "$ext" "$verdict"
+# done
+# sudo ip netns del i9pod1 2>/dev/null; ~/i9/reset.sh
+# --- output ---
+05-ordertest.conflist.orig
+10-ordertest.conflist
+
+=== 05 sorts first, but its extension is .orig — is it a live config? ===
+[{"address":"10.91.10.2/24","gateway":"10.91.10.1","interface":2}]
+   ^ 10.91.10.x = the .conflist won; the .orig was never read
+
+=== rename it to .conf (the single-plugin form) and try again ===
+05-ordertest.conf
+10-ordertest.conflist
+        }
+    ]
+}
+=== which extensions does libcni actually consider? ===
+  .conf             ?? 
+  .conflist         LOADED  (01-probe won)
+  .json             ignored (99-fallback won)
+  .conflist.orig    ignored (99-fallback won)
+  .conflist.bak     ignored (99-fallback won)
+  .yaml             ignored (99-fallback won)
+reset done

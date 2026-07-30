@@ -1,0 +1,64 @@
+# captured 2026-07-30T09:04:04Z on sandbox
+# --- snippet ---
+# echo "=== the IPAM reservation the ADD created ==="
+# sudo ls -l /var/lib/cni/networks/i9net/
+# sudo sh -c "cat /var/lib/cni/networks/i9net/10.90.0.2"; echo
+# echo
+# echo "=== DEL #1 — the real teardown ==="
+# sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+#   CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?  (and note: no output at all on success)"
+# sudo ip netns exec i9pod1 ip -br addr
+# sudo ls -l /var/lib/cni/networks/i9net/
+# echo
+# echo "=== DEL #2 — same container, same interface, nothing left to delete ==="
+# sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+#   CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?  <-- the MUST in section 2"
+# echo
+# echo "=== DEL #3 — a container ID that was never ADDed ==="
+# sudo env CNI_COMMAND=DEL CNI_CONTAINERID=never-existed-at-all \
+#   CNI_NETNS=/var/run/netns/i9pod1 CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== DEL #4 — netns path that does not exist any more (node rebooted mid-life) ==="
+# sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+#   CNI_NETNS=/var/run/netns/deleted-by-a-reboot CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# echo
+# echo "=== DEL #5 — CNI_NETNS omitted entirely (the spec makes it optional on DEL) ==="
+# sudo env CNI_COMMAND=DEL CNI_CONTAINERID=i9-demo-container-0001 \
+#   CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin \
+#   /opt/cni/bin/bridge < ~/i9/i9bridge.json
+# echo "exit=$?"
+# --- output ---
+=== the IPAM reservation the ADD created ===
+total 8
+-rw------- 1 root root 28 Jul 30 15:03 10.90.0.2
+-rw------- 1 root root  9 Jul 30 15:03 last_reserved_ip.0
+-rwxr-x--- 1 root root  0 Jul 30 15:03 lock
+i9-demo-container-0001
+eth0
+
+=== DEL #1 — the real teardown ===
+exit=0  (and note: no output at all on success)
+lo               DOWN           
+total 4
+-rw------- 1 root root 9 Jul 30 15:03 last_reserved_ip.0
+-rwxr-x--- 1 root root 0 Jul 30 15:03 lock
+
+=== DEL #2 — same container, same interface, nothing left to delete ===
+exit=0  <-- the MUST in section 2
+
+=== DEL #3 — a container ID that was never ADDed ===
+exit=0
+
+=== DEL #4 — netns path that does not exist any more (node rebooted mid-life) ===
+exit=0
+
+=== DEL #5 — CNI_NETNS omitted entirely (the spec makes it optional on DEL) ===
+exit=0

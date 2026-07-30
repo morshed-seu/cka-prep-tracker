@@ -1,0 +1,56 @@
+# captured 2026-07-30T12:42:11Z on sandbox
+# --- snippet ---
+# bash ~/i9/gcverb.sh
+# --- output ---
+=== A. three attachments, and the holder of each address ===
+    10.90.0.2    cnitool-c3af9ea7303b56406479
+    10.90.0.3    cnitool-6c80ef25d4a4145c2395
+    10.90.0.4    cnitool-68353ca9f9dcdd34474f
+    and the on-disk format is CRLF, which is easy to get wrong:
+      0000000   c   n   i   t   o   o   l   -   c   3   a   f   9   e   a   7
+      0000020   3   0   3   b   5   6   4   0   6   4   7   9  \r  \n
+      (host-local/backend/disk/backend.go:  LineBreak = "\r\n")
+
+=== B. the leak: all three pods vanish, no DEL, and the cache is gone too ===
+    /var/run is tmpfs, so libcni's result cache does not survive a reboot;
+    /var/lib/cni's reservations do. That asymmetry is the whole incident.
+    network namespaces left:  0
+    cached attachments left:  0
+    reservations still held:  3
+
+=== C. cnitool gc: phase one has no cache to read, so nothing happens ===
+    cnitool gc exit=0
+    reservations after:      3
+
+=== D. so call the GC verb directly, with an explicit list ===
+    telling it: [{"containerID":"cnitool-6c80ef25d4a4145c2395","ifname":"eth0"}]
+    gc exit=0  (success, and no output)
+    reservations after:      3   <-- unchanged
+
+=== E. an EMPTY list means nothing is valid. Reclaim everything? ===
+    gc exit=0
+    reservations after:      3   <-- still unchanged
+
+=== F. because not one reference plugin registers a GC handler ===
+    plugins v1.9.1: grep -c 'GC:' in each plugin's main file
+      bridge 0   ipvlan 0   macvlan 0   loopback 0   portmap 0
+      bandwidth 0   tuning 0   firewall 0   host-local 0   static 0
+    skel dispatches GC, version-gates it, and calls a handler that is nil.
+    So GC on this box is a well-formed success that does nothing at all.
+
+=== G. the version gate is real, though: ask for GC at 1.0.0 ===
+{
+    "code": 1,
+    "msg": "config version does not allow GC"
+}    exit=1
+
+=== H. STATUS, same story: answered, and always ready ===
+    bridge      exit=0 output=[]
+    host-local  exit=0 output=[]
+    portmap     exit=0 output=[]
+    loopback    exit=0 output=[]
+    macvlan     exit=0 output=[]
+    even with the pool full, host-local never returns code 50 or 51.
+
+=== I. the field repair is still the one from I9.10 ===
+    reservations after rm:   1

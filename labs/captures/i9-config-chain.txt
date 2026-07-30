@@ -1,0 +1,111 @@
+# captured 2026-07-30T09:08:22Z on sandbox
+# --- snippet ---
+# rm -f ~/i9/net.d/* /tmp/i9-dump.log
+# cat > ~/i9/net.d/10-chain.conflist <<EOF
+# {
+#   "cniVersion": "1.1.0",
+#   "name": "i9chain",
+#   "plugins": [
+#     { "type": "bridge", "bridge": "i9chain0", "isGateway": true, "ipMasq": true,
+#       "ipam": { "type": "host-local", "subnet": "10.92.0.0/24",
+#                 "routes": [ { "dst": "0.0.0.0/0" } ] } },
+#     { "type": "i9-dump" },
+#     { "type": "portmap", "capabilities": { "portMappings": true } }
+#   ]
+# }
+# EOF
+# sudo ip netns del i9pod1 2>/dev/null; sudo ip netns add i9pod1
+# echo "=== ADD the chain: bridge -> i9-dump -> portmap ==="
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin \
+#   CAP_ARGS="{\"portMappings\":[{\"hostPort\":18099,\"containerPort\":80,\"protocol\":\"tcp\"}]}" \
+#   cnitool add i9chain /var/run/netns/i9pod1 | jq .
+# echo
+# echo "=== what the SECOND plugin was handed on stdin ==="
+# cat /tmp/i9-dump.log
+# echo
+# echo "=== the DNAT rule the THIRD plugin wrote, using an address it never allocated ==="
+# sudo iptables -t nat -S | grep -i "18099"
+# --- output ---
+=== ADD the chain: bridge -> i9-dump -> portmap ===
+{
+  "cniVersion": "1.1.0",
+  "interfaces": [
+    {
+      "mac": "9a:d3:a5:68:b2:ac",
+      "name": "i9chain0"
+    },
+    {
+      "mac": "3a:4e:a3:c0:bc:9d",
+      "name": "vethe9fbc5cb"
+    },
+    {
+      "mac": "aa:11:17:ba:51:67",
+      "name": "eth0",
+      "sandbox": "/var/run/netns/i9pod1"
+    }
+  ],
+  "ips": [
+    {
+      "address": "10.92.0.2/24",
+      "gateway": "10.92.0.1",
+      "interface": 2
+    }
+  ],
+  "routes": [
+    {
+      "dst": "0.0.0.0/0"
+    }
+  ]
+}
+
+=== what the SECOND plugin was handed on stdin ===
+=== 09:08:22 CNI_COMMAND=ADD CNI_IFNAME=eth0
+--- environment parameters ---
+CNI_ARGS=
+CNI_COMMAND=ADD
+CNI_CONTAINERID=cnitool-c3af9ea7303b56406479
+CNI_IFNAME=eth0
+CNI_NETNS=/var/run/netns/i9pod1
+CNI_PATH=/opt/cni/bin
+--- stdin ---
+{
+  "cniVersion": "1.1.0",
+  "name": "i9chain",
+  "prevResult": {
+    "cniVersion": "1.1.0",
+    "interfaces": [
+      {
+        "mac": "9a:d3:a5:68:b2:ac",
+        "name": "i9chain0"
+      },
+      {
+        "mac": "3a:4e:a3:c0:bc:9d",
+        "name": "vethe9fbc5cb"
+      },
+      {
+        "mac": "aa:11:17:ba:51:67",
+        "name": "eth0",
+        "sandbox": "/var/run/netns/i9pod1"
+      }
+    ],
+    "ips": [
+      {
+        "address": "10.92.0.2/24",
+        "gateway": "10.92.0.1",
+        "interface": 2
+      }
+    ],
+    "routes": [
+      {
+        "dst": "0.0.0.0/0"
+      }
+    ]
+  },
+  "type": "i9-dump"
+}
+
+=== the DNAT rule the THIRD plugin wrote, using an address it never allocated ===
+-A CNI-DN-e1934a5559f4338ad545c -s 10.92.0.0/24 -p tcp -m tcp --dport 18099 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-e1934a5559f4338ad545c -s 127.0.0.1/32 -p tcp -m tcp --dport 18099 -j CNI-HOSTPORT-SETMARK
+-A CNI-DN-e1934a5559f4338ad545c -p tcp -m tcp --dport 18099 -j DNAT --to-destination 10.92.0.2:80
+-A CNI-HOSTPORT-DNAT -p tcp -m comment --comment "dnat name: \"i9chain\" id: \"cnitool-c3af9ea7303b56406479\"" -m multiport --dports 18099 -j CNI-DN-e1934a5559f4338ad545c

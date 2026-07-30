@@ -1,0 +1,73 @@
+# captured 2026-07-30T09:05:42Z on sandbox
+# --- snippet ---
+# echo "=== what the spec says about these paths: nothing ==="
+# echo "  grep -c \"net.d\\|/opt/cni\\|lexical\" SPEC.md  ->  0"
+# echo
+# echo "=== the real directories on this box ==="
+# sudo ls -l /etc/cni/net.d/
+# echo
+# sudo jq -r ".cniVersion, .name, [.plugins[].type]|tostring" /etc/cni/net.d/nerdctl-bridge.conflist
+# echo
+# echo "=== now a private conf dir, so the experiment cannot break nerdctl ==="
+# mkdir -p ~/i9/net.d && rm -f ~/i9/net.d/*
+# cat > ~/i9/net.d/10-ordertest.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "ordertest", "plugins": [
+#   { "type": "bridge", "bridge": "i9ord10", "isGateway": true,
+#     "ipam": { "type": "host-local", "subnet": "10.91.10.0/24" } } ] }
+# EOF
+# ls ~/i9/net.d/
+# sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add ordertest /var/run/netns/i9pod1 | jq -c ".ips"
+# sudo ip netns exec i9pod1 ip -br addr show eth0
+# echo
+# echo "=== drop in a SECOND file that sorts BEFORE it, same network name ==="
+# cat > ~/i9/net.d/05-ordertest.conflist <<EOF
+# { "cniVersion": "1.1.0", "name": "ordertest", "plugins": [
+#   { "type": "bridge", "bridge": "i9ord5", "isGateway": true,
+#     "ipam": { "type": "host-local", "subnet": "10.91.5.0/24" } } ] }
+# EOF
+# ls ~/i9/net.d/
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool del ordertest /var/run/netns/i9pod1
+# sudo ip netns del i9pod1; sudo ip netns add i9pod1
+# sudo env NETCONFPATH=~/i9/net.d CNI_PATH=/opt/cni/bin cnitool add ordertest /var/run/netns/i9pod1 | jq -c ".ips"
+# echo
+# echo "=== which bridge got created? ==="
+# ip -br link show i9ord5 2>&1
+# ip -br link show i9ord10 2>&1
+# echo
+# echo "=== and a .conflist that is only meant as a backup ==="
+# cp ~/i9/net.d/05-ordertest.conflist ~/i9/net.d/05-ordertest.conflist.orig
+# cp ~/i9/net.d/05-ordertest.conflist ~/i9/net.d/00-backup.conflist
+# ls ~/i9/net.d/
+# --- output ---
+=== what the spec says about these paths: nothing ===
+  grep -c "net.d\|/opt/cni\|lexical" SPEC.md  ->  0
+
+=== the real directories on this box ===
+total 8
+drwxr-xr-x 2 root root 4096 Jul 28 16:31 default
+-rw-r--r-- 1 root root  860 Jul 30 14:07 nerdctl-bridge.conflist
+
+1.0.0
+bridge
+["bridge","portmap","firewall","tuning"]
+
+=== now a private conf dir, so the experiment cannot break nerdctl ===
+10-ordertest.conflist
+[{"address":"10.91.10.2/24","gateway":"10.91.10.1","interface":2}]
+eth0@if63        UP             10.91.10.2/24 fe80::c4bc:15ff:fe39:e4cf/64 
+
+=== drop in a SECOND file that sorts BEFORE it, same network name ===
+05-ordertest.conflist
+10-ordertest.conflist
+[{"address":"10.91.5.2/24","gateway":"10.91.5.1","interface":2}]
+
+=== which bridge got created? ===
+i9ord5           UP             72:6f:97:9b:39:54 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+i9ord10          DOWN           d2:e5:9e:c6:d2:9f <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+
+=== and a .conflist that is only meant as a backup ===
+00-backup.conflist
+05-ordertest.conflist
+05-ordertest.conflist.orig
+10-ordertest.conflist
