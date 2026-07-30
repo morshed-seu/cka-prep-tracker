@@ -837,6 +837,119 @@ CMD ["/bin/sh"]
 
 <p class="docs-links"><b>Docs:</b> <code>config.md § Properties</code> for <code>created_by</code>, so you can see the leak is by design. Search the BuildKit docs for <em>"RUN --mount"</em>, <em>"cache mounts"</em> and <em>"build secrets"</em>; the Docker docs for <em>"build arguments"</em>, which say plainly that they are not for secrets. On the Kubernetes side, search for <em>"pull an image from a private registry"</em> to see how coarse pull authorisation actually is.</p>
 </article>
+<article class="lesson" id="cp-i6-7" data-id="i6-7">
+<div class="lesson-head"><span class="cp-id">I6.7</span><h4>Multi-platform: what an index costs and what it buys</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Half your colleagues are on ARM laptops and most of your nodes are x86, or the other way round, and <code>exec format error</code> is the ugliest way to discover which. <a href="i4.html#cp-i4-8">I4.8</a> showed you what a multi-platform image <em>is</em> from the outside; this checkpoint has you produce one, and — more usefully — measure honestly what it costs, because the answer is neither "nothing" nor "don't bother".</p>
+
+<h5>The concept</h5>
+<p>One <code>--platform=linux/amd64,linux/arm64</code> and the builder solves the graph once per platform, then publishes an <strong>image index</strong>: a small JSON document listing one manifest per platform, each tagged with its <code>platform</code> object. From <a href="i4.html#cp-i4-3">I4.3</a>, that index is the extra hop at the top of the graph, and from <a href="i5.html#cp-i5-4">I5.4</a> it is what a client resolves a tag to before choosing a manifest. The payoff is exactly one thing, and it is real: <strong>a single image reference that works on both architectures</strong>, so nobody has to think about <code>-arm64</code> tag suffixes ever again.</p>
+<p>The cost is where honesty is required. Building for a foreign architecture means running foreign binaries, and unless you have a real machine of that architecture, they run under <strong>QEMU user-mode emulation</strong> — a translation layer registered with the kernel through <code>binfmt_misc</code>, so that executing an aarch64 binary transparently invokes the emulator instead of failing. It is genuinely transparent; it is also slower, and how much slower depends entirely on what the step does. The lab measures two cases on the same machine and gets 1.6× for one and 4.1× for another, which is why quoting a single multiplier is not useful.</p>
+<p>The case that matters is the one that does not appear as a multiplier at all. When this module's labs tried to <code>apk add build-base</code> — a 250 MB toolchain install that takes about twenty seconds natively — inside an emulated arm64 stage, it did not complete in <strong>520 seconds</strong>, and the run was abandoned. That is the shape of the real problem: it is not that emulated builds are some tidy factor slower, it is that a step which was comfortably fast becomes effectively unbounded, and CI times out rather than reporting a slowdown.</p>
+<p>Which sets up the decision. If your foreign stage only <em>copies in</em> an artefact built natively — the multi-stage pattern from <a href="#cp-i6-5">I6.5</a>, with a Go or Rust cross-compile in a native stage — emulation costs almost nothing, because almost nothing foreign runs. If your foreign stage compiles or installs packages, you want a real builder per architecture and the results combined into one index, which is what projects with heavy builds end up doing. Both routes produce the identical artefact; the index does not record how it was made.</p>
+<p>One last thing worth checking rather than assuming, because it caught this repo out in <a href="i4.html#cp-i4-8">I4.8</a>: an index's entries are not all images. Docker Hub's <code>alpine:3.21</code> carries 16 entries for 8 architectures, the extra 8 being attestation manifests marked <code>platform: unknown/unknown</code>. The index you build below has exactly 2 entries and no attestations, because nothing here asked for them — so "count the entries and divide by the platforms" is a habit that works on your own images and misleads on everyone else's.</p>
+
+<div class="specref">
+<p>The <code>platform</code> object is the whole mechanism — it is what makes an entry selectable. Two details in the normative text pay off directly: the property is only <em>SHOULD</em> be present, so an entry may legally have none (which is how attestation manifests get away with <code>unknown/unknown</code>), and <code>architecture</code> and <code>variant</code> are separate fields, so <code>arm64</code> plus <code>v8</code> never concatenates into a string like "arm64v8".</p>
+<blockquote>This OPTIONAL property describes the minimum runtime requirements of the image. This property SHOULD be present if its target is platform-specific.<br><br><strong>architecture</strong> <em>string</em><br>This REQUIRED property specifies the CPU architecture. Image indexes SHOULD use, and implementations SHOULD understand, values listed in the Go Language document for GOARCH.</blockquote>
+<cite>OCI image-spec v1.1.1 — <a href="https://github.com/opencontainers/image-spec/blob/v1.1.1/image-index.md#image-index-property-descriptions">image-index.md § Image Index Property Descriptions</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Before building anything, ask the builder what it can even emit. A builder with no emulation registered will simply refuse a foreign platform, and the answer is one command.
+<pre class="cmd">sudo buildctl debug workers</pre>
+<pre class="out">ID				PLATFORMS
+r6ocwg6qqflcq0er8gukwx0cr	linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/amd64/v4,<b>linux/arm64</b>,linux/386</pre>
+<p>If <code>linux/arm64</code> is missing, register the emulators first — one container does it, by writing entries into the kernel's <code>binfmt_misc</code>:</p>
+<pre class="cmd">sudo nerdctl run --privileged --rm tonistiigi/binfmt --install arm64
+sudo systemctl restart buildkit</pre>
+<pre class="out">  "emulators": [
+    ...
+    <b>"qemu-aarch64"</b>
+  ]</pre>
+<p>The restart is needed because the worker reports its platform list at startup.</p></li>
+
+<li>Now measure the tax, with the fairest possible test: one build, one identical CPU-bound step, two architectures. Because both run in the same build you are comparing them on the same machine at the same moment.
+<pre class="cmd">mkdir -p ~/i6/mp &amp;&amp; cd ~/i6/mp
+printf 'FROM alpine:3.21\nRUN i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo loop done\nRUN uname -m\n' &gt; Dockerfile.cpu
+sudo nerdctl build --no-cache --progress=plain --platform=linux/amd64,linux/arm64 \
+  -f Dockerfile.cpu --output type=image,name=i6/cpu:v1 . 2&gt;&amp;1 \
+  | grep -E "linux/(amd64|arm64) 2/3\]|^#[0-9]+ DONE [0-9]"</pre>
+<pre class="out">#7 [linux/amd64 2/3] RUN i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo loop done
+#7 DONE <b>0.8s</b>
+#8 [linux/arm64 2/3] RUN i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo loop done
+#8 DONE <b>3.3s</b></pre>
+<p><b>4.1×</b> for interpreter-bound work. The same experiment with <code>dd | sha256sum</code> over 64 MB gave 0.8 s against 1.3 s — only 1.6×, because much of that step is not instruction translation at all. One number does not describe emulation; the workload does.</p></li>
+
+<li>Now find the edge of it, which is more useful than either ratio. Try a package install inside the emulated stage — natively this takes about twenty seconds.
+<pre class="cmd">printf 'FROM alpine:3.21\nRUN apk add --no-cache build-base &gt;/dev/null\nCOPY big.c /big.c\nRUN gcc -O2 -o /big /big.c\n' &gt; Dockerfile.cc
+sudo nerdctl build --no-cache --progress=plain --platform=linux/amd64,linux/arm64 \
+  -f Dockerfile.cc --output type=image,name=i6/cc:v1 .</pre>
+<pre class="out">vm.sh: TIMED OUT after 520s — snippet still running on the VM.</pre>
+<p>Not a slowdown you can put a factor on — a step that simply did not finish inside a generous timeout. This is how emulated builds actually fail in CI: not with a warning, with a job timeout. Take it as the boundary of the technique rather than as a bug.</p></li>
+
+<li>Build and push something sensible instead — a two-platform image whose steps are cheap — and then look at what you produced.
+<pre class="cmd">printf 'FROM alpine:3.21\nRUN dd if=/dev/zero bs=1M count=64 2&gt;/dev/null | sha256sum &gt; /sum\nRUN uname -m &gt; /arch\n' &gt; Dockerfile
+sudo nerdctl build --no-cache --platform=linux/amd64,linux/arm64 \
+  --output type=image,name=127.0.0.1:5000/i6/mp:v1,push=true,registry.insecure=true .
+curl -s -H "Accept: application/vnd.oci.image.index.v1+json" \
+  http://127.0.0.1:5000/v2/i6/mp/manifests/v1 \
+  | jq '{mediaType, entries: (.manifests|length), manifests: [.manifests[] | {digest, platform}]}'</pre>
+<pre class="out">{
+  "mediaType": "<b>application/vnd.oci.image.index.v1+json</b>",
+  "entries": <b>2</b>,
+  "manifests": [
+    { "digest": "sha256:a08e2b09e471a4ac01b1eb8c00e272211134e8c11b02fa73675c9e226a34423f",
+      "platform": { "architecture": "amd64", "os": "linux" } },
+    { "digest": "sha256:d385c3b8eaedefe4389a0e14347061b04ece90064e60ab9b403f383f94a4c808",
+      "platform": { "architecture": "arm64", "os": "linux" } }
+  ]
+}</pre>
+<p>Exactly the structure from <a href="i4.html#cp-i4-8">I4.8</a>, now produced by you: two entries, two platform objects, no <code>variant</code> field at all. Note there are no attestation manifests here — nothing asked for them — so this index is 2 entries for 2 platforms, unlike Docker Hub's 16 for 8.</p></li>
+
+<li>Confirm each manifest really is the architecture it claims, by reading the config rather than trusting the index. This is <a href="i4.html#cp-i4-8">I4.8</a>'s discipline, and the reason for it is that the platform object is a label a producer writes, not a fact a registry checks.
+<pre class="cmd">for d in $(curl -s -H "Accept: application/vnd.oci.image.index.v1+json" \
+           http://127.0.0.1:5000/v2/i6/mp/manifests/v1 | jq -r '.manifests[].digest'); do
+  C=$(curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+      http://127.0.0.1:5000/v2/i6/mp/manifests/$d | jq -r .config.digest)
+  curl -s http://127.0.0.1:5000/v2/i6/mp/blobs/$C | jq -r '"  \(.architecture)\t\(.variant // "-")\t\(.os)"'
+done</pre>
+<pre class="out">  amd64	-	linux
+  arm64	-	linux</pre></li>
+
+<li>Finally, see the difference from the outside, because it explains a class of confusing 404s. Ask the single-platform image from <a href="#cp-i6-4">I6.4</a> for an index.
+<pre class="cmd">curl -s -o /dev/null -w "index Accept -&gt; %{http_code}\n" \
+  -H "Accept: application/vnd.oci.image.index.v1+json" \
+  http://127.0.0.1:5000/v2/i6/one/manifests/v1
+curl -s -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json" \
+  http://127.0.0.1:5000/v2/i6/one/manifests/v1 | jq -r .mediaType</pre>
+<pre class="out">index Accept -&gt; <b>404</b>
+application/vnd.oci.image.manifest.v1+json</pre>
+<p>A single-platform build produces no index at all, and <code>registry:2</code> enforces <code>Accept</code> strictly — so asking for only an index gets <code>404</code>, exactly as <a href="i5.html#cp-i5-4">I5.4</a> warned. The tag was fine; the header was wrong.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can register emulation, confirm it from the builder's own platform list, build and push a two-platform image, and read back its index and each manifest's real architecture. You can also state what emulation costs <em>for a given workload</em> rather than quoting a multiplier, and say which shape of Dockerfile makes it nearly free.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The emulation tax has no single number, and the failure mode is a timeout rather than a slowdown.</strong> Measured on one machine: 1.6× for a hashing step, 4.1× for an interpreter loop, and a package install that did not finish in 520 s. Budget for the workload you actually have, and set CI timeouts that fail loudly.</li>
+<li><strong>Registering <code>binfmt</code> changes the host kernel, not the build.</strong> Those entries persist for every process on the machine and are lost on reboot unless something re-registers them. A build that works on your laptop and fails on a fresh CI runner with <code>exec format error</code> is usually this and nothing else.</li>
+<li><strong>Cross-compiling and emulating are different strategies, and the good one is boring.</strong> Compile natively and <code>COPY --from</code> the artefact into the foreign stage, and hardly any foreign code runs during the build. Reach for emulation when a step genuinely must execute on the target architecture.</li>
+<li><strong>An index entry may legally have no <code>platform</code>, so do not assume every entry is an image.</strong> The spec only <em>SHOULD</em>s the property. Attestation manifests use exactly that latitude, which is why <a href="i4.html#cp-i4-8">I4.8</a>'s selector has to skip them by media type <em>and</em> by <code>unknown/unknown</code>.</li>
+<li><strong><code>architecture</code> and <code>variant</code> are separate fields.</strong> There is no <code>arm64v8</code> value; there is <code>arm64</code> with an optional <code>v8</code>. The images above have no variant at all, which is normal and not a defect.</li>
+<li><strong>Resolving a tag is not selecting a platform.</strong> If a tag resolves to a single manifest rather than an index, <code>--platform</code> has nothing to choose from and is silently ignored — the arm64/amd64 incident from <a href="i4.html#cp-i4-8">I4.8</a> that surfaces hours later as <code>exec format error</code>. Check the resolved config's own <code>architecture</code> when it matters.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the fix for one of the more baffling pod failures: a container that crashes instantly with <code>exec format error</code>, which <a href="w6.html#cp-6-16">W6.16</a> teaches you to read from <code>--previous</code> logs and an exit code, and which means the image's architecture does not match the node's. Publish an index and the kubelet's pull resolves the right manifest per node with no scheduling rules, no tag suffixes and no <code>nodeSelector</code> on <code>kubernetes.io/arch</code>. Where you <em>do</em> still need that label is when only some of your images are multi-platform — a mixed-architecture cluster with a single-platform image is precisely the case <a href="w3.html#cp-3-12">W3.12</a>'s <code>nodeSelector</code> exists to constrain, and it is worth knowing that as the workaround rather than the design.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>image-index.md § Image Index Property Descriptions</code> for the <code>platform</code> object and the <code>SHOULD</code> that lets attestations exist. Search the BuildKit docs for <em>"multi-platform builds"</em> and the three strategies it lists. On the Kubernetes side, search for <em>"well-known labels"</em> for <code>kubernetes.io/arch</code>, and note that a proper index means you do not need it.</p>
+</article>
 </div><!-- /g-doing-it-properly -->
 
 <div class="quiz" id="quiz">
