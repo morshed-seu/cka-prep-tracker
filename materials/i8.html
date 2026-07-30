@@ -133,6 +133,16 @@ running, already holding the same containers.</li>
 <p>That last point is the one worth carrying: the migration was mostly a change of address, not a
 change of machinery. The containerd you took apart in I7 is what Docker was driving all along.</p>
 
+<div class="specref">
+<p>The contract's identity is three lines at the top of one file. This is what replaced
+"open a pull request against the kubelet":</p>
+<blockquote>syntax = "proto3";<br>
+<br>
+package runtime.v1;<br>
+option go_package = "k8s.io/cri-api/pkg/apis/runtime/v1";</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Confirm the shape on your own box. There is no Docker here, no kubelet, and yet a full CRI
@@ -870,6 +880,15 @@ evidence. It also explains why the reverse order matters at teardown (I8.11): th
 condition from <code>Status()</code>, and a <code>lastCNILoadStatus</code> string that says why the
 config failed to load. Between them they name the fault precisely.</p>
 
+<div class="specref">
+<p>The proto says nothing about CNI — that is I9's specification. What it does say is whose
+IP it is, and the answer explains why the address survives container restarts:</p>
+<blockquote>message PodSandboxNetworkStatus {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// IP address of <b>the PodSandbox</b>.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;string ip = 1;</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Take the CNI configuration away and watch the runtime notice. Nothing is restarted here — a
@@ -1002,6 +1021,16 @@ CRI is stateless enough that it asks for them again rather than remembering. Sec
 start are separate calls for exactly the reason <a href="i2.html#cp-i2-11">I2.11</a> gave for runc:
 everything expensive and fallible happens in create, so start is a fast, near-certain operation, and
 a supervisor can prepare many containers and release them together.</p>
+
+<div class="specref">
+<p>Two of the four verbs, one line apart, and each comment is one sentence long — the
+sequence is not described anywhere in the proto, because it falls out of the dependencies:</p>
+<blockquote>// CreateContainer creates a new container in specified PodSandbox<br>
+rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse) {}<br>
+// StartContainer starts the container.<br>
+rpc StartContainer(StartContainerRequest) returns (StartContainerResponse) {}</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
 
 <h5>Lab</h5>
 <ol class="lab">
@@ -1470,6 +1499,14 @@ error message all at once. CRI reserves a unique name per container built from
 the log filename <code>0.log</code>, <code>1.log</code>, and the same number
 <code>kubectl</code> shows you as <code>RESTARTS</code>. One mechanism, three faces.</p>
 
+<div class="specref">
+<p>The call behind <code>crictl inspect</code>, and the clause that makes it useful on a
+node whose API server is unreachable — it answers about containers, present or not:</p>
+<blockquote>// ContainerStatus returns status of the container. If the container is not<br>
+// present, returns an error.</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Start a container, stop it, and try to recreate it with the same metadata. The refusal names the
@@ -1584,6 +1621,17 @@ inside itself effectively has no logs.</strong> Nothing is reading that file. Th
 fd 1 and fd 2, and anything that does not go there does not exist as far as Kubernetes is
 concerned.</p>
 
+<div class="specref">
+<p>The container half of the log path, with the spec's own example — <code>Instance#</code>
+is the attempt number, which is the whole story of <code>0.log</code> and <code>1.log</code>:</p>
+<blockquote>// Path relative to PodSandboxConfig.LogDirectory for container to store<br>
+// the log (STDOUT and STDERR) on the host.<br>
+// E.g.,<br>
+//&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;PodSandboxConfig.LogDirectory = `/var/log/pods/&lt;NAMESPACE&gt;_&lt;NAME&gt;_&lt;UID&gt;/`<br>
+//&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ContainerConfig.LogPath = `containerName/<b>Instance#</b>.log`</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Run a container that prints a short stdout line, a short stderr line, and one 20,000-byte line,
@@ -1697,6 +1745,16 @@ by the runtime.</p>
 sole owner of the cgroup tree, <strong><code>systemd</code> on both sides is the only correct
 answer</strong> — and kubeadm sets it on both. The failure when they disagree is the subject of the
 drill.</p>
+
+<div class="specref">
+<p>The runtime handlers you are about to list are specified here — and the second comment
+line explains the nameless first entry rather than leaving it looking like a bug:</p>
+<blockquote>message RuntimeHandler {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// Name must be unique in StatusResponse.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// <b>An empty string denotes the default handler.</b><br>
+&nbsp;&nbsp;&nbsp;&nbsp;string name = 1;</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
 
 <h5>Lab</h5>
 <ol class="lab">
@@ -1833,6 +1891,14 @@ fixed. And state is in memory, so restarting the server loses the records while 
 running, which is <a href="i7.html#cp-i7-3">I7.3</a> in reverse and a good demonstration of why real
 runtimes have a metadata store.</p>
 
+<div class="specref">
+<p>The first method you will implement, and the only one whose contract is a complete
+sentence about what to return:</p>
+<blockquote>// Version returns the runtime name, runtime version, and runtime API version.<br>
+rpc Version(VersionRequest) returns (VersionResponse) {}</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Compile the protobufs. The proto has <strong>no imports</strong>, so this is a single command
@@ -1966,6 +2032,20 @@ each has a one-command discriminator. Do them with the page scrolled away.</p>
 <p>The pattern to notice across all three is that <strong>the error text is the least reliable
 evidence</strong>. Two of the three produce messages that are either byte-identical to a different
 fault or silent altogether. What separates them is a targeted question asked of a different layer.</p>
+
+<div class="specref">
+<p>The message behind every "the node is broken" report. Note that <code>reason</code>
+and <code>message</code> are free-form strings the runtime fills in — which is why two of this
+drill's three faults are diagnosed from somewhere other than the text:</p>
+<blockquote>message RuntimeCondition {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// Type of runtime condition.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;string type = 1;<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// Status of the condition, one of true/false. Default: false.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;bool status = 2;<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// Brief CamelCase string containing reason for the condition's last transition.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;string reason = 3;</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
 
 <h5>Lab</h5>
 <ol class="lab">
