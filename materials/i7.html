@@ -1182,6 +1182,198 @@ ID             CREATED AT                  LABELS
 
 <p class="docs-links"><b>Docs:</b> containerd's <code>garbage-collection.md</code> — read the <code>gc.ref</code> label table and the lease section together, they only make sense as a pair. Then <code>ctr leases --help</code>, and on the Kubernetes side search for "garbage collection" to find the kubelet's separate <code>imageGCHighThresholdPercent</code>.</p>
 </article>
+<article class="lesson" id="cp-i7-14" data-id="i7-14">
+<div class="lesson-head"><span class="cp-id">I7.14</span><h4>Write access to the socket is root on the node</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>One sentence carries this whole checkpoint: <strong>write access to the containerd socket is root on the node.</strong> Not "can lead to root", not "with a known exploit" — access to that socket <em>is</em> administrative control of the machine, immediately and by design. Internalising this is what makes you recoil, correctly, from every "just mount the socket into the pod" suggestion you will ever be offered.</p>
+
+<h5>The concept</h5>
+<p>Look at what containerd's API is for: it creates processes with arbitrary uids, arbitrary mounts, arbitrary capabilities and arbitrary namespaces. That is the job. It follows, with no cleverness required, that anyone who can ask containerd for a container can ask for a container that mounts the host's root filesystem and runs as uid 0 inside it — and now they can read and write every file on the node.</p>
+<p>There is nothing to patch here, because nothing is broken. A runtime that <em>could not</em> do this would not be a runtime. The socket's <code>0660 root:root</code> mode is the entire access control, which is why it is owned by root and not group-writable to anyone you would not already trust as root.</p>
+<p>This is <a href="b12.html#cp-b12-2">B12.2's least-privilege lesson</a> arriving with teeth. The reason the daemonless, rootless build tooling in <a href="i6.html#cp-i6-6">I6.6</a> exists at all is to avoid handing this socket — or Docker's equivalent <code>/var/run/docker.sock</code> — to a CI job that only wants to build an image. "Mount the socket so the build can run" and "give this job root on every node it lands on" are the same sentence.</p>
+<p>On a Kubernetes node the consequence is sharper still, and worth being able to state precisely: a pod that can mount the host's container socket needs <strong>no RBAC permission at all</strong> to become cluster-admin. It does not go through the API server. It reads the kubelet's client certificate off the host disk and simply <em>is</em> the node. Every keycard in <a href="w7.html#cp-7-5">W7's authorization model</a> is bypassed, because the attack never knocks on that door.</p>
+
+<div class="specref">
+<p>This checkpoint has no OCI spec to quote — the socket and its permissions are containerd's, not a standard's — so the reference is containerd's own security posture: the socket is a privileged interface, protected by filesystem permissions and nothing else. The runtime spec does, however, define exactly the capability that makes a mounted host root dangerous:</p>
+<blockquote>rootfsPropagation (string, OPTIONAL) sets the rootfs's mount propagation. Its value is either <code>shared</code>, <code>slave</code>, <code>private</code> or <code>unbindable</code>.</blockquote>
+<p>— i.e. the API openly takes host-mount instructions, because taking them is the point.</p>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md">config-linux.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at the socket and its mode. This is the entire access-control story.
+<pre class="cmd">ls -l /run/containerd/containerd.sock
+stat -c '%A %U:%G' /run/containerd/containerd.sock</pre>
+<pre class="out">srw-rw---- 1 root root 0 Jul 30 12:55 /run/containerd/containerd.sock
+<b>srw-rw---- root:root</b></pre>
+<p>A socket (<code>s</code>), read/write for owner and group, both root. Nothing else can open it.</p></li>
+
+<li>Confirm the target is genuinely off-limits by the normal path.
+<pre class="cmd">sudo head -1 /etc/shadow >/dev/null && echo "(shadow is root-only, as expected)"</pre>
+<pre class="out">(shadow is root-only, as expected)</pre></li>
+
+<li>Now read it anyway — through a container, using only socket access. No exploit, no CVE.
+<pre class="cmd">sudo ctr run --rm \
+  --mount type=bind,src=/,dst=/host,options=rbind:ro \
+  docker.io/library/alpine:3.21 pwn head -1 /host/etc/shadow</pre>
+<pre class="out"><b>root:*:20639:0:99999:7:::</b></pre>
+<p>The container bind-mounted the host's root filesystem and read a root-only file out of it. That is the whole demonstration: the API did exactly what it is designed to do.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain, without using the word "exploit", why socket access equals node root, and why mounting a container socket into a workload is a security decision of the first order rather than a convenience.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>This is not a containerd flaw, and "fixing" it makes no sense.</strong> The same is true of <code>docker.sock</code>, the CRI socket, and any runtime API. The mitigation is never mounting the socket where it does not belong.</li>
+<li><strong>Group membership is the quiet danger.</strong> Adding a user to a <code>docker</code> or containerd-adjacent group is granting passwordless root. It rarely looks like that on the <code>usermod</code> line, which is exactly why it slips through review.</li>
+<li><strong>A read-only bind mount does not save you.</strong> The demo used <code>:ro</code> and still read <code>/etc/shadow</code>; drop the <code>:ro</code> and it writes. Read access to the whole host is already a full compromise — the kubelet's key is world-readable to root.</li>
+<li><strong>Rootless containerd narrows this but does not erase it.</strong> A rootless socket grants the running user's privileges, not root's — better, but still "everything that user can do", which on a build box is often plenty.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the concrete form of <a href="b9.html#cp-b9-1">B9's note</a> that socket access is node control, and it is why <a href="w7.html#cp-7-5">W7's authorization lineup</a> can be entirely sidestepped: a hostPath mount of the socket is a path around RBAC, not through it. The advanced track has no dedicated Pod Security Standards lesson to link here — so the honest pointer is that preventing this is a <code>securityContext</code>/admission concern handled outside these materials, and the rule to carry is simply: the container socket never goes into a container.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> there is no exam doc for this — it is a habit, not a command. The nearest searchable anchors are the OCI runtime spec's <code>config-linux.md</code> (mounts and propagation) and the Kubernetes docs for "hostPath" and "Pod Security Standards", which exist to stop exactly this.</p>
+</article>
+<article class="lesson" id="cp-i7-15" data-id="i7-15">
+<div class="lesson-head"><span class="cp-id">I7.15</span><h4>The runtime narrating itself</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>ctr events</code> is the runtime's own audit log, streaming live, and it answers the one question node logs are worst at: <em>did this container exit, or was it never started?</em> When a pod is flapping and the journal is ambiguous, watching the event stream while you reproduce the problem tells you the exact sequence and the exact exit code, in order, with timestamps.</p>
+
+<h5>The concept</h5>
+<p>Everything you have driven this module is a set of <strong>gRPC services</strong> over the socket from <a href="#cp-i7-14">I7.14</a>: Containers, Tasks, Images, Content, Snapshots, Leases, Events. Every client you have — <code>ctr</code>, <code>nerdctl</code>, the kubelet's CRI calls — is a different face on the same services. <code>ctr events</code> subscribes to the Events service and prints every state change the daemon publishes.</p>
+<p>A single <code>true</code> container produces a whole narrative. Each line is <code>timestamp · namespace · topic · payload</code>, and the topics map one-to-one onto the API calls that caused them. Running one container end to end emits eight:</p>
+<div class="flow"><span>/snapshot/prepare</span><em>→</em><span>/containers/create</span><em>→</em><span>/tasks/create</span><em>→</em><span>/tasks/start</span><em>→</em><span>/tasks/exit</span><em>→</em><span>/tasks/delete</span><em>→</em><span>/containers/delete</span><em>→</em><span>/snapshot/remove</span></div>
+<p>That ordering is the whole lifecycle you have spent the module assembling, made observable: the snapshot is prepared <em>before</em> the container record exists, the task is a separate object created and started after the container, and teardown unwinds in reverse. The <code>/tasks/exit</code> event is the one that carries the exit code and the exit timestamp — it is where "container exited 137" physically comes from.</p>
+<p>One honest detail from the capture: a container that exits <strong>0</strong> emits a <code>/tasks/exit</code> event with <em>no</em> <code>exit_status</code> field at all — the field is omitted when it is zero, following protobuf's default-value rule. So "no exit_status in the event" means success, not missing data. A non-zero exit puts the number there.</p>
+
+<div class="specref">
+<p>An event is a small, typed envelope — and the three fields you read off each line in the lab are exactly the ones the source defines:</p>
+<blockquote>// Envelope provides the packaging for an event.<br>type Envelope struct {<br>&nbsp;&nbsp;Timestamp time.Time<br>&nbsp;&nbsp;Namespace string<br>&nbsp;&nbsp;Topic&nbsp;&nbsp;&nbsp;&nbsp; string<br>&nbsp;&nbsp;Event&nbsp;&nbsp;&nbsp;&nbsp; typeurl.Any<br>}</blockquote>
+<cite>containerd core/events — <a href="https://github.com/containerd/containerd/blob/main/core/events/events.go">core/events/events.go</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>In one command, watch a whole container life. Start the watcher, run a container, let the watcher time out.
+<pre class="cmd">sudo timeout 8 ctr events &gt; /tmp/ev.txt 2>&amp;1 &amp;
+sleep 1
+sudo ctr run --rm docker.io/library/alpine:3.21 evdemo true
+wait</pre>
+<pre class="out">(evdemo runs `true` and exits immediately)</pre></li>
+
+<li>List the topics that one container produced.
+<pre class="cmd">sudo sed 's/\x1b\[[0-9;]*m//g' /tmp/ev.txt | grep -oE '/[a-z/]+ ' | sort -u</pre>
+<pre class="out"><b>/containers/create</b>
+/containers/delete
+/snapshot/prepare
+/snapshot/remove
+<b>/tasks/create</b>
+/tasks/delete
+<b>/tasks/exit</b>
+<b>/tasks/start</b></pre>
+<p>Eight events for one <code>true</code>. Snapshot first, container second, task third.</p></li>
+
+<li>Read the exit event in full — it carries the code and the timestamp.
+<pre class="cmd">sudo sed 's/\x1b\[[0-9;]*m//g' /tmp/ev.txt | grep '/tasks/exit'</pre>
+<pre class="out">2026-07-30 07:31:38.765... default <b>/tasks/exit</b> {"container_id":"evdemo","id":"evdemo","pid":64880,"exited_at":{"seconds":1785396698,...}}</pre>
+<p>No <code>exit_status</code> field — because <code>true</code> exited 0, and protobuf omits zero. A failing container would show <code>"exit_status":1</code> here.</p></li>
+
+<li>Read the create event, and notice it names the runtime plugin.
+<pre class="cmd">sudo sed 's/\x1b\[[0-9;]*m//g' /tmp/ev.txt | grep '/containers/create'</pre>
+<pre class="out">... default /containers/create {"id":"evdemo","image":"docker.io/library/alpine:3.21","runtime":{"name":"<b>io.containerd.runc.v2</b>"}}</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can watch a container's lifecycle as an event stream, name the topic that carries the exit code, and read "no <code>exit_status</code>" correctly as "exited zero" rather than "data missing".</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Events are per-namespace.</strong> On a Kubernetes node you need <code>ctr -n k8s.io events</code>, or you will watch an empty stream while the kubelet is busy — the same <code>-n</code> trap as <a href="#cp-i7-5">I7.5</a>, one more time.</li>
+<li><strong>Events are not persisted.</strong> The stream is live only; there is no backlog to query after the fact. If you did not have <code>ctr events</code> running when it happened, it is gone — which is why you start the watcher <em>before</em> reproducing the problem.</li>
+<li><strong>A restart of containerd breaks the stream silently.</strong> Anything that happened during the gap (<a href="#cp-i7-3">I7.3</a>) is simply absent, with no marker. Do not treat a quiet stream as "nothing happened".</li>
+<li><strong>Zero-valued fields vanish, not just <code>exit_status</code>.</strong> This is a general protobuf property; do not infer "the runtime didn't record X" from an absent field.</li>
+</ul>
+
+<div class="k8s-link">
+<p>On a node reproducing a pod-startup problem, <code>ctr -n k8s.io events</code> shows the pause container (<a href="w1.html#cp-1-21">W1.21</a>) being created before its app containers, in exactly the order I8's CRI lesson will formalise. When <a href="w6.html#cp-6-1">W6.1</a> teaches <code>kubectl get events</code> as a first move, this is the layer underneath it — Kubernetes events are the cluster's story, containerd events are the node's, and a stuck pod sometimes only shows up in the lower one.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> containerd's <code>events.md</code> for the topic list and payload types; <code>ctr events --help</code> (there is almost nothing to it). On the Kubernetes side, contrast with <code>kubectl get events --watch</code>, which is the same idea at the cluster layer.</p>
+</article>
+<article class="lesson" id="cp-i7-16" data-id="i7-16">
+<div class="lesson-head"><span class="cp-id">I7.16</span><h4>The friendly client is a face, not a system</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p><code>nerdctl</code> gives you Docker's command-line ergonomics directly on top of containerd, which is genuinely convenient — but the reason it belongs in this module is what it <em>proves</em>: "Docker commands" were never a runtime feature. Everything <code>docker run</code> does is a client-side convention layered on the primitives you have handled by hand, and seeing that is what stops Docker knowledge from misleading you when you debug a cluster.</p>
+
+<h5>The concept</h5>
+<p><code>nerdctl</code> is a Docker-compatible CLI that talks to containerd's ordinary API — the same daemon, the same content store, the same snapshots you have been inspecting. Run a container with it and you can immediately find the identical object with <code>ctr</code> and its shim with <code>ps</code>. There is no second system.</p>
+<p>What <code>nerdctl</code> adds over <code>ctr</code> is <em>convention</em>: default bridge networking, port publishing, named volumes, restart policies, a <code>logs</code> command. Every one of those is a decision, made in the client, on top of primitives that have no opinion — and every one is something Kubernetes chooses to do <em>differently</em>. That is precisely why <code>docker run</code> fluency transfers so unevenly to a cluster: the primitives are shared, the conventions are not.</p>
+<p>One concrete illustration the lab makes visible: <code>nerdctl run --name web</code> does <strong>not</strong> key the containerd container as <code>web</code>. It generates a 64-hex container ID exactly as Docker does, stores <code>web</code> in a <code>nerdctl/name</code> label, and resolves the friendly name for you at display time. So <code>ctr containers ls</code> shows the long ID, and the name lives in the metadata store (<a href="#cp-i7-12">I7.12</a>) as a label — the "friendly name" is pure client sugar, and the container underneath is keyed the way everything in containerd is keyed.</p>
+
+<div class="specref">
+<p>nerdctl is explicit that it is a client, not a runtime — the same containerd you have been driving:</p>
+<blockquote>nerdctl is a Docker-compatible CLI for containerd.<br>✅ Same UI/UX as <code>docker</code></blockquote>
+<cite>nerdctl README — <a href="https://github.com/containerd/nerdctl/blob/main/README.md">containerd/nerdctl</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Run a container the friendly way. (Pull first so the run is instant.)
+<pre class="cmd">sudo nerdctl pull docker.io/library/nginx:alpine
+sudo nerdctl run -d --name web docker.io/library/nginx:alpine
+sudo nerdctl ps --format '{{.ID}}  {{.Names}}'</pre>
+<pre class="out">2f0a8d1fba3d  <b>web</b></pre>
+<p>A short ID and the name you gave it — exactly the Docker experience.</p></li>
+
+<li>Find the same object with <code>ctr</code>. It is keyed by the full ID, not by <code>web</code>.
+<pre class="cmd">ID=$(sudo nerdctl inspect web --format '{{.Id}}')
+echo "$ID"
+sudo ctr containers ls | grep "${ID:0:12}"</pre>
+<pre class="out">2f0a8d1fba3d1f880406f852e180e8875d64d7e503ee80a8b47063b74dddcea3
+<b>2f0a8d1fba3d</b>1f88...   docker.io/library/nginx:alpine   io.containerd.runc.v2</pre></li>
+
+<li>Prove <code>web</code> is a label, not the key.
+<pre class="cmd">sudo ctr containers info "$ID" | grep 'nerdctl/name'</pre>
+<pre class="out">        "<b>nerdctl/name</b>": "web",</pre></li>
+
+<li>The task, its PID, and the same shim architecture from I7.1 — no exceptions for the friendly client.
+<pre class="cmd">sudo ctr task ls | grep "${ID:0:12}"
+P=$(sudo ctr task ls | grep "${ID:0:12}" | awk '{print $2}')
+ps -o pid,comm -p "$(ps -o ppid= -p "$P" | tr -d ' ')"</pre>
+<pre class="out">2f0a8d1fba3d...   <b>66648</b>   RUNNING
+    PID COMMAND
+  66613 <b>containerd-shim</b></pre></li>
+
+<li>The payoff line: on a node with a kubelet, point <code>nerdctl</code> at <code>k8s.io</code> and see the pods.
+<pre class="cmd">sudo nerdctl --namespace k8s.io ps</pre>
+<pre class="out">CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES</pre>
+<p>Empty here — this box runs no kubelet — but on a real node this is every running pod, through the friendly client, in the one namespace that matters (<a href="#cp-i7-5">I7.5</a>).</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can run a container with <code>nerdctl</code> and then locate the identical object, its label-stored name and its shim through <code>ctr</code> and <code>ps</code> — proving to yourself that the friendly client is a face, not a system.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The friendly name is not the containerd key.</strong> Scripts that assume <code>ctr container rm web</code> will work after <code>nerdctl run --name web</code> fail — the key is the long ID. Resolve the name through <code>nerdctl</code>, or match the label.</li>
+<li><strong><code>nerdctl</code> defaults to the <code>default</code> namespace</strong>, so <code>nerdctl ps</code> on a Kubernetes node shows nothing until you add <code>--namespace k8s.io</code>. Same reflex, third client.</li>
+<li><strong>nerdctl's networking is not Kubernetes' networking.</strong> The bridge, the published ports and the DNS it sets up are its own conventions; a pod gets none of them, it gets the CNI plumbing from <a href="b9.html#cp-b9-4">B9</a> and <a href="w4.html#cp-4-1">W4</a> instead. Do not reason about pod connectivity from <code>nerdctl run -p</code> behaviour.</li>
+<li><strong><code>nerdctl logs</code> reads the shim's log, not a Docker logging driver.</strong> It works because the shim owns stdio (<a href="#cp-i7-1">I7.1</a>); it is not evidence that containerd has Docker's log-driver machinery, which it does not.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is why <code>docker run</code> experience helps unevenly with <a href="w6.html#cp-6-1">W6's troubleshooting</a>: the container primitives you learned transfer perfectly, but the networking, naming and logging conventions do not, because Kubernetes replaced every one of them. <code>nerdctl --namespace k8s.io</code> is the bridge — it is the closest thing to "docker on a Kubernetes node", and it is exactly as far from the cluster's own model as <code>ctr</code> is.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the nerdctl README and its command reference for the Docker-compatibility surface; contrast any command with its <code>ctr</code> equivalent to see what convention was added. On the Kubernetes side, <code>crictl</code> is the CRI-level analogue — read its docs next to nerdctl's to see the two different clients over the one daemon.</p>
+</article>
 </div><!-- /g-the-process-tree -->
 
 <!-- ---------------- Objects ---------------- --><div class="grp" id="g-objects"><h3>Objects</h3>
