@@ -70,6 +70,17 @@ Two more, learned the hard way and worth never repeating:
   shell (exit 144). Use the bracket trick: `pkill -f '[f]oo\.py'`.
 - **Scratch files go in `~`, not `/tmp`.** `/tmp` is sticky, so a root-owned
   file left by a `sudo`ing snippet cannot be unlinked by the next run.
+- **No nested quoted heredoc inside a snippet.** A `python3 - <<'PY'` block
+  inside the snippet is re-parsed by the outer shell and dies on the first `(`.
+  Generate the file with a shell loop, or `vm.sh put` it.
+- **A `jq` program containing `$vars` must be a file**, read with `jq -f`. Inline
+  in double quotes, the VM-side shell expands `$s` to nothing and you get
+  `Cannot index number with object`.
+- **A build or install can outlive `CKA_VM_TIMEOUT` with no output at all.** The
+  capture file is then written empty and `vm.sh` exits 1 — that is a timeout,
+  not a silent success. Anything emulated (I6.7) or `apt`/`apk`-heavy wants
+  `run_in_background` plus a generous timeout, and a recursive `grep -r /` inside
+  a container will eat the whole budget on its own.
 
 ## Commit discipline
 
