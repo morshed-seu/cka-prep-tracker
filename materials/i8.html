@@ -393,6 +393,392 @@ pull-policy and pull-secret behaviour that lives entirely on the ImageService si
 
 
 
+<!-- ---------------- The sandbox model ---------------- --><div class="grp" id="g-the-sandbox-model"><h3>The sandbox model</h3>
+<article class="lesson" id="cp-i8-4" data-id="i8-4">
+<div class="lesson-head"><span class="cp-id">I8.4</span><h4>Create a pod without Kubernetes, and meet the pause container</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>A pod is not a kernel object. Linux has no idea what one is. <strong>A pod is a container that
+does nothing, plus other containers that borrow its namespaces</strong> — and you can build one by
+hand, in three commands, with no Kubernetes anywhere. Doing it once permanently removes the
+mystery from a lot of pod behaviour.</p>
+
+<h5>The concept</h5>
+<p>The interface calls it a <strong>sandbox</strong>: the room rented, numbered and wired before any
+guest checks in. <code>RunPodSandbox</code> is the call that rents it, and what it actually produces
+is an ordinary container running a program called <code>pause</code> whose entire job is to exist.</p>
+
+<p>Why must something exist? Because of ordering and lifetime. A namespace is destroyed when the
+last process in it exits <em>unless something pins it</em> (B6.3's lesson, that a namespace is a
+file you can hold open). The pod's network and IPC namespaces must be created before the first app
+container starts, must survive every app container dying and being replaced, and must be the last
+thing torn down. "A process that does nothing, for as long as the pod lives" is precisely the right
+tool, and its source is a few dozen lines: set up signal handling, reap orphaned children, block
+forever.</p>
+
+<p>You will see that "block forever" literally. The kernel's own record of what the pause process is
+doing names the syscall.</p>
+
+<p>There is one refinement the folklore misses, and it is visible on this box. <strong>On containerd
+the network namespace is not held by pause at all.</strong> It is created and <em>bind-mount
+pinned</em> under <code>/var/run/netns/</code> before the pause container exists, because CNI has to
+run against it first (that is I8.7's seam). Pause genuinely holds the IPC and UTS namespaces via
+<code>/proc/&lt;pid&gt;/ns/…</code>, and the netns is pinned by a file. Both mechanisms are B6's;
+only one of them is the pause container.</p>
+
+<div class="specref">
+<p>What the call is required to do — note "creates <em>and starts</em>", which is why there is no
+separate start step for a sandbox:</p>
+<blockquote>// RunPodSandbox creates and starts a pod-level sandbox. Runtimes must ensure<br>
+// the sandbox is in the ready state on success.</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a sandbox config. This is a <code>PodSandboxConfig</code> message in JSON; crictl
+unmarshals it with protobuf's JSON rules, so both <code>log_directory</code> and
+<code>logDirectory</code> work.
+<pre class="cmd">cat &gt; sandbox.json &lt;&lt;'EOF'
+{
+  "metadata": { "name": "demo", "namespace": "i8", "uid": "i8-demo-uid-0001", "attempt": 0 },
+  "log_directory": "/var/log/pods/i8_demo_i8-demo-uid-0001",
+  "dns_config": {
+    "servers": ["10.96.0.10"],
+    "searches": ["i8.svc.cluster.local", "svc.cluster.local", "cluster.local"],
+    "options": ["ndots:5"]
+  },
+  "port_mappings": [ { "protocol": 0, "container_port": 80, "host_port": 18080 } ],
+  "linux": {
+    "cgroup_parent": "/i8demo",
+    "security_context": { "namespace_options": { "network": 0, "pid": 1, "ipc": 0 } }
+  }
+}
+EOF
+sudo mkdir -p /var/log/pods/i8_demo_i8-demo-uid-0001/app</pre></li>
+
+<li>Run it — and watch it fail the first time, because this is a genuinely instructive failure.
+<pre class="cmd">sudo crictl runp sandbox.json</pre>
+<pre class="out">E0730 13:55:35.820048 remote_runtime.go:237] "RunPodSandbox from runtime service failed"
+  err="rpc error: code = <b>DeadlineExceeded</b> desc = stream terminated by RST_STREAM with
+  error code: CANCEL"</pre>
+<p>That message names nothing. It does not mention images, or the network, or the sandbox. It is
+crictl's own 10-second timeout firing and cancelling the call. The cause is only in the runtime's
+log:</p>
+<pre class="cmd">sudo journalctl -u containerd --since -2min | grep -o 'failed to pull image [^\]*'</pre>
+<pre class="out">failed to pull image <b>"registry.k8s.io/pause:3.10.2"</b></pre>
+<p>The runtime was pulling the sandbox image and had not finished. Note the tag: the default on
+containerd 2.3.3 is <strong><code>pause:3.10.2</code></strong>, and pulling <code>pause:3.10</code>
+by hand does not satisfy it.</p></li>
+
+<li>Give it the time it needs.
+<pre class="cmd">POD=$(sudo crictl -t 60s runp sandbox.json); echo "$POD"</pre>
+<pre class="out"><b>d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e</b></pre></li>
+
+<li>Find what it produced. The sandbox is an ordinary containerd container in the
+<code>k8s.io</code> namespace — the namespace I7.5 introduced, here holding the objects a kubelet
+would own.
+<pre class="cmd">sudo ctr -n k8s.io containers ls
+sudo ctr -n k8s.io tasks ls</pre>
+<pre class="out">CONTAINER                                                           IMAGE                          RUNTIME
+d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e    <b>registry.k8s.io/pause:3.10.2</b>   io.containerd.runc.v2
+
+TASK                                                                PID      STATUS
+d703566d914ca7b25ef2e54b1e056a6b19ea1c83ae96f92ade9634dd42801b8e    <b>73974</b>    RUNNING</pre></li>
+
+<li>Read the pause process. This is the whole program.
+<pre class="cmd">sudo tr '\0' ' ' &lt; /proc/73974/cmdline; echo
+grep -E '^Name|^Threads|^VmRSS' /proc/73974/status
+sudo cat /proc/73974/stack | head -3</pre>
+<pre class="out"><b>/pause</b>
+Name:	pause
+VmRSS:	     <b>624 kB</b>
+Threads:	<b>1</b>
+[&lt;0&gt;] <b>__do_sys_pause</b>+0x34/0x70
+[&lt;0&gt;] x64_sys_call+0x21cc/0x25a0
+[&lt;0&gt;] do_syscall_64+0x87/0x180</pre>
+<p>One thread, 624 kB resident, blocked in <code>pause(2)</code> — the syscall whose entire
+definition is "sleep until a signal arrives". There is nothing else to it.</p></li>
+
+<li>Confirm the sandbox image is <strong>pinned</strong>, which is why image garbage collection can
+never evict it and strand the node.
+<pre class="cmd">sudo crictl images -o json | jq -c '.images[] | select(.repoTags[0]|test("pause")) | {repoTags, pinned}'</pre>
+<pre class="out">{"repoTags":["registry.k8s.io/pause:3.10"],"pinned":<b>false</b>}
+{"repoTags":["registry.k8s.io/pause:3.10.2"],"pinned":<b>true</b>}</pre>
+<p>Only the configured one is pinned. The copy you pulled by hand is an ordinary image and will be
+garbage-collected like any other — a useful reminder that "I already pulled pause" is not the same
+claim as "the sandbox image is present".</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have a running pod that no API server knows about, you can name its pause process's PID, and
+you can say in one sentence why a process that does nothing is the correct implementation of a pod.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The sandbox image tag is not <code>pause:3.10</code>.</strong> On containerd 2.3.3 the
+default is <code>registry.k8s.io/pause:3.10.2</code>, and it moves between containerd releases. Read
+it from the runtime (<code>containerd config default | grep -A2 pinned_images</code>) rather than
+assuming — pre-pulling the wrong tag is a real air-gapped-cluster failure.</li>
+<li><strong>A <code>DeadlineExceeded</code> from crictl is your timeout, not the runtime's
+failure.</strong> The call is still running on the server when you see it. Raise
+<code>-t</code> and read the runtime's journal; the error text alone will never tell you what
+happened.</li>
+<li><strong>"The pause container holds the pod's network namespace" is nearly right and slightly
+wrong.</strong> On containerd the netns is a bind-mount pin under <code>/var/run/netns/</code>
+created before pause exists. Pause holds IPC and UTS. The distinction matters when you are looking
+for a leaked namespace after a bad teardown.</li>
+</ul>
+
+<div class="k8s-link">
+<p><a href="w1.html#cp-1-21">W1.21 — Meet the pause container</a> is the same object seen from a
+real cluster. The namespace-pinning mechanism underneath it was built by hand in
+<a href="b6.html#cp-b6-3">B6.3 — namespace identity: reading membership by inode under /proc</a>,
+and the reason a pod's PID 1 must reap orphans is <a href="b2.html#cp-b2-9">B2.9 — orphans, zombies,
+reaping, and what PID 1 owes its children</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>pods</em> and read the "Pod
+lifecycle" page's description of the pod's shared context — everything it describes is the sandbox
+you just created. The pause image's source lives in <code>kubernetes/kubernetes</code> under
+<code>build/pause/</code>.</p>
+</article>
+<article class="lesson" id="cp-i8-5" data-id="i8-5">
+<div class="lesson-head"><span class="cp-id">I8.5</span><h4>The one field that explains "containers in a pod share a network namespace"</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<h5>Why it matters</h5>
+<p>Sidecars reach each other on <code>localhost</code>. They cannot see each other's files. They
+cannot see each other's processes — usually. All of that is famous pod behaviour, and all of it is
+one array in the generated OCI config, with a <code>path</code> on some entries and not others.
+Once you have seen it, pod semantics stop being a Kubernetes feature and become a consequence.</p>
+
+<h5>The concept</h5>
+<p><a href="i2.html#cp-i2-7">I2.7</a> taught the runtime spec's <code>linux.namespaces</code> array
+and the rule that governs it: an entry with a <code>path</code> means <em>join this existing
+namespace</em>, and an entry without one means <em>unshare a new one</em>. B6 taught that a namespace
+is identified by an inode you can read through <code>/proc/&lt;pid&gt;/ns/</code>. Put the two
+together and the CRI plugin's job for an app container is almost trivial: look up the sandbox's PID,
+and write <code>/proc/&lt;that pid&gt;/ns/net</code> into the container's config.</p>
+
+<p>The default split is: <strong>net, IPC and UTS joined; mount and cgroup private.</strong> Shared
+network means one IP, one loopback, one port space — which is why two containers in a pod cannot
+both bind :80, and why one can curl the other on <code>127.0.0.1</code>. Shared UTS means one
+hostname. Private mount namespace means each container keeps its own filesystem view, which is why a
+sidecar cannot read the app's files unless a volume is explicitly shared into both.</p>
+
+<p>PID is the interesting one, because it is configurable and because <strong>the switch is on the
+container config, not the pod config</strong> — a detail that is easy to get backwards. In
+Kubernetes you write <code>shareProcessNamespace: true</code> at pod level; the kubelet translates
+that into <code>namespace_options.pid = POD</code> on <em>each container's</em> CRI request. Setting
+it on the sandbox config alone does nothing, as the lab below demonstrates.</p>
+
+<div class="specref">
+<p>The enum that decides it, with the spec's own examples:</p>
+<blockquote>enum NamespaceMode {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// A POD namespace is common to all containers in a pod.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// For example, a container with a PID namespace of POD expects to view<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// all of the processes in all of the containers in the pod.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;POD       = 0;<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// A CONTAINER namespace is restricted to a single container.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// For example, a container with a PID namespace of CONTAINER expects to<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// view only the processes in that container.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;CONTAINER = 1;<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// A NODE namespace is the namespace of the Kubernetes node.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// For example, a container with a PID namespace of NODE expects to view<br>
+&nbsp;&nbsp;&nbsp;&nbsp;// all of the processes on the host running the kubelet.<br>
+&nbsp;&nbsp;&nbsp;&nbsp;NODE      = 2;</blockquote>
+<cite>Kubernetes cri-api, <code>runtime.v1</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">pkg/apis/runtime/v1/api.proto</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start an app container in the sandbox from I8.4, then compare the two processes' namespace
+inodes directly. <code>readlink</code> on <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> gives the
+identity; equal strings mean the same namespace.
+<pre class="cmd">for n in net ipc uts mnt pid cgroup user; do
+  a=$(sudo readlink /proc/73974/ns/$n); b=$(sudo readlink /proc/74019/ns/$n)
+  printf '%-8s %-22s %-22s %s\n' "$n" "$a" "$b" "$([ "$a" = "$b" ] &amp;&amp; echo SHARED || echo private)"
+done</pre>
+<pre class="out">ns       pause                  app
+net      <b>net:[4026532285]       net:[4026532285]       SHARED</b>
+ipc      <b>ipc:[4026532345]       ipc:[4026532345]       SHARED</b>
+uts      <b>uts:[4026532344]       uts:[4026532344]       SHARED</b>
+mnt      mnt:[4026532343]       mnt:[4026532347]       <b>private</b>
+pid      pid:[4026532346]       pid:[4026532346]       SHARED
+cgroup   cgroup:[4026531835]    cgroup:[4026532348]    private
+user     user:[4026531837]      user:[4026531837]      SHARED</pre></li>
+
+<li>Now read the config the CRI plugin generated to make that happen. This is the payoff.
+<pre class="cmd">B=/run/containerd/io.containerd.runtime.v2.task/k8s.io/$CTR
+sudo jq -c '.linux.namespaces[]' $B/config.json</pre>
+<pre class="out">{"type":"pid","<b>path":"/proc/73974/ns/pid"</b>}
+{"type":"ipc","<b>path":"/proc/73974/ns/ipc"</b>}
+{"type":"uts","<b>path":"/proc/73974/ns/uts"</b>}
+{"type":"mount"}
+{"type":"network","<b>path":"/proc/73974/ns/net"</b>}
+{"type":"cgroup"}</pre>
+<p>73974 is the pause container's PID. Four entries with a path, two without. That is the entire
+mechanism.</p></li>
+
+<li>Read the <em>sandbox</em>'s config for contrast, and find the one difference that matters.
+<pre class="cmd">sudo jq -c '.linux.namespaces[]' /run/containerd/io.containerd.runtime.v2.task/k8s.io/$POD/config.json
+sudo ls -l /var/run/netns/</pre>
+<pre class="out">{"type":"pid"}
+{"type":"ipc"}
+{"type":"uts"}
+{"type":"mount"}
+{"type":"network","path":"<b>/var/run/netns/cni-abb45341-cb46-8219-6001-e86d4e60e888</b>"}
+
+-r--r--r-- 1 root root 0 Jul 30 13:56 cni-abb45341-cb46-8219-6001-e86d4e60e888</pre>
+<p>The sandbox unshares its own PID, IPC and UTS namespaces — but <em>joins</em> a network namespace
+that already existed, pinned as a file. containerd created and pinned it, ran CNI against it, and
+only then started pause into it.</p></li>
+
+<li>Prove where the PID switch lives. Two sandboxes, identical except for
+<code>namespace_options.pid</code> on the <strong>container</strong> config.
+<pre class="cmd"># container config with  "linux": { "security_context": { "namespace_options": { "pid": 1 } } }
+sudo crictl exec $C1 ps -o pid,comm
+# ... and the same with "pid": 0
+sudo crictl exec $C2 ps -o pid,comm</pre>
+<pre class="out">### pid = 1 (CONTAINER)          app OCI: {"type":"pid"}
+  PID   COMMAND
+    1 <b>sleep</b>
+    7 ps
+
+### pid = 0 (POD)                app OCI: {"type":"pid","path":"/proc/77929/ns/pid"}
+  PID   COMMAND
+    1 <b>pause</b>
+    7 sleep
+   13 ps</pre>
+<p>With <code>POD</code>, the app container's PID 1 <em>is the pause process</em> — which is exactly
+why pause has to reap zombies: with process-namespace sharing on, it inherits every orphan in the
+pod.</p></li>
+
+<li>Confirm the negative result: the same field on the <em>sandbox</em> config changes nothing.
+<pre class="cmd"># sandbox config with  "linux": { "security_context": { "namespace_options": { "pid": 1 } } }
+# app container config left at its default
+sudo crictl exec $C ps -o pid,comm</pre>
+<pre class="out">  PID   COMMAND
+    1 pause
+    7 sleep</pre>
+<p>Still shared. The sandbox-level field is not the one the runtime reads for app containers. Set
+<code>network: 2</code> there, however, and the sandbox lands in the host's netns with no network
+entry in its config at all — so the field <em>is</em> parsed; it just governs a different thing.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can point at a single line of JSON and say "this is why two containers in a pod share an IP",
+and you can predict, for any pair of namespaces, whether two containers in a pod share it by
+default.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>shareProcessNamespace</code> is a pod-level field that becomes a container-level
+CRI field.</strong> If you are writing a CRI client (I8.15) and set it only on the
+<code>PodSandboxConfig</code>, nothing happens and nothing warns you. The kubelet sets it on every
+container in the pod.</li>
+<li><strong>Sharing the PID namespace changes what PID 1 is inside your container.</strong> An
+application that assumes it is PID 1 — some init-like supervisors do — behaves differently the moment
+someone turns on process-namespace sharing for debugging. It also means one container can
+<code>kill</code> another's processes.</li>
+<li><strong>Shared network namespace means shared port space.</strong> Two containers in one pod
+cannot both listen on the same port, and the second one fails with <code>EADDRINUSE</code> from
+inside the container, which looks nothing like a Kubernetes error.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The runtime-spec field this is all built on is <a href="i2.html#cp-i2-7">I2.7 —
+linux.namespaces, and the field that explains pods</a>; the kernel mechanism is
+<a href="b6.html#cp-b6-12">B6.12 — nsenter: joining a namespace someone else made</a>. In the
+advanced track, the consequences show up throughout <a href="w4.html#cp-4-1">W4</a>'s pod-networking
+model.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the exam docs for <em>share process namespace</em> for the
+pod-spec field, and for <em>pod</em> → "Pod lifecycle" for the shared-context description. The
+authoritative list of what is and is not shared is the <code>NamespaceOption</code> message in
+<code>api.proto</code>.</p>
+</article>
+<article class="lesson" id="cp-i8-6" data-id="i8-6">
+<div class="lesson-head"><span class="cp-id">I8.6</span><h4>TODO headline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<!-- CHECKPOINT: a real sandbox config field by field: DNS configuration (which becomes the resolv.conf written into the sandbox), port mappings, the linux security context, cgroup parent, and the log directory. Change the DNS block, recreate the sandbox, and find the file it produced on disk.
+     UNDER THE HOOD: This is where B10's resolver lesson meets Kubernetes and where several classic mysteries get their explanation. The runtime — not the workload, not the container image — writes the sandbox's resolv.conf, which is why every pod on a cluster has the same nameserver regardless of its base image, and why ndots:5 in that generated file makes an external lookup take five failed queries before it succeeds. The log directory field is the other quiet one: it is where the CRI log files I12 dissects will be written, chosen by the kubelet, and the reason kubectl logs works at all. -->
+
+<h5>Why it matters</h5>
+<p>TODO plain-English hook.</p>
+
+<h5>The concept</h5>
+<p>TODO. Absorb and expand the "under the hood" note above.</p>
+
+<div class="specref">
+<p>TODO what the spec actually says.</p>
+<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
+<cite>TODO spec, version — <a href="TODO">file</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
+<pre class="cmd">TODO</pre>
+<pre class="out">TODO captured output</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>TODO what the reader can now do.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>TODO.</strong></li>
+</ul>
+
+<div class="k8s-link">
+<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> TODO.</p>
+</article>
+<article class="lesson" id="cp-i8-7" data-id="i8-7">
+<div class="lesson-head"><span class="cp-id">I8.7</span><h4>TODO headline</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+<!-- CHECKPOINT: the seam where the next module begins: RunPodSandbox is what triggers the CNI ADD. Delete your CNI configuration, run crictl runp again, and read the failure — a pod that cannot get an IP fails at sandbox creation, before a single application container has been considered.
+     UNDER THE HOOD: The ordering explains an entire family of cluster symptoms. Because networking is attached to the sandbox, and the sandbox precedes every app container, a broken CNI produces pods stuck in ContainerCreating with an error mentioning networking and no container logs to read — there is nothing to log, nothing was started. It also explains why a pod keeps its IP across container restarts but not across pod restarts: the IP belongs to the sandbox's network namespace, not to any container. I9 opens exactly this seam and makes you implement the other side of it. -->
+
+<h5>Why it matters</h5>
+<p>TODO plain-English hook.</p>
+
+<h5>The concept</h5>
+<p>TODO. Absorb and expand the "under the hood" note above.</p>
+
+<div class="specref">
+<p>TODO what the spec actually says.</p>
+<blockquote>TODO verbatim quote — fetch it, never write it from memory.</blockquote>
+<cite>TODO spec, version — <a href="TODO">file</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>TODO. Every command must be RUN before it is written — tools/vm.sh cap.
+<pre class="cmd">TODO</pre>
+<pre class="out">TODO captured output</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>TODO what the reader can now do.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>TODO.</strong></li>
+</ul>
+
+<div class="k8s-link">
+<p>TODO where this shows up in Kubernetes, with a deep link.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> TODO.</p>
+</article>
+</div><!-- /g-the-sandbox-model -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
