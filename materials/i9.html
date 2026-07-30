@@ -2614,6 +2614,168 @@ line — that is the conformance review. The reference implementation to compare
 which is about 700 lines of Go doing what these 430 lines of bash do, plus IPv6 and the reconciliation of an
 existing bridge's settings.</p>
 </article>
+<article class="lesson" id="cp-i9-16" data-id="i9-16">
+<div class="lesson-head"><span class="cp-id">I9.16</span><h4>Debugging drill — three faults that blame the wrong thing</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Each of these three faults produces a symptom that points somewhere other than its cause. One reports a
+JSON parsing problem, one reports an address shortage on a node running nothing, and one reports nothing at
+all — it just quietly changes which network every new pod joins. Plant them, read them from the symptom
+end, and the next time you meet one in a cluster you will recognise it in seconds.</p>
+
+<h5>The concept</h5>
+<p>Work each fault the same way. Write down the symptom exactly as an operator would see it. Then ask the
+question this module has been training: <strong>which side of the contract is this?</strong> A malformed
+result is the plugin's side. An exhausted store is the plugin's state. A wrong config file is the runtime's
+selection. Those three are diagnosed with three different commands and none of them is
+<code>systemctl restart</code>.</p>
+
+<div class="specref">
+<p>The sentence behind fault 3, which the drill will show being violated in the most ordinary way possible:</p>
+<blockquote>- The network configuration should not change between _add_ and _delete_.<br>- The network configuration should not change between _attachments_.</blockquote>
+<cite>CNI spec 1.1.0, § Lifecycle &amp; Ordering — <a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault 1 — a plugin that says hello.</strong> Plant one line of well-meaning output in the
+wrong place. This is the single most common bug in a hand-written plugin.
+<pre class="cmd">sudo install -m0755 ~/i9/cni-minibridge /opt/cni/bin/mb-broken
+# insert an echo just before the plugin reads its configuration
+sudo sed -i '/^CONFIG=\$(cat)$/i echo "mb-broken: starting up, about to read the config"' /opt/cni/bin/mb-broken
+# install a conflist using it, then create a sandbox
+sudo crictl runp ~/i9/drill-pod.json</pre>
+<pre class="out">E0730 18:53:02.943347 remote_runtime.go:237] "RunPodSandbox from runtime service failed"
+  err="rpc error: code = Unknown desc = failed to setup network for sandbox
+  \"9af9907d12c3fb…\": plugin type=\"mb-broken\" failed (add):
+  <b>failed to unmarshal raw result: invalid character 'm' looking for beginning of value</b>"</pre>
+<p>Stop and read that. It says <code>invalid character 'm'</code>. Nothing about networking, nothing about
+a bridge or an address or a namespace. An operator who has not met this goes looking for a corrupted
+manifest, a containerd bug, or a serialisation problem — and the <code>'m'</code> is the first letter of
+<code>mb-broken</code>.</p>
+<p>The diagnosis is to run the plugin by hand, which takes one command:</p>
+<pre class="cmd">sudo env CNI_COMMAND=ADD CNI_CONTAINERID=f1 CNI_NETNS=/var/run/netns/i9pod1 \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/mb-broken &lt; ~/i9/f1.json 2&gt;/dev/null | head -2</pre>
+<pre class="out"><b>mb-broken: starting up, about to read the config</b>
+{"cniVersion":"1.1.0","interfaces":[{"name":"mbr0",…}],"ips":[{"address":"10.97.0.2/24",…}],…}</pre>
+<p>A line of prose, then a perfectly good result. Valid as neither. <strong>The fix is
+<code>&gt;&amp;2</code>.</strong></p>
+<p>Note also what this fault does <em>not</em> break: the plugin's actual work succeeded. The bridge exists,
+the veth exists, the address was allocated. Only the report was unreadable — so a node suffering this
+accumulates wired-up namespaces and reserved addresses for pods that never started, which sets up fault 2
+on its own.</p></li>
+<li><strong>Fault 2 — no addresses left, and nothing running.</strong> Fill a <code>/29</code>'s store
+with reservations whose holders are long gone, as a reboot or a crashed kubelet would.
+<pre class="cmd">for i in 2 3 4 5 6; do
+  sudo sh -c "printf 'pod-deleted-in-january-$i\r\neth0\r\n' &gt; /var/lib/cni/minibridge/minibridge/10.99.0.$i"
+done
+echo "running pods on this node: $(sudo crictl pods -q | wc -l)"
+echo "reservations held:         $(sudo ls /var/lib/cni/minibridge/minibridge | grep -c '^10\.')"
+sudo crictl runp ~/i9/drill-pod.json</pre>
+<pre class="out">running pods on this node: <b>0</b>
+reservations held:         <b>5</b>
+E0730 18:53:06.383488 remote_runtime.go:237] "RunPodSandbox from runtime service failed"
+  err="rpc error: code = Unknown desc = failed to setup network for sandbox \"63d80a856140…\":
+  plugin type=\"minibridge\" failed (add): Invalid network config;
+  <b>no IP addresses available in 10.99.0.0/29 — 5 reservations held</b>"</pre>
+<p>Our plugin volunteers the reservation count, which the reference plugin does not — I9.10's message stops
+at the range. Even so, nothing in it names a file or a directory. The evidence is one command:</p>
+<pre class="cmd">sudo ls -l /var/lib/cni/minibridge/minibridge</pre>
+<pre class="out">-rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.2
+-rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.3
+-rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.4
+-rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.5
+-rw-r--r-- 1 root root 32 Jul 30 18:53 10.99.0.6</pre>
+<p>Five reservations, zero pods. The reflex to build: <strong>compare
+<code>ls /var/lib/cni/networks/&lt;net&gt;/ | wc -l</code> against <code>crictl pods -q | wc -l</code>.</strong>
+When they disagree wildly, you have found it.</p>
+<p>Because this plugin implements <code>GC</code>, the repair is a verb rather than an <code>rm</code>:</p>
+<pre class="cmd">jq -n '{cniVersion:"1.1.0",name:"minibridge",type:"minibridge",
+        ipam:{subnet:"10.99.0.0/29"},"cni.dev/valid-attachments":[]}' &gt; ~/i9/f2gc.json
+sudo env CNI_COMMAND=GC CNI_PATH=/opt/cni/bin /opt/cni/bin/minibridge &lt; ~/i9/f2gc.json
+sudo crictl runp ~/i9/drill-pod.json</pre>
+<pre class="out">minibridge: gc: reclaiming 10.99.0.2 held by pod-deleted-in-january-2/eth0
+minibridge: gc: reclaiming 10.99.0.3 held by pod-deleted-in-january-3/eth0
+minibridge: gc: reclaiming 10.99.0.4 held by pod-deleted-in-january-4/eth0
+minibridge: gc: reclaiming 10.99.0.5 held by pod-deleted-in-january-5/eth0
+minibridge: gc: reclaiming 10.99.0.6 held by pod-deleted-in-january-6/eth0
+<b>minibridge: gc: reclaimed 5 reservation(s)</b>
+468de4954f39cb46bf253bdde8fbfb20e1702dfc766f76b979cece7277496818
+{"ip":"<b>10.99.0.2</b>"}</pre>
+<p>On a node running the reference plugins that same repair is <code>rm</code>, because I9.14 established
+that <code>GC</code> reclaims nothing there. Either way: delete <em>only</em> the entries whose holders are
+gone, never the directory.</p></li>
+<li><strong>Fault 3 — two conf files, and the one the operator expected to lose.</strong> This is the
+quietest of the three: no error at any point. Start with a working network.
+<pre class="cmd"># /etc/cni/net.d/05-production.conflist  -> bridge prodbr0, 10.50.0.0/24
+sudo crictl runp ~/i9/drill-pod.json &gt;/dev/null 2&gt;&amp;1
+sudo crictl inspectp "$(sudo crictl pods -q | head -1)" | jq -c '{ip:.status.network.ip}'</pre>
+<pre class="out">{"ip":"<b>10.50.0.2</b>"}</pre>
+<p>Now the operator adds a second network and numbers it <code>00-</code>, reasoning either that it does not
+matter or that a lower number is loaded first and therefore overridden later.</p>
+<pre class="cmd"># add /etc/cni/net.d/00-newnet.conflist -> bridge newbr0, 10.60.0.0/24
+sudo sh -c 'ls /etc/cni/net.d/*.conflist' | xargs -n1 basename
+sudo crictl rmp -f $(sudo crictl pods -q); sudo crictl runp ~/i9/drill-pod.json &gt;/dev/null 2&gt;&amp;1
+sudo crictl inspectp "$(sudo crictl pods -q | head -1)" | jq -c '{ip:.status.network.ip}'</pre>
+<pre class="out">00-newnet.conflist
+05-production.conflist
+nerdctl-bridge.conflist
+{"ip":"<b>10.60.0.2</b>"}</pre>
+<p>Every new pod is now on the new network. Nothing errored, nothing logged a warning, and
+<code>NetworkReady</code> stayed <code>true</code> throughout. Pods created before the change are still on
+<code>10.50.0.0/24</code> with their old routes and rules, so the node now has two populations that may not
+be able to reach each other — and the only evidence is a filename.</p>
+<p>The fix is to make the second file not a config file, which per I9.5 means changing its
+<em>extension</em>, not its number:</p>
+<pre class="cmd">sudo mv /etc/cni/net.d/00-newnet.conflist /etc/cni/net.d/00-newnet.conflist.disabled
+sudo ls /etc/cni/net.d/
+sudo crictl rmp -f $(sudo crictl pods -q); sudo crictl runp ~/i9/drill-pod.json &gt;/dev/null 2&gt;&amp;1
+sudo crictl inspectp "$(sudo crictl pods -q | head -1)" | jq -c '{ip:.status.network.ip}'</pre>
+<pre class="out">00-newnet.conflist.disabled
+05-production.conflist
+default
+nerdctl-bridge.conflist
+{"ip":"<b>10.50.0.3</b>"}</pre>
+<p>Back on production. Renaming <em>within</em> <code>.conflist</code> would not have helped, and renaming to
+<code>.conflist.disabled</code> did — the last dotted component is the whole decision.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown "invalid character 'x' looking for beginning of value" during sandbox creation, you say "a plugin
+wrote to stdout" and run it by hand to confirm. Shown an address-exhaustion error, you compare the
+reservation count with the running-pod count before anything else. Shown a node whose new pods have
+addresses in an unexpected range, you <code>ls /etc/cni/net.d</code> and read the filenames in sort order.
+And you can state which rename disables a conflist and which does not.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Fault 1 feeds fault 2.</strong> A plugin whose result is unparseable still did the work, so every
+failed sandbox creation leaves a reservation and a wired namespace behind. Fix the stdout bug and you may
+still have a full store.</li>
+<li><strong>Fault 3 has no error message, so it will not be found by searching logs.</strong> It is found by
+listing a directory. Add that to your node-triage habits alongside <code>crictl info</code>.</li>
+<li><strong>None of these is fixed by restarting containerd.</strong> Fault 1 needs a code change, fault 2
+needs state deleted, fault 3 needs a file renamed. A restart re-reads the conf directory, which makes fault
+3 <em>appear</em> to respond to restarts — and that coincidence has sent people down long wrong roads.</li>
+<li><strong>Two of the three are invisible to <code>kubectl</code>.</strong> The exhaustion shows up as a pod
+event; the wrong-network fault shows up as an IP in the wrong range, which nothing flags. Both are node-level
+diagnoses.</li>
+</ul>
+
+<div class="k8s-link">
+<p>These are the CNI faults behind <a href="w4.html#cp-4-8">W4.8 — break the CNI on purpose and read the
+signatures</a>, and they belong in the ladder of
+<a href="w6.html#cp-6-1">W6.1 — the universal first moves</a>. Fault 1's shape — an error naming a
+serialisation problem when the cause is a component writing to the wrong place — is the same class as
+<a href="i8.html#cp-i8-16">I8.16</a>'s three faults that all claim the node is broken.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> in the exam docs, search <em>troubleshooting clusters</em> for
+node-level triage and <em>network plugins</em> for the conf-directory contract. The plugin-side rules you
+were checking against are § Section 2 and § Error of
+<a href="https://github.com/containernetworking/cni/blob/v1.3.0/SPEC.md">SPEC.md</a>.</p>
+</article>
 </div><!-- /g-project-drill -->
 
 <div class="quiz" id="quiz">
