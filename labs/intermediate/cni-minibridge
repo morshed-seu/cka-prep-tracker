@@ -1,0 +1,436 @@
+#!/bin/bash
+# cni-minibridge — B9's net-up.sh, rewritten as a spec-compliant CNI plugin.
+#
+# The mechanism is unchanged from labs/intermediate/seed/net-up.sh: a bridge, a
+# veth pair, an address, a route, a masquerade rule. Everything added here is
+# contract:
+#
+#   * configuration arrives as JSON on stdin, parameters in CNI_* variables;
+#   * the result goes to stdout as JSON, and NOTHING else ever does;
+#   * DEL is idempotent and succeeds on an empty world;
+#   * CHECK verifies rather than assumes;
+#   * VERSION advertises what we can actually produce;
+#   * errors are structured objects with the spec's own numeric codes.
+#
+# It deliberately does three things the reference plugins at v1.9.1 do not,
+# each one a lesson from I9's labs:
+#
+#   1. DEL finds the container's address in the IPAM store, keyed by container
+#      ID, instead of reading it out of the network namespace. `bridge` reads
+#      the namespace, so when the namespace is already gone its DEL returns
+#      success — as the idempotency MUST requires — while silently leaking the
+#      masquerade rule. Two of the three realistic teardown orders leak. This
+#      one does not. (I9.9, labs/captures/i9-plugins-bridge-masq-leak.txt)
+#   2. GC is implemented. Not one reference plugin registers a GC handler, so
+#      `CNI_COMMAND=GC` is a well-formed success that reclaims nothing — which
+#      is why the field repair for a full node is still `rm` on a directory.
+#      (I9.14, labs/captures/i9-stack-gc-status.txt)
+#   3. STATUS reports code 50 when the pool is exhausted, which is the case the
+#      spec added those codes for and which host-local never reports. (I9.14)
+#
+# It also returns the spec's code 7 for an unusable network config, where the
+# reference plugins return 999 — even though the spec's own example for code 7
+# is the very message they put in a 999. (I9.4)
+#
+# Usage — never invoked by hand in anger, but this is what a runtime does:
+#   CNI_COMMAND=ADD CNI_CONTAINERID=abc123 CNI_NETNS=/var/run/netns/pod1 \
+#     CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin ./cni-minibridge < conf.json
+#
+# Drive it properly with cnitool, then install it as /opt/cni/bin/minibridge
+# and let containerd call it. See materials/i9.html lesson I9.15.
+
+set -u
+umask 077
+
+# --------------------------------------------------------------------------
+# stdout is the result channel. Diagnostics go to stderr, which the spec
+# explicitly reserves for "unstructured output such as logs".
+# --------------------------------------------------------------------------
+log() { printf 'minibridge: %s\n' "$*" >&2; }
+
+# A structured error result, then a non-zero exit. Both halves matter: a
+# runtime reads the object, a shell reads the status.
+err() {
+  local code=$1 msg=$2 details=${3:-}
+  jq -cn --argjson code "$code" --arg msg "$msg" --arg details "$details" \
+    '{cniVersion:"1.1.0", code:$code, msg:$msg}
+     + (if $details == "" then {} else {details:$details} end)'
+  exit 1
+}
+
+SUPPORTED='["0.3.1","0.4.0","1.0.0","1.1.0"]'
+
+# --------------------------------------------------------------------------
+# VERSION is answerable without reading any configuration, so do it first.
+# --------------------------------------------------------------------------
+if [ "${CNI_COMMAND:-}" = VERSION ]; then
+  jq -cn --argjson v "$SUPPORTED" '{cniVersion:"1.1.0", supportedVersions:$v}'
+  exit 0
+fi
+
+command -v jq >/dev/null || err 5 "jq not found" "minibridge is written in bash and jq"
+
+# Validate the verb before reading stdin. A bad CNI_COMMAND is code 4 — an
+# invalid environment parameter — and diagnosing it does not need the config,
+# so checking it here keeps a missing variable from surfacing as a config error.
+case ${CNI_COMMAND:-} in
+  ADD|DEL|CHECK|GC|STATUS) ;;
+  '') err 4 "required env variables [CNI_COMMAND] missing" \
+        "set CNI_COMMAND to one of ADD, DEL, CHECK, GC, STATUS, VERSION" ;;
+  *)  err 4 "unknown CNI_COMMAND: ${CNI_COMMAND}" \
+        "minibridge understands ADD, DEL, CHECK, GC, STATUS and VERSION" ;;
+esac
+
+CONFIG=$(cat)
+[ -n "$CONFIG" ] || err 5 "empty stdin" "the runtime must supply the network configuration on stdin"
+printf '%s' "$CONFIG" | jq -e . >/dev/null 2>&1 \
+  || err 6 "failed to decode network configuration" "stdin was not valid JSON"
+
+j() { printf '%s' "$CONFIG" | jq -r "$1"; }
+
+# --- version negotiation, per plugin, exactly as the spec describes ---------
+CNIVER=$(j '.cniVersion // ""')
+if [ -z "$CNIVER" ]; then
+  CNIVER=$(j '(.cniVersions // []) | last // ""')
+fi
+[ -n "$CNIVER" ] || err 7 "no cniVersion in configuration" \
+  "set cniVersion, or cniVersions for a 1.1.0 runtime to choose from"
+printf '%s' "$SUPPORTED" | jq -e --arg v "$CNIVER" 'index($v)' >/dev/null \
+  || err 1 "incompatible CNI versions" \
+       "config is \"$CNIVER\", minibridge supports $(printf '%s' "$SUPPORTED" | tr -d '[]\"')"
+
+NETNAME=$(j '.name // ""')
+[ -n "$NETNAME" ] || err 7 "network has no name" "the name field is required"
+
+BRIDGE=$(j '.bridge // "mbr0"')
+SUBNET=$(j '.ipam.subnet // ""')
+IPMASQ=$(j '.ipMasq // false')
+MTU=$(j '.mtu // 1500')
+
+STATEDIR=/var/lib/cni/minibridge/$NETNAME
+LOCK=$STATEDIR/lock
+
+# --------------------------------------------------------------------------
+# The required environment parameters differ per command — DEL, for instance,
+# makes CNI_NETNS optional precisely so teardown can run after the namespace
+# is gone. Code 4 is the spec's code for this, and it MUST name the variables.
+# --------------------------------------------------------------------------
+need() {
+  local missing=
+  for v in "$@"; do
+    eval "[ -n \"\${$v:-}\" ]" || missing="$missing $v"
+  done
+  [ -z "$missing" ] || err 4 "required env variables [${missing# }] missing" \
+    "CNI_COMMAND=${CNI_COMMAND:-unset}"
+}
+
+# --------------------------------------------------------------------------
+# IPAM, in the shape host-local uses: one file per address under the network's
+# directory, named for the address, containing the holder's container ID and
+# interface name. The line break is CRLF, because host-local's on-disk format
+# is CRLF and matching it means the same tooling reads both stores.
+#
+# The spec requires plugins to handle concurrent execution across containers
+# and to lock shared resources, so every read-modify-write here holds flock.
+# --------------------------------------------------------------------------
+ipam_init() { mkdir -p "$STATEDIR"; : >>"$LOCK"; }
+
+# Print the first free address in the subnet, reserving it for $1/$2.
+ipam_alloc() {
+  local id=$1 ifname=$2 base prefix net_a net_b net_c first last i cand
+  base=${SUBNET%/*}; prefix=${SUBNET#*/}
+  [ "$prefix" -ge 8 ] && [ "$prefix" -le 30 ] \
+    || err 7 "Invalid network config" "Network $SUBNET too small to allocate from."
+  IFS=. read -r net_a net_b net_c _ <<EOF
+$base
+EOF
+  # Only /24-and-smaller single-octet ranges, which is all this teaching
+  # plugin claims to support. Anything wider is an honest refusal.
+  [ "$prefix" -ge 24 ] || err 7 "Invalid network config" \
+    "minibridge only allocates from a /24 or smaller; got $SUBNET"
+  first=$(( ( $(printf '%s' "$base" | cut -d. -f4) ) + 2 ))
+  last=$(( first - 2 + (1 << (32 - prefix)) - 2 ))
+  for i in $(seq "$first" "$last"); do
+    cand="$net_a.$net_b.$net_c.$i"
+    if [ ! -e "$STATEDIR/$cand" ]; then
+      printf '%s\r\n%s\r\n' "$id" "$ifname" >"$STATEDIR/$cand"
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The address held by $1/$2, if any. This is what lets DEL work without the
+# namespace, and it is the whole difference from the reference plugin.
+ipam_find() {
+  local id=$1 ifname=$2 f
+  [ -d "$STATEDIR" ] || return 1
+  for f in "$STATEDIR"/*.*.*.*; do
+    [ -e "$f" ] || continue
+    if [ "$(tr -d '\r' <"$f" | sed -n 1p)" = "$id" ] &&
+       [ "$(tr -d '\r' <"$f" | sed -n 2p)" = "$ifname" ]; then
+      basename "$f"; return 0
+    fi
+  done
+  return 1
+}
+
+ipam_release() { rm -f "$STATEDIR/$1"; }
+
+gateway() { printf '%s.1' "$(printf '%s' "${SUBNET%/*}" | cut -d. -f1-3)"; }
+
+# --------------------------------------------------------------------------
+# A network namespace path is not a network namespace name, and `ip link set
+# ... netns` wants a name. Paths under /run/netns are already named — that is
+# what the directory is for — so use the basename. Anything else gets a
+# temporary bind mount into the same directory, which is exactly how `ip netns`
+# and containerd pin a namespace in the first place.
+# --------------------------------------------------------------------------
+NS_TEMP=
+ns_name() {
+  case $1 in
+    /var/run/netns/*|/run/netns/*) basename "$1" ;;
+    *)
+      NS_TEMP=mb-$(printf '%s' "$1" | sha256sum | cut -c1-12)
+      mkdir -p /run/netns
+      [ -e "/run/netns/$NS_TEMP" ] || : >"/run/netns/$NS_TEMP"
+      mount --bind "$1" "/run/netns/$NS_TEMP" 2>/dev/null || true
+      printf '%s' "$NS_TEMP" ;;
+  esac
+}
+ns_cleanup() {
+  [ -n "$NS_TEMP" ] || return 0
+  umount "/run/netns/$NS_TEMP" 2>/dev/null || true
+  rm -f "/run/netns/$NS_TEMP"
+}
+
+# A host-side name must be unique and fit in IFNAMSIZ-1 = 15 characters.
+host_veth() { printf 'mb%s' "$(printf '%s%s' "$1" "$2" | sha256sum | cut -c1-11)"; }
+
+# The rule is per address, not per subnet, so DEL removes exactly one pod's
+# egress and nobody else's — net-up.sh's single `-s 10.20.0.0/24` rule could
+# only ever be removed all at once. The `! -d $SUBNET` exclusion keeps traffic
+# staying inside the pod subnet un-NATed, so a pod sees its peers by their own
+# addresses rather than the node's. The reference bridge plugin achieves the
+# same shape with a per-container chain that ACCEPTs the subnet first and also
+# excludes multicast; this is that logic flattened into one rule.
+#
+# Every command that touches this rule rebuilds the string from the config, so
+# ADD, CHECK, DEL and GC must all be handed the same configuration. The spec
+# requires exactly that: "The network configuration should not change between
+# add and delete."
+masq_rule() {
+  printf -- '-s %s/32 ! -d %s -m comment --comment minibridge:%s -j MASQUERADE' \
+    "$1" "$SUBNET" "$NETNAME"
+}
+
+masq_add() {
+  [ "$IPMASQ" = true ] || return 0
+  # shellcheck disable=SC2046
+  iptables -t nat -C POSTROUTING $(masq_rule "$1") 2>/dev/null && return 0
+  # shellcheck disable=SC2046
+  iptables -t nat -A POSTROUTING $(masq_rule "$1")
+}
+masq_del() {
+  [ -n "${1:-}" ] || return 0
+  # Without the subnet the rule string cannot be rebuilt, and deleting a
+  # half-formed rule is worse than leaving it: say so on stderr and move on.
+  if [ -z "$SUBNET" ]; then
+    log "cannot remove the masquerade rule for $1: ipam.subnet missing from the config"
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  while iptables -t nat -C POSTROUTING $(masq_rule "$1") 2>/dev/null; do
+    # shellcheck disable=SC2046
+    iptables -t nat -D POSTROUTING $(masq_rule "$1") || break
+  done
+}
+
+bridge_up() {
+  ip link show "$BRIDGE" >/dev/null 2>&1 || ip link add "$BRIDGE" type bridge
+  ip addr show dev "$BRIDGE" | grep -q "$(gateway)/" \
+    || ip addr add "$(gateway)/${SUBNET#*/}" dev "$BRIDGE"
+  ip link set "$BRIDGE" up
+  sysctl -wq net.ipv4.ip_forward=1
+}
+
+# --------------------------------------------------------------------------
+# The commands.
+# --------------------------------------------------------------------------
+cmd_add() {
+  need CNI_COMMAND CNI_CONTAINERID CNI_NETNS CNI_IFNAME
+  [ -n "$SUBNET" ] || err 7 "Invalid network config" "ipam.subnet is required"
+  [ -e "$CNI_NETNS" ] || err 3 "Container unknown or does not exist" \
+    "CNI_NETNS=$CNI_NETNS does not exist"
+
+  local ns hv ip
+  ns=$(ns_name "$CNI_NETNS")
+  trap ns_cleanup EXIT
+
+  ip -n "$ns" link show "$CNI_IFNAME" >/dev/null 2>&1 \
+    && err 7 "interface already exists" \
+         "$CNI_IFNAME is already present in $CNI_NETNS; the runtime must DEL first"
+
+  ipam_init
+  exec 9>"$LOCK"; flock 9
+  ip=$(ipam_alloc "$CNI_CONTAINERID" "$CNI_IFNAME") || err 7 "Invalid network config" \
+    "no IP addresses available in $SUBNET — $(ls "$STATEDIR" | grep -c '\.' ) reservations held"
+  flock -u 9
+
+  bridge_up
+  hv=$(host_veth "$CNI_CONTAINERID" "$CNI_IFNAME")
+  ip link del "$hv" 2>/dev/null
+
+  # If anything below fails the ADD has half-run, so undo it before returning
+  # the error: the spec has the runtime call DEL after a failed ADD, but a
+  # plugin that cleans up after itself does not depend on that.
+  if ! {
+      ip link add "$hv" mtu "$MTU" type veth peer name "$CNI_IFNAME" mtu "$MTU" netns "$ns" &&
+      ip link set "$hv" master "$BRIDGE" && ip link set "$hv" up &&
+      ip -n "$ns" link set "$CNI_IFNAME" up &&
+      ip -n "$ns" addr add "$ip/${SUBNET#*/}" dev "$CNI_IFNAME" &&
+      ip -n "$ns" route replace default via "$(gateway)" dev "$CNI_IFNAME"
+    }; then
+    ip link del "$hv" 2>/dev/null
+    ipam_release "$ip"
+    err 11 "failed to wire the interface" "try again later; state was rolled back"
+  fi
+
+  masq_add "$ip"
+
+  # Hairpin, so a pod can reach itself through a Service VIP. The reference
+  # bridge plugin makes this optional; net-up.sh never did it at all.
+  [ -e "/sys/class/net/$hv/brport/hairpin_mode" ] &&
+    printf 1 >"/sys/class/net/$hv/brport/hairpin_mode"
+  # Do not accept IPv6 router advertisements from inside the container.
+  sysctl -wq "net.ipv6.conf.$hv.accept_ra=0" 2>/dev/null
+
+  local brmac hvmac ctmac
+  brmac=$(cat "/sys/class/net/$BRIDGE/address")
+  hvmac=$(cat "/sys/class/net/$hv/address")
+  ctmac=$(ip -n "$ns" -j link show "$CNI_IFNAME" | jq -r '.[0].address')
+
+  jq -cn --arg v "$CNIVER" --arg br "$BRIDGE" --arg brmac "$brmac" \
+        --arg hv "$hv" --arg hvmac "$hvmac" \
+        --arg ct "$CNI_IFNAME" --arg ctmac "$ctmac" --arg sb "$CNI_NETNS" \
+        --arg ip "$ip/${SUBNET#*/}" --arg gw "$(gateway)" '
+    {cniVersion:$v,
+     interfaces:[{name:$br, mac:$brmac},
+                 {name:$hv, mac:$hvmac},
+                 {name:$ct, mac:$ctmac, sandbox:$sb}],
+     ips:[{address:$ip, gateway:$gw, interface:2}],
+     routes:[{dst:"0.0.0.0/0", gw:$gw}],
+     dns:{}}'
+}
+
+# DEL must succeed when there is nothing to delete. Every step below is
+# therefore best-effort, and the exit status is 0 unless we were handed
+# nonsense we could not even parse.
+cmd_del() {
+  need CNI_COMMAND CNI_CONTAINERID CNI_IFNAME
+
+  local ip hv ns
+  ip=$(ipam_find "$CNI_CONTAINERID" "$CNI_IFNAME" || true)
+
+  # The address came from the store, not the namespace, so this works even
+  # when the namespace was destroyed before we were called.
+  masq_del "$ip"
+  [ -n "$ip" ] && ipam_release "$ip"
+
+  hv=$(host_veth "$CNI_CONTAINERID" "$CNI_IFNAME")
+  ip link del "$hv" 2>/dev/null
+
+  if [ -n "${CNI_NETNS:-}" ] && [ -e "${CNI_NETNS:-}" ]; then
+    ns=$(ns_name "$CNI_NETNS")
+    trap ns_cleanup EXIT
+    ip -n "$ns" link del "$CNI_IFNAME" 2>/dev/null
+  fi
+  exit 0
+}
+
+# CHECK consults prevResult for what should exist, and reports a resource that
+# was created by this plugin, is listed there, and is now missing or wrong.
+cmd_check() {
+  need CNI_COMMAND CNI_CONTAINERID CNI_NETNS CNI_IFNAME
+  local ns want got ip
+  [ -e "$CNI_NETNS" ] || err 3 "Container unknown or does not exist" "$CNI_NETNS is gone"
+  ns=$(ns_name "$CNI_NETNS")
+  trap ns_cleanup EXIT
+
+  ip -n "$ns" link show "$CNI_IFNAME" >/dev/null 2>&1 \
+    || err 7 "interface missing" "$CNI_IFNAME not found in $CNI_NETNS"
+
+  want=$(j '(.prevResult.ips // []) | map(.address) | join(",")')
+  if [ -n "$want" ]; then
+    got=$(ip -n "$ns" -j addr show "$CNI_IFNAME" \
+          | jq -r '[.[0].addr_info[] | select(.family=="inet") | "\(.local)/\(.prefixlen)"] | join(",")')
+    [ "$want" = "$got" ] || err 7 "address mismatch" "prevResult says $want, namespace has $got"
+  fi
+
+  ip=$(ipam_find "$CNI_CONTAINERID" "$CNI_IFNAME" || true)
+  [ -n "$ip" ] || err 7 "IP reservation missing" \
+    "no reservation in $STATEDIR for $CNI_CONTAINERID/$CNI_IFNAME"
+
+  if [ "$IPMASQ" = true ]; then
+    # shellcheck disable=SC2046
+    iptables -t nat -C POSTROUTING $(masq_rule "$ip") 2>/dev/null \
+      || err 7 "masquerade rule missing" "no POSTROUTING rule for $ip"
+  fi
+  exit 0
+}
+
+# GC: the runtime hands us the complete set of attachments that should exist,
+# and everything else is ours to reclaim. This is the verb no reference plugin
+# implements, which is why leaked reservations are still cleaned up by hand.
+cmd_gc() {
+  need CNI_COMMAND
+  local valid f id ifname reclaimed=0
+  valid=$(printf '%s' "$CONFIG" \
+          | jq -c '[ (."cni.dev/valid-attachments" // ."cni.dev/attachments" // [])[]
+                     | "\(.containerID)/\(.ifname)" ]')
+  [ -d "$STATEDIR" ] || exit 0
+  ipam_init
+  exec 9>"$LOCK"; flock 9
+  for f in "$STATEDIR"/*.*.*.*; do
+    [ -e "$f" ] || continue
+    id=$(tr -d '\r' <"$f" | sed -n 1p)
+    ifname=$(tr -d '\r' <"$f" | sed -n 2p)
+    if printf '%s' "$valid" | jq -e --arg k "$id/$ifname" 'index($k)' >/dev/null; then
+      continue
+    fi
+    log "gc: reclaiming $(basename "$f") held by $id/$ifname"
+    masq_del "$(basename "$f")"
+    ip link del "$(host_veth "$id" "$ifname")" 2>/dev/null
+    rm -f "$f"
+    reclaimed=$((reclaimed + 1))
+  done
+  flock -u 9
+  log "gc: reclaimed $reclaimed reservation(s)"
+  exit 0
+}
+
+# STATUS: are we able to service an ADD right now? The spec reserves code 50
+# for "not available" and 51 for "not available, and existing containers may
+# have limited connectivity". An exhausted address pool is the textbook 50.
+cmd_status() {
+  [ -n "$SUBNET" ] || err 50 "The plugin is not available" "ipam.subnet is not configured"
+  command -v iptables >/dev/null || err 51 "The plugin is not available" \
+    "iptables is missing, so existing masquerade rules cannot be maintained"
+  ipam_init
+  local free
+  free=$(SUBNET=$SUBNET; ipam_alloc __status_probe__ __probe__ 2>/dev/null || true)
+  if [ -z "$free" ]; then
+    err 50 "The plugin is not available" "no IP addresses available in $SUBNET"
+  fi
+  ipam_release "$free"
+  exit 0
+}
+
+case $CNI_COMMAND in
+  ADD)    cmd_add ;;
+  DEL)    cmd_del ;;
+  CHECK)  cmd_check ;;
+  GC)     cmd_gc ;;
+  STATUS) cmd_status ;;
+esac
