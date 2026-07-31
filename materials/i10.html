@@ -252,7 +252,197 @@ done</pre>
 
 <p class="docs-links"><b>Docs:</b> in the Kubernetes docs, search <em>node-pressure eviction</em> and <em>local ephemeral storage</em>; for the runtime side, <code>crictl stats</code> and <code>crictl imagefsinfo</code> in the cri-tools documentation.</p>
 </article>
+
+<article class="lesson" id="cp-i10-3" data-id="i10-3">
+<div class="lesson-head"><span class="cp-id">I10.3</span><h4>Shared until you write: copy-up and its price</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two facts that sound unrelated have the same cause. Starting a hundred pods from one image is nearly free. Opening a two-gigabyte file inside a container for writing is not — it costs two gigabytes before a single byte changes. Both fall out of one rule you already met in <a href="b5.html#cp-b5-14">B5.14</a>, and being able to derive them rather than remember them is the point of this checkpoint.</p>
+
+<h5>The concept</h5>
+<p>Every container from an image mounts the same read-only lowerdir stack and gets its own empty upperdir. Reads fall through the stack until a layer has the file, so unmodified files are read straight from the shared copy — one set of bytes on disk, however many containers.</p>
+<p>Writes are where it changes. Overlayfs cannot modify a file in a read-only lower layer, so the first write to any such file triggers a <strong>copy-up</strong>: the kernel copies the file <em>in its entirety</em> into that container's upperdir, then applies the write to the copy. The cost is proportional to the file's size, not to the size of the change. Appending one byte to a four-megabyte library copies four megabytes.</p>
+<p>This is why a container that opens a large data file read-write pays for it at open time, in disk and in latency, and why the same container reading that file pays nothing. It is also why "the image is only 200 MB" tells you nothing about what the container will cost on the node.</p>
+
+<div class="specref">
+<p>Copy-up is kernel behaviour, not a container standard — no OCI document mentions it. The authority is the overlayfs documentation, and it is explicit that the copy precedes the change.</p>
+<blockquote>When a file in the lower filesystem is accessed in a way that requires write-access, such as opening for write access, changing some metadata etc., the file is first copied from the lower filesystem to the upper filesystem (copy_up).<br>
+[…]<br>
+The copy_up may turn out to be unnecessary, for example if the file is opened for read-write but the data is not modified.</blockquote>
+<cite>Linux kernel documentation — <a href="https://docs.kernel.org/filesystems/overlayfs.html">filesystems/overlayfs.rst</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start two containers from one image and look at what the snapshotter recorded. Two <code>Active</code> snapshots, one shared <code>Committed</code> parent.
+<pre class="cmd">sudo ctr -n i10 run -d docker.io/library/alpine:3.21 c1 sleep 600
+sudo ctr -n i10 run -d docker.io/library/alpine:3.21 c2 sleep 600
+sudo ctr -n i10 snapshot ls</pre>
+<pre class="out">KEY                        PARENT                     KIND
+<b>c1</b>                         sha256:7211d01aba8f…       Active
+<b>c2</b>                         sha256:7211d01aba8f…       Active
+sha256:7211d01aba8f…                                  Committed</pre>
+<p>Both parents are the same digest. That is the sharing, stated as data.</p></li>
+
+<li>Confirm it in the mount arguments: same lowerdir, different upperdirs.
+<pre class="cmd">for C in c1 c2; do
+  echo "-- $C"
+  sudo ctr -n i10 snapshot mounts /mnt $C | tr ',' '\n' | grep -E "lowerdir|upperdir"
+done</pre>
+<pre class="out">-- c1
+upperdir=…/snapshots/<b>422</b>/fs
+lowerdir=…/snapshots/<b>421</b>/fs
+-- c2
+upperdir=…/snapshots/<b>423</b>/fs
+lowerdir=…/snapshots/<b>421</b>/fs</pre>
+<pre class="cmd">sudo du -sh …/snapshots/421/fs</pre>
+<pre class="out">8.2M	…/snapshots/421/fs        <b>one copy, serving both containers</b></pre></li>
+
+<li>Prove the isolation. Each container writes the same filename, and neither sees the other's.
+<pre class="cmd">sudo ctr -n i10 task exec --exec-id a1 c1 sh -c 'echo "c1 was here" &gt; /mine.txt'
+sudo ctr -n i10 task exec --exec-id a2 c2 sh -c 'echo "c2 was here" &gt; /mine.txt'
+sudo ctr -n i10 task exec --exec-id b1 c1 cat /mine.txt
+sudo ctr -n i10 task exec --exec-id b2 c2 cat /mine.txt</pre>
+<pre class="out">c1 sees: <b>c1 was here</b>
+c2 sees: <b>c2 was here</b></pre>
+<p>From the host, each file is a plain file in its own upperdir — no container magic, just two directories:</p>
+<pre class="out">  …/snapshots/422/fs/mine.txt -&gt; c1 was here
+  …/snapshots/423/fs/mine.txt -&gt; c2 was here</pre></li>
+
+<li>Now the price. Pick the largest file the image ships — chosen from the host side of the lowerdir, which is both more reliable than searching inside and a useful reminder that the two views are the same bytes.
+<pre class="cmd">LO=$(sudo ctr -n i10 snapshot mounts /mnt c1 | tr ',' '\n' | sed -n 's/^lowerdir=//p')
+sudo find "$LO" -type f -printf '%s %p\n' | sort -rn | head -1</pre>
+<pre class="out"><b>4498768</b> …/snapshots/421/fs/usr/lib/libcrypto.so.3</pre></li>
+
+<li>Append exactly one byte to it from inside <code>c1</code>, measuring the writable layer either side.
+<pre class="cmd">U1=$(sudo ctr -n i10 snapshot mounts /mnt c1 | tr ',' '\n' | sed -n 's/^upperdir=//p')
+sudo du -sb "$U1" | cut -f1
+sudo ctr -n i10 task exec --exec-id cu1 c1 sh -c "printf x &gt;&gt; /usr/lib/libcrypto.so.3"
+sudo du -sb "$U1" | cut -f1</pre>
+<pre class="out">12          <b>before: just the 12-byte mine.txt</b>
+<b>4498781</b>     <b>after one byte: the whole library, copied</b></pre></li>
+
+<li>Check that the shared copy is untouched and <code>c2</code> is unaffected — the isolation holds in both directions.
+<pre class="cmd">sudo ls -l "$LO/usr/lib/libcrypto.so.3"
+sudo ctr -n i10 task exec --exec-id cu2 c2 sh -c "ls -l /usr/lib/libcrypto.so.3"</pre>
+<pre class="out">-rwxr-xr-x 1 root root <b>4498768</b> Apr 10 04:19 …/snapshots/421/fs/usr/lib/libcrypto.so.3
+-rwxr-xr-x 1 root root <b>4498768</b> Apr  9 22:19 /usr/lib/libcrypto.so.3</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain from the copy-up rule — not from memory — why a hundred pods from one image cost one copy of it, why <code>c1</code>'s one-byte append cost 4,498,769 bytes, and why the answer would have been the same had the file been a gigabyte.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Copy-up is triggered by intent, not by change.</strong> Opening for write is enough; so is <code>chmod</code> or <code>touch</code>. A process that opens a large file read-write and writes nothing still pays in full.</li>
+<li><strong>Alpine's <code>busybox find</code> does not accept <code>-size +1M</code>.</strong> Combined with <code>2&gt;/dev/null</code> it fails silently and hands you an empty variable — which is precisely how the first attempt at this lab produced a plausible-looking wrong answer. Select from the host side.</li>
+<li><strong>Sharing is per layer, not per image.</strong> Two images built on the same base share the base's snapshots and nothing above. This is why rebasing images onto a common parent is a real disk optimisation on a busy node.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the whole reason a node can run many pods of one image cheaply, and it sets the honest cost model for <code>emptyDir</code> versus writing into the container filesystem — see <a href="w5.html#cp-5-1">W5.1</a>. It is also why databases and anything else that rewrites large files in place belong on a volume (<a href="w5.html#cp-5-3">W5.3</a>) rather than in the container's own filesystem: on a volume there is no lower layer, so there is no copy-up.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the kernel's <em>overlayfs</em> documentation, sections <em>Non-directories</em> and <em>Multiple lower layers</em>; and <a href="b5.html#cp-b5-14">B5.14</a>, where you did this by hand with three directories.</p>
+</article>
 </div><!-- /g-a-container-s-three-stor -->
+
+<!-- ---------------- Volumes at runtime level ---------------- --><div class="grp" id="g-volumes-at-runtime-level"><h3>Volumes at runtime level</h3>
+<article class="lesson" id="cp-i10-4" data-id="i10-4">
+<div class="lesson-head"><span class="cp-id">I10.4</span><h4>A volume is one entry in the mounts array</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The word "volume" suggests an object — something created, tracked, owned. At the runtime layer there is no such object. There is an array in a JSON file and a directory somebody manages. Once you have added one by hand, the entire Kubernetes storage stack reads as elaborate bookkeeping around a field you can type yourself.</p>
+
+<h5>The concept</h5>
+<p>The runtime spec's <code>mounts</code> array is a list of <code>mount(2)</code> arguments — source, destination, type, options — that the runtime executes inside the container's mount namespace after <code>pivot_root</code>. That is the whole mechanism. Everything the ecosystem calls a volume is built on it:</p>
+<ul>
+<li>a Docker named volume is a directory under <code>/var/lib/docker/volumes</code> plus a name in a database;</li>
+<li>a Kubernetes <code>emptyDir</code> is a directory under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/</code> that the kubelet creates and deletes;</li>
+<li>a PVC-backed volume is the same again, with a CSI driver having mounted something there first.</li>
+</ul>
+<p>The orchestration around each of those is elaborate and genuinely valuable — it is what makes a volume follow a pod across nodes, survive a reschedule, and be requested declaratively. The runtime-level primitive it all lands on is one line of JSON.</p>
+
+<div class="specref">
+<p>The spec is unusually blunt here: it does not define volume semantics at all, it defers to the <code>mount(2)</code> man page and specifies only the ordering.</p>
+<blockquote>**`mounts`** (array of objects, OPTIONAL) specifies additional mounts beyond [`root`](#root).<br>
+The runtime MUST mount entries in the listed order.<br>
+For Linux, the parameters are as documented in [mount(2)][mount.2] system call man page.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#mounts">config.md § Mounts</a></cite>
+<p>"In the listed order" is load-bearing: mounts that nest inside one another only work one way round, and a runtime is required to respect what you wrote rather than sort it for you.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a bundle the <a href="i2.html#cp-i2-3">I2.3</a> way and look at what a container gets before anyone adds a volume.
+<pre class="cmd">mkdir -p ~/i10/vol/rootfs &amp;&amp; cd ~/i10/vol
+curl -sSLo ~/alpine-minirootfs.tar.gz \
+  https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.5-x86_64.tar.gz
+sudo tar -C rootfs -xzf ~/alpine-minirootfs.tar.gz
+sudo runc spec
+jq -r '.mounts[] | "\(.type)\t\(.destination)"' config.json</pre>
+<pre class="out">proc	/proc
+tmpfs	/dev
+devpts	/dev/pts
+tmpfs	/dev/shm
+mqueue	/dev/mqueue
+sysfs	/sys
+cgroup	/sys/fs/cgroup
+count: <b>7</b></pre>
+<p>Seven mounts, every one of them kernel plumbing. None of them is storage in any sense a user would recognise.</p></li>
+
+<li>Make the directory that will be the volume. Note the order of events: the data exists before any container does.
+<pre class="cmd">mkdir -p ~/i10-vol
+echo "data that outlives containers" | sudo tee ~/i10-vol/ledger.txt</pre></li>
+
+<li>Add the eighth mount. This is the entire feature.
+<pre class="cmd">jq --arg src "$HOME/i10-vol" \
+  '.mounts += [{"destination":"/data","type":"bind","source":$src,"options":["rbind","rw"]}]' \
+  config.json &gt; config.new &amp;&amp; sudo mv config.new config.json
+jq '.mounts[-1]' config.json</pre>
+<pre class="out">{
+  "destination": "/data",
+  "type": "bind",
+  "source": "/home/ubuntu/i10-vol",
+  "options": [ "rbind", "rw" ]
+}</pre></li>
+
+<li>Run it. The container reads what was there, appends, and reports how the kernel sees the mount.
+<pre class="cmd">sudo runc run volbox</pre>
+<pre class="out"><b>data that outlives containers</b>
+total 4
+-rw-r--r--    1 root     root            43 Jul 31 02:48 ledger.txt
+442 433 8:1 /home/ubuntu/i10-vol /data rw,relatime - <b>ext4 /dev/sda1</b> rw,discard,errors=remount-ro</pre>
+<p>The <code>mountinfo</code> line is worth reading slowly: inside the container, <code>/data</code> is a subtree of the host's <code>ext4</code> root filesystem on <code>/dev/sda1</code>. There is no volume driver, no indirection, and nothing that would look different to the kernel from any other bind mount.</p></li>
+
+<li>Delete the container and check what survived.
+<pre class="cmd">sudo runc list
+cat ~/i10-vol/ledger.txt</pre>
+<pre class="out">ID          PID         STATUS      BUNDLE      CREATED     OWNER
+data that outlives containers
+<b>written-by-1</b></pre>
+<p>No containers exist. The data does, including the line written by PID 1 inside the one that is gone. That gap — between the lifetime of the container and the lifetime of the bytes — is the only thing a volume actually provides.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can add a volume to a container without any tool that knows the word "volume", and you can point at the exact JSON that makes <code>emptyDir</code>, <code>hostPath</code> and a PVC mount identical from the runtime's point of view.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Order matters and the runtime will not fix it.</strong> The spec says entries are mounted in the order listed. Mount <code>/data/inner</code> before <code>/data</code> and the first one disappears under the second.</li>
+<li><strong><code>rbind</code> and <code>bind</code> are not the same.</strong> <code>rbind</code> brings along mounts nested under the source; plain <code>bind</code> brings only the top one, so a volume containing another mount arrives mysteriously empty at that sub-path.</li>
+<li><strong>A bind mount has no size of its own.</strong> It is the host filesystem, so <code>df</code> inside the container reports the host's free space and no limit applies — the subject of <a href="#cp-i10-5">I10.5</a>.</li>
+</ul>
+
+<div class="k8s-link">
+<p><a href="w5.html#cp-5-2">W5.2</a> walks the kubelet's side of exactly this: every pod volume becomes a directory under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/</code>, and the container's generated <code>config.json</code> gets one <code>mounts</code> entry per <code>volumeMounts</code> entry. The <code>subPath</code> field, which surprises people by being resolved on the node rather than by the storage system, is nothing more than a longer <code>source</code> in that JSON.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the OCI runtime spec's <em>Mounts</em> section and <code>man 2 mount</code>; in the Kubernetes docs, <em>volumes</em> and <em>volumeMounts</em> under the pod spec reference.</p>
+</article>
+</div><!-- /g-volumes-at-runtime-level -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
