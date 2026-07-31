@@ -1,4 +1,51 @@
-# captured 2026-07-31T10:22:13Z on sandbox
+# captured 2026-07-31T10:27:07Z on sandbox
 # --- snippet ---
 # bash ~/i11-runv2.sh
 # --- output ---
+Pushing signature to: 127.0.0.1:5000/i11/hardened
+    hardened digest: sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a   (i11/unsigned:v1 is byte-identical and NOT signed)
+    pre-flight verify: OK
+
+=== A. signed image, every control on ===
+    == resolving 127.0.0.1:5000/i11/hardened:v1
+    == pinned to 127.0.0.1:5000/i11/hardened@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+    == verifying signature with /home/ubuntu/i11cs/cosign.pub
+    == signature OK
+    == running with: caps=[] noNewPrivileges=true uid=1000 readonly=true seccomp=allow.json
+    identity: uid=1000 euid=1000
+    attempts:
+      write a file into /                BLOCKED   errno=30  Read-only file system
+      write a file into /tmp             SUCCEEDED
+      chown /tmp/scratch to 99:99        BLOCKED   errno=1   Operation not permitted
+      mkdir /tmp/d                       BLOCKED   errno=38  Function not implemented
+      exec setuid-root /suid             uid=1000 euid=1000   <-- no escalation
+
+=== B. byte-identical image, no signature ===
+    == resolving 127.0.0.1:5000/i11/unsigned:v1
+    == pinned to 127.0.0.1:5000/i11/unsigned@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+    == verifying signature with /home/ubuntu/i11cs/cosign.pub
+    
+    run-verified: REFUSING TO RUN — signature did not verify for 127.0.0.1:5000/i11/unsigned@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+                     Error: no signatures found
+
+=== C. signed, verified with the wrong key ===
+    == resolving 127.0.0.1:5000/i11/hardened:v1
+    == pinned to 127.0.0.1:5000/i11/hardened@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+    == verifying signature with /home/ubuntu/i11cs/wrong.pub
+    
+    run-verified: REFUSING TO RUN — signature did not verify for 127.0.0.1:5000/i11/hardened@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+                     Error: no matching attestations: failed to verify signature: could not verify envelope: accepted signatures do not match threshold, Found: 0, Expected 1
+
+=== D. the same image with NO controls, for contrast ===
+    == resolving 127.0.0.1:5000/i11/hardened:v1
+    == pinned to 127.0.0.1:5000/i11/hardened@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+    == verifying signature with /home/ubuntu/i11cs/cosign.pub
+    == signature OK
+    == RUNNING WITH NO CONTROLS (--unsafe): default caps, root, writable rootfs, no seccomp
+    identity: uid=0 euid=0
+    attempts:
+      write a file into /                BLOCKED   errno=13  Permission denied
+      write a file into /tmp             SUCCEEDED
+      chown /tmp/scratch to 99:99        BLOCKED   errno=1   Operation not permitted
+      mkdir /tmp/d                       SUCCEEDED
+      exec setuid-root /suid             uid=0 euid=0   <-- ESCALATED
