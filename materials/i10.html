@@ -633,6 +633,200 @@ escaped
 </article>
 </div><!-- /g-volumes-at-runtime-level -->
 
+<!-- ---------------- The CSI shape ---------------- --><div class="grp" id="g-the-csi-shape"><h3>The CSI shape</h3>
+<article class="lesson" id="cp-i10-7" data-id="i10-7">
+<div class="lesson-head"><span class="cp-id">I10.7</span><h4>Why there is an interface here at all</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>By now this story should be predictable, and that is the point of asking it a third time. You have watched the same thing happen to runtimes (<a href="i8.html#cp-i8-1">CRI</a>) and to networking (<a href="i9.html#cp-i9-1">CNI</a>). Storage went the same way for the same reason, and once you can see the pattern you can predict where the next interface will appear.</p>
+
+<h5>The concept</h5>
+<p>Storage drivers used to live <em>in tree</em>: the code that talked to AWS EBS, GCE PD, Ceph, NFS and a dozen others was inside the Kubernetes repository. Every vendor's bug was a Kubernetes bug, every vendor's fix waited for a Kubernetes release, and every vendor's credentials-handling code ran in the controller manager. Adding support for a new storage system meant getting a pull request merged into Kubernetes.</p>
+<p>CSI replaced that with a contract. A driver is now a separate program speaking a versioned gRPC API; Kubernetes ships a client and some generic controllers, and the vendor ships everything that knows about their storage. The in-tree plugins were migrated behind the same interface and removed.</p>
+<p>Here is the two-sentence version worth remembering: <strong>CSI replaced vendor code living inside Kubernetes with a versioned gRPC contract that vendor code implements from outside. That made storage support a matter of installing a driver rather than upgrading Kubernetes — and made every storage system's bugs its own again.</strong></p>
+<p>Notice the shape each interface took, because the shape follows the interaction rather than the subject:</p>
+<table class="langpair">
+<thead><tr><th>Interface</th><th>Interaction it supports</th><th>Shape it took</th></tr></thead>
+<tbody>
+<tr><td><strong>CNI</strong></td><td>one short action per sandbox, then done</td><td>an exec'd binary, JSON on stdin</td></tr>
+<tr><td><strong>CRI</strong></td><td>long-lived, stateful, error-heavy</td><td>gRPC on a unix socket</td></tr>
+<tr><td><strong>CSI</strong></td><td>long-lived, stateful, error-heavy, and partly off-node</td><td>gRPC on a unix socket, split into three services</td></tr>
+</tbody>
+</table>
+<p>All three are versioned contracts with their own release cycles, and Kubernetes ships a client for each. Once you see that, "how do I add X to Kubernetes" almost always answers itself: find which interface already covers it.</p>
+
+<div class="specref">
+<p>CSI does not mention Kubernetes in its definitions at all. It speaks of a "CO" — a Container Orchestration system — and Kubernetes is merely one. That abstraction is the whole point of the exercise.</p>
+<blockquote>| Volume | A unit of storage that will be made available inside of a CO-managed container, via the CSI. |<br>
+| CO | Container Orchestration system, communicates with Plugins using CSI service RPCs. |<br>
+| Plugin | Aka “plugin implementation”, a gRPC endpoint that implements the CSI Services. |</blockquote>
+<cite>Container Storage Interface v1.13.0 — <a href="https://github.com/container-storage-interface/spec/blob/v1.13.0/spec.md">spec.md § Terminology</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the contract's own size. It is a single <code>.proto</code> file, and counting its calls per service tells you where the complexity lives before you read a word of prose.
+<pre class="cmd">curl -sSLo ~/csi.proto https://raw.githubusercontent.com/container-storage-interface/spec/v1.13.0/csi.proto
+wc -l ~/csi.proto
+awk '/^service /{s=$2} /^  rpc /{c[s]++} END{for(k in c) printf "  %-18s %s\n", k, c[k]}' ~/csi.proto</pre>
+<pre class="out">2373 /home/ubuntu/csi.proto
+  <b>Identity           3</b>
+  <b>Controller        17</b>
+  <b>Node              10</b>
+  SnapshotMetadata   2
+  GroupController    4</pre>
+<p>Thirty-six calls, and two thirds of them are Controller and Node. The three services in the middle of that list are <a href="#cp-i10-8">I10.8</a>; the other two are newer optional additions, and their presence is a good reminder that the contract is still growing.</p></li>
+
+<li>Confirm which version is current, because this is a fast-moving spec and this repo's own notes were two releases stale until this module was written.
+<pre class="cmd">curl -s https://api.github.com/repos/container-storage-interface/spec/releases/latest | jq -r '.tag_name, .published_at'</pre>
+<pre class="out"><b>v1.13.0</b>
+2026-07-27T19:48:53Z</pre></li>
+
+<li>Stand up a real driver. The reference implementation ships only as a container image, and running it is the entire deployment story: a process, a socket in a directory, and a data directory.
+<pre class="cmd">sudo mkdir -p /var/lib/kubelet /var/lib/i10-csi /var/lib/i10-csi-data
+sudo mount --bind /var/lib/kubelet /var/lib/kubelet
+sudo mount --make-rshared /var/lib/kubelet          # I10.6, applied
+
+sudo nerdctl run -d --name hostpath --privileged \
+  -v /var/lib/i10-csi:/csi \
+  -v /var/lib/i10-csi-data:/csi-data-dir \
+  -v /var/lib/kubelet:/var/lib/kubelet:rshared \
+  registry.k8s.io/sig-storage/hostpathplugin:v1.18.0 \
+  --endpoint=unix:///csi/csi.sock --nodeid=sandbox --drivername=hostpath.csi.k8s.io --enable-attach</pre>
+<pre class="out">findmnt: /var/lib/kubelet <b>shared</b>
+I0731 02:53:20.547663  1 hostpath.go:120] Driver: hostpath.csi.k8s.io
+I0731 02:53:20.547906  1 hostpath.go:121] Version: v1.18.0
+I0731 02:53:20.548309  1 server.go:87] Listening for connections on address: &amp;net.UnixAddr{Name:"<b>/csi/csi.sock</b>", Net:"unix"}</pre></li>
+
+<li>That is the whole surface a CSI driver exposes to the world.
+<pre class="cmd">sudo ls -l /var/lib/i10-csi/</pre>
+<pre class="out">srwxr-xr-x 1 root root 0 Jul 31 08:53 <b>csi.sock</b></pre>
+<p>A socket. Everything Kubernetes knows how to do with storage, it does by connecting to one of these — which is why the next two checkpoints can do all of it from Python.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can give the two-sentence account of what CSI replaced, explain why CNI is an executable and CSI is a gRPC service without appealing to history, and you have a running driver with a socket to talk to.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The spec version and the driver version are unrelated numbers.</strong> The spec is at v1.13.0; the reference hostpath driver is at v1.18.0. Neither predicts the other, and a driver may implement an older spec quite legitimately.</li>
+<li><strong>"In-tree" is not entirely past tense in the vocabulary.</strong> The migration is done, but you will still meet <code>kubernetes.io/aws-ebs</code>-style names in old manifests and in the <code>CSIMigration</code> documentation. They are translated to CSI calls now.</li>
+<li><strong>Version-checking this page's own claims found the repo two releases behind.</strong> CSI was recorded here as v1.11.0; it is v1.13.0, released the same week. Re-check rather than inherit.</li>
+</ul>
+
+<div class="k8s-link">
+<p><a href="w5.html#cp-5-11">W5.11</a> describes this architecture from the Kubernetes side, and <a href="w5.html#cp-5-10">W5.10</a> installs two real provisioners — the same system, entered through <code>kubectl</code> rather than through a socket. The driver you just started is the thing those manifests are wrapping.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the CSI spec's <em>Terminology</em> and <em>Architecture</em> sections; the kubernetes-csi documentation site for <em>drivers</em> and <em>sidecar containers</em>; and in the Kubernetes docs, <em>CSI Volume Plugins</em> and <em>CSIMigration</em>.</p>
+</article>
+
+<article class="lesson" id="cp-i10-8" data-id="i10-8">
+<div class="lesson-head"><span class="cp-id">I10.8</span><h4>Three services, and the four calls that matter</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The three-way split is not organisational tidiness — it is a diagnostic map. Learn which service a call belongs to and half of CSI debugging becomes arithmetic: a volume stuck with no PersistentVolume is a Controller problem, a pod stuck <code>ContainerCreating</code> on one node is a Node problem, and those two live in different pods with different logs.</p>
+
+<h5>The concept</h5>
+<p>The split is by <em>where the work must run</em>, not by what it does.</p>
+<ul>
+<li><strong>Identity</strong> — who are you, are you healthy, what do you support. Three calls. Every other component asks these first.</li>
+<li><strong>Controller</strong> — cluster-wide operations that talk to a storage API somewhere: create a volume, delete it, attach it to a node. These can run anywhere in the cluster, because they are API calls to a SAN or a cloud provider.</li>
+<li><strong>Node</strong> — operations that perform <code>mount(2)</code>, and therefore <em>must</em> run on the machine where the pod will run.</li>
+</ul>
+<p>That is exactly why a CSI driver ships as two workloads: a Deployment for the Controller half and a DaemonSet for the Node half. And it is why the four calls that matter sort the way they do:</p>
+<div class="flow"><span>CreateVolume</span><em>Controller</em><span>ControllerPublishVolume</span><em>Controller</em><span>NodeStageVolume</span><em>Node</em><span>NodePublishVolume</span><em>Node</em></div>
+<p>The spec draws the same sequence as a state machine, and it is worth committing to memory because every stuck volume is stuck between two of these boxes.</p>
+<pre class="out">   CreateVolume +------------+ DeleteVolume
+ +-------------&gt;|  CREATED   +--------------+
+ |              +---+----^---+              |
+ |       Controller |    | Controller       v
++++         Publish |    | Unpublish       +++
+|X|          Volume |    | Volume          | |
++-+             +---v----+---+             +-+
+                | NODE_READY |
+                +---+----^---+
+               Node |    | Node
+            Publish |    | Unpublish
+             Volume |    | Volume
+                +---v----+---+
+                | PUBLISHED  |
+                +------------+</pre>
+
+<div class="specref">
+<p>The spec assigns the Node service its defining property in one sentence, and it is the reason the split exists at all.</p>
+<blockquote>The Plugin SHALL assume that this RPC will be executed on the node where the volume will be used.</blockquote>
+<cite>Container Storage Interface v1.13.0 — <a href="https://github.com/container-storage-interface/spec/blob/v1.13.0/spec.md#nodestagevolume">spec.md § NodeStageVolume</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Generate Python stubs from the spec's own <code>.proto</code>. This is the same move as <a href="i8.html#cp-i8-2">I8.2</a>, and it means the client below is generated from the contract rather than written against a guess.
+<pre class="cmd">~/.venv-intermediate/bin/python -m grpc_tools.protoc -I ~ \
+  --python_out=$HOME/csi --grpc_python_out=$HOME/csi ~/csi.proto
+ls ~/csi</pre>
+<pre class="out">csi_pb2.py  csi_pb2_grpc.py</pre></li>
+
+<li>Ask the driver who it is. <a href="../labs/intermediate/csi-probe.py">csi-probe.py</a> is on this site; it makes the calls in order and names the Kubernetes component that would have made each one.
+<pre class="cmd">sudo CSI_PB_DIR=$HOME/csi ~/.venv-intermediate/bin/python ~/csi-probe.py identity</pre>
+<pre class="out">GetPluginInfo         name=hostpath.csi.k8s.io version=v1.18.0
+GetPluginCapabilities service: <b>CONTROLLER_SERVICE</b>
+GetPluginCapabilities service: GROUP_CONTROLLER_SERVICE
+GetPluginCapabilities service: VOLUME_ACCESSIBILITY_CONSTRAINTS
+Probe                 ready= <b>unset (spec: assume ready)</b>
+NodeGetInfo           node_id=sandbox max_volumes=0
+Controller can: ['<b>&lt;unknown:11&gt;</b>', 'CLONE_VOLUME', 'CREATE_DELETE_SNAPSHOT', 'CREATE_DELETE_VOLUME',
+                 'EXPAND_VOLUME', 'GET_CAPACITY', 'GET_SNAPSHOT', 'GET_VOLUME', 'LIST_SNAPSHOTS',
+                 'LIST_VOLUMES', '<b>PUBLISH_UNPUBLISH_VOLUME</b>', 'SINGLE_NODE_MULTI_WRITER']
+Node can:       ['<b>&lt;unknown:4&gt;</b>', 'EXPAND_VOLUME', 'GET_VOLUME_STATS', 'SINGLE_NODE_MULTI_WRITER',
+                 '<b>STAGE_UNSTAGE_VOLUME</b>']</pre>
+<p>Three things in that output are worth more than the rest. <code>Probe</code> returned an <em>unset</em> readiness, which the spec says means ready — a client reading <code>.ready.value</code> without checking presence declares a healthy driver dead, because an unset protobuf bool reads as false. And two capabilities came back as numbers with no name.</p></li>
+
+<li>Chase the unknown numbers, because the answer is a lesson in how versioned contracts age.
+<pre class="cmd">sed -n '/message ControllerServiceCapability/,/^}/p' ~/csi.proto | grep -E "^\s+[A-Z_]+ = "</pre>
+<pre class="out">      LIST_VOLUMES_PUBLISHED_NODES = 10;
+      GET_VOLUME = <b>12</b> [(alpha_enum_value) = true];
+      …
+      GET_VOLUME_HEALTH = 16 [(alpha_enum_value) = true];</pre>
+<p>There is no 11. The number the driver advertises does not exist in this version of the spec — it was <code>VOLUME_CONDITION</code>, since replaced by the <code>GET_VOLUME_HEALTH</code> family at different numbers. The Node service has the same gap at 4. The driver is not broken and the spec is not broken; a capability was renumbered, and a client that calls <code>Type.Name()</code> on the raw value crashes with <code>ValueError</code> against a perfectly healthy driver. That is why the probe carries a two-line helper that falls back to <code>&lt;unknown:N&gt;</code>.</p></li>
+
+<li>Now sort the four calls yourself, by making them. Controller first — this is what <code>external-provisioner</code> does when a PVC appears with nothing to satisfy it.
+<pre class="cmd">sudo CSI_PB_DIR=$HOME/csi ~/.venv-intermediate/bin/python ~/csi-probe.py provision i10-demo</pre>
+<pre class="out">CreateVolume          volume_id=<b>7b57f732-8c8b-11f1-8b50-e2e86637cddb</b> bytes=67108864
+  (this is the PV object's spec.csi.volumeHandle)
+ControllerPublishVolume ok  publish_context= {}
+  (this is external-attacher acting on a VolumeAttachment object)</pre>
+<p>That volume id is not an internal detail: it is precisely what lands in a PersistentVolume's <code>spec.csi.volumeHandle</code>, which is how a PV and the vendor's actual storage are tied together.</p></li>
+
+<li>Then the Node half, which is <a href="#cp-i10-9">I10.9</a>'s subject, and the reason this checkpoint stops here.
+<pre class="cmd">sudo … csi-probe.py stage   "$VOL"
+sudo … csi-probe.py publish "$VOL" pod-aaaa1111</pre>
+<pre class="out">NodeStageVolume       /var/lib/kubelet/plugins/kubernetes.io/csi/hostpath.csi.k8s.io/<b>7b57f732…</b>/globalmount
+NodePublishVolume     /var/lib/kubelet/pods/<b>pod-aaaa1111</b>/volumes/kubernetes.io~csi/pvc-7b57f732/mount</pre>
+<p>Read the two paths. One is keyed by <em>volume</em>, one by <em>pod</em>. That is the entire stage/publish distinction, visible in the filesystem before anyone explains it.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given any of the four calls you can name its service, say which Kubernetes component issues it, and say whether it runs on the pod's node or anywhere in the cluster. Given "PVC is Pending with no PV" versus "pod is ContainerCreating with a mount error on one node", you can name which half of the driver to read logs from.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>sudo</code> resets <code>HOME</code>.</strong> The generated stubs live under <code>~/csi</code>, so <code>sudo python csi-probe.py</code> looks in <code>/root/csi</code> and dies with <code>ModuleNotFoundError</code>. Pass <code>CSI_PB_DIR</code> explicitly.</li>
+<li><strong>An unset <code>Probe</code> readiness means ready.</strong> The field is a wrapper type precisely so that "not answered" and "answered false" are different. Treating them the same restarts healthy drivers.</li>
+<li><strong>Capability enums have gaps, and drivers advertise numbers your spec version does not define.</strong> Measured here on the reference driver, not a hypothetical. Never call <code>Name()</code> on an unvalidated enum value.</li>
+<li><strong>A call the driver did not advertise is a call it never receives.</strong> The CO checks capabilities and skips; if a driver forgets to advertise <code>STAGE_UNSTAGE_VOLUME</code>, staging is silently not attempted rather than failing loudly.</li>
+</ul>
+
+<div class="k8s-link">
+<p><a href="w5.html#cp-5-11">W5.11</a> is this same architecture named from the Kubernetes side, and <a href="w5.html#cp-5-12">W5.12</a> traces one mount end to end on a node — the two paths from the last lab step are exactly what it finds. The Controller/Node split is also why <a href="w5.html#cp-5-9">W5.9</a>'s <code>WaitForFirstConsumer</code> exists: for topology-constrained storage, the Controller cannot sensibly create the volume until the scheduler has chosen the node.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the CSI spec's <em>RPC Interface</em> section — the service definitions and the volume lifecycle diagram; and the kubernetes-csi site's <em>Developing CSI Drivers</em>.</p>
+</article>
+</div><!-- /g-the-csi-shape -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
