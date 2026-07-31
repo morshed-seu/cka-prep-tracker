@@ -1008,27 +1008,269 @@ GetPluginCapabilities service: CONTROLLER_SERVICE</pre>
 </article>
 </div><!-- /g-the-csi-shape -->
 
+<!-- ---------------- Project &amp; drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson project" id="cp-i10-11" data-id="i10-11">
+<div class="lesson-head"><span class="cp-id">I10.11</span><h4>Mini project — volman.py, a volume manager in two hundred lines</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Every claim this module has made is testable by writing the thing. A volume manager that creates named volumes, enforces a size limit, attaches them to containers and survives container deletion is about two hundred lines — and writing it is what turns "a volume is a bind mount plus bookkeeping" from a slogan into something you have proven.</p>
+
+<h5>What you are building</h5>
+<p><a href="../labs/intermediate/volman.py">volman.py</a> keeps volumes under <code>/var/lib/volman</code>: an ext4 image per volume for a real size limit, a JSON file for the bookkeeping, and one function per CSI call. The verbs are deliberately named after the contract from <a href="#cp-i10-8">I10.8</a>, so the program is also a restatement of it:</p>
+<table class="langpair">
+<thead><tr><th>volman verb</th><th>stands in for</th><th>does</th></tr></thead>
+<tbody>
+<tr><td><code>create</code></td><td><code>CreateVolume</code> (Controller)</td><td><code>truncate</code> + <code>mkfs.ext4</code> on an image file</td></tr>
+<tr><td><code>stage</code></td><td><code>NodeStageVolume</code> (Node)</td><td>loop-mount it once, at a global path</td></tr>
+<tr><td><code>attach</code></td><td><code>NodePublishVolume</code> (Node)</td><td>add one entry to a bundle's <code>config.json</code></td></tr>
+<tr><td><code>detach</code></td><td><code>NodeUnpublishVolume</code></td><td>remove that entry</td></tr>
+<tr><td><code>unstage</code></td><td><code>NodeUnstageVolume</code></td><td>unmount the global mount</td></tr>
+<tr><td><code>rm</code></td><td><code>DeleteVolume</code> (Controller)</td><td>delete the image — refusing while referenced</td></tr>
+</tbody>
+</table>
+<p>The one place it deliberately does <em>better</em> than the reference driver is <code>rm</code>: <a href="#cp-i10-9">I10.9</a> showed <code>DeleteVolume</code> destroying a volume out from under two live mounts, so <code>volman rm</code> refuses while anything still holds it.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Create a volume. Nothing is mounted and no container exists — this is a Controller operation and could have happened on another machine entirely.
+<pre class="cmd">sudo python3 volman.py create appdata --size 32M
+sudo python3 volman.py ls</pre>
+<pre class="out">created appdata (32M) -&gt; /var/lib/volman/images/appdata.img
+NAME         SIZE   USED     STAGED                             PUBLISHED
+appdata      32M    -        -                                  0</pre></li>
+
+<li>Attach it to a container. Staging happens automatically first, exactly as the kubelet would do it.
+<pre class="cmd">sudo python3 volman.py attach appdata ~/i10/a --dest /data
+sudo jq -c '.mounts[-1]' ~/i10/a/config.json</pre>
+<pre class="out"><b>staged</b> appdata at /var/lib/volman/mnt/appdata
+<b>attached</b> appdata -&gt; /data in /home/ubuntu/i10/a/config.json
+{"destination":"/data","type":"bind","source":"/var/lib/volman/mnt/appdata","options":["rbind","rw"]}</pre>
+<p>That last line is <a href="#cp-i10-4">I10.4</a>'s mounts entry, written by a program instead of by hand. There is nothing else to a volume.</p></li>
+
+<li>Run the container and write to it. The size the container sees is the loop device's, not the host's.
+<pre class="cmd">cd ~/i10/a &amp;&amp; sudo runc run boxa</pre>
+<pre class="out"><b>/dev/loop1</b>               26.0M     24.0K     23.7M   0% /data
+total 20
+-rw-r--r--    1 root     root            21 Jul 31 03:01 ledger.txt
+drwx------    2 root     root         16384 Jul 31 03:01 lost+found</pre>
+<p><code>lost+found</code> is a nice tell: this is a real ext4 filesystem, not a directory pretending to be one.</p></li>
+
+<li>Destroy the container completely — delete its bundle, rootfs and all — and check the volume.
+<pre class="cmd">sudo runc delete -f boxa &amp;&amp; sudo rm -rf ~/i10/a
+sudo runc list
+sudo python3 volman.py ls</pre>
+<pre class="out">ID          PID         STATUS      BUNDLE      CREATED     OWNER
+NAME         SIZE   USED     STAGED                             PUBLISHED
+appdata      32M    <b>28K</b>      /var/lib/volman/mnt/appdata        1</pre>
+<p>No containers exist. The volume does, with the data in it.</p></li>
+
+<li>The payoff: a second, entirely unrelated container mounts the same volume at a different path and reads the first one's data.
+<pre class="cmd">sudo python3 volman.py attach appdata ~/i10/b --dest /shared
+cd ~/i10/b &amp;&amp; sudo runc run boxb</pre>
+<pre class="out"><b>container A was here</b></pre>
+<p>That is the whole value proposition of a volume, demonstrated end to end in about a hundred lines of Python and two <code>mount</code> calls.</p></li>
+
+<li>Check the size limit is real rather than advisory, by overrunning it.
+<pre class="cmd">…  # dd if=/dev/zero of=/shared/fill bs=1M count=100</pre>
+<pre class="out">26533888 bytes (25.3MB) copied, 0.030787 seconds, 821.9MB/s
+/dev/loop1               26.0M     25.3M         0 <b>100%</b> /shared</pre>
+<p>The write stopped at the filesystem boundary. This is why the project uses a loop image rather than a plain directory: it is the only way to give a bind mount a size that means something.</p></li>
+
+<li>Try to delete it while it is in use.
+<pre class="cmd">sudo python3 volman.py rm appdata</pre>
+<pre class="out">volman: appdata is still published to ['/home/ubuntu/i10/a', '/home/ubuntu/i10/b']</pre></li>
+
+<li>Now the interesting failure, which happened by accident the first time this ran and was kept. Bundle <code>a</code> was deleted from disk in step 4 without ever being detached, so the volume is pinned by a reference to a container that no longer exists.
+<pre class="cmd">sudo python3 volman.py detach appdata ~/i10/b
+sudo python3 volman.py unstage appdata
+sudo jq -c '.appdata.published' /var/lib/volman/volumes.json
+ls -d ~/i10/a</pre>
+<pre class="out">detached appdata from /home/ubuntu/i10/b
+volman: appdata is still published to ['/home/ubuntu/i10/a']
+["/home/ubuntu/i10/a"]
+ls: cannot access '/home/ubuntu/i10/a': No such file or directory</pre>
+<p>A PersistentVolumeClaim stuck <code>Terminating</code> on a finalizer, in miniature: the bookkeeping holds a reference the world no longer contains, and the delete blocks until somebody removes it. That is not a bug in the design — it is the design working, and it is exactly why <code>kubectl patch</code>-ing finalizers off a PVC is such a dangerous habit.</p></li>
+
+<li>Drop the stale reference and finish the teardown in spec order.
+<pre class="cmd">sudo python3 volman.py detach appdata ~/i10/a
+sudo python3 volman.py unstage appdata
+sudo python3 volman.py rm appdata
+sudo python3 volman.py ls</pre>
+<pre class="out">detached appdata from /home/ubuntu/i10/a
+unstaged appdata
+deleted appdata
+no volumes</pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Your volume manager creates a volume with a size that is enforced, attaches it to two containers in turn, survives the complete destruction of the first, refuses to delete a volume in use, and tears down cleanly leaving no mounts and no image file. If you wrote it yourself, check that <code>stage</code> is idempotent — running it twice must do no work the second time, because the spec requires that of <code>NodeStageVolume</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Write the state file atomically.</strong> <code>volman.py</code> writes to a temporary file and <code>os.replace</code>s it. A volume manager interrupted mid-write with a truncated JSON file has lost every volume it manages — and this is precisely why <a href="i7.html#cp-i7-12">containerd's metadata store</a> is the one with no upstream to rebuild from.</li>
+<li><strong><code>os.path.ismount</code> is the check, not the state file.</strong> Trusting your own record of "staged" across a reboot means trying to bind from a path with nothing mounted at it, which succeeds and gives the container an empty directory.</li>
+<li><strong>Refuse, do not clean up.</strong> It is tempting to make <code>rm</code> unmount and detach automatically. The reference driver's willingness to delete a mounted volume is the failure in <a href="#cp-i10-9">I10.9</a>; refusing is the better contract.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now built, at small scale, what a StorageClass plus a provisioner plus the kubelet do together (<a href="w5.html#cp-5-8">W5.8</a>, <a href="w5.html#cp-5-10">W5.10</a>). The <code>volumes.json</code> file is etcd's job; the <code>published</code> list is what finalizers protect; <code>stage</code> and <code>attach</code> are the two calls the kubelet makes. Nothing in the Kubernetes storage stack is a different kind of thing from this — there is simply a great deal more of it, distributed, and with an API in front.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 8 losetup</code> and <code>man 8 mkfs.ext4</code>; the CSI spec's volume lifecycle diagram, to check your verb ordering against.</p>
+</article>
+
+<article class="lesson drill" id="cp-i10-12" data-id="i10-12">
+<div class="lesson-head"><span class="cp-id">I10.12</span><h4>Debugging drill — the empty directory and the uid from nowhere</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Both faults below produce symptoms that point away from the cause. One shows an empty directory where a filesystem is unquestionably mounted; the other refuses a write on behalf of a user that appears in no <code>/etc/passwd</code> on either side. Neither is guessable — both are readable, from evidence you now know how to collect.</p>
+
+<h5>Fault 1 — the storage is mounted and the container sees nothing</h5>
+<ol class="lab">
+<li>The setup is the CSI arrangement in miniature: a volume bound into a container, and then a "node plugin" (here, the host) mounting the real storage underneath that path afterwards.
+<pre class="cmd">sudo mount --bind ~/i10-drill ~/i10-drill &amp;&amp; sudo mount --make-rshared ~/i10-drill
+#  … container started with the volume mounted rprivate  …
+sudo mount -t tmpfs tmpfs ~/i10-drill/data
+echo "the-real-data" | sudo tee ~/i10-drill/data/payload.txt</pre></li>
+
+<li>The host is completely satisfied that the data is there.
+<pre class="cmd">ls -l ~/i10-drill/data</pre>
+<pre class="out">-rw-r--r-- 1 root root 14 Jul 31 09:03 <b>payload.txt</b></pre></li>
+
+<li>The application disagrees.
+<pre class="cmd">sudo runc exec drillbox sh -c 'ls -la /vol/data; df -h /vol/data | tail -1'</pre>
+<pre class="out">total 8
+drwxrwxr-x    2 1000     1000          4096 Jul 31 03:03 .
+drwxrwxr-x    3 1000     1000          4096 Jul 31 03:03 ..
+<b>/dev/sda1                18.3G      8.9G      9.4G  48% /</b></pre>
+<p>An empty directory, and — the giveaway — <code>df</code> reports the root filesystem rather than a <code>tmpfs</code>. The container is not looking at a broken mount; it is looking at the directory that existed <em>before</em> anything was mounted over it.</p></li>
+
+<li>Collect the evidence that names the fault: the same filter against both mount tables.
+<pre class="cmd">grep " $HOME/i10-drill/data " /proc/self/mountinfo
+sudo runc exec drillbox sh -c 'grep " /vol/data " /proc/self/mountinfo || echo "  (no such mount in this namespace)"'
+sudo runc exec drillbox sh -c 'grep " /vol " /proc/self/mountinfo | sed "s/ - .*//"'</pre>
+<pre class="out">256 93 0:52 / /home/ubuntu/i10-drill/data rw,relatime <b>shared:261</b> - tmpfs tmpfs rw,inode64
+  <b>(no such mount in this namespace)</b>
+440 417 8:1 /home/ubuntu/i10-drill /vol rw,relatime            <b>← no propagation tag at all</b></pre>
+<details class="reveal"><summary>Diagnosis</summary>
+<p>The mount exists on the host and does not exist in the container's mount namespace, so it is not a storage problem at all — the mount event never propagated. The container's <code>/vol</code> line carries neither <code>shared:</code> nor <code>master:</code>, which is <code>rprivate</code>: nothing crosses in either direction. The fix is <code>mountPropagation: HostToContainer</code> (<code>rslave</code>), after which the same line reads <code>master:1</code> and the <code>tmpfs</code> appears inside. This is precisely why CSI node plugins need propagation configured on the kubelet directory, and the fault is only visible by comparing the two mount tables — every single-sided view looks correct.</p></details></li>
+
+<li>The reverse case is the same mechanism and is worth reproducing too: with <code>rprivate</code>, a mount made <em>inside</em> the container is invisible on the host. That version bites when a container is expected to expose something to the node, and the diagnosis is identical.</li>
+</ol>
+
+<h5>Fault 2 — permission denied, on a uid that exists nowhere</h5>
+<ol class="lab">
+<li>The volume, from the host's point of view, belongs to a perfectly ordinary numeric owner.
+<pre class="cmd">ls -ln ~/i10-drill2
+getent passwd 5000 || echo "no - it is only a number here"</pre>
+<pre class="out">-rw-rw-r-- 1 <b>5000</b> 5000 11 Jul 31 09:08 app.conf
+<b>no - it is only a number here</b></pre></li>
+
+<li>The container runs in a user namespace, as a hardened workload does. Watch what it sees.
+<pre class="cmd">unshare --user --map-users=0:100000:65536 --map-groups=0:100000:65536 -- \
+  sh -c 'cat /proc/self/uid_map; ls -ln ~/i10-drill2; ls -l ~/i10-drill2;
+         touch ~/i10-drill2/write-test; cat ~/i10-drill2/app.conf'</pre>
+<pre class="out">         0     100000      65536
+-rw-rw-r-- 1 <b>65534</b> 65534 11 Jul 31 09:08 app.conf
+-rw-rw-r-- 1 <b>nobody nogroup</b> 11 Jul 31 09:08 app.conf
+touch: cannot touch '/home/ubuntu/i10-drill2/write-test': <b>Permission denied</b>
+app config</pre>
+<details class="reveal"><summary>Diagnosis</summary>
+<p>The container maps container uids 0–65535 onto host uids 100000–165535. The file's owner, host uid 5000, is <em>outside that map</em>, so it has no representation inside the namespace at all and the kernel substitutes the overflow uid — 65534, displayed as <code>nobody</code>. The number appears in no <code>/etc/passwd</code> on either side: on the host 5000 is unnamed, and inside, 65534 is a placeholder meaning "unmappable", not a user. Reading still works because the file is world-readable; writing does not, because ownership cannot match. The fixes are the ones Kubernetes offers — <code>fsGroup</code> to chown the volume into a range the container can use (with the cost measured in <a href="#cp-i10-9">I10.9</a>), a matching <code>runAsUser</code>, or an idmapped mount so the kernel translates ownership at the mount rather than on disk.</p>
+<pre class="out">cat /proc/sys/kernel/overflowuid  →  <b>65534</b></pre></details></li>
+
+<li>Contrast, and a note on this machine: mapping yourself to root inside a namespace is refused here, while the <code>subuid</code>-backed path above works.
+<pre class="cmd">unshare --user --map-root-user -- id</pre>
+<pre class="out">unshare: write failed /proc/self/uid_map: <b>Operation not permitted</b></pre>
+<p>Two different mechanisms: <code>--map-users</code> goes through the setuid helper <code>newuidmap</code> and is authorised by <code>/etc/subuid</code>; <code>--map-root-user</code> writes <code>uid_map</code> directly. On Ubuntu 24.04 the second is blocked in this configuration — the same class of unexplained <code>EPERM</code> as <a href="i1.html#cp-i1-4">I1.4</a>'s AppArmor wall, and worth recognising before it is mistaken for a storage fault.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>For fault 1 you can produce, in two commands, the evidence that a mount exists on the host and not in the container, and name the propagation setting that caused it. For fault 2 you can explain where 65534 comes from without looking it up, and name three different fixes with their costs.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Neither fault produces a useful error message.</strong> Fault 1 produces no error at all — an empty directory is not an error condition. Fault 2's message names a path, not the mapping that caused it.</li>
+<li><strong>Both faults look like the storage system failed.</strong> Both are entirely local to the node, and neither would be improved by anything the storage vendor could do.</li>
+<li><strong>A <code>nobody</code>-owned file is a symptom with exactly one cause family.</strong> An unmapped id — from a user namespace, or from NFS squashing. It is never corruption, and chowning it on the host without changing the map does not help.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Fault 1 is the classic CSI-driver-on-a-misconfigured-node incident and connects straight to <a href="w5.html#cp-5-12">W5.12</a>'s mount trace. Fault 2 is what a <code>securityContext</code> with <code>runAsUser</code> or a user-namespaced pod meets when it is handed a volume that was written by something else — the reason <code>fsGroup</code> exists, and the reason it is applied at stage time rather than per pod.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 7 user_namespaces</code>, sections on <em>uid_map</em> and the overflow ids; <code>man 8 mount</code> on shared subtrees; in the Kubernetes docs, <em>fsGroup</em>, <em>fsGroupChangePolicy</em> and <em>user namespaces for pods</em>.</p>
+</article>
+</div><!-- /g-project-drill -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>A pod has no volumes, no PVC, and a 256 MiB memory limit. It fills the node's disk. Where did the bytes go, and which of the three storages is that?
+<details class="reveal"><summary>Answer</summary><p>Into its writable layer — the overlay upperdir, one per container, private and unlimited unless <code>ephemeral-storage</code> limits are set. It is destroyed with the container and recoverable from nowhere, which is why the usual cause (a log file written inside the container) loses the logs as well as filling the node.</p></details></li>
+
+<li>A container appends one byte to a 4 MB file that came from its image. How much does its writable layer grow, and why?
+<details class="reveal"><summary>Answer</summary><p>By the whole 4 MB — measured here as 12 bytes to 4,498,781. Overlayfs cannot modify a file in a read-only lower layer, so the first write triggers a copy-up of the entire file before the change is applied. The cost is the file's size, never the change's.</p></details></li>
+
+<li>Why does <code>crictl imagefsinfo</code> sometimes report a few megabytes on a node whose snapshotter directory holds gigabytes?
+<details class="reveal"><summary>Answer</summary><p>Because it counts only what the CRI created. Snapshots made by <code>ctr</code>, or in another containerd namespace such as <code>buildkit</code>, are on the same filesystem and invisible to it — measured here as 9,986,048 bytes reported against 2.3 GB on disk. The kubelet's eviction input has the same blind spot.</p></details></li>
+
+<li>What is a volume, at the runtime layer, in one sentence?
+<details class="reveal"><summary>Answer</summary><p>One entry in <code>config.json</code>'s <code>mounts</code> array — source, destination, type, options, handed to <code>mount(2)</code> — plus a directory that somebody else manages. A stock bundle has seven mounts, all kernel plumbing; a volume is the eighth.</p></details></li>
+
+<li>A container writing into an <code>emptyDir: {medium: Memory}</code> is killed with exit 137 and a <code>dmesg</code> line about a memory cgroup. Nothing allocated that much memory. Explain.
+<details class="reveal"><summary>Answer</summary><p>A <code>tmpfs</code> is memory. Its pages are charged to the cgroup of the process that wrote them, so filling it consumes the container's memory limit and the OOM killer ends the process. The <code>tmpfs</code> will happily advertise half of RAM in <code>df</code> — 1.9 GB here against a 128 MiB limit — because the filesystem and the cgroup know nothing about each other.</p></details></li>
+
+<li>Why can that same OOM kill show up as exit status 0?
+<details class="reveal"><summary>Answer</summary><p>If the write is in a shell pipeline, the exit status is the last command's. Measured: identical writes gave 137 unpiped and 0 piped into <code>tail</code>. In Kubernetes that means no <code>OOMKilled</code> reason and no restart under <code>restartPolicy: OnFailure</code>.</p></details></li>
+
+<li>Reading a <code>mountinfo</code> line for a volume inside a container, how do you tell which <code>mountPropagation</code> produced it?
+<details class="reveal"><summary>Answer</summary><p>No tag means <code>rprivate</code> (<code>None</code>); <code>master:N</code> means <code>rslave</code> (<code>HostToContainer</code>); <code>shared:N</code> with N matching the host's peer group means <code>rshared</code> (<code>Bidirectional</code>). Beware <code>shared:246 master:1</code> — that is a slave that shares only with itself, which is what you get when the mount asks for <code>rshared</code> but <code>rootfsPropagation</code> is left at slave.</p></details></li>
+
+<li>Sort these into services and order them: <code>NodePublishVolume</code>, <code>CreateVolume</code>, <code>NodeStageVolume</code>, <code>ControllerPublishVolume</code>.
+<details class="reveal"><summary>Answer</summary><p><code>CreateVolume</code> (Controller) → <code>ControllerPublishVolume</code> (Controller) → <code>NodeStageVolume</code> (Node) → <code>NodePublishVolume</code> (Node). The spec's state machine names the states between them: CREATED, NODE_READY, PUBLISHED. Controller calls run anywhere; Node calls must run on the pod's node, because they perform <code>mount(2)</code>.</p></details></li>
+
+<li>Three pods on one node share a <code>ReadWriteOnce</code> volume happily, and a fourth pod on another node cannot get it. Why is that consistent?
+<details class="reveal"><summary>Answer</summary><p>Because the access mode is about nodes. The volume is staged once per node — the expensive step — and published once per pod as a cheap bind mount off that staging path. Any number of pods can be published on the node where it is staged; a second node would require a second stage, which RWO forbids.</p></details></li>
+
+<li>A PVC is stuck <code>Pending</code> with no PersistentVolume. A different pod is stuck <code>ContainerCreating</code> with a mount error on one node. Which component do you read for each?
+<details class="reveal"><summary>Answer</summary><p>The first is the Controller side — <code>external-provisioner</code> calling <code>CreateVolume</code>, running in the driver's Deployment. The second is the Node side — the kubelet calling <code>NodeStageVolume</code>/<code>NodePublishVolume</code> against the driver's DaemonSet pod on that node. Different pods, different logs, and the split is by where the work must run.</p></details></li>
+
+<li>Which sidecar makes the mount calls?
+<details class="reveal"><summary>Answer</summary><p>None. The kubelet calls the Node service itself. <code>node-driver-registrar</code> only tells the kubelet the driver exists — and it makes no Kubernetes API calls at all, needing no RBAC; it registers over a socket under <code>/var/lib/kubelet/plugins_registry/</code>.</p></details></li>
+
+<li>A pod shows an empty directory where a CSI volume should be, and the node shows the filesystem correctly mounted at the same path. What do you check, and with what?
+<details class="reveal"><summary>Answer</summary><p>Mount propagation, by grepping the same path in both <code>/proc/self/mountinfo</code> tables — the host's and the container's. If the mount exists in one and not the other, no storage component failed; the mount event did not cross the namespace boundary. The container's line for the parent volume will carry no propagation tag.</p></details></li>
+
+<li>A volume's files show as owned by <code>nobody</code> inside a container and writes fail. What is the one cause family?
+<details class="reveal"><summary>Answer</summary><p>An unmapped id. The owning uid falls outside the container's user-namespace map, so the kernel substitutes the overflow uid, 65534. It is never corruption. Fixes: <code>fsGroup</code> (a recursive chown, measured at 5.74 s per 500,000 files on local ext4), a matching <code>runAsUser</code>, or an idmapped mount.</p></details></li>
+
+<li>Why is it dangerous to remove a PersistentVolume's finalizer to unstick a delete?
+<details class="reveal"><summary>Answer</summary><p>Because <code>DeleteVolume</code> does not check whether the volume is still mounted anywhere — measured here, it destroyed a volume with two live pod mounts, which then pointed at <code>//deleted</code> and could no longer be unpublished, since the driver had forgotten the volume. The finalizer is the thing holding the delete until the node side has finished; removing it is removing the check.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>You can name a container's three storages, locate each on the node, and say what survives what.</li>
+<li>You can add a volume by hand and explain <code>emptyDir</code>, <code>hostPath</code> and a PVC as one mechanism with different bookkeeping.</li>
+<li>You can predict how a bind, a <code>tmpfs</code> and a block-backed volume each fail under load, including the OOM kill that mentions no storage.</li>
+<li>You can read mount propagation off a <code>mountinfo</code> line and say which Kubernetes setting produced it.</li>
+<li>You can drive a real CSI driver through its whole lifecycle over a socket, and diagnose a stuck volume by naming the loop that stopped.</li>
+<li>You have written a volume manager whose verbs are the CSI calls, and debugged the two faults whose symptoms point away from their causes.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="b5.html#cp-b5-13">Go deeper: B5 built overlayfs, bind mounts, propagation and loop devices by hand →</a></div>
 
-<nav class="pager"><a href="i9.html">← I9</a><a href="../intermediate.html#i11">I11 · TODO →</a></nav>
+<nav class="pager"><a href="i9.html">← I9</a><a href="../intermediate.html#i11">I11 · Container security &amp; supply chain →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+Authored against Ubuntu 24.04 LTS on kernel <code>6.8.0-136-generic</code>, containerd <code>2.3.3</code>, runc <code>1.5.1</code>, crictl <code>v1.36.0</code>, <code>registry.k8s.io/sig-storage/hostpathplugin:v1.18.0</code>, OCI runtime-spec <code>v1.3.0</code> and CSI spec <code>v1.13.0</code>. Every command and every line of output was captured from a live run on 2026-07-31.
+<br><br>
+Version-sensitive findings from that run, recorded because they contradict widely-repeated claims: the CSI spec is at <strong>v1.13.0</strong> (2026-07-27), two releases beyond the v1.11.0 this repository previously recorded. <code>hostpathplugin</code> v1.18.0 advertises Controller capability <strong>11</strong> and Node capability <strong>4</strong>, neither of which exists in the v1.13.0 enums — they were <code>VOLUME_CONDITION</code>, since replaced by the <code>GET_VOLUME_HEALTH</code> family at different numbers — so a client calling <code>Type.Name()</code> on the raw value crashes against a healthy driver. <code>Probe</code> returns an <em>unset</em> readiness, which the spec says means ready. <code>crictl imagefsinfo</code> counts only CRI-created containers: 300 MB written through <code>ctr</code> moved it by zero bytes, and the same write through <code>crictl</code> moved it by 314 MB. A bare runc bundle's default mount propagation is <em>slave</em>, not private, so it does not match Kubernetes' <code>mountPropagation: None</code>; and asking for <code>rshared</code> on a mount without setting <code>linux.rootfsPropagation</code> yields <code>shared:N master:1</code>, which looks shared and behaves like a slave. <code>DeleteVolume</code> succeeded against a volume with two live pod mounts. Recursive <code>fsGroup</code> chown measured 0.48 s for 50,000 files and 5.74 s for 500,000 on local ext4 — the "minutes" of folklore requires network-backed storage.
 </footer>
 </main>
 </div>
