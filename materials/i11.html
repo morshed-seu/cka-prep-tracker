@@ -926,6 +926,16 @@ ps -eo pid,uid,user,args | grep '[s]leep 6'</pre>
 <p>Networking is the part that cannot be faked with mounts. A user namespace lets you create a network namespace, but it does not let you attach a <code>veth</code> to a host bridge or write a NAT rule in the host's tables — those need <code>CAP_NET_ADMIN</code> <em>on the host</em>. So rootless stacks run a <strong>userspace network stack</strong>: <code>slirp4netns</code> holds one end of a TAP device inside the namespace and translates the container's packets into ordinary sockets opened as your user. That is why the container's addresses come from a private range that exists nowhere on the host, and why published ports are proxied rather than DNAT'd.</p>
 <p>Cgroups are the one thing that works properly, and only because systemd already solved it: <code>user@1000.service</code> gets a delegated subtree, so limits set inside it are real kernel limits. This is the same delegation <a href="i1.html#cp-i1-6">I1.6</a> ran into, and what is delegated has grown — measure it rather than assuming.</p>
 
+<div class="specref">
+<p>There is no "rootless" section in any OCI document, and the runtime spec's abstract does not mention privilege at all. What it does say about cgroups is the one line that lets a rootless runtime be conformant while setting no limits: the path is OPTIONAL, and the runtime decides what happens when it is absent.</p>
+<blockquote><b>cgroupsPath</b> (string, OPTIONAL) path to the cgroups. It can be used to either control the cgroups hierarchy for containers or to run a new process in an existing container.<br><br>
+[…] If the value is not specified, the runtime MAY define the default cgroups path.
+Runtimes MAY consider certain <code>cgroupsPath</code> values to be invalid, and MUST generate an error if this is the case.<br><br>
+Implementations of the Spec can choose to name cgroups in any manner. The Spec does not include naming schema for cgroups.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Linux Configuration</em> § Control groups — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#control-groups">config-linux.md</a></cite>
+</div>
+<p>Everything that makes rootless actually work — the copy-up mounts, the userspace network, the systemd cgroup delegation — lives below the specification, in <code>rootlesskit</code> and the distribution. That is why rootless behaves differently on different machines in ways <code>config.json</code> never explains.</p>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Install the prerequisites and run the setup tool from the nerdctl distribution. <code>rootlesskit</code> also needs the <code>userns</code> grant from I11.6, so add it to the same AppArmor profile first.
@@ -1047,6 +1057,15 @@ head: /host/etc/shadow: <b>Permission denied</b>      ← rootless containerd</p
 <p>That framing is what makes the table below uncomfortable. Most container controls constrain a process that is <em>already inside</em>, and most of them constrain it in exactly one dimension. The three that change the shape of the problem rather than trimming it are the user namespace, the absence of a host mount, and the absence of the container socket — and only the first is a control you turn on rather than a thing you refrain from doing.</p>
 <p>One term to keep straight, because the rest of the table depends on it. <strong>Escape to host</strong> means obtaining host-root code execution. <strong>Read host secrets</strong> means getting at a file like <code>/etc/shadow</code> or a kubelet credential, which usually does <em>not</em> require an escape — it requires a mount. Conflating the two is the most common error in these discussions, and it is why "we dropped all capabilities" is offered as an answer to a question about a <code>hostPath</code>.</p>
 
+<div class="specref">
+<p>Read the runtime specification's own abstract and notice what is not in it. There is no mention of security, isolation, trust or threat — the document is about configuration and lifecycle, and it never claims a container is a boundary.</p>
+<blockquote>The Open Container Initiative Runtime Specification aims to specify the configuration, execution environment, and lifecycle of a container.<br><br>
+A container's configuration is specified as the <code>config.json</code> for the supported platforms and details the fields that enable the creation of a container.
+The execution environment is specified to ensure that applications running inside a container have a consistent environment between runtimes along with common actions defined for the container's lifecycle.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Abstract</em> — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/spec.md">spec.md</a></cite>
+</div>
+<p>That absence is the reason this checkpoint exists. No standard will tell you what a container protects you from; the fields in <a href="i2.html#cp-i2-4">I2.4</a> are levers with no stated purpose. The table below has to come from measurement, and the nearest thing to an authoritative version of it is NIST SP 800-190, which is a guide rather than a specification.</p>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Build the grid from the results this module already produced. Each cell says what the control does <em>on its own</em>, against an attacker who already has code execution in the container.
@@ -1138,6 +1157,19 @@ CapBnd:	0000000000000000</pre>
 </ul>
 <p>"Keyless" is therefore a misnomer — there is a key, it just lives for ten minutes and its identity is an OIDC subject. The reason it dominates in CI is that there is no secret to store, so there is no secret to leak.</p>
 <p>Where the signature is <em>stored</em> has changed. Older cosign pushed it to a tag derived from the image digest, <code>sha256-&lt;hex&gt;.sig</code>. Current cosign uses the OCI <strong>referrers</strong> mechanism: an artifact whose manifest has a <code>subject</code> field pointing at the image, discovered through the registry's <code>/v2/&lt;name&gt;/referrers/&lt;digest&gt;</code> endpoint — with a <em>fallback tag schema</em>, <code>sha256-&lt;hex&gt;</code> holding an index, for registries that do not implement it. Both mechanisms are in play in the lab below, and one very familiar tool now lies about which.</p>
+
+<div class="specref">
+<p>The mechanism cosign now uses is the distribution spec's referrers API, and the fallback the lab meets is specified beside it — including the exact tag name.</p>
+<blockquote>To fetch the list of referrers, perform a <code>GET</code> request to a path in the following format: <code>/v2/&lt;name&gt;/referrers/&lt;digest&gt;</code><br><br>
+If the referrers API returns a 404, the client MUST fallback to pulling the referrers tag schema. The response SHOULD be an image index with the same content that would be expected from the referrers API.<br><br>
+<b>Referrers Tag Schema</b><br>
+<code>&lt;alg&gt;-&lt;ref&gt;</code><br>
+ · <code>&lt;alg&gt;</code>: the digest algorithm (e.g. <code>sha256</code> or <code>sha512</code>)<br>
+ · <code>&lt;ref&gt;</code>: the digest from the <code>subject</code> field (limit of 64 characters)<br><br>
+This tag should return an image index matching the expected response of the referrers API. Maintaining the content of this tag is the responsibility of clients pushing and deleting image manifests that contain a <code>subject</code> field.</blockquote>
+<cite>OCI Distribution Specification v1.1.1, <em>Listing Referrers</em> and <em>Referrers Tag Schema</em> — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#listing-referrers">spec.md</a></cite>
+</div>
+<p>Three things to carry into the lab. The fallback is a <strong>MUST</strong>, not a nicety — a conformant client has to try both. The tag is <code>&lt;alg&gt;-&lt;ref&gt;</code>, which is why <code>sha256-f27cad91…</code> appears in the tag list. And it "should return an image <em>index</em>" — which is precisely why one <code>Accept</code> header gets 200 and another gets 404.</p>
 
 <h5>Lab</h5>
 <ol class="lab">
@@ -1294,6 +1326,17 @@ envelope: <b>accepted signatures do not match threshold, Found: 0, Expected 1</b
 <p>The most important of the predicate types is <strong>SLSA provenance</strong>, which answers "what built this": a <code>buildDefinition</code> naming the build type and its external parameters (source repository, commit), and a <code>runDetails</code> naming the builder and the invocation. SLSA's levels are essentially statements about how trustworthy that provenance is — whether it exists at all, whether the builder generated it rather than the build script, and whether the build was isolated enough that the provenance cannot have been forged by the thing being built.</p>
 <p>The storage mechanism is the one you already dissected in I11.9: another referrer artifact with a <code>subject</code> pointing at the image. Signature and attestation are the same shape; only the payload differs.</p>
 
+<div class="specref">
+<p>The layering is specified by in-toto rather than by the OCI, and the Statement's four fields are the whole of it. Note the sentence about immutability, and the one about matching purely by digest.</p>
+<blockquote><b><code>_type</code></b> <em>string (TypeURI), required</em> — Identifier for the schema of the Statement. Always <code>https://in-toto.io/Statement/v1</code> for this version of the spec.<br><br>
+<b><code>subject</code></b> <em>array of ResourceDescriptor objects, required</em> — Set of software artifacts that the attestation applies to. Each element represents a single software artifact. Each element MUST have <code>digest</code> set.<br>
+Subjects are assumed to be <em>immutable</em>, i.e. the artifacts identified by the subject SHOULD NOT change.<br>
+[…] IMPORTANT: Subject artifacts are matched purely by digest, regardless of content type.<br><br>
+<b><code>predicateType</code></b> <em>string (TypeURI), required</em> — URI identifying the type of the Predicate.</blockquote>
+<cite>in-toto Attestation Framework, <em>Statement</em> — <a href="https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md">spec/v1/statement.md</a>. Note that cosign v3.1.2 still emits <code>_type: https://in-toto.io/Statement/v0.1</code>, the previous version, as the lab shows.</cite>
+</div>
+<p>"Matched purely by digest" is the sentence that connects this checkpoint to <a href="#cp-i11-13">I11.13</a>: an attestation is bound to bytes, and a tag that moves leaves it attached to bytes nobody is running.</p>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Write a predicate. In a real pipeline the builder generates this — BuildKit will emit one for you with <code>--attest type=provenance</code> — but writing it by hand is the fastest way to see that it is only JSON.
@@ -1401,6 +1444,22 @@ https://sigstore.dev/cosign/sign/v1,https://slsa.dev/provenance/v1</pre>
 <p>An SBOM is a list of the components in an artifact, with versions and enough identity to match against a vulnerability database. Generating one from an image is not guesswork: the tool unpacks the layers and reads the package managers' own databases — <code>/lib/apk/db/installed</code> for Alpine, <code>/var/lib/dpkg/status</code> for Debian, plus language-level manifests like <code>*.dist-info</code> for Python and <code>go.mod</code> data embedded in Go binaries. Each finding records <em>which cataloger</em> found it and <em>at which path</em>, so a surprising entry can always be traced back.</p>
 <p>The identity that makes the whole thing work is the <strong>purl</strong> (package URL): <code>pkg:apk/alpine/zlib@1.3.2-r0?arch=x86_64&amp;distro=alpine-3.21.7</code>. It encodes ecosystem, namespace, name, version and qualifiers in one string, so matching against an advisory does not depend on string-comparing human-written package names.</p>
 <p>Three formats are in circulation and you will meet all of them. <strong>SPDX</strong> is the ISO-standardised one, licensing-oriented in origin. <strong>CycloneDX</strong> comes from OWASP and is security-oriented. <strong>syft-json</strong> is the tool's native format and is the most detailed. They describe the same image and — as the lab shows — report different <em>counts</em>, which is the first thing to understand before anyone builds a metric on top of one.</p>
+
+<div class="specref">
+<p>No OCI document defines an SBOM. The load-bearing specification here is the package-URL format, because a purl is what makes an inventory joinable to an advisory database — the same string in your SBOM and in somebody else's vulnerability feed.</p>
+<blockquote>A purl is a URL composed of seven components:<br>
+<code>scheme:type/namespace/name@version?qualifiers#subpath</code><br>
+Components are separated by a specific character for unambiguous parsing.<br><br>
+ · <b>scheme</b> — Required — The URL scheme with the constant value of "pkg".<br>
+ · <b>type</b> — Required — The package "type" or package "protocol" such as maven, npm, nuget, gem, pypi, etc.<br>
+ · <b>namespace</b> — Optional — A name prefix such as a Maven groupid, a Docker image owner, a GitHub user or organization. Namespace is type-specific.<br>
+ · <b>name</b> — Required — The name of the package.<br>
+ · <b>version</b> — Optional — The version of the package.<br>
+ · <b>qualifiers</b> — Optional — Qualifier data for a package such as OS, architecture, repository, etc.<br>
+ · <b>subpath</b> — Optional — Subpath within a package, relative to the package root.</blockquote>
+<cite>Package-URL Specification (ECMA-427), <em>Specification</em> § Table 1 — <a href="https://github.com/package-url/purl-spec">package-url/purl-spec</a></cite>
+</div>
+<p>Map that onto the entry the lab produces — <code>pkg:apk/alpine/alpine-baselayout@3.6.8-r1?arch=x86_64&amp;distro=alpine-3.21.7</code> — and every component is accounted for. The <code>distro</code> qualifier is what lets a matcher distinguish "Alpine's build of zlib" from "Debian's build of zlib", which is the difference the two scanners argue about in the next checkpoint.</p>
 
 <h5>Lab</h5>
 <ol class="lab">
@@ -1528,6 +1587,13 @@ Verification for 127.0.0.1:5000/i11/app:v1 --
 </ul>
 <p>Which leaves one thing a scan measures reliably: <strong>how much software is in the image</strong>. That is a decision you control completely, and it is where the leverage is.</p>
 
+<div class="specref">
+<p>Nothing standardises what a scanner must report, which is why two of them disagree below. The nearest authority is CVSS, and its own introduction is careful about what a score is for — the Base score describes the vulnerability, and everything about <em>your</em> exposure is explicitly out of scope.</p>
+<blockquote>Consumers may use CVSS information as input to an organizational vulnerability management process that also considers factors that are not part of CVSS in order to rank the threats to their technology infrastructure and make informed remediation decisions. Such factors may include: number of customers on a product line, monetary losses due to a breach, life or property threatened, or public sentiment on highly publicized vulnerabilities. <b>These are outside the scope of CVSS.</b></blockquote>
+<cite>FIRST, <em>Common Vulnerability Scoring System v3.1: Specification Document</em>, § 1 Introduction — <a href="https://www.first.org/cvss/v3.1/specification-document">first.org/cvss/v3.1</a></cite>
+</div>
+<p>So a policy of "fail the build on any CRITICAL" is a policy about a number computed by somebody who knew nothing about your deployment — and, as the lab shows, computed differently by different tools from the same input.</p>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Scan the five images from I11.11 and put the numbers next to the package counts.
@@ -1642,6 +1708,13 @@ jq '[.Results[]?.Vulnerabilities[]?] | length' app.triv.json</pre>
 <p>Nothing in the specification prevents re-pushing a tag; it is an ordinary <code>PUT</code>, and the registry answers <code>201 Created</code> with a new <code>Docker-Content-Digest</code>. Some registries offer immutability as a policy feature, but it is a policy, not a property of the format, and it is off by default in the reference implementation.</p>
 <p>So a digest-pinned reference gives you three things a tag cannot: the bytes cannot change under you, a mirror or proxy cannot substitute different content, and any signature, attestation, SBOM or scan result about that digest stays about the thing you are running. That last one is the point — the supply-chain machinery is only load-bearing at the digest level, and a tag re-push silently unhooks all of it.</p>
 
+<div class="specref">
+<p>The spec defines both reference forms in a single sentence. What is more interesting is what it does <em>not</em> say: there is no statement anywhere in the document about whether a tag may be repointed at different content.</p>
+<blockquote><code>&lt;reference&gt;</code> MUST be either (a) the digest of the manifest or (b) a tag.</blockquote>
+<cite>OCI Distribution Specification v1.1.1, <em>Pulling manifests</em> — <a href="https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pulling-manifests">spec.md</a></cite>
+</div>
+<p>Grep the whole specification for "immutable" or "overwrite" in connection with tags and you get nothing. Tag immutability is therefore not a property of the format and not a guarantee any conformant registry owes you — it is an optional feature some registries offer, and the reference implementation leaves it off. That silence is what makes the lab below possible.</p>
+
 <h5>Lab</h5>
 <ol class="lab">
 <li>Push an image and record what the tag currently means.
@@ -1752,27 +1825,344 @@ error during command execution: no signatures found</pre>
 </article>
 </div><!-- /g-supply-chain -->
 
+<!-- ---------------- Project &amp; drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson project" id="cp-i11-14" data-id="i11-14">
+<div class="lesson-head"><span class="cp-id">I11.14</span><h4>Mini project — run-verified.sh, and proving every control by breaking it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Thirteen checkpoints, thirteen controls, each demonstrated on its own. This one puts them in a single script that refuses to run an image whose signature does not verify and otherwise runs it locked down — and then, critically, attempts exactly the thing each control forbids and records the error. Those five error strings are the deliverable. They are what you will recognise in a bug report six months from now, when somebody says "the container just says permission denied".</p>
+
+<h5>The concept</h5>
+<p>Three design decisions in the script are worth stating before the code, because each is a place where a naive version is wrong:</p>
+<ul>
+<li><strong>Verify before unpacking.</strong> An unverified image is untrusted data. Unpacking it — even into a scratch directory — runs <code>tar</code> over attacker-controlled bytes before anything has vouched for them. Resolve, verify, <em>then</em> fetch layers.</li>
+<li><strong>Resolve the tag once, then never mention it again.</strong> Everything downstream uses the digest. This is <a href="#cp-i11-13">I11.13</a> made into control flow: the thing verified and the thing run cannot be different if only one reference exists.</li>
+<li><strong>Make each control's failure distinguishable.</strong> If every blocked action returns <code>EPERM</code>, the proof proves nothing — you cannot tell which control fired. Setting the seccomp profile's <code>defaultErrnoRet</code> to <code>ENOSYS</code> gives seccomp its own errno, and leaving <code>chown</code> <em>in</em> the allow-list forces the capability check to be the thing that blocks it.</li>
+</ul>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the image the project is about: distroless in the literal sense — no distribution, no shell, no package manager. Two statically-linked binaries and a <code>/tmp</code>.
+<pre class="cmd">gcc -static -O2 -o probe ~/probe.c     # attempts each forbidden thing, reports errno
+gcc -static -O2 -o suid  ~/suid.c      # installed setuid-root; prints what it got
+mkdir -p img/root/tmp
+cp probe img/root/probe; cp suid img/root/suid
+sudo sh -c 'chown root:root img/root/probe img/root/suid img/root/tmp
+            chmod 0755 img/root/probe; chmod 4755 img/root/suid; chmod 1777 img/root/tmp'
+( cd img/root &amp;&amp; sudo tar --numeric-owner --sort=name --mtime='@0' -cf ../layer.tar . )
+gzip -n -9 -c img/layer.tar &gt; img/layer.tar.gz     # -n and mtime=0: reproducible, per I6.11</pre>
+<pre class="out">layer:  681700 bytes gz  (1587200 uncompressed)
+files:  <b>4</b></pre>
+<p>Four entries in the whole image. Compare with I11.11's table: <code>python:3.13</code> has 479 <em>packages</em>. Write the config and manifest by hand — the shapes are I4's — and push with three <code>curl</code> calls, then sign <strong>by digest</strong>.</p>
+<pre class="out">Docker-Content-Digest: sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+size on the wire: 681700 bytes
+Signing artifact...
+Pushing signature to: 127.0.0.1:5000/i11/hardened</pre></li>
+
+<li>Write the seccomp allow-list, and note the two deliberate choices in it.
+<pre class="cmd">printf '{ "defaultAction": "SCMP_ACT_ERRNO", "defaultErrnoRet": 38,
+  "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [ { "names": [%s], "action": "SCMP_ACT_ALLOW" } ] }\n' "$NAMES" &gt; allow.json
+jq -r '"allowed: \([.syscalls[].names[]]|length) names; default \(.defaultAction) errno \(.defaultErrnoRet)"' allow.json</pre>
+<pre class="out">allowed: <b>78</b> names; default SCMP_ACT_ERRNO errno <b>38</b>   (ENOSYS)</pre>
+<p>78 = I11.3's working 74, plus <code>chown</code>, <code>fchownat</code>, <code>fork</code> and <code>vfork</code>. <code>mkdir</code> and <code>mkdirat</code> are deliberately <em>absent</em>, so seccomp is what blocks <code>mkdir</code>; <code>chown</code> is deliberately <em>present</em>, so the capability set is what blocks <code>chown</code>. Two failures, two mechanisms, two errnos.</p></li>
+
+<li>The script. Verification gates everything; the hardening is one <code>jq</code> filter.
+<pre class="cmd">#!/bin/bash
+set -euo pipefail
+REF=${1:?usage: run-verified.sh [--unsafe] &lt;image-ref&gt; [command...]}; shift || true
+
+# 1. resolve the tag to a digest, and never mention the tag again  (I11.13)
+REPO=${REF%@*}; REPO=${REPO%:*}
+DIGEST=$(skopeo inspect --tls-verify=false "docker://$REF" | jq -r .Digest)
+PINNED="$REPO@$DIGEST"
+
+# 2. verify, and stop here if it does not                          (I11.9)
+if ! cosign verify --key "$KEY" --allow-http-registry --insecure-ignore-tlog=true \
+        "$PINNED" &gt;/dev/null 2&gt;verify.err; then
+  die "REFUSING TO RUN — signature did not verify for $PINNED
+       $(grep -m1 -E '^(Error|error)' verify.err)"
+fi
+
+# 3. only now unpack
+skopeo copy --src-tls-verify=false "docker://$PINNED" "oci:$WORK/oci:run"
+#   … untar each layer into $WORK/rootfs …
+
+# 4. one filter, every control                             (I11.1/2/3/5)
+jq --slurpfile s "$SECCOMP" --argjson args "$ARGS" --argjson uid "$UID_IN" '
+    .process.args                     = $args
+  | .process.user.uid                 = $uid
+  | .process.user.gid                 = $uid
+  | .process.noNewPrivileges          = true
+  | .process.capabilities.bounding    = []
+  | .process.capabilities.effective   = []
+  | .process.capabilities.permitted   = []
+  | .root.readonly                    = true
+  | .linux.seccomp                    = $s[0]
+  | .mounts += [{"destination":"/tmp","type":"tmpfs","source":"tmpfs",
+                 "options":["nosuid","nodev","mode=1777","size=8m"]}]
+  ' "$WORK/config.json" &gt; c.tmp &amp;&amp; mv c.tmp "$WORK/config.json"
+
+( cd "$WORK" &amp;&amp; sudo runc --root /run/runc-i11 run "rv-$$" )</pre>
+<p>Note <code>.process.capabilities</code> gets all three arrays emptied even though I11.1 showed only <code>bounding</code> matters. That is deliberate: the extra two lines cost nothing and a reader of the config should not have to know the kernel's <code>execve</code> rules to see that the intent is "no capabilities".</p></li>
+
+<li>Run it, and read the five proofs.
+<pre class="cmd">bash run-verified.sh 127.0.0.1:5000/i11/hardened:v1</pre>
+<pre class="out">== resolving 127.0.0.1:5000/i11/hardened:v1
+== pinned to 127.0.0.1:5000/i11/hardened@sha256:5e15d4cb147029164575efee54a03123d169e737cb4472a3e69a5ddfa261d39a
+== verifying signature with /home/ubuntu/i11cs/cosign.pub
+== <b>signature OK</b>
+== running with: caps=[] noNewPrivileges=true uid=1000 readonly=true seccomp=allow.json
+
+identity: <b>uid=1000 euid=1000</b>
+attempts:
+  write a file into /                <b>BLOCKED   errno=30  Read-only file system</b>
+  write a file into /tmp             SUCCEEDED
+  chown /tmp/scratch to 99:99        <b>BLOCKED   errno=1   Operation not permitted</b>
+  mkdir /tmp/d                       <b>BLOCKED   errno=38  Function not implemented</b>
+  exec setuid-root /suid             <b>uid=1000 euid=1000   &lt;-- no escalation</b></pre>
+<p>Five controls, five distinguishable outcomes. Learn this table — it is the point of the whole module:</p>
+<table class="langpair">
+<thead><tr><th>Attempt</th><th>Error</th><th>Which control</th></tr></thead>
+<tbody>
+<tr><td>write into <code>/</code></td><td><code>errno=30</code> <em>Read-only file system</em> (EROFS)</td><td><code>root.readonly</code></td></tr>
+<tr><td>write into <code>/tmp</code></td><td>succeeds</td><td>the <code>tmpfs</code> that makes the above survivable</td></tr>
+<tr><td><code>chown</code></td><td><code>errno=1</code> <em>Operation not permitted</em> (EPERM)</td><td>empty capability bounding set</td></tr>
+<tr><td><code>mkdir</code></td><td><code>errno=38</code> <em>Function not implemented</em> (ENOSYS)</td><td>seccomp allow-list</td></tr>
+<tr><td>exec setuid-root binary</td><td>no error; <code>euid</code> unchanged</td><td><code>noNewPrivileges</code></td></tr>
+</tbody>
+</table></li>
+
+<li>Prove the gate, twice. First an image that is byte-identical and simply not signed:
+<pre class="cmd">bash run-verified.sh 127.0.0.1:5000/i11/unsigned:v1</pre>
+<pre class="out">== pinned to 127.0.0.1:5000/i11/unsigned@sha256:<b>5e15d4cb…</b>   ← the same digest as the signed one
+== verifying signature with /home/ubuntu/i11cs/cosign.pub
+run-verified: <b>REFUSING TO RUN</b> — signature did not verify for 127.0.0.1:5000/i11/unsigned@sha256:5e15d4cb…
+                 Error: <b>no signatures found</b></pre>
+<p>Identical bytes, identical digest, different repository — and no signature attached there, so it is refused. Then the same image with the wrong public key:</p>
+<pre class="cmd">COSIGN_PUB=$HOME/i11cs/wrong.pub bash run-verified.sh 127.0.0.1:5000/i11/hardened:v1</pre>
+<pre class="out">run-verified: REFUSING TO RUN — signature did not verify for …@sha256:5e15d4cb…
+                 Error: no matching attestations: failed to verify signature: could not
+                 verify envelope: <b>accepted signatures do not match threshold, Found: 0, Expected 1</b></pre>
+<p>Two different refusals with two different messages — "there is nothing here" versus "there is something here and it is not yours". In an incident those mean very different things.</p></li>
+
+<li>Finally, the contrast. Same image, same script, controls off.
+<pre class="cmd">bash run-verified.sh --unsafe 127.0.0.1:5000/i11/hardened:v1</pre>
+<pre class="out">== RUNNING WITH NO CONTROLS (--unsafe): default caps, root, writable rootfs, no seccomp
+
+identity: <b>uid=0 euid=0</b>
+attempts:
+  write a file into /                BLOCKED   <b>errno=13  Permission denied</b>
+  write a file into /tmp             SUCCEEDED
+  chown /tmp/scratch to 99:99        BLOCKED   errno=1   Operation not permitted
+  mkdir /tmp/d                       <b>SUCCEEDED</b>
+  exec setuid-root /suid             <b>uid=0 euid=0   &lt;-- ESCALATED</b></pre>
+<p>Three things to read here, and the last is the whole module in one line.</p>
+<p>First, <code>mkdir</code> now succeeds and the setuid binary <strong>escalates to root</strong> — those two controls were doing exactly what they claimed. Second, <code>chown</code> is <em>still</em> blocked, because a default <code>runc spec</code> bundle does not grant <code>CAP_CHOWN</code> either: this container was never as unconfined as "no controls" suggests, which is I11.1's point about defaults.</p>
+<p>Third, and most instructive: the write into <code>/</code> is still blocked, but with <strong><code>errno=13</code> rather than <code>errno=30</code></strong>. Different number, different cause. In the hardened run it was <code>EROFS</code> — the read-only rootfs. Here the rootfs is writable and the failure is <code>EACCES</code>, because the extraction directory is owned by uid 1000 and container root has no <code>CAP_DAC_OVERRIDE</code>. Same attempt, same message from a careless reader's point of view, two entirely different mechanisms — which is precisely why the project records errnos and not prose.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have a script that will not run an unverified image, and a five-row table mapping each control to the exact error it produces. Given any one of those five errors in isolation, you can name the control that produced it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Verify before you unpack, not after.</strong> The order in the script is the security property. A version that fetches layers first has already processed untrusted input.</li>
+<li><strong>Distinguishable errnos are a design choice, not a default.</strong> Left at the default <code>EPERM</code>, seccomp and capability failures are indistinguishable in a log. <code>defaultErrnoRet</code> costs one field.</li>
+<li><strong>Extract with <code>sudo</code>, delete with <code>sudo</code>.</strong> A rootfs unpacked by <code>sudo tar</code> cannot be removed by the next run without it — this failed the first time and produced sixty lines of <code>rm: Permission denied</code> before anything security-related happened.</li>
+<li><strong>Signing a repository, not an image.</strong> <code>i11/unsigned</code> holds byte-identical content at the identical digest and still fails verification, because the signature artifact lives in the repository beside the image. Copying an image between registries does not bring its signature — use <code>cosign copy</code>.</li>
+<li><strong>A hardened container needs its <code>/tmp</code>.</strong> Every one of the five proofs depends on the <code>tmpfs</code> being there; without it the probe cannot even create the file it then fails to <code>chown</code>, and you get one confusing failure instead of four clear ones.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The pod spec that corresponds to this script is short, and worth writing out beside it: <code>securityContext</code> with <code>runAsNonRoot: true</code>, <code>runAsUser: 1000</code>, <code>allowPrivilegeEscalation: false</code>, <code>readOnlyRootFilesystem: true</code>, <code>capabilities.drop: ["ALL"]</code> and <code>seccompProfile.type: RuntimeDefault</code>, plus an <code>emptyDir</code> mounted at <code>/tmp</code> and an image reference pinned by digest. The signature gate is the one part Kubernetes cannot express — it is an admission webhook. That list is also, exactly, the Pod Security Standards <em>Restricted</em> profile, which the advanced track has no lesson on; the nearest live material is <a href="w1.html#cp-1-2">W1.2</a>, where you look at what the control-plane pods on a node actually run as, and can now read their <code>securityContext</code> with some idea of which fields matter.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the Kubernetes <em>Pod Security Standards</em> page for the Restricted profile's field list; <code>cosign copy --help</code> for moving signatures with images; and the four checkpoints this script assembles — <a href="#cp-i11-1">I11.1</a>, <a href="#cp-i11-2">I11.2</a>, <a href="#cp-i11-3">I11.3</a> and <a href="#cp-i11-5">I11.5</a>.</p>
+</article>
+<article class="lesson drill" id="cp-i11-15" data-id="i11-15">
+<div class="lesson-head"><span class="cp-id">I11.15</span><h4>Debugging drill — the container that dies before it starts, and the signature about other bytes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Both faults below are ones you will meet the week after somebody turns on hardening, and both produce an error message that names the wrong thing. The first fails inside the runtime, before your program's first instruction, with a message about file descriptors. The second fails a signature check on an image that is signed, with a key that is right. Neither is guessable; both are readable, from evidence this module has already taught you to collect.</p>
+
+<h5>Fault 1 — the container dies before its first instruction</h5>
+<ol class="lab">
+<li>The setup: a workload has been given a seccomp allow-list, hand-written from the syscalls the application was observed to make. It ran fine under <code>strace</code> during development.
+<pre class="cmd">runsec F allow-29.json '["/bin/sh","-c","echo hello from inside"]'</pre>
+<pre class="out">reopen exec fifo: duplicate handle fd: <b>fcntl(F_DUPFD_CLOEXEC): operation not permitted</b>
+level=error msg="runc run failed: <b>container process is already dead</b>"</pre>
+<p>Nothing here says "seccomp". "Operation not permitted" is the errno a capability check produces, so the first instinct is to go and look at the capability set — which is fine, and wrong.</p></li>
+
+<li>Rule that out, because it is cheap. The capabilities are whatever they were, and the container ran before the profile was attached.
+<pre class="cmd">jq -c '.process.capabilities.bounding' config.json
+jq 'del(.linux.seccomp)' config.json &gt; c.tmp &amp;&amp; mv c.tmp config.json
+sudo runc --root /run/runc-i11 run i11probe</pre>
+<pre class="out">["CAP_AUDIT_WRITE","CAP_KILL","CAP_NET_BIND_SERVICE"]
+<b>hello from inside</b></pre>
+<p>So it is the profile. That still leaves "which syscall", and an allow-list has no list of what it denied.</p></li>
+
+<li>Collect the evidence. The technique is to change the profile's <em>action</em>, not its contents: an <code>SCMP_ACT_ERRNO</code> default makes the kernel lie quietly to whoever asked, while a killing default makes it write an audit record naming the process and the syscall number.
+<pre class="cmd">sudo dmesg -C
+jq '.defaultAction = "SCMP_ACT_KILL_PROCESS"' allow-29.json &gt; allow-29-kill.json
+runsec G allow-29-kill.json '["/bin/sh","-c","echo hello from inside"]'
+sudo dmesg | tail -1</pre>
+<pre class="out">level=error msg="runc run failed: container process is already dead"
+
+audit: type=1326 audit(1785487928.040:123): auid=1000 uid=0 gid=0 ses=50 pid=8326
+  <b>comm="runc:[2:INIT]"</b> exe="/runc" <b>sig=31</b> arch=c000003e <b>syscall=72</b> compat=0
+  ip=0x7a18954fabee code=0x80000000</pre>
+<details class="reveal"><summary>Diagnosis</summary>
+<p>Two facts in that one line settle it. <code>comm="runc:[2:INIT]"</code> says the process that was killed is <strong>the runtime's own init process</strong>, not the workload — so the profile is being applied before the workload exists, and the syscalls that matter are the ones <code>runc</code> makes while finishing the container setup, not the ones the application makes. <code>syscall=72</code> on x86-64 is <code>fcntl</code>, which matches the original error text exactly once you know where to look.</p>
+<p>The general shape: <strong>a seccomp allow-list must cover the runtime's setup, not just your program.</strong> Observing an application under <code>strace</code> and allow-listing what you see produces a profile that cannot start a container, and the failure is attributed to the profile only if you already know that the filter is installed by <code>runc init</code> before <code>execve</code>.</p>
+</details></li>
+
+<li>Confirm the diagnosis by fixing exactly the named syscall — and watch it fail again, one syscall further along.
+<pre class="cmd">jq '.syscalls[0].names += ["fcntl"]' allow-29.json &gt; allow-30.json
+runsec H allow-30.json '["/bin/sh","-c","echo hello from inside"]'</pre>
+<pre class="out">thread '&lt;unnamed&gt;' panicked at src/procfs.rs:200:14:
+<b>at least one candidate /proc/thread-self path should work</b>
+level=error msg="runc run failed: container process is already dead"</pre>
+<p>A Rust panic from <code>libpathrs</code>, the library runc uses for safe path resolution — it is missing <code>openat2</code> and <code>statfs</code>. This is the second half of the lesson: fixing the named syscall is not the fix, it is one step of a walk. Repeat the <code>KILL_PROCESS</code> technique after each round.</p></li>
+
+<li>The repair, and the number that makes the point.
+<pre class="out">29 names  ->  fcntl                                   (fails)
+30 names  ->  openat2, statfs, fstatfs                 (fails)
+71 names  ->  mount, umount2, pivot_root, capset, …    (fails)
+<b>74 names  ->  works</b></pre>
+<p>Four rounds to run <code>echo</code>. The durable repair is not a longer hand-written list — it is to start from the runtime's default profile and <em>subtract</em>, which is why every shipped profile is that shape.</p></li>
+</ol>
+
+<h5>Fault 2 — the image is fine, the signature is fine, and verification fails</h5>
+<ol class="lab">
+<li>The setup: a release was signed at build time, carefully, by digest. A deployment now refuses to start it.
+<pre class="cmd">cosign verify --key cosign.pub --allow-http-registry --insecure-ignore-tlog=true $R/i11/mutable:v1</pre>
+<pre class="out">Error: <b>no signatures found</b>
+error during command execution: no signatures found</pre>
+<p>Read what that sentence suggests: signing never ran, or ran against a different repository, or the signature was garbage-collected. All three are worth ten minutes each, and all three are wrong.</p></li>
+
+<li>Ask the obvious follow-up tool, and get the message confirmed — wrongly.
+<pre class="cmd">cosign tree --allow-http-registry $R/i11/mutable:v1</pre>
+<pre class="out">📦 Supply Chain Security Related artifacts for an image: 127.0.0.1:5000/i11/mutable:v1
+<b>No Supply Chain Security Related Artifacts found</b> for image 127.0.0.1:5000/i11/mutable:v1,
+ start creating one with simply running$ cosign sign &lt;img&gt;</pre>
+<p>Two tools now agree there is nothing here, and both are resolving the same tag before they look. This is the moment the investigation goes wrong if you stop.</p></li>
+
+<li>Go one level below the tools. The registry's own tag list is not filtered through any resolution.
+<pre class="cmd">curl -s http://$R/v2/i11/mutable/tags/list | jq -c .tags</pre>
+<pre class="out">["<b>sha256-f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>","v1"]</pre>
+<p>There <em>is</em> a signature artifact, sitting under the referrers fallback tag from <a href="#cp-i11-9">I11.9</a> — and that tag name <strong>is a digest</strong>. Compare it with the digest <code>:v1</code> resolves to now.</p></li>
+
+<li>The one command that names the fault.
+<pre class="cmd">skopeo inspect --tls-verify=false docker://$R/i11/mutable:v1 | jq -r .Digest</pre>
+<pre class="out">sha256:<b>67cba4faf3b5730d90988d09ec638c7c36defd859dec41960790927a13317575</b>
+
+signature artifact is attached to: sha256:<b>f27cad91…</b>
+the tag resolves to:               sha256:<b>67cba4fa…</b></pre>
+<details class="reveal"><summary>Diagnosis</summary>
+<p>The tag was re-pushed. Signature verification by tag resolves the tag first and then looks for a signature attached to <em>that</em> digest, finds none, and reports the literal truth: no signatures found for what you asked about. Nothing is broken — the signing worked, the key is right, and the signature is still in the registry attached to the digest it was always about. It is the <em>tag</em> that stopped pointing at the signed bytes.</p>
+<p>Verify by digest and it passes:</p>
+<pre class="out">cosign verify … i11/mutable@sha256:f27cad91…
+  Verification for 127.0.0.1:5000/i11/mutable@sha256:f27cad91… --
+    - <b>The signatures were verified against the specified public key</b></pre>
+<p>Which also tells you what else is now wrong, without further investigation: the attestation, the SBOM and the last clean scan are all attached to <code>f27cad91…</code> too, and every node that has not re-pulled is still running it.</p>
+</details></li>
+
+<li>The repair is not "re-sign the new digest". Decide first which bytes were supposed to be there.
+<table class="langpair">
+<thead><tr><th>If the re-push was…</th><th>then…</th></tr></thead>
+<tbody>
+<tr><td>intentional (a rebuild published to the same tag)</td><td>sign the new digest, regenerate the SBOM and scan, and fix the process — a tag that moves is a release you cannot audit</td></tr>
+<tr><td>unintentional (a pipeline pushed a stale build, a mirror sync)</td><td>re-push the correct manifest, and confirm the digest matches the signature again</td></tr>
+<tr><td>unexplained</td><td>treat it as an incident: someone with push access replaced a released artifact, and the registry's audit log is now the only record of who</td></tr>
+</tbody>
+</table>
+<p>And the durable repair, in all three rows: deploy by digest, and have the verifying admission webhook rewrite the reference to the digest it verified, so that the thing that was checked and the thing that runs cannot diverge.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a container that dies with an error about file descriptors, your first move is to swap the seccomp <code>defaultAction</code> for a killing one and read <code>dmesg</code>. Given <code>no signatures found</code>, your first move is to compare the digest the tag resolves to against the digest the signature is attached to.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An <code>SCMP_ACT_ERRNO</code> default hides the evidence.</strong> It is the safer production choice and the worse debugging one. Reproducing with <code>SCMP_ACT_KILL_PROCESS</code> is the diagnostic technique; do not ship it.</li>
+<li><strong><code>dmesg -C</code> before, not after.</strong> A busy node's ring buffer will have rotated the record away by the time you look, and <code>type=1326</code> records are easy to miss among everything else. Clear, reproduce, read.</li>
+<li><strong>The seccomp fault moves.</strong> Each fix reveals the next missing syscall. Budget for several rounds, and note that the second one presented as a Rust panic rather than an errno.</li>
+<li><strong>"No signatures found" is not "not signed".</strong> Measured above on an image with a valid signature sitting in the same repository.</li>
+<li><strong>A moved tag breaks four things and reports one.</strong> Signature, attestation, SBOM and scan are all digest-bound; only the signature check is loud about it.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Both faults have direct Kubernetes shapes. The first is a pod stuck in <code>CreateContainerError</code> after somebody set <code>seccompProfile.type: Localhost</code>, where <code>kubectl describe</code> shows the runtime's message and the syscall is only in the node's <code>dmesg</code> — <a href="w6.html#cp-6-2">W6.2</a> is the general ladder down to the node for when <code>kubectl</code> stops explaining things. The second is an admission webhook rejecting a Deployment whose image tag was rebuilt, and it is the reason those webhooks mutate the reference to a digest.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 seccomp</code> for the <code>SECCOMP_RET_*</code> values behind <code>code=0x80000000</code>; <code>man 8 auditctl</code> for <code>type=1326</code> (<code>SECCOMP</code>) records; <code>cosign tree --help</code>; and <a href="i3.html#cp-i3-1">I3.1</a>, where the runtime's second copy of itself was taken apart — the reason the profile applies to <code>runc</code> at all.</p>
+</article>
+</div><!-- /g-project-drill -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
-<li>TODO — 8+ questions, one per hard idea.
-<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+<li>A <code>config.json</code> lists <code>CAP_CHOWN</code> in <code>bounding</code>, <code>permitted</code> and <code>effective</code>, and sets <code>process.user.uid</code> to 1000. Does the container get <code>CAP_CHOWN</code>?
+<details class="reveal"><summary>Answer</summary><p>No. Measured: <code>CapPrm</code> and <code>CapEff</code> both came out zero. On <code>execve</code> as a non-root uid the kernel recomputes permitted from the file's capabilities and the ambient set, and container images have neither — so the arrays are discarded. Only <code>bounding</code> survives, as a ceiling. Granting it needs <code>ambient</code>, which in turn requires the capability to be in <code>inheritable</code> and <code>permitted</code> too; ambient alone makes runc warn <em>"can't raise ambient capability"</em>. This is exactly a pod with <code>runAsNonRoot: true</code> and <code>capabilities.add</code>.</p></details></li>
+
+<li>The same capability is listed in <code>bounding</code> and <code>permitted</code> but deliberately left out of <code>effective</code>, and the container runs as root. Is it effective?
+<details class="reveal"><summary>Answer</summary><p>Yes — <code>CapEff</code> came back <code>0x…421</code> and the <code>chown</code> succeeded. For a uid-0 <code>execve</code> the kernel sets effective′ = permitted′, so the <code>effective</code> array is overwritten before the first instruction. For a root container it is documentation, not configuration.</p></details></li>
+
+<li>A seccomp profile blocks <code>chmod</code>, <code>fchmodat</code> and <code>fchmodat2</code> in one <code>syscalls[]</code> entry with <code>args: [{index: 2, …}]</code>. What is wrong with it?
+<details class="reveal"><summary>Answer</summary><p>The argument positions differ. <code>chmod(path, mode)</code> has the mode at index 1; <code>fchmodat(dirfd, path, mode, flags)</code> has it at index 2. One <code>args</code> block applies to every name in its entry, so the rule silently never fires for <code>chmod</code> — which is what musl calls. Group syscalls by argument layout, not by what they are named.</p></details></li>
+
+<li>A container dies with <code>fcntl(F_DUPFD_CLOEXEC): operation not permitted</code> and <code>container process is already dead</code>, before running anything. What is the fastest way to find out which syscall a seccomp allow-list is missing?
+<details class="reveal"><summary>Answer</summary><p>Change <code>defaultAction</code> from <code>SCMP_ACT_ERRNO</code> to <code>SCMP_ACT_KILL_PROCESS</code>, clear <code>dmesg</code>, reproduce, and read the <code>type=1326</code> audit record. It names the process (<code>comm="runc:[2:INIT]"</code> — the runtime's own init, not your workload) and the syscall number (<code>syscall=72</code>, <code>fcntl</code>). Expect several rounds: 29 → 30 → 71 → 74 names before <code>echo</code> ran.</p></details></li>
+
+<li>An AppArmor profile denies writes to a path. The write is blocked and the audit log is empty. Is the profile working?
+<details class="reveal"><summary>Answer</summary><p>Yes. A bare <code>deny</code> rule suppresses the audit message as well as the access. Write it as <code>audit deny</code> and the <code>apparmor="DENIED"</code> record appears. Measured with two otherwise identical profiles — so "check the audit log to confirm" is only advice for the second form.</p></details></li>
+
+<li>A pod sets <code>readOnlyRootFilesystem: true</code> and mounts a writable <code>hostPath</code>. What can a compromised process still write?
+<details class="reveal"><summary>Answer</summary><p>Everything under the <code>hostPath</code>, straight through to the host filesystem — measured. <code>root.readonly</code> covers the rootfs only; every entry in <code>mounts</code> keeps the options it was given. Also still writable: <code>/dev</code> and <code>/dev/shm</code>, which the runtime creates as separate <code>tmpfs</code> mounts.</p></details></li>
+
+<li>Why does <code>runc spec --rootless</code> map exactly one id rather than your whole <code>/etc/subuid</code> range?
+<details class="reveal"><summary>Answer</summary><p>Because installing a wider mapping means chowning into the subuid range, and an unprivileged user cannot do that — <code>chown 100000:100000</code> is <code>EPERM</code>, and runc fails with <code>fchown fd 7: operation not permitted</code>. A subuid-backed container needs a helper that creates the user namespace with the setuid <code>newuidmap</code> first, then runs runc inside it. That is <code>rootlesskit</code>'s entire job, and it is why the rootless containerd stack's <code>uid_map</code> has two lines.</p></details></li>
+
+<li>A rootless container and a root container both bind-mount <code>/</code> and read <code>/etc/shadow</code>. What happens?
+<details class="reveal"><summary>Answer</summary><p>The root one prints <code>root:*:20639:0:99999:7:::</code>. The rootless one gets <code>Permission denied</code>, because its uid 0 is host uid 1000. That single pair is the argument for the user namespace, and it is why mounting the container socket into a pod is equivalent to granting node root.</p></details></li>
+
+<li>You sign an image by digest, carefully. A deployment that references it by tag now reports <code>no signatures found</code>. What happened, and what else broke?
+<details class="reveal"><summary>Answer</summary><p>The tag was re-pushed and now resolves to a different digest. Verification by tag resolves first, then looks for a signature attached to <em>that</em> digest — and reports the literal truth. The attestation, the SBOM and the last clean scan are all bound to the old digest too, and nodes that have not re-pulled are still running it. <code>cosign tree</code> does not help: it resolves the tag as well and reports "No Supply Chain Security Related Artifacts found". The tag list does — the referrers fallback tag <em>is</em> the old digest.</p></details></li>
+
+<li>One image, scanned by two tools, gives the same total of 13 findings. Why might one fail a "no criticals" gate and the other pass it?
+<details class="reveal"><summary>Answer</summary><p>Because they source severity differently. The same three CVEs in the same <code>libc6@2.36-9+deb12u14</code> were Critical/High/High under grype (NVD's CVSS) and MEDIUM/MEDIUM/MEDIUM under trivy (Debian's own assessment of those bugs in Debian's build). Neither is wrong. A threshold policy inherits whichever opinion the tool bought.</p></details></li>
+
+<li>A scanner reports a CRITICAL in your image. How do you decide whether the vulnerable code is reachable?
+<details class="reveal"><summary>Answer</summary><p>Read the SBOM's <code>locations</code> for that package and see what they point at. For <code>python:3.13</code>'s first critical the four locations were all dpkg bookkeeping — the status file, a copyright file, <code>.md5sums</code>, <code>.list</code> — and the package name ended in <code>-dev</code>. <code>ldd</code> on the interpreter linked four libraries, none of them the vulnerable one. The finding is true and the code is on no executed path; the fix is deleting the package, which is the same conclusion the package-count arithmetic already gave.</p></details></li>
+
+<li>Five controls, five outcomes. Match each to what produced it: <code>errno=30</code>, <code>errno=1</code>, <code>errno=38</code>, an unchanged <code>euid</code>, and a write that succeeded.
+<details class="reveal"><summary>Answer</summary><p><code>errno=30</code> (EROFS) writing to <code>/</code> — <code>root.readonly</code>. <code>errno=1</code> (EPERM) on <code>chown</code> — the empty capability bounding set. <code>errno=38</code> (ENOSYS) on <code>mkdir</code> — the seccomp allow-list, given its own errno by <code>defaultErrnoRet</code>. Unchanged <code>euid</code> after exec'ing a setuid-root binary — <code>noNewPrivileges</code>. The write that succeeded is <code>/tmp</code>, the <code>tmpfs</code> that makes a read-only rootfs survivable. With the controls off, the same write to <code>/</code> failed with <code>errno=13</code> instead — a different mechanism entirely (no <code>CAP_DAC_OVERRIDE</code> on a uid-1000 directory), which is why the project records errnos rather than prose.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>TODO one line per objective, in the past tense of capability.</li>
+<li>You can read a <code>config.json</code>'s security fields and say which of them the kernel will actually honour, given the uid beside them.</li>
+<li>You can write a seccomp profile in its real JSON form, choose its action deliberately, and diagnose one that blocks a syscall the runtime itself needs.</li>
+<li>You can attach a mandatory-access-control policy with one field, and explain why a working denial may leave no trace in the audit log.</li>
+<li>You can classify a workload that breaks on a read-only rootfs into "needs a <code>tmpfs</code>", "needs a volume", or "needs rebuilding", by reading where its failed writes point.</li>
+<li>You can run a container and then a whole containerd stack as an unprivileged user, and list what that buys and what it costs.</li>
+<li>You can fill in a control-versus-attack table and defend the empty cells.</li>
+<li>You can sign an image, attach an attestation and an SBOM, find all three in the registry with <code>curl</code>, and say why a digest is the only reference any of it is bound to.</li>
+<li>You have a script that refuses to run what does not verify, and a five-row table mapping each control to the exact error it produces.</li>
 </ul>
 </div>
 
-<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+<div class="godeep"><a href="b12.html#cp-b12-1">Go deeper: B12 built threat models, signatures, PKI, seccomp and AppArmor from nothing →</a></div>
 
-<nav class="pager"><a href="i10.html">← I10</a><a href="../intermediate.html#i12">I12 · TODO →</a></nav>
+<nav class="pager"><a href="i10.html">← I10</a><a href="../intermediate.html#i12">I12 · Observability of a running runtime →</a></nav>
 
 <footer>
-TODO authored-against line: distro, kernel, tool versions, verification date,
-and every version-sensitive finding the live run produced.
+Authored against Ubuntu 24.04 LTS on kernel <code>6.8.0</code>, runc <code>1.5.1</code>, containerd <code>2.3.3</code>, nerdctl <code>2.3.5</code>, cosign <code>v3.1.2</code>, syft <code>v1.50.0</code>, trivy <code>v0.72.0</code>, grype <code>v0.116.1</code>, rootlesskit <code>v3.0.2</code>, slirp4netns <code>1.2.1</code>, OCI runtime-spec <code>v1.3.0</code> and distribution-spec <code>v1.1.1</code>, in-toto Statement v1, verified 2026-07-31.
+Version-sensitive findings from that run: <code>runc spec</code> emits <b>three</b> capability sets and three capabilities, with <code>noNewPrivileges</code> and <code>root.readonly</code> already <b>true</b>; the <code>effective</code> array is a no-op for a root container and <code>permitted</code> a no-op for a non-root one; seccomp <code>architectures</code> <b>adds</b> rather than selects; AppArmor <code>deny</code> is silent without the <code>audit</code> keyword; cgroup delegation to <code>user@1000.service</code> now covers <code>cpuset cpu io memory hugetlb pids rdma misc</code>; cosign v3 refuses <code>--tlog-upload=false</code>, stores signatures as OCI <b>referrers</b> rather than <code>.sig</code> tags, and <code>cosign triangulate</code> is deprecated and now reports a path that 404s. Kubernetes user namespaces (<code>hostUsers: false</code>) are enabled by default from v1.33 but reached GA only in <b>v1.36</b>; AppArmor's <code>securityContext.appArmorProfile</code> field is GA from v1.31. Re-check all of these before reusing them.
 </footer>
 </main>
 </div>
