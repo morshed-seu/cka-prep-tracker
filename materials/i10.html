@@ -442,6 +442,195 @@ data that outlives containers
 
 <p class="docs-links"><b>Docs:</b> the OCI runtime spec's <em>Mounts</em> section and <code>man 2 mount</code>; in the Kubernetes docs, <em>volumes</em> and <em>volumeMounts</em> under the pod spec reference.</p>
 </article>
+
+<article class="lesson" id="cp-i10-5" data-id="i10-5">
+<div class="lesson-head"><span class="cp-id">I10.5</span><h4>Three things you can mount, told apart by how they fail</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A bind, a <code>tmpfs</code> and a real filesystem on a block device all arrive as a directory inside the container and look identical to the application. They are not remotely identical, and the cleanest way to tell them apart is to fill each one until something breaks. One of them gets your container OOM-killed with a message about memory and no mention of storage anywhere.</p>
+
+<h5>The concept</h5>
+<p><strong>A bind</strong> is part of the host's filesystem, so it has no size of its own. <code>df</code> inside the container reports the host's free space, and nothing enforces a limit — which is why size limits on ordinary bind mounts are so awkward, and why the mini project in <a href="#cp-i10-11">I10.11</a> reaches for a loop image to get one.</p>
+<p><strong>A <code>tmpfs</code></strong> is memory pretending to be a filesystem. The pages are page cache, and — this is the part that catches people — they are charged to the <em>cgroup of the process that wrote them</em>. So filling a <code>tmpfs</code> mounted into a container consumes that container's memory limit. Fill it past the limit and the kernel's OOM killer ends the process, reporting a memory problem, because from the kernel's point of view it is one. B7's OOM lesson (<a href="b7.html#cp-b7-9">B7.9</a>) arriving from an unexpected direction.</p>
+<p><strong>A real filesystem on a block device</strong> is the only one of the three with genuine quota semantics: its own superblock, its own free-space accounting, its own <code>ENOSPC</code>. Fill it and the write fails, the process handles it or does not, and nothing gets killed.</p>
+<div class="flow"><span>bind</span><em>fills the node</em><span>tmpfs</span><em>OOM-kills the container</em><span>block device</span><em>ENOSPC, container lives</em></div>
+
+<div class="specref">
+<p>The spec allows all three through the same field — the difference is entirely in <code>type</code> and <code>options</code>, which it hands to <code>mount(2)</code> without interpretation.</p>
+<blockquote>* **`type`** (string, OPTIONAL) The type of the filesystem to be mounted.<br>
+    * Linux: filesystem types supported by the kernel as listed in /proc/filesystems (e.g., "minix", "ext2", "ext3", "jfs", "xfs", "reiserfs", "msdos", "proc", "nfs", "iso9660"). For bind mounts (when `options` include either `bind` or `rbind`), the type is a dummy, often "none" (not listed in /proc/filesystems).</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#mounts">config.md § Mounts</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Establish whether this machine has swap, because swap decides whether a <code>tmpfs</code> can escape a memory limit by being paged out. There is none here, so the experiment is clean.
+<pre class="cmd">swapon --show || echo "  (no swap)"
+free -m | head -2</pre>
+<pre class="out">  (no swap)
+               total        used        free      shared  buff/cache   available
+Mem:            3910         471        3079           4         596        3438</pre></li>
+
+<li>The bind case: a container writing into a host directory sees the host's filesystem, with the host's free space and no limit at all.
+<pre class="out">/dev/sda1                18.3G      6.9G     11.4G  38% /data</pre></li>
+
+<li>Now a <code>tmpfs</code>, with a 128 MiB memory limit and swap disabled the OCI way — setting <code>memory.swap</code> equal to <code>memory.limit</code>, which yields <code>memory.swap.max = 0</code> (the <a href="i2.html#cp-i2-8">I2.8</a> finding). Then write 400 MB into it.
+<pre class="cmd">jq '.process.args=["/bin/sh","-c","df -h /cache | tail -1; dd if=/dev/zero of=/cache/fill bs=1M count=400"]
+    | .mounts += [{"destination":"/cache","type":"tmpfs","source":"tmpfs","options":["nosuid","nodev","mode=1777"]}]
+    | .linux.resources = {"memory":{"limit":134217728,"swap":134217728}}
+    | .linux.cgroupsPath = "/i10tmpfs"' config.json.bak &gt; c.b &amp;&amp; sudo cp c.b config.json
+sudo runc run volbox; echo "runc exit status: $?"</pre>
+<pre class="out">tmpfs                     1.9G         0      1.9G   0% /cache
+<b>Killed</b>
+runc exit status: <b>137</b></pre>
+<p>Note the <code>df</code> line first: the <code>tmpfs</code> advertises 1.9 GB, half of RAM, because no <code>size=</code> option was given. Nothing about that number knows the container has a 128 MiB limit — the filesystem and the cgroup are unrelated mechanisms, and the application sees only the friendly one.</p></li>
+
+<li>Ask the kernel what it did. This is the diagnostic that names the real cause, and it says nothing about storage.
+<pre class="cmd">sudo dmesg | grep -i -E "oom|killed process" | tail -2</pre>
+<pre class="out">oom-kill:constraint=CONSTRAINT_MEMCG,…,<b>oom_memcg=/i10tmpfs</b>,task_memcg=/i10tmpfs,task=<b>dd</b>,pid=6968
+Memory cgroup out of memory: Killed process 6968 (<b>dd</b>) total-vm:2648kB, anon-rss:1024kB, file-rss:896kB</pre>
+<p><code>oom_memcg</code> names the cgroup, and <code>task=dd</code> names the victim. A reader who does not know a <code>tmpfs</code> was involved sees a container killed for using memory it never allocated.</p></li>
+
+<li>The same run, with one difference, and the difference is worth a gotcha of its own. Pipe the write into <code>tail</code> — as a logging entrypoint would — and the exit status changes:
+<pre class="cmd">… "dd if=/dev/zero of=/cache/fill bs=1M count=400 2&gt;&amp;1 | tail -1"   # piped
+… "dd if=/dev/zero of=/cache/fill bs=1M count=400 2&gt;/dev/null"      # not piped</pre>
+<pre class="out">piped:      Killed          runc exit status: <b>0</b>
+not piped:                  runc exit status: <b>137</b></pre>
+<p>The pipeline's exit status is <code>tail</code>'s, and <code>tail</code> succeeded. The container was OOM-killed and reported success. In Kubernetes that is a container that exits 0, is not restarted by <code>restartPolicy: OnFailure</code>, and shows no <code>OOMKilled</code> reason — from a shell pipeline in the entrypoint.</p></li>
+
+<li>Finally the block device: a 32 MiB ext4 image on a loop device, exactly <a href="b5.html#cp-b5-10">B5.10</a>, bind-mounted into the container.
+<pre class="cmd">dd if=/dev/zero of=~/disk32.img bs=1M count=32 status=none
+mkfs.ext4 -q ~/disk32.img
+sudo mount -o loop ~/disk32.img ~/i10-blk
+losetup -a | grep disk32</pre>
+<pre class="out">/dev/loop0: []: (/home/ubuntu/disk32.img)</pre>
+<pre class="cmd">…  # same bundle, /vol bound to ~/i10-blk, same 128 MiB memory limit
+sudo runc run volbox; echo "runc exit status: $?"</pre>
+<pre class="out">/dev/loop0               26.0M     24.0K     23.7M   0% /vol
+25+0 records out
+26542080 bytes (25.3MB) copied, 0.040802 seconds, 620.4MB/s
+runc exit status: <b>0</b>
+/dev/loop0               26.0M     26.0M         0 <b>100%</b> /home/ubuntu/i10-blk</pre>
+<p>The write stopped at the filesystem boundary, the container exited normally, and the node is unaffected. This is the only one of the three where "how big is this volume" is a question with an answer.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a container that died with exit 137 and a <code>dmesg</code> line about a memory cgroup, you can say whether the memory was allocated by the application or written into a <code>tmpfs</code>, and you can name which of the three mount kinds would have produced <code>ENOSPC</code> instead.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A <code>tmpfs</code>'s advertised size is not the limit that will kill you.</strong> Without <code>size=</code>, Linux offers half of RAM — 1.9 GB here — while the cgroup limit was 128 MiB. Both numbers are real; only one is enforced against the container.</li>
+<li><strong>A pipeline hides the kill.</strong> Measured: identical write, exit 0 piped and 137 unpiped. Any entrypoint of the form <code>app | tee</code> reports the wrong outcome for every signal death, not just OOM.</li>
+<li><strong>Root in a container cannot necessarily write to a bind mount.</strong> The first run of this lab returned <em>Permission denied</em> writing to a directory owned by uid 1000, because a stock <code>runc spec</code> grants only <code>CAP_AUDIT_WRITE</code>, <code>CAP_KILL</code> and <code>CAP_NET_BIND_SERVICE</code> — no <code>CAP_DAC_OVERRIDE</code>, so uid 0 does <em>not</em> bypass permission checks. Adding that one capability changed nothing else and made the write succeed. This is <a href="b4.html#cp-b4-10">B4.10</a> arriving as a storage bug, and it is half of the drill in <a href="#cp-i10-12">I10.12</a>.</li>
+<li><strong>Appending to an existing root-owned file still works in that situation</strong>, because the check is on the directory for creation and on the file for writing. A volume that appears writable for one file and not for another is this, not corruption.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>emptyDir: {}</code> is the bind case and lands on the node's disk; <code>emptyDir: {medium: Memory}</code> is the <code>tmpfs</code> case and is charged to the pod's memory limit, which is the trap this lesson exists for — see <a href="w5.html#cp-5-1">W5.1</a>. <code>/dev/shm</code> is the same mechanism again, which is why a container doing large shared-memory work gets OOM-killed rather than told it is out of disk. The block-device case is what a real CSI-provisioned volume gives you, and the reason a PVC has a size that means something.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 5 tmpfs</code>; the kernel's <em>cgroup-v2</em> documentation, <em>Memory Interface Files</em>; and in the Kubernetes docs, <em>emptyDir</em> and the <em>sizeLimit</em> field.</p>
+</article>
+
+<article class="lesson" id="cp-i10-6" data-id="i10-6">
+<div class="lesson-head"><span class="cp-id">I10.6</span><h4>Mount propagation, and why HostToContainer exists</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><a href="b5.html#cp-b5-12">B5.12</a> taught propagation as kernel mechanics. Here is what it is <em>for</em>. A CSI node plugin runs as a pod and mounts a volume into a host path; the workload pod must see that mount appear inside a directory it already has mounted. Under the wrong propagation that is impossible, and the symptom is uniquely maddening: an empty directory where a filesystem plainly is mounted, one namespace over.</p>
+
+<h5>The concept</h5>
+<p>A mount is not a fact about a path, it is a fact about a path <em>in a mount namespace</em>. Propagation settings decide whether a mount event crosses between namespaces, and there are three that matter:</p>
+<ul>
+<li><strong>private</strong> — nothing crosses, in either direction.</li>
+<li><strong>slave</strong> — mounts made on the host appear inside the container; mounts made inside stay inside. One-way, downhill.</li>
+<li><strong>shared</strong> — events cross both ways; a mount made inside the container appears on the host.</li>
+</ul>
+<p>Kubernetes exposes exactly these as <code>mountPropagation: None</code> (rprivate), <code>HostToContainer</code> (rslave) and <code>Bidirectional</code> (rshared). <code>Bidirectional</code> requires a privileged container, for the reason the lab makes visible: a container that can create mounts on the host can mount things the node's administrator did not agree to.</p>
+<p>One subtlety decides whether any of this works: <strong>the host-side path must itself be a shared mount point</strong>. Propagation happens between peers in a peer group, and a plain directory is not in one. This is why a node's kubelet directory is deliberately made shared, and why a CSI driver's manifest asks for <code>Bidirectional</code> on <code>/var/lib/kubelet</code>.</p>
+
+<div class="specref">
+<p>The runtime spec carries propagation twice — per mount, in <code>options</code>, and once for the whole root filesystem. The second one is the field people miss, and the lab shows it deciding the outcome.</p>
+<blockquote>**`rootfsPropagation`** (string, OPTIONAL) sets the rootfs's mount propagation.<br>
+Its value is either `shared`, `slave`, `private` or `unbindable`.<br>
+It's worth noting that a peer group is defined as a group of VFS mounts that propagate events to each other.<br>
+[…]<br>
+* **`private`**: the rootfs mount doesn't receive mount propagation events from the host and further mounts in nested containers will be isolated from the host and from the rootfs (even if the nested container `rootfsPropagation` option is shared).</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#rootfs-mount-propagation">config-linux.md § Rootfs Mount Propagation</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Make the host side a shared mount point. Without this step every result below is "no", for a reason that has nothing to do with the container.
+<pre class="cmd">sudo mount --bind ~/i10-prop ~/i10-prop
+sudo mount --make-rshared ~/i10-prop
+findmnt -no TARGET,PROPAGATION ~/i10-prop
+findmnt -no TARGET,PROPAGATION /</pre>
+<pre class="out">/home/ubuntu/i10-prop <b>shared</b>
+/                     <b>shared</b>      ← systemd sets this up at boot</pre></li>
+
+<li>Run the same container three times, changing only the propagation option on the volume, and test both directions each time. Direction A is the host mounting something under the volume; direction B is the container mounting something inside it.
+<pre class="cmd">jq --arg src "$HOME/i10-prop" --arg prop "$PROP" \
+  '.mounts += [{"destination":"/prop","type":"bind","source":$src,"options":["rbind","rw",$prop]}]
+   | .process.capabilities.effective += ["CAP_SYS_ADMIN"]' …</pre></li>
+
+<li><strong>rprivate</strong> — nothing crosses. Note the container's <code>mountinfo</code> line has no propagation tag at all.
+<pre class="out">464 454 8:1 /home/ubuntu/i10-prop /prop rw,relatime - ext4 /dev/sda1
+A. host mounts a tmpfs under the source -&gt; can the container see it?
+   <b>no</b>  - the container sees an empty directory where a filesystem is mounted
+B. container mounts a tmpfs inside -&gt; can the host see it?
+   <b>no</b>  - the host sees an empty directory</pre></li>
+
+<li><strong>rslave</strong> — the <code>master:1</code> tag appears, and host mounts now arrive inside.
+<pre class="out">464 454 8:1 /home/ubuntu/i10-prop /prop rw,relatime <b>master:1</b> - ext4 /dev/sda1
+A. host mounts a tmpfs under the source -&gt; can the container see it?
+   <b>YES</b> - the mount appeared inside (this is HostToContainer)
+B. container mounts a tmpfs inside -&gt; can the host see it?
+   <b>no</b>  - the host sees an empty directory</pre>
+<p>That is <code>mountPropagation: HostToContainer</code>, exactly: downhill only.</p></li>
+
+<li><strong>rshared</strong>, and here the naive expectation is wrong. Setting the option on the mount is not enough:
+<pre class="out">464 454 8:1 … /prop rw,relatime <b>shared:246 master:1</b> - ext4 /dev/sda1
+B. container mounts a tmpfs inside -&gt; can the host see it?
+   <b>no</b></pre>
+<p>Read the tag: <code>master:1</code> says this mount is a slave of peer group 1 — the host's — and <code>shared:246</code> says it shares with peer group 246, a new group containing only itself. Events come down and go nowhere. The cause is that runc makes the rootfs <em>slave</em> by default, and the mount inherits that.</p></li>
+
+<li>Set <code>linux.rootfsPropagation</code> as well, and the picture completes.
+<pre class="cmd">jq '.linux.rootfsPropagation = "rshared"
+    | .mounts += [{"destination":"/prop","type":"bind","source":$src,"options":["rbind","rw","rshared"]}]' …</pre>
+<pre class="out">host-side peer group:  274 31 8:1 … /home/ubuntu/i10-prop rw,relatime <b>shared:1</b>
+
+rootfsPropagation = rslave:
+inside:  464 454 8:1 … /prop rw,relatime <b>master:1</b>
+container -&gt; host: <b>no</b>
+
+rootfsPropagation = rshared:
+inside:  464 454 8:1 … /prop rw,relatime <b>shared:1</b>
+container -&gt; host: <b>YES, the mount escaped onto the host</b>
+escaped
+422 31 0:53 / /home/ubuntu/i10-prop/inner rw,relatime shared:257
+423 274 0:53 / /home/ubuntu/i10-prop/inner rw,relatime shared:257</pre>
+<p><code>shared:1</code> — the same peer group as the host's mount — is the configuration that makes events cross. And notice the escaped mount appears <em>twice</em> in the host's table, once under each peer. That duplication is normal for shared subtrees, and it is why mount tables on nodes running CSI drivers are so much longer than expected.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown a <code>mountinfo</code> line, you can say which Kubernetes <code>mountPropagation</code> value produced it by reading the <code>shared:</code> and <code>master:</code> tags, and you can explain why a driver that needs <code>Bidirectional</code> must also be privileged.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The host path must already be a shared mount point.</strong> A plain directory has no peer group, so nothing propagates and every test says "no" — with no error to explain it.</li>
+<li><strong>A bare runc bundle's default is not Kubernetes' default.</strong> With no propagation option at all, the volume came out <code>master:1</code> — a slave, i.e. host-to-container propagation working. Kubernetes' default is <code>None</code>, which explicitly asks for <code>rprivate</code>. Do not test the default and conclude anything about a pod.</li>
+<li><strong><code>rootfsPropagation</code> overrules the per-mount option.</strong> Asking for <code>rshared</code> on the mount while the rootfs is slave gives you <code>shared:N master:1</code>, which looks shared and behaves like a slave.</li>
+<li><strong>A mount that escapes onto the host outlives the container.</strong> That is the actual risk behind requiring privileged for <code>Bidirectional</code>: nothing unmounts it when the pod goes away.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the whole content of the <code>mountPropagation</code> field, and it is why CSI node plugins are deployed as privileged DaemonSets with <code>Bidirectional</code> on the kubelet directory — see the architecture in <a href="w5.html#cp-5-11">W5.11</a> and the end-to-end mount trace in <a href="w5.html#cp-5-12">W5.12</a>. When a pod shows an empty directory where a CSI volume should be, propagation is the first thing to check on the node, before anything about the storage system.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the kernel's <em>sharedsubtree</em> documentation; <code>man 8 mount</code> under <em>Shared subtree operations</em>; and in the Kubernetes docs, <em>mountPropagation</em> in the volumeMounts reference.</p>
+</article>
 </div><!-- /g-volumes-at-runtime-level -->
 
 <div class="quiz" id="quiz">
