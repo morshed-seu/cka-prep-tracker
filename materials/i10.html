@@ -825,6 +825,187 @@ NodePublishVolume     /var/lib/kubelet/pods/<b>pod-aaaa1111</b>/volumes/kubernet
 
 <p class="docs-links"><b>Docs:</b> the CSI spec's <em>RPC Interface</em> section — the service definitions and the volume lifecycle diagram; and the kubernetes-csi site's <em>Developing CSI Drivers</em>.</p>
 </article>
+
+<article class="lesson" id="cp-i10-9" data-id="i10-9">
+<div class="lesson-head"><span class="cp-id">I10.9</span><h4>Stage versus publish: once per node, once per pod</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the distinction people skip, and skipping it costs them the answer to a question that surprises everyone: how can a <code>ReadWriteOnce</code> volume serve three pods at once? Get stage and publish straight and that stops being a puzzle and becomes a consequence.</p>
+
+<h5>The concept</h5>
+<p>There are two Node-side mount operations, and they exist because some of the work is expensive and must not be repeated.</p>
+<p><strong><code>NodeStageVolume</code> happens once per node.</strong> It does the costly things: format the filesystem if it has never been formatted, run <code>fsck</code>, attach the device, apply an <code>fsGroup</code> ownership change — then mounts the result at a <em>global staging path</em>, keyed by volume.</p>
+<p><strong><code>NodePublishVolume</code> happens once per pod.</strong> It bind-mounts from the staging path into that pod's own directory. This is cheap, because everything expensive already happened.</p>
+<p>Now the surprise resolves itself. <code>ReadWriteOnce</code> means the volume can be staged on <strong>one node</strong>. On that node, any number of pods can be published from the same staging mount — which is why several pods on one node can share an RWO volume while a pod on a second node cannot get it at all. The access mode was always a statement about nodes, not pods.</p>
+<div class="flow"><span>attach + format + fsck + chown</span><em>NodeStageVolume, once</em><span>/…/globalmount</span><em>NodePublishVolume, per pod</em><span>/…/pods/&lt;uid&gt;/…/mount</span></div>
+
+<div class="specref">
+<p>The spec makes the ordering a requirement on the CO, not a suggestion, and makes re-staging a no-op rather than an error.</p>
+<blockquote>The CO MUST guarantee that this RPC is called and returns a success before any `NodePublishVolume` is called for the given volume on the given node.<br>
+[…]<br>
+If the volume corresponding to the `volume_id` is already staged to the `staging_target_path`, and is identical to the specified `volume_capability` the Plugin MUST reply `0 OK`.</blockquote>
+<cite>Container Storage Interface v1.13.0 — <a href="https://github.com/container-storage-interface/spec/blob/v1.13.0/spec.md#nodestagevolume">spec.md § NodeStageVolume</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Try to collapse the two steps. Publish a freshly created volume without staging it first, exactly as a CO with a bug would.
+<pre class="cmd">sudo … csi-probe.py provision i10-order-a
+sudo … csi-probe.py publish "$V1" pod-1111</pre>
+<pre class="out">gRPC <b>FAILED_PRECONDITION</b>: volume "9ea9941c-…" must be staged before publishing
+mounts created: <b>0</b></pre>
+<p>The driver enforces what the spec requires of the caller. Nothing was mounted, and the error names the cause precisely.</p></li>
+
+<li>Do it properly: stage once, publish twice, for two different pods.
+<pre class="cmd">sudo … csi-probe.py stage   "$VOL"
+sudo … csi-probe.py publish "$VOL" pod-aaaa1111
+sudo … csi-probe.py publish "$VOL" pod-bbbb2222
+findmnt -no TARGET,SOURCE | grep -E "globalmount|kubernetes.io~csi"</pre>
+<pre class="out">/var/lib/kubelet/pods/<b>pod-aaaa1111</b>/volumes/kubernetes.io~csi/pvc-aece9ac8/mount   /dev/sda1[/var/lib/i10-csi-data/aece9ac8-…]
+/var/lib/kubelet/pods/<b>pod-bbbb2222</b>/volumes/kubernetes.io~csi/pvc-aece9ac8/mount   /dev/sda1[/var/lib/i10-csi-data/aece9ac8-…]</pre>
+<p>Two pod mounts, one source. Each appears twice in the full table — the shared-subtree duplication from <a href="#cp-i10-6">I10.6</a>, now on a real driver.</p></li>
+
+<li>Confirm they are the same bytes, which is the entire promise of a shared volume.
+<pre class="cmd">echo "written through pod-aaaa1111" | sudo tee $A/hello.txt
+sudo cat $B/hello.txt
+sudo find /var/lib/i10-csi-data -name hello.txt</pre>
+<pre class="out">pod-bbbb2222 reads: <b>written through pod-aaaa1111</b>
+/var/lib/i10-csi-data/aece9ac8-8c8b-11f1-8b50-e2e86637cddb/hello.txt</pre>
+<p>And there is the last piece of demystification: the "volume" this driver provisions is a directory named after a UUID. Everything above it — the staging mount, the two pod mounts, the PV object, the PVC — is naming and bookkeeping around that directory.</p></li>
+
+<li>Now try to unstage while pods still hold it. This is what happens when a CO gets teardown ordering wrong.
+<pre class="cmd">sudo … csi-probe.py unstage "$V1"</pre>
+<pre class="out">NodeUnstageVolume  <b>INTERNAL</b>: volume "9ea9941c-…" is still published at
+  ["/var/lib/kubelet/pods/pod-1111/…/mount" "/var/lib/kubelet/pods/pod-2222/…/mount"] on node "sandbox"</pre>
+<pre class="cmd">sudo … csi-probe.py unpublish "$V1" pod-2222
+sudo … csi-probe.py unstage   "$V1"</pre>
+<pre class="out">NodeUnpublishVolume  ok
+NodeUnstageVolume    <b>INTERNAL</b>: volume "9ea9941c-…" is still published at
+  ["/var/lib/kubelet/pods/pod-1111/…/mount"] on node "sandbox"</pre>
+<pre class="cmd">sudo … csi-probe.py unpublish "$V1" pod-1111
+sudo … csi-probe.py unstage   "$V1"</pre>
+<pre class="out">NodeUnpublishVolume  ok
+NodeUnstageVolume    <b>ok</b>
+mounts left: <b>0</b></pre>
+<p>Staging is refcounted by publications, and the driver refuses until the last one is gone. This is the mechanism behind a volume that will not detach because one pod on one node is still terminating.</p></li>
+
+<li>Finally, the failure that <em>is not</em> refused. Delete the volume while a pod still has it published.
+<pre class="cmd">sudo … csi-probe.py delete "$V2"    # ControllerUnpublishVolume + DeleteVolume</pre>
+<pre class="out">before: <b>2</b> pod mount(s)
+ControllerUnpublishVolume  <b>ok</b>
+DeleteVolume               <b>ok</b>
+after:  <b>2</b> pod mount(s), and the volume is gone
+what the mount now points at:
+  /var/lib/kubelet/pods/pod-3333/…/mount   /dev/sda1[/var/lib/i10-csi-data/9f56707a-…<b>//deleted</b>]
+and the tidy-up that is now nobody's job:
+NodeUnpublishVolume  <b>NOT_FOUND</b>: volume id 9f56707a-… does not exist in the volumes list</pre>
+<p><code>//deleted</code> is the kernel's marker for a mount whose source directory has been unlinked. The mount is still there, the data is not, and the call that would clean it up now refuses because the driver has forgotten the volume. This is why PersistentVolumes carry finalizers — something must hold the delete until the node side is finished.</p></li>
+
+<li>The other expensive-once operation is <code>fsGroup</code>. Measure it, because "it is slow on large volumes" is not a number.
+<pre class="cmd">sudo find "$STAGE" -type f | wc -l
+sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+/usr/bin/time -f "  cold: %e s" sudo chown -R 0:2000 "$STAGE"
+/usr/bin/time -f "  warm: %e s" sudo chown -R 0:3000 "$STAGE"
+/usr/bin/time -f "  %e s" sudo stat -c '%u:%g' "$STAGE"</pre>
+<pre class="out">50000 files
+  cold: <b>0.48 s</b>
+  warm: 0.18 s
+one stat() on the top directory:  <b>0.00 s</b></pre>
+<pre class="cmd">…  # the same operation on ten times the files
+sudo find "$STAGE" -type f | wc -l</pre>
+<pre class="out">500000 files
+  cold: <b>5.74 s</b></pre>
+<p>Half a million small files cost 5.74 seconds of pod start-up, on local ext4 with nothing else happening. That is the cost <code>fsGroupChangePolicy: OnRootMismatch</code> avoids by doing the single <code>stat</code> instead — and it is charged once per node when done at stage time, rather than once per pod.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can explain why several pods on one node can share a <code>ReadWriteOnce</code> volume and a pod on a second node cannot, predict the error class for publishing before staging and unstaging before unpublishing, and give a measured figure for what a recursive <code>fsGroup</code> chown costs.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The chown figure depends entirely on the backing store.</strong> 5.74 s for 500,000 files is local ext4. On network-backed storage each operation is a round trip, which is where the "minutes" in the folklore comes from. Quoting one number for both is how this gets argued about.</li>
+<li><strong><code>DeleteVolume</code> does not check whether the volume is mounted.</strong> Measured: it succeeded with two live pod mounts, which then pointed at <code>//deleted</code> and could no longer be unpublished. Ordering is the caller's responsibility, and finalizers are how Kubernetes discharges it.</li>
+<li><strong>Staging is refcounted, unstaging is not idempotent in the way you might hope.</strong> The driver returns <code>INTERNAL</code> — not a nice typed error — while publications remain, and the message body is where the actual paths are.</li>
+<li><strong>Not every driver stages.</strong> If <code>STAGE_UNSTAGE_VOLUME</code> is not advertised, the CO goes straight to publish and there is no global mount at all. Looking for <code>globalmount</code> on such a node and finding nothing is not a fault.</li>
+</ul>
+
+<div class="k8s-link">
+<p><a href="w5.html#cp-5-6">W5.6</a> is where access modes are established as node-level guarantees — this checkpoint is the mechanism underneath that claim. <a href="w5.html#cp-5-12">W5.12</a> traces the two paths on a real node, and they are the same two you produced by hand. The <code>fsGroup</code> measurement is the justification for <code>fsGroupChangePolicy</code>, which sits in a pod's <code>securityContext</code> — a field the advanced track deliberately does not cover, so this page is where it is explained.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the CSI spec's <em>NodeStageVolume</em> and <em>NodePublishVolume</em> sections, including their error tables; and in the Kubernetes docs, <em>access modes</em> and <em>configure a security context for a pod</em> for <code>fsGroupChangePolicy</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i10-10" data-id="i10-10">
+<div class="lesson-head"><span class="cp-id">I10.10</span><h4>The sidecars: controllers that translate objects into gRPC</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A CSI driver's pod usually has four or five containers in it, and only one of them is the vendor's. Knowing what the others do turns "the volume is stuck" from a vendor-support question into a question with a shape: <em>which loop stopped turning?</em></p>
+
+<h5>The concept</h5>
+<p>The vendor writes one thing: a gRPC server that knows their storage. Everything Kubernetes-shaped — watching objects, respecting finalizers, retrying with backoff, leader-electing between replicas — is done by generic sidecar containers that the project maintains, running next to the driver in the same pod and talking to it over the same socket you used in <a href="#cp-i10-8">I10.8</a>.</p>
+<p>Each sidecar is an ordinary controller in the <a href="b13.html#cp-b13-12">B13</a> sense: watch an object, compare desired to actual, act, record. The only unusual part is that "act" means a gRPC call instead of another API write.</p>
+<table class="langpair">
+<thead><tr><th>Sidecar</th><th>Watches</th><th>Calls</th></tr></thead>
+<tbody>
+<tr><td><code>external-provisioner</code></td><td>PersistentVolumeClaim</td><td><code>CreateVolume</code>, <code>DeleteVolume</code></td></tr>
+<tr><td><code>external-attacher</code></td><td>VolumeAttachment</td><td><code>ControllerPublishVolume</code>, <code>ControllerUnpublishVolume</code></td></tr>
+<tr><td><code>external-resizer</code></td><td>PersistentVolumeClaim (size changes)</td><td><code>ControllerExpandVolume</code></td></tr>
+<tr><td><code>external-snapshotter</code></td><td>VolumeSnapshot, VolumeSnapshotContent</td><td><code>CreateSnapshot</code>, <code>DeleteSnapshot</code></td></tr>
+<tr><td><code>node-driver-registrar</code></td><td>nothing — it makes no API calls at all</td><td><code>GetPluginInfo</code>, then registers with the kubelet over a socket</td></tr>
+<tr><td><code>livenessprobe</code></td><td>nothing</td><td><code>Probe</code>, exposed as an HTTP health endpoint</td></tr>
+</tbody>
+</table>
+<p>The registrar is the one worth pausing on, because it is commonly described incorrectly. It does not watch Node objects and it needs no RBAC: it asks the driver its name, then creates a registration socket that the kubelet's plugin watcher notices. That is the whole mechanism by which a node learns a driver exists.</p>
+<p>Nobody publishes on the node's behalf. <code>NodeStageVolume</code> and <code>NodePublishVolume</code> are called by <strong>the kubelet itself</strong> — there is no sidecar for them, which is why those two calls appear in kubelet logs and the others do not.</p>
+
+<div class="specref">
+<p>The registrar's own documentation is blunt about the thing most summaries get wrong:</p>
+<blockquote>The node-driver-registrar does not interact with the Kubernetes API, so no RBAC rules are needed.</blockquote>
+<cite>kubernetes-csi/node-driver-registrar — <a href="https://github.com/kubernetes-csi/node-driver-registrar#readme">README</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Map each call you made in <a href="#cp-i10-8">I10.8</a> and <a href="#cp-i10-9">I10.9</a> onto the component that would have made it on a real cluster. This is the checkpoint's actual work; <code>csi-probe.py</code> prints the answer beside each call so you can check yourself.
+<pre class="out">CreateVolume            &lt;- external-provisioner, reacting to a PVC
+ControllerPublishVolume &lt;- external-attacher, reacting to a VolumeAttachment
+NodeStageVolume         &lt;- the kubelet, on the node the pod was scheduled to
+NodePublishVolume       &lt;- the kubelet, once per pod</pre></li>
+
+<li>Look at the two sockets involved, because the distinction explains a whole class of "driver not found" problems. The driver creates one; the registrar creates the other.
+<pre class="cmd">sudo ls -l /var/lib/i10-csi/                      # the driver's own socket
+ls /var/lib/kubelet/plugins_registry/ 2&gt;/dev/null || echo "  (no registry dir — no kubelet on this box)"</pre>
+<pre class="out">srwxr-xr-x 1 root root 0 Jul 31 08:53 <b>csi.sock</b>
+  (no registry dir — no kubelet on this box)</pre>
+<p>On a real node there would be a second socket, <code>/var/lib/kubelet/plugins_registry/&lt;drivername&gt;-reg.sock</code>, created by the registrar. The kubelet watches that directory; a driver whose registrar failed is running, healthy, answering gRPC — and invisible.</p></li>
+
+<li>Confirm the division of labour from the other end: ask the driver for the identity information the registrar would ask for, and note that it is the whole conversation.
+<pre class="cmd">sudo CSI_PB_DIR=$HOME/csi ~/.venv-intermediate/bin/python ~/csi-probe.py identity | head -2</pre>
+<pre class="out">GetPluginInfo         name=<b>hostpath.csi.k8s.io</b> version=v1.18.0
+GetPluginCapabilities service: CONTROLLER_SERVICE</pre>
+<p>The registrar takes that name and reports it to the kubelet along with the driver's socket path. Everything after that is the kubelet calling the Node service directly.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a stuck volume you can name the loop to inspect: PVC Pending with no PV means <code>external-provisioner</code>; a VolumeAttachment that never becomes attached means <code>external-attacher</code>; a pod stuck <code>ContainerCreating</code> with a mount error means the kubelet and the Node service; and a driver that seems entirely absent from a node means the registrar.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The registrar is widely described as watching Node objects. It does not.</strong> The summary page for the sidecars is vague enough to invite that reading; the component's own README says it makes no API calls and needs no RBAC. Checked while writing this page, because the first source said otherwise.</li>
+<li><strong>There is no sidecar for the Node service's mount calls.</strong> The kubelet makes them. Looking for an <code>external-mounter</code> in a driver's pod is looking for something that does not exist.</li>
+<li><strong>Sidecars are versioned separately from the driver and from the spec.</strong> Three independent version streams in one pod, which is why compatibility matrices exist for CSI drivers at all.</li>
+<li><strong>Leader election is per sidecar.</strong> Two replicas of a controller Deployment do not split the work; one is elected and the other waits, so "the provisioner is running" is not the same as "the provisioner is the leader".</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is <a href="w5.html#cp-5-11">W5.11</a> from the other side, and the two descriptions should now be recognisably the same system. It is also <a href="b13.html#cp-b13-12">B13's reconciliation loop</a> with a translator bolted on — every sidecar is watch, compare, act, and the acting happens to be a gRPC call. When a volume is stuck, the productive first question is which of those loops stopped turning, not what the vendor's driver logged.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the kubernetes-csi site's <em>CSI Sidecar Containers</em> page and each sidecar's own README; in the Kubernetes docs, <em>CSIDriver</em> and <em>VolumeAttachment</em> in the API reference.</p>
+</article>
 </div><!-- /g-the-csi-shape -->
 
 <div class="quiz" id="quiz">
