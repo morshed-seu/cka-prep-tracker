@@ -87,6 +87,16 @@ Two more, learned the hard way and worth never repeating:
   nothing because the pattern never expands. Wrap the whole thing:
   `sudo sh -c 'rm -f /etc/cni/net.d/00-*'`. This cost three separate rounds in
   I-S14 and each time the symptom looked like the *lab* being wrong.
+- **A daemon started with `ctr run -d` and no `--log-uri` will block on write.**
+  Its stdout is the shim's `log` FIFO (I-S12), which nobody drains, so once
+  ~64 KB accumulates the process stops — while still holding its listening
+  socket. In I-S16 the `registry:2` container did this twice: it accepted TCP
+  connections and answered nothing, and once left `:5000` held by a stray
+  `sleep` with the registry itself dead. Symptoms look like a hung network.
+  Always pass `--log-uri file:///var/log/<name>.log`.
+- **A rootfs unpacked with `sudo tar` cannot be removed without `sudo`.**
+  A scratch-directory reset written as plain `rm -rf` produces sixty lines of
+  *Permission denied* before the interesting part of the script runs.
 - **Never run two `tools/vm.sh` calls concurrently.** They share
   `~/.vmrun/run.sh` and `~/.vmrun/out`, so a backgrounded capture and a
   foreground one interleave and each reads the other's output. Serialise them.
