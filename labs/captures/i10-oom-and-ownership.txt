@@ -1,0 +1,32 @@
+# captured 2026-07-31T02:50:01Z on sandbox
+# --- snippet ---
+# bash ~/i10-5b.sh
+# --- output ---
+==============================================================
+1. The OOM kill that reported success, and the same run without a pipe
+==============================================================
+-- with the write piped into tail, exactly as a logging entrypoint would do:
+Killed
+runc exit status: 0
+
+-- the identical write, not piped:
+runc exit status: 137
+
+-- how far it got before the kernel stopped it:
+[  557.180225] Memory cgroup out of memory: Killed process 7439 (dd) total-vm:2648kB, anon-rss:1024kB, file-rss:896kB, shmem-rss:0kB, UID:0 pgtables:52kB oom_score_adj:0
+
+==============================================================
+2. Why the bind mount was read-only in practice: uid 1000 vs a root
+   with no CAP_DAC_OVERRIDE
+==============================================================
+drwxrwxr-x 2 1000 1000 4096 Jul 31 08:48 /home/ubuntu/i10-vol
+the capability set a stock runc bundle gives its process:
+["CAP_AUDIT_WRITE","CAP_KILL","CAP_NET_BIND_SERVICE"]
+uid=0(root) gid=0(root)
+touch: /data/new-file: Permission denied
+^ that is the fault
+but appending to a root-owned file worked
+
+-- add CAP_DAC_OVERRIDE and nothing else changes:
+now it works
+-rw-r--r--    1 0        0                0 Jul 31 02:50 /data/new-file

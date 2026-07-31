@@ -1,0 +1,31 @@
+# captured 2026-07-31T03:10:02Z on sandbox
+# --- snippet ---
+# bash ~/i10-drill2.sh
+# --- output ---
+== the volume, as the host sees it
+total 4
+-rw-rw-r-- 1 5000 5000 11 Jul 31 09:10 app.conf
+is 5000 a user on this host? no - it is only a number here
+
+== the same directory, seen from inside a user namespace mapping 0->100000
+the process believes it is: 65534:65534
+the map it is living under:
+         0     100000      65536
+the volume:
+total 4
+-rw-rw-r-- 1 65534 65534 11 Jul 31 09:10 app.conf
+total 4
+-rw-rw-r-- 1 nobody nogroup 11 Jul 31 09:10 app.conf
+writing to it:
+touch: cannot touch '/home/ubuntu/i10-drill2/write-test': Permission denied
+reading it:
+app config
+
+== for contrast: mapping yourself to root inside is refused on this box
+unshare: write failed /proc/self/uid_map: Operation not permitted
+   (the subuid-backed newuidmap path above works; the direct uid_map write does not)
+
+== the rule the fault comes down to
+a volume is usable only if its owning uid falls inside the map the container runs under.
+5000 does not, so the kernel showed the overflow uid (65534) and refused the write.
+65534

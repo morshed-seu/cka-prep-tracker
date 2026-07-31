@@ -1,0 +1,56 @@
+# captured 2026-07-31T02:58:18Z on sandbox
+# --- snippet ---
+# bash ~/i10-csi-run.sh
+# --- output ---
+== the spec's 36 calls, split by service
+  Identity           3
+  SnapshotMetadata   2
+  Controller         17
+  Node               10
+  GroupController    4
+
+== 1. Identity: who are you, are you healthy, what do you support
+GetPluginInfo         name=hostpath.csi.k8s.io version=v1.18.0
+GetPluginCapabilities service: CONTROLLER_SERVICE
+GetPluginCapabilities service: GROUP_CONTROLLER_SERVICE
+GetPluginCapabilities service: VOLUME_ACCESSIBILITY_CONSTRAINTS
+Probe                 ready= unset (spec: assume ready)
+NodeGetInfo           node_id=sandbox max_volumes=0
+Controller can: ['<unknown:11>', 'CLONE_VOLUME', 'CREATE_DELETE_SNAPSHOT', 'CREATE_DELETE_VOLUME', 'EXPAND_VOLUME', 'GET_CAPACITY', 'GET_SNAPSHOT', 'GET_VOLUME', 'LIST_SNAPSHOTS', 'LIST_VOLUMES', 'PUBLISH_UNPUBLISH_VOLUME', 'SINGLE_NODE_MULTI_WRITER']
+Node can:       ['<unknown:4>', 'EXPAND_VOLUME', 'GET_VOLUME_STATS', 'SINGLE_NODE_MULTI_WRITER', 'STAGE_UNSTAGE_VOLUME']
+
+== 2. Controller: what external-provisioner does when a PVC appears
+CreateVolume          volume_id=aece9ac8-8c8b-11f1-8b50-e2e86637cddb bytes=67108864
+  (this is the PV object's spec.csi.volumeHandle)
+ControllerPublishVolume ok  publish_context= {}
+  (this is external-attacher acting on a VolumeAttachment object)
+
+== 3. Node, part one: NodeStageVolume - ONCE PER NODE
+NodeStageVolume       /var/lib/kubelet/plugins/kubernetes.io/csi/hostpath.csi.k8s.io/aece9ac8-8c8b-11f1-8b50-e2e86637cddb/globalmount
+  (format-if-needed and mount, once per node - the expensive half)
+
+== 4. Node, part two: NodePublishVolume - ONCE PER POD, for two pods
+NodePublishVolume     /var/lib/kubelet/pods/pod-aaaa1111/volumes/kubernetes.io~csi/pvc-aece9ac8/mount
+  (bind mount into this pod's directory - the cheap half, once per pod)
+NodePublishVolume     /var/lib/kubelet/pods/pod-bbbb2222/volumes/kubernetes.io~csi/pvc-aece9ac8/mount
+  (bind mount into this pod's directory - the cheap half, once per pod)
+
+== one volume, one staging mount, two pod mounts - all from one directory
+/var/lib/kubelet/pods/pod-aaaa1111/volumes/kubernetes.io~csi/pvc-aece9ac8/mount                                                 /dev/sda1[/var/lib/i10-csi-data/aece9ac8-8c8b-11f1-8b50-e2e86637cddb]
+/var/lib/kubelet/pods/pod-aaaa1111/volumes/kubernetes.io~csi/pvc-aece9ac8/mount                                               /dev/sda1[/var/lib/i10-csi-data/aece9ac8-8c8b-11f1-8b50-e2e86637cddb]
+/var/lib/kubelet/pods/pod-bbbb2222/volumes/kubernetes.io~csi/pvc-aece9ac8/mount                                               /dev/sda1[/var/lib/i10-csi-data/aece9ac8-8c8b-11f1-8b50-e2e86637cddb]
+/var/lib/kubelet/pods/pod-bbbb2222/volumes/kubernetes.io~csi/pvc-aece9ac8/mount                                                 /dev/sda1[/var/lib/i10-csi-data/aece9ac8-8c8b-11f1-8b50-e2e86637cddb]
+
+== the two pods are looking at the same bytes
+pod-bbbb2222 reads: written through pod-aaaa1111
+and the driver keeps it in a plain directory:
+/var/lib/i10-csi-data/aece9ac8-8c8b-11f1-8b50-e2e86637cddb/hello.txt
+
+== 5. teardown, in the reverse order, both pods first
+NodeUnpublishVolume        ok
+NodeUnpublishVolume        ok
+NodeUnstageVolume          ok
+ControllerUnpublishVolume  ok
+DeleteVolume               ok
+mounts left behind:
+0

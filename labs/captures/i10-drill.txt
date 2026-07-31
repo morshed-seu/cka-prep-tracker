@@ -1,0 +1,46 @@
+# captured 2026-07-31T03:03:20Z on sandbox
+# --- snippet ---
+# bash ~/i10-drill.sh
+# --- output ---
+==============================================================
+FAULT 1 - the storage is mounted, and the container sees nothing
+==============================================================
+-- first, what a bare runc bundle does with no propagation option at all:
+440 417 8:1 /home/ubuntu/i10-drill /vol rw,relatime master:1
+
+-- now the same volume with rprivate, which is what Kubernetes'
+   mountPropagation: None (the default) asks the runtime for:
+-- the 'CSI node plugin' now mounts the real storage under the volume path:
+on the host, the data is plainly there:
+total 4
+-rw-r--r-- 1 root root 14 Jul 31 09:03 payload.txt
+
+-- what the application in the container sees at the same path:
+total 8
+drwxrwxr-x    2 1000     1000          4096 Jul 31 03:03 .
+drwxrwxr-x    3 1000     1000          4096 Jul 31 03:03 ..
+/dev/sda1                18.3G      8.9G      9.4G  48% /
+
+-- the evidence that names the fault:
+host mount table:
+256 93 0:52 / /home/ubuntu/i10-drill/data rw,relatime shared:261 | tmpfs tmpfs rw,inode64
+container mount table (same filter):
+  (no such mount in this namespace)
+propagation of the volume mount inside the container:
+440 417 8:1 /home/ubuntu/i10-drill /vol rw,relatime
+
+==============================================================
+FAULT 2 - permission denied, on a uid that exists nowhere
+==============================================================
+on the host the volume is owned by a perfectly ordinary user:
+total 4
+-rw-rw-r-- 1 1000 1000 11 Jul 31 09:03 app.conf
+which is: ubuntu:1000
+
+-- inside the container:
+time="2026-07-31T09:03:23+06:00" level=error msg="runc run failed: unable to start container process: error during container init: error preparing rootfs: remount-private dst=/home/ubuntu/i10/vol/rootfs, flags=MS_PRIVATE: permission denied"
+
+-- the mapping that explains the number:
+{"containerID":0,"hostID":100000,"size":65536}
+this container maps container 0..65535 onto host 100000..165535.
+host uid 1000 is outside that range, so it has no number inside at all.
