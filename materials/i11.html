@@ -1121,6 +1121,277 @@ CapBnd:	0000000000000000</pre>
 </article>
 </div><!-- /g-rootless -->
 
+<!-- ---------------- Supply chain ---------------- --><div class="grp" id="g-supply-chain"><h3>Supply chain</h3>
+<article class="lesson" id="cp-i11-9" data-id="i11-9">
+<div class="lesson-head"><span class="cp-id">I11.9</span><h4>Signing an image, and finding where the signature went</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p><a href="i4.html#cp-i4-2">I4.2</a> established that a digest is a fingerprint of the bytes: change anything and the digest changes. What a digest cannot tell you is <em>who made those bytes</em> — it is an integrity check with nobody's name on it. A signature adds the name. The mechanically interesting part, and the part that surprises people, is that the signature is not inside the image at all: it is a second artifact sitting beside it in the same registry, and finding it teaches you more about the registry API than about cryptography.</p>
+
+<h5>The concept</h5>
+<p><a href="b12.html#cp-b12-6">B12.6</a> built the primitive: sign a hash with a private key, and anyone holding the public key can check it. Here the thing being hashed is a small JSON payload naming the image's digest, and the result is stored back in the registry.</p>
+<p>There are two ways to hold the key, and the difference is operational rather than cryptographic:</p>
+<ul>
+<li><strong>Key-based.</strong> You generate a keypair, keep the private half secret, and distribute the public half. Simple, and it inherits every key-management problem you have ever had — rotation, revocation, and the fact that a leaked key is indistinguishable from a legitimate one.</li>
+<li><strong>Keyless.</strong> You authenticate to an OIDC provider (a CI system's workload identity, a Google or GitHub account), a certificate authority called <strong>Fulcio</strong> issues a certificate binding a short-lived key to that identity, you sign, and the certificate expires in ten minutes. Because the certificate is dead by the time anyone verifies, the signature is only meaningful if there is proof it existed while the certificate was valid — which is what the <strong>Rekor</strong> transparency log provides: an append-only, publicly auditable record of the signature and its timestamp. Verification then asks "was this signed by <em>identity X</em> from <em>issuer Y</em>", not "does this match key K".</li>
+</ul>
+<p>"Keyless" is therefore a misnomer — there is a key, it just lives for ten minutes and its identity is an OIDC subject. The reason it dominates in CI is that there is no secret to store, so there is no secret to leak.</p>
+<p>Where the signature is <em>stored</em> has changed. Older cosign pushed it to a tag derived from the image digest, <code>sha256-&lt;hex&gt;.sig</code>. Current cosign uses the OCI <strong>referrers</strong> mechanism: an artifact whose manifest has a <code>subject</code> field pointing at the image, discovered through the registry's <code>/v2/&lt;name&gt;/referrers/&lt;digest&gt;</code> endpoint — with a <em>fallback tag schema</em>, <code>sha256-&lt;hex&gt;</code> holding an index, for registries that do not implement it. Both mechanisms are in play in the lab below, and one very familiar tool now lies about which.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Push something to sign. The I5 registry, and the alpine layout from I4.
+<pre class="cmd">cd ~/i11cs; R=127.0.0.1:5000
+skopeo copy --dest-tls-verify=false oci:$HOME/i11/oci:3.21 docker://$R/i11/app:v1
+DIG=$(skopeo inspect --tls-verify=false docker://$R/i11/app:v1 | jq -r .Digest)
+echo "$DIG"; curl -s http://$R/v2/i11/app/tags/list</pre>
+<pre class="out">sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+{"name":"i11/app","tags":["v1"]}</pre></li>
+
+<li>Generate a keypair. <code>COSIGN_PASSWORD</code> empty keeps the lab non-interactive; in real use this is the passphrase encrypting the private key at rest.
+<pre class="cmd">export COSIGN_PASSWORD=""
+cosign generate-key-pair
+cat cosign.pub</pre>
+<pre class="out">Private key written to cosign.key
+Public key written to cosign.pub
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfWxa6+Kf35kxmuy9bYvONknysviJ
+En6+3mcsv2VbE0NYQAd6/EVB48qmh7Xp3DAnFT6XRT68tc8oJ0An47dWSg==
+-----END PUBLIC KEY-----</pre>
+<p>178 bytes: an ECDSA P-256 public key. The private half is 653 bytes, mode 0600, encrypted with the password.</p></li>
+
+<li>Sign — and meet cosign v3's first change. The old way of saying "do not publish to a transparency log" is refused:
+<pre class="cmd">cosign sign --key cosign.key --allow-http-registry --tlog-upload=false -y $R/i11/app:v1</pre>
+<pre class="out">Error: <b>--tlog-upload=false is not supported with --signing-config</b> or
+--use-signing-config. Provide a signing config with --signing-config without a
+transparency log service, which can be created with `cosign signing-config create`
+or `curl https://raw.githubusercontent.com/sigstore/root-signing/refs/heads/main/
+targets/signing_config.v0.2.json | jq 'del(.rekorTlogUrls)'` for the public instance</pre>
+<p>The error is also the fix. A signing config is a document listing which Fulcio, Rekor, OIDC and timestamping services to use; delete the log entry and there is nothing to publish to.</p>
+<pre class="cmd">curl -fsSL https://raw.githubusercontent.com/sigstore/root-signing/refs/heads/main/targets/signing_config.v0.2.json \
+  | jq 'del(.rekorTlogUrls)' &gt; sc-notlog.json
+jq -c 'keys' sc-notlog.json
+cosign sign --key cosign.key --signing-config sc-notlog.json --allow-http-registry -y $R/i11/app:v1</pre>
+<pre class="out">["caUrls","mediaType","oidcUrls","rekorTlogConfig","tsaConfig","tsaUrls"]
+
+<b>WARNING: Image reference 127.0.0.1:5000/i11/app:v1 uses a tag, not a digest</b>, to
+    identify the image to sign. This can lead you to sign a different image than the
+    intended one. […] The ability to refer to images by tag will be removed in a
+    future release.
+Signing artifact...
+Pushing signature to: 127.0.0.1:5000/i11/app</pre>
+<p>Read that warning now and remember it — <a href="#cp-i11-13">I11.13</a> is the demonstration of exactly what it is warning about.</p></li>
+
+<li>Go and find the signature. It is not in the image, and it is not where the obvious tool says it is.
+<pre class="cmd">curl -s http://$R/v2/i11/app/tags/list
+cosign triangulate --allow-http-registry $R/i11/app:v1
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  http://$R/v2/i11/app/manifests/sha256-${DIG#sha256:}.sig</pre>
+<pre class="out">{"name":"i11/app","tags":["<b>sha256-f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>","v1"]}
+
+Command "triangulate" is deprecated, […] please use `oras discover` or `cosign tree`
+127.0.0.1:5000/i11/app:sha256-f27cad91….sig
+<b>404</b></pre>
+<p>A new tag appeared, and it has <strong>no <code>.sig</code> suffix</strong> — but <code>triangulate</code> still reports the old name, and that name 404s. It is deprecated for exactly this reason: it describes a storage layout cosign no longer uses.</p></li>
+
+<li>Ask for the real tag, and watch <a href="i5.html#cp-i5-4">I5.4</a>'s lesson about <code>Accept</code> bite a security tool.
+<pre class="cmd">MAN=application/vnd.oci.image.manifest.v1+json
+IDX=application/vnd.oci.image.index.v1+json
+for a in "$MAN" "$IDX" "$MAN,$IDX"; do
+  printf '%-92s -&gt; %s\n' "$a" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Accept: $a" http://$R/v2/i11/app/manifests/sha256-${DIG#sha256:})"
+done</pre>
+<pre class="out">application/vnd.oci.image.manifest.v1+json                          -&gt; <b>404</b>
+application/vnd.oci.image.index.v1+json                             -&gt; <b>200</b>
+application/vnd.oci.image.manifest.v1+json,…index.v1+json           -&gt; <b>200</b></pre>
+<p>The object is an <em>index</em>, and <code>registry:2</code> enforces <code>Accept</code> strictly, so asking for a manifest gets a 404 that means "wrong type", not "not there". This is the single most misleading response in the registry API, and it is worth recognising instantly.</p></li>
+
+<li>Now read what is actually stored.
+<pre class="cmd">curl -s -H "Accept: $IDX" http://$R/v2/i11/app/manifests/sha256-${DIG#sha256:} \
+  | jq '{mediaType, manifests: [.manifests[] | {artifactType, digest, size}]}'
+curl -s -o /dev/null -w 'referrers API -&gt; HTTP %{http_code}\n' http://$R/v2/i11/app/referrers/$DIG</pre>
+<pre class="out">{
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    { "artifactType": "<b>application/vnd.dev.sigstore.bundle.v0.3+json</b>",
+      "digest": "sha256:af2363173566f1a2eb4f8c2c59a1788fb498496accfc63628cd4dfc0fbfc487b", "size": 879 },
+    { "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+      "digest": "sha256:f52d620385e60215af3277f9fac484fa4f4e87505411b3b3c811aed709b21827", "size": 874 }
+  ]
+}
+referrers API -&gt; HTTP <b>404</b></pre>
+<p>The registry does not implement the referrers endpoint, so cosign fell back to the tag schema — the fallback exists precisely so signing works against registries written before the mechanism did. (This capture was taken after <a href="#cp-i11-10">I11.10</a> had also run, which is why there are two entries: the signature and an attestation, same artifact type, same mechanism. Immediately after signing there is one.)</p></li>
+
+<li>One level deeper: the signature artifact itself.
+<pre class="cmd">SD=$(curl -s -H "Accept: $IDX" http://$R/v2/i11/app/manifests/sha256-${DIG#sha256:} | jq -r '.manifests[0].digest')
+curl -s -H "Accept: $MAN" http://$R/v2/i11/app/manifests/$SD \
+  | jq '{artifactType, subject: .subject.digest, config: .config.mediaType, layers: [.layers[] | {mediaType, size}]}'</pre>
+<pre class="out">{
+  "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+  <b>"subject": "sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339"</b>,
+  "config": "application/vnd.oci.empty.v1+json",
+  "layers": [ { "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json", "size": 1690 } ]
+}</pre>
+<p>An ordinary OCI manifest with three tells: a <code>subject</code> naming the image it is about, an <em>empty</em> config (the <code>oci.empty.v1</code> descriptor from image-spec 1.1), and one layer holding the payload. Nothing here is signature-specific machinery — it is the generic "artifact attached to an image" pattern, which is why attestations in the next checkpoint use the same shape.</p>
+<pre class="cmd">curl -s http://$R/v2/i11/app/blobs/$(curl -s -H "Accept: $MAN" http://$R/v2/i11/app/manifests/$SD | jq -r '.layers[0].digest') | head -c 300</pre>
+<pre class="out">{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","verificationMaterial":
+{"publicKey":{"hint":"jUKb09bBiRRVAE48GcXhX6+zotcO8hv46AzfeayQZhQ="},
+"<b>timestampVerificationData</b>":{"rfc3161Timestamps":[{"signedTimestamp":"MIICyTADAgEAMIICwAY…</pre>
+<p>Note the RFC3161 timestamp: even with the transparency log switched off, cosign got a signed timestamp from a timestamping authority, because "when was this signed" is load-bearing for any signature whose key might later be revoked.</p></li>
+
+<li>Verify, with the right key and then the wrong one.
+<pre class="cmd">cosign verify --key cosign.pub --allow-http-registry --insecure-ignore-tlog=true $R/i11/app:v1
+cosign generate-key-pair --output-key-prefix wrong
+cosign verify --key wrong.pub --allow-http-registry --insecure-ignore-tlog=true $R/i11/app:v1</pre>
+<pre class="out">Verification for 127.0.0.1:5000/i11/app:v1 --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - <b>The signatures were verified against the specified public key</b>
+
+[{"critical":{"identity":{"docker-reference":"127.0.0.1:5000/i11/app"},
+  "image":{"docker-manifest-digest":"sha256:f27cad91…"},
+  "type":"https://sigstore.dev/cosign/sign/v1"},"optional":{}}]
+
+Error: no matching attestations: failed to verify signature: could not verify
+envelope: <b>accepted signatures do not match threshold, Found: 0, Expected 1</b></pre>
+<p>The payload that was signed is that last JSON object, and it contains the image's <strong>digest</strong>. That is the fact the whole next checkpoint rests on: a signature is a statement about bytes, and a tag is not bytes.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can sign an image, then locate its signature in the registry using nothing but <code>curl</code> and <code>jq</code>, and explain why the same request returns 404 or 200 depending on one header.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>cosign triangulate</code> is deprecated and now wrong.</strong> It printed a <code>.sig</code> tag that returns 404 on a registry where the signature is perfectly present under the referrers fallback tag. Use <code>cosign tree</code>, or query the referrers endpoint yourself.</li>
+<li><strong>A 404 from a manifest fetch can mean "wrong <code>Accept</code>".</strong> Measured: the same URL gave 404 for the manifest media type and 200 for the index type, on the same object. See <a href="i5.html#cp-i5-4">I5.4</a>.</li>
+<li><strong>Signing by tag is a warning, not an error.</strong> cosign tells you and proceeds. Sign digests.</li>
+<li><strong>Verification does not check the image runs, or is good, or is yours.</strong> It checks that somebody holding that key made a statement about that digest. If the key is in the same CI system as the build, an attacker who owns the build owns the signature too — which is the argument for keyless with a verified workload identity.</li>
+<li><strong>Deleting an image does not delete its signature.</strong> The referrer artifact is a separate manifest with its own lifecycle; registry garbage collection cleans it only if it knows about the subject relationship.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes has no built-in signature verification — the kubelet pulls whatever the pod spec names. Enforcement is an admission webhook: <em>Sigstore Policy Controller</em>, <em>Kyverno</em>'s <code>verifyImages</code> rule, or Connaisseur, each of which does the <code>cosign verify</code> above at admission time and rewrites the tag to the digest it verified. The advanced track has no admission-controller lesson to link into — the nearest relative is <a href="w7.html#cp-7-5">W7.5</a>, which walks the request through authentication and authorization but stops before admission. The reason a verifying webhook must rewrite the tag to the digest it verified is <a href="#cp-i11-13">I11.13</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the Sigstore documentation for cosign, Fulcio and Rekor; the OCI distribution spec's <em>referrers</em> section and image-spec's <code>subject</code> field; <code>cosign sign --help</code> for the v3 signing-config flags; and <a href="b12.html#cp-b12-6">B12.6</a>, which is the signature primitive with no registry in sight.</p>
+</article>
+<article class="lesson" id="cp-i11-10" data-id="i11-10">
+<div class="lesson-head"><span class="cp-id">I11.10</span><h4>Attestations: a signed statement about the image, not of it</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A signature answers one question: <em>did somebody holding this key vouch for these bytes?</em> It cannot tell you where the bytes came from, what source commit produced them, which builder ran, or whether a human could have interfered. Those are separate claims, and an attestation is the mechanism for making one and signing it. The practical difference shows up the moment you have a real incident: "this image is signed" narrows nothing, while "this image was built by pipeline P from commit C" tells you exactly which code to read.</p>
+
+<h5>The concept</h5>
+<p>An attestation is three nested things, and separating them makes the whole ecosystem legible:</p>
+<ul>
+<li>A <strong>predicate</strong> — the claim itself, in whatever schema fits: build provenance, an SBOM, a test result, a vulnerability scan, a manual review sign-off.</li>
+<li>An <strong>in-toto Statement</strong> wrapping it — a tiny envelope with a <code>subject</code> (name plus digest), a <code>predicateType</code> URI saying how to read the predicate, and the predicate. This is what makes the claim <em>about</em> something.</li>
+<li>A <strong>DSSE envelope</strong> around that — the signature layer, carrying the base64 payload plus one or more signatures.</li>
+</ul>
+<p>The most important of the predicate types is <strong>SLSA provenance</strong>, which answers "what built this": a <code>buildDefinition</code> naming the build type and its external parameters (source repository, commit), and a <code>runDetails</code> naming the builder and the invocation. SLSA's levels are essentially statements about how trustworthy that provenance is — whether it exists at all, whether the builder generated it rather than the build script, and whether the build was isolated enough that the provenance cannot have been forged by the thing being built.</p>
+<p>The storage mechanism is the one you already dissected in I11.9: another referrer artifact with a <code>subject</code> pointing at the image. Signature and attestation are the same shape; only the payload differs.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a predicate. In a real pipeline the builder generates this — BuildKit will emit one for you with <code>--attest type=provenance</code> — but writing it by hand is the fastest way to see that it is only JSON.
+<pre class="cmd">cd ~/i11cs
+cat &gt; prov.json &lt;&lt;'EOF'
+{
+  "buildDefinition": {
+    "buildType": "https://example.com/i11/handbuilt@v1",
+    "externalParameters": {
+      "source": "git+https://example.com/i11/app@refs/heads/main",
+      "commit": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"
+    }
+  },
+  "runDetails": {
+    "builder": { "id": "https://example.com/i11/buildkit-on-sandbox" },
+    "metadata": { "invocationId": "i11-s16-round-1" }
+  }
+}
+EOF</pre></li>
+
+<li>Attach and sign it. Same key, same signing config, one different subcommand.
+<pre class="cmd">cosign attest --key cosign.key --signing-config sc-notlog.json --allow-http-registry \
+  --type slsaprovenance1 --predicate prov.json -y $R/i11/app:v1
+curl -s http://$R/v2/i11/app/tags/list | jq -c .tags</pre>
+<pre class="out">Using payload from: prov.json
+Signing artifact...
+
+["sha256-f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339","v1"]</pre>
+<p><strong>No new tag.</strong> The attestation joined the same referrers index the signature is in — go back and look, and there are now two entries, both <code>artifactType: application/vnd.dev.sigstore.bundle.v0.3+json</code>. One artifact type, two kinds of claim, told apart by their payloads.</p></li>
+
+<li>Verify it and read the statement back out. The output is a DSSE envelope, so the interesting part is base64.
+<pre class="cmd">cosign verify-attestation --key cosign.pub --allow-http-registry \
+  --insecure-ignore-tlog=true --type slsaprovenance1 $R/i11/app:v1 \
+  | tail -1 | jq -r .payload | base64 -d | jq .</pre>
+<pre class="out">Verification for 127.0.0.1:5000/i11/app:v1 --
+  - The signatures were verified against the specified public key
+
+{
+  "_type": "<b>https://in-toto.io/Statement/v0.1</b>",
+  "predicateType": "<b>https://slsa.dev/provenance/v1</b>",
+  "subject": [
+    { "name": "127.0.0.1:5000/i11/app",
+      "digest": { "sha256": "<b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b>" } }
+  ],
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://example.com/i11/handbuilt@v1",
+      "externalParameters": {
+        "commit": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "source": "git+https://example.com/i11/app@refs/heads/main"
+      }
+    },
+    "runDetails": {
+      "builder": { "id": "https://example.com/i11/buildkit-on-sandbox" },
+      "metadata": { "invocationId": "i11-s16-round-1" }
+    }
+  }
+}</pre>
+<p>Three layers, visible at once: the DSSE envelope you just decoded, the in-toto Statement with its <code>subject</code>, and your predicate untouched inside it. Note that <code>subject.digest</code> is the image digest — an attestation, like a signature, is bound to bytes and not to a name.</p></li>
+
+<li>Now articulate the difference, because this is the point of the checkpoint. Ask two questions of the same image:
+<table class="langpair">
+<thead><tr><th>Question</th><th>What answers it</th><th>What it does <em>not</em> tell you</th></tr></thead>
+<tbody>
+<tr><td>Did someone we trust vouch for these bytes?</td><td><code>cosign verify</code></td><td>anything about how the bytes came to be — a developer signing a laptop build passes identically</td></tr>
+<tr><td>Which source and which builder produced these bytes?</td><td><code>cosign verify-attestation --type slsaprovenance1</code></td><td>whether that source is any good — provenance is a chain of custody, not a quality judgement</td></tr>
+</tbody>
+</table>
+<p>The gap between the two rows is the whole reason SLSA exists. A signed image tells you the artifact was not swapped in transit. Signed provenance tells you the artifact is the output of a build you can go and audit — and if the builder is the one that signed it, that the build script could not have lied about itself.</p></li>
+
+<li>One thing to check, which people routinely get wrong: verification succeeds if <em>any</em> attestation matches, so ask for the type you care about.
+<pre class="cmd">cosign verify-attestation --key cosign.pub --allow-http-registry \
+  --insecure-ignore-tlog=true --type cyclonedx $R/i11/app:v1 2&gt;&amp;1 | tail -2</pre>
+<pre class="out">Error: <b>no matching attestations</b>: none of the attestations matched the predicate type:
+https://cyclonedx.org/bom</pre>
+<p>Which is what you want: a policy that says "must have provenance" has to name the predicate type, or it accepts an image whose only attestation is a test report.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state the difference between a signature and an attestation in one sentence each, decode a DSSE payload by hand, and name the field a policy must check so that "has an attestation" does not silently mean "has any attestation at all".</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An attestation is only as trustworthy as who generated it.</strong> Provenance written by the build script it describes is a claim the build makes about itself. SLSA's levels are graded almost entirely on whether the <em>platform</em> produced it out of the build's reach.</li>
+<li><strong>Signature and attestation look identical in the registry.</strong> Same <code>artifactType</code>, same referrers index, same subject. Tools tell them apart by the payload's media type, so <code>cosign tree</code> showing "two artifacts" tells you nothing about what they claim.</li>
+<li><strong><code>--type</code> is a filter on verification, not just a label on signing.</strong> Omit it and you are asking "is there anything signed attached to this image".</li>
+<li><strong>The subject is a digest.</strong> An attestation attached to <code>:v1</code> follows the digest, not the tag — so a re-pushed tag orphans it exactly the way <a href="#cp-i11-13">I11.13</a> orphans a signature.</li>
+<li><strong>Attestations grow.</strong> An SBOM attestation for a large image is megabytes, stored in the registry, pulled by every verifier. Attaching SBOMs to every build of every image is a real storage and bandwidth decision, not a free win.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Attestation verification is admission-time work, the same as signature verification — Sigstore's Policy Controller and Kyverno both express policies like "the image must carry SLSA provenance whose <code>builder.id</code> is our pipeline and whose <code>source</code> is our repository". That is a much stronger statement than "signed by our key", and it is expressible only because the predicate is structured data rather than an opaque blob. Kubernetes itself checks none of this; the advanced track's closest material is <a href="w7.html#cp-7-5">W7.5</a>'s walk through the request path, which stops before admission.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the in-toto Attestation specification (<em>Statement</em> and <em>predicate</em> layers); SLSA v1.0's <em>Provenance</em> schema and its levels; the DSSE envelope specification; and <code>cosign attest --help</code> for the built-in predicate types.</p>
+</article>
+</div><!-- /g-supply-chain -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
