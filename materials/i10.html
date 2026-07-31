@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="A container's three storages, a volume as one line of JSON, mount propagation with a purpose, and the CSI contract driven by hand against a real driver.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I10 — Container storage: volumes, snapshots, the CSI shape — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I10 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4</a></li>
+    <li><a href="i5.html">I5</a></li>
+    <li><a href="i6.html">I6</a></li>
+    <li><a href="i7.html">I7</a></li>
+    <li><a href="i8.html">I8</a></li>
+    <li><a href="i9.html">I9</a></li>
+    <li><a href="i10.html">I10 · Container storage</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i10">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I10 — Container storage: volumes, snapshots, the CSI shape</h1>
+  <p>The third contract, and the one with the least mystery in it: a volume at the runtime layer is a bind mount plus some bookkeeping. Get that sentence properly earned and Kubernetes storage becomes a naming and orchestration layer over mechanics you already have.</p>
+  <p>Storage is where Kubernetes vocabulary is thickest — PersistentVolume, PersistentVolumeClaim, StorageClass, provisioner, attacher, stage, publish — and where the machinery underneath is thinnest. Nearly all of it reduces to three things you have already built: a directory, <code>mount(2)</code>, and a program keeping a record of which is which. This module spends its five hours proving that, ending with a real CSI driver you drive by hand over its socket, and a hundred-line volume manager of your own.</p>
+  <div class="weights">
+    <span>Checkpoints<b>12</b></span>
+    <span>Hours<b>~5</b></span>
+    <span>Prerequisites<b>I7 · B5</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li>Name a container's three storages, find each one physically on the node, and say which survives what.</li>
+<li>Add a volume by hand — one entry in <code>config.json</code>'s <code>mounts</code> array — and tell a bind, a <code>tmpfs</code> and a real block device apart by how each one fails.</li>
+<li>Work mount propagation in both directions, and explain from the mount table alone why <code>mountPropagation: HostToContainer</code> exists.</li>
+<li>Drive a real CSI driver over its socket: Identity, Controller, Node, and the four calls that matter.</li>
+<li>Explain stage versus publish well enough to predict which component failed from the symptom.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I7</strong> (snapshots and where the writable layer lives) and <strong>B5</strong> (VFS, mounts, overlayfs, propagation, loop devices — you will reuse that module's <code>disk.img</code> trick).</p>
+<p><strong>Which machine.</strong> Everything below ran on <code>sandbox</code>, the Ubuntu 24.04 VM carrying the intermediate toolchain: kernel <code>6.8.0-136-generic</code>, containerd <code>2.3.3</code>, runc <code>1.5.1</code>, crictl <code>v1.36.0</code>, plus <code>registry.k8s.io/sig-storage/hostpathplugin:v1.18.0</code> and the CSI spec at <strong>v1.13.0</strong> for the second half. Every command and every line of output on this page came from that machine on 2026-07-31.</p>
+</div>
+
+<!-- ---------------- A container's three storages ---------------- --><div class="grp" id="g-a-container-s-three-stor"><h3>A container&#x27;s three storages</h3>
+<article class="lesson" id="cp-i10-1" data-id="i10-1">
+<div class="lesson-head"><span class="cp-id">I10.1</span><h4>Three storages, and only one of them is a volume</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Nearly every storage question in Kubernetes is really one question wearing a disguise: <em>which of the three storages is this?</em> A container has exactly three, they behave completely differently, and confusing them produces the two most baffling incidents on the list — a pod with no volumes filling a node's disk, and data that vanishes on a restart nobody ordered.</p>
+
+<h5>The concept</h5>
+<p>Every running container reads and writes through three separate things stacked into one apparent filesystem.</p>
+<p><strong>The image layers.</strong> Read-only, shared between every container started from that image, owned by the snapshotter. Ten pods from one image cost one copy on the node, and every byte is re-fetchable from a registry at any time. This is <a href="b5.html#cp-b5-13">B5's overlayfs</a> lowerdir stack, and <a href="i7.html#cp-i7-11">I7.11</a> is where you last saw the directories.</p>
+<p><strong>The writable layer.</strong> One per container, private to it, unshared. It is the overlay's upperdir — every file the container creates or modifies lands here. It is counted against the node's ephemeral storage, it is destroyed with the container, and it is recoverable from nowhere at all. No registry has a copy, because it never came from one.</p>
+<p><strong>Mounts from outside.</strong> Anything the runtime was told to mount into the container from elsewhere: a host directory, a <code>tmpfs</code>, a real block device. This is the only category whose lifetime is independent of the container, and <em>everything</em> a pod spec calls a volume is one of these.</p>
+<p>Hold on to that last sentence. <code>emptyDir</code>, <code>hostPath</code>, a ConfigMap projection, a PVC backed by a cloud disk — at the runtime layer these are all the third category, differing only in who created the directory and what they put in it before the mount happened.</p>
+<div class="flow"><span>image layers</span><em>shared, re-fetchable</em><span>writable layer</span><em>private, gone with the container</em><span>outside mounts</span><em>independent lifetime</em></div>
+
+<div class="specref">
+<p>It is worth noticing what the runtime spec does <em>not</em> say. There are no layers in it, no sharing, no snapshotter — the root filesystem is one directory, and everything about layering is an invention of the layer above.</p>
+<blockquote>**`root`** (object, OPTIONAL) specifies the container's root filesystem.<br>
+[…]<br>
+* **`path`** (string, REQUIRED) Specifies the path to the root filesystem for the container.<br>
+    […] The value SHOULD be the conventional `rootfs`.<br>
+<br>
+    A directory MUST exist at the path declared by the field.</blockquote>
+<cite>OCI Runtime Specification v1.3.0 — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#root">config.md § Root</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start one container with a host directory mounted in, so all three storages exist at once. The mount source gets a five-megabyte file so it is distinguishable by size alone.
+<pre class="cmd">mkdir -p ~/i10-host
+echo "written on the host" &gt; ~/i10-host/note.txt
+head -c 5000000 /dev/urandom &gt; ~/i10-host/blob.bin
+
+sudo ctr -n default run -d \
+  --mount type=bind,src=$HOME/i10-host,dst=/data,options=rbind:rw \
+  docker.io/library/alpine:3.21 i10a sleep 600
+sudo ctr -n default task exec --exec-id e1 i10a cat /data/note.txt</pre>
+<pre class="out">TASK    PID     STATUS
+i10a    2162    RUNNING
+<b>written on the host</b></pre></li>
+
+<li>Ask the snapshotter what it made. One <code>Active</code> snapshot for the container, and a <code>Committed</code> one for each image layer — the vocabulary from <a href="i7.html#cp-i7-11">I7.11</a>.
+<pre class="cmd">sudo ctr -n default snapshot ls | head -3</pre>
+<pre class="out">KEY                        PARENT                     KIND
+<b>i10a</b>                       sha256:7211d01aba8f…       <b>Active</b>
+sha256:01d51a501d9d…       sha256:5a7e76502fb4…       <b>Committed</b> </pre></li>
+
+<li>Now get the actual paths. <code>ctr snapshot mounts</code> prints the exact <code>mount</code> command the runtime would use, which is where the two directories are named.
+<pre class="cmd">sudo ctr -n default snapshot mounts /mnt i10a | tr ',' '\n' | grep -E "lowerdir|upperdir"</pre>
+<pre class="out">upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<b>417</b>/fs
+lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<b>5</b>/fs</pre></li>
+
+<li>Measure all three. This is the whole checkpoint in four numbers.
+<pre class="cmd">sudo du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/5/fs
+sudo du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/417/fs
+du -sh ~/i10-host</pre>
+<pre class="out">8.2M	…/snapshots/5/fs          <b>image layers — shared by every container from this image</b>
+8.0K	…/snapshots/417/fs        <b>writable layer — this container's, and empty so far</b>
+4.8M	/home/ubuntu/i10-host     <b>the outside mount — the runtime never touched it</b></pre></li>
+
+<li>One more number for scale, because it explains a class of full-disk incident: the snapshotter's whole tree against the content store it was unpacked from.
+<pre class="cmd">sudo du -sh /var/lib/containerd/io.containerd.content.v1.content
+sudo du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs</pre>
+<pre class="out">716M	…/io.containerd.content.v1.content
+<b>2.3G</b>	…/io.containerd.snapshotter.v1.overlayfs</pre>
+<p>Unpacked layers cost roughly three times the compressed blobs they came from — the <a href="i7.html#cp-i7-12">I7.12</a> measurement, and the reason <code>crictl images</code> never explains a full node.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>For any running container you can now name its three storages, print the two snapshotter paths from a single command, and say without hesitating which one survives <code>ctr container rm</code>, which one survives a node rebuild, and which one exists only because someone asked for it in a spec.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The content store is a fourth thing, not one of the three.</strong> It holds compressed blobs as pulled; the snapshotter holds them unpacked and mountable. Both live under <code>/var/lib/containerd</code> and neither is a volume. Deleting an image frees the first; only deleting containers frees the second.</li>
+<li><strong>"Shared" means shared bytes, not a shared directory.</strong> The lowerdir is one path on disk that many containers mount simultaneously. Nothing is copied per container until something writes — which is <a href="#cp-i10-3">I10.3</a>.</li>
+<li><strong>The numbers move under you.</strong> <code>du</code> on a live snapshot tree races with running containers. Take the measurement twice if it matters.</li>
+</ul>
+
+<div class="k8s-link">
+<p>A pod's <code>volumes:</code> list is the third category, exclusively. <a href="w5.html#cp-5-1">W5.1</a> walks the ephemeral kinds — <code>emptyDir</code>, <code>hostPath</code>, ConfigMap and Secret projections — and <a href="w5.html#cp-5-2">W5.2</a> shows where the kubelet puts them on the node, under <code>/var/lib/kubelet/pods/&lt;uid&gt;/volumes/</code>. Neither of the other two storages is nameable in a pod spec at all: you influence the image layers by choosing an image, and the writable layer only through <code>ephemeral-storage</code> limits.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the OCI runtime spec for <em>root</em> and <em>readonly</em>; the containerd docs for <em>snapshotters</em>; and in the Kubernetes docs, <em>ephemeral storage</em> under node-pressure eviction.</p>
+</article>
+
+<article class="lesson" id="cp-i10-2" data-id="i10-2">
+<div class="lesson-head"><span class="cp-id">I10.2</span><h4>The pod with no volumes that fills the node</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A pod with no volumes, no PVCs and a perfectly modest memory limit can fill a node's disk and get itself — and its innocent neighbours — evicted. Nothing limits how much a container writes into its own root filesystem unless somebody set an <code>ephemeral-storage</code> limit, and almost nobody does. The usual culprit is not application data but a log file written inside the container, which <a href="i8.html#cp-i8-1">the CRI</a> also cannot show you through <code>kubectl logs</code>. Worst of both worlds, from one mistake.</p>
+
+<h5>The concept</h5>
+<p>The writable layer is an ordinary directory on the node's filesystem. There is no quota on it, no reservation, and no accounting the container can see. <code>df</code> inside the container reports the <em>host's</em> filesystem, because that is genuinely what it is writing to. So a container that writes 300 MB writes 300 MB of the node's disk, and it does so through a path with no gate on it.</p>
+<p>What makes this hard to diagnose is that the accounting is split. The kubelet learns about disk usage through the CRI, and — as the lab shows — the CRI reports only the containers <em>it</em> created. A node whose disk is full of snapshots made by <code>ctr</code>, or by a build in another containerd namespace, will report a comfortable few megabytes while <code>du</code> screams.</p>
+
+<div class="specref">
+<p>The CRI splits its answer in two, and the split is exactly the distinction this lesson turns on: images are shared and re-fetchable, container writable layers are not.</p>
+<blockquote>// ImageFsInfo returns information of the filesystem that is used to store images.<br>
+rpc ImageFsInfo(ImageFsInfoRequest) returns (ImageFsInfoResponse) {}</blockquote>
+<cite>Kubernetes CRI, <code>runtime.v1</code> — <a href="https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto">api.proto</a>; the response carries <code>image_filesystems</code> and <code>container_filesystems</code> separately</cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>First, the accounting trap, because it changes how you read every number that follows. Ask the CRI what the image filesystem holds, then ask <code>du</code> about the very same path.
+<pre class="cmd">sudo crictl imagefsinfo | jq -c '.status.imageFilesystems[0] | {mountpoint: .fsId.mountpoint, usedBytes: .usedBytes.value}'
+sudo du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+for n in default k8s.io buildkit; do printf "  %-10s %s\n" "$n" "$(sudo ctr -n $n snapshot ls 2&gt;/dev/null | tail -n +2 | wc -l)"; done</pre>
+<pre class="out">{"mountpoint":"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs","usedBytes":"<b>9986048</b>"}
+<b>2.3G</b>	/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+  default    70
+  k8s.io     <b>3</b>
+  buildkit   97
+</pre>
+<p>Nine and a half megabytes reported, 2.3 gigabytes on disk. The CRI counts only what the CRI created — three snapshots in the <code>k8s.io</code> namespace — while the other 167 are invisible to it. On a real node that gap is a build cache or a stray <code>ctr</code> container, and it is why "the kubelet says there is plenty of room" is not evidence.</p></li>
+
+<li>Now run a container through the CRI itself, so it lands in the accounting. Two small JSON files are the whole pod spec at this level.
+<pre class="cmd">cat &gt; i10-pod.json &lt;&lt;'EOF'
+{ "metadata": { "name": "i10pod", "namespace": "i10", "uid": "i10-uid-1", "attempt": 0 },
+  "log_directory": "/tmp/i10-logs", "linux": {} }
+EOF
+cat &gt; i10-ctr.json &lt;&lt;'EOF'
+{ "metadata": { "name": "writer", "attempt": 0 },
+  "image": { "image": "docker.io/library/alpine:3.21" },
+  "command": [ "sleep", "600" ], "log_path": "writer.0.log", "linux": {} }
+EOF
+POD=$(sudo crictl runp i10-pod.json)
+CID=$(sudo crictl create "$POD" i10-ctr.json i10-pod.json)
+sudo crictl start "$CID"</pre></li>
+
+<li>Ask what that container's writable layer costs, before it has written anything.
+<pre class="cmd">sudo crictl stats -o json "$CID" | jq -c '.stats[] | {name: .attributes.metadata.name, writableLayer: .writableLayer.usedBytes.value}'</pre>
+<pre class="out">{"name":"writer","writableLayer":"<b>0</b>"}</pre></li>
+
+<li>Write 300 MB into the container's own root filesystem. No volume is involved, and nothing in the pod spec mentions storage.
+<pre class="cmd">sudo crictl exec "$CID" dd if=/dev/urandom of=/big.bin bs=1M count=300
+sleep 12    # CRI stats are computed on a window, not on demand
+sudo crictl stats -o json "$CID" | jq -c '.stats[] | {writableLayer: .writableLayer.usedBytes.value, inodes: .writableLayer.inodesUsed.value}'
+sudo crictl imagefsinfo | jq -c '.status.imageFilesystems[0].usedBytes.value'</pre>
+<pre class="out">314572800 bytes (300.0MB) copied, 0.707064 seconds, 424.3MB/s
+{"writableLayer":"<b>314580992</b>","inodes":"4"}
+"<b>324587520</b>"</pre>
+<p>Both numbers moved, and this is the input the kubelet's eviction manager reads. Nothing warned anybody; the container asked for no storage and was given the node's disk.</p></li>
+
+<li>Find those exact bytes from the host. They are a plain file in the upperdir from <a href="#cp-i10-1">I10.1</a> — run this against a container started with <code>ctr</code>, where the snapshot key is a name you chose.
+<pre class="cmd">UP=$(sudo ctr -n k8s.io snapshot mounts /mnt i10b | tr ',' '\n' | sed -n 's/^upperdir=//p')
+sudo ls -l "$UP/big.bin"
+sudo du -sh "$UP"</pre>
+<pre class="out">-rw-r--r-- 1 root root <b>314572800</b> Jul 31 08:44 …/snapshots/418/fs/big.bin
+<b>301M</b>	…/snapshots/418/fs</pre></li>
+
+<li>Delete the container and watch the space come back. Poll for it rather than checking once — the removal is asynchronous, and a single check will lie to you.
+<pre class="cmd">sudo ctr -n k8s.io container rm i10b
+for i in $(seq 1 15); do
+  if sudo test -d "$UP"; then echo "  +$((i*200))ms  still there"; else echo "  +$((i*200))ms  GONE"; break; fi
+  sleep 0.2
+done</pre>
+<pre class="out">  +200ms  still there
+  +400ms  still there
+  +600ms  still there
+  <b>+800ms  GONE</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state where a container's writes physically land, produce the file from the host with one <code>ls</code>, show the number the kubelet would evict on, and explain why that number can disagree with <code>du</code> by two orders of magnitude on a busy node.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>crictl imagefsinfo</code> nests its answer under <code>.status</code>.</strong> A <code>jq</code> filter of <code>.imageFilesystems[0]</code> silently yields <code>null</code>, which reads like an empty node rather than a wrong query. This cost a round while writing this page.</li>
+<li><strong>A container made with <code>ctr</code> is invisible to CRI accounting even in the <code>k8s.io</code> namespace.</strong> Writing 300 MB through <code>ctr</code> moved <code>imagefsinfo</code> by exactly zero bytes; the same write through <code>crictl</code> moved it by 314 MB. The CRI reports on what it created, not on what is in the namespace.</li>
+<li><strong>Deletion is asynchronous.</strong> Check once, immediately after <code>container rm</code>, and the upperdir is still on disk — it went away at +800 ms here. A monitoring check written that way reports a leak that does not exist.</li>
+<li><strong>Container filesystem stats are windowed.</strong> <code>crictl stats</code> right after a write shows the old value. The twelve-second sleep in the lab is not decoration.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism under node disk pressure and the <code>ephemeral-storage</code> request and limit. <a href="w6.html#cp-6-12">W6.12</a> reads <code>DiskPressure</code> from the node's side, and <a href="w6.html#cp-6-2">W6.2</a> is where logs physically live — the other half of the logging mistake. <a href="w5.html#cp-5-1">W5.1</a> specifies <code>emptyDir</code>, which lands on this same filesystem and is charged the same way. The fix for the logging case is not a bigger disk: it is not writing logs to a file inside the container, so that both this problem and the <code>kubectl logs</code> one disappear together.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> in the Kubernetes docs, search <em>node-pressure eviction</em> and <em>local ephemeral storage</em>; for the runtime side, <code>crictl stats</code> and <code>crictl imagefsinfo</code> in the cri-tools documentation.</p>
+</article>
+</div><!-- /g-a-container-s-three-stor -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i9.html">← I9</a><a href="../intermediate.html#i11">I11 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
