@@ -763,6 +763,364 @@ escaped</pre>
 </article>
 </div><!-- /g-runtime-hardening -->
 
+<!-- ---------------- Rootless ---------------- --><div class="grp" id="g-rootless"><h3>Rootless</h3>
+<article class="lesson" id="cp-i11-6" data-id="i11-6">
+<div class="lesson-head"><span class="cp-id">I11.6</span><h4>Rootless runc, and why its default mapping is exactly one id</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Every control so far has been about limiting what a container can do <em>given</em> that the runtime runs as root. Rootless changes the premise: the container's uid 0 is an ordinary unprivileged uid on the host, so an escape lands you as a normal user rather than as root. It is the single largest change in blast radius available, and it is also the one with the most surprising list of things that stop working. This lesson gets it running and finds the boundary; the next one takes the whole stack down.</p>
+
+<h5>The concept</h5>
+<p><a href="i1.html#cp-i1-1">I1.1</a> and <a href="i1.html#cp-i1-2">I1.2</a> built the mechanism: a user namespace holds a <code>uid_map</code> saying "container uid 0 is host uid N", the mapping may be written exactly once, and writing a mapping with more than one entry requires the setuid helper <code>newuidmap</code> backed by a range in <code>/etc/subuid</code>. A rootless container is that, with a rootfs on top.</p>
+<p>The OCI config expresses it with <code>linux.uidMappings</code> and <code>linux.gidMappings</code>, plus a <code>user</code> namespace in <code>linux.namespaces</code>. <code>runc spec --rootless</code> generates a bundle that will run as you, and comparing it with the ordinary one is the fastest way to see what an unprivileged runtime cannot do — cgroup limits disappear, the network namespace disappears, and <code>/sys</code> stops being a fresh <code>sysfs</code> mount and becomes a bind of the host's.</p>
+<p>The important structural fact, and the one that catches everyone: the generated mapping has <strong><code>size: 1</code></strong>. It maps container uid 0 to your uid and nothing else. That is not conservatism — it is the only mapping <code>runc</code> can install on its own, because installing a wider one means writing subuid ranges into <code>uid_map</code>, and doing that requires a privilege <code>runc</code> does not have. Wider mappings are the job of a helper that sets the namespace up first, which is what <code>rootlesskit</code> does in the next checkpoint.</p>
+
+<div class="specref">
+<p>Three fields, and one line at the end that is the whole reason step 6 below fails.</p>
+<blockquote><b>uidMappings</b> (array of objects, OPTIONAL) describes the user namespace uid mappings from the host to the container.<br>
+<b>gidMappings</b> (array of objects, OPTIONAL) describes the user namespace gid mappings from the host to the container.<br><br>
+Each entry has the following structure:<br>
+ · <b>containerID</b> <em>(uint32, REQUIRED)</em> - is the starting uid/gid in the container.<br>
+ · <b>hostID</b> <em>(uint32, REQUIRED)</em> - is the starting uid/gid on the host to be mapped to <em>containerID</em>.<br>
+ · <b>size</b> <em>(uint32, REQUIRED)</em> - is the number of ids to be mapped.<br><br>
+The runtime SHOULD NOT modify the ownership of referenced filesystems to realize the mapping.
+Note that the number of mapping entries MAY be limited by the kernel.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Linux Configuration</em> § User namespace mappings — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#user-namespace-mappings">config-linux.md</a></cite>
+</div>
+<p><em>"SHOULD NOT modify the ownership of referenced filesystems"</em> is the spec telling the runtime not to <code>chown</code> your rootfs into the mapped range — which leaves the question of who does, and that is the question step 6 runs into.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Unpack a rootfs that <em>you</em> own — a rootless runtime cannot read root-owned files any more than any other unprivileged process can. <code>--no-same-owner</code> is what makes the extraction work without <code>sudo</code>.
+<pre class="cmd">rm -rf ~/rl &amp;&amp; mkdir -p ~/rl/rootfs &amp;&amp; cd ~/rl
+IDX=$(jq -r '.manifests[0].digest' ~/i11/oci/index.json | sed 's/sha256://')
+for l in $(jq -r '.layers[].digest' ~/i11/oci/blobs/sha256/$IDX | sed 's/sha256://'); do
+  tar --no-same-owner -xzf ~/i11/oci/blobs/sha256/$l -C rootfs
+done
+ls rootfs</pre>
+<pre class="out">bin dev etc home lib media mnt opt proc root run sbin srv sys tmp usr var</pre></li>
+
+<li>Generate the rootless bundle and diff it against what you know.
+<pre class="cmd">runc spec --rootless
+jq -c '.linux.uidMappings, .linux.gidMappings' config.json
+jq -c '[.linux.namespaces[].type]' config.json
+jq -c '.linux.cgroupsPath // "(unset)", .linux.resources // "(unset)"' config.json
+jq -c '.mounts[] | select(.destination=="/sys")' config.json</pre>
+<pre class="out">[{"containerID":0,"hostID":1000,"size":<b>1</b>}]
+[{"containerID":0,"hostID":1000,"size":<b>1</b>}]
+["pid","ipc","uts","mount","cgroup",<b>"user"</b>]
+"(unset)"
+"(unset)"
+{"destination":"/sys","type":<b>"none"</b>,"source":"/sys","options":["rbind","nosuid","noexec","nodev","ro"]}</pre>
+<p>Four differences, each one a thing an unprivileged process cannot do. <code>user</code> is added. <strong><code>network</code> is gone</strong> — you cannot create a network namespace with interfaces in it without help, so a rootless container shares the host's network by default. <code>cgroupsPath</code> and <code>resources</code> are gone, so there are no limits. And <code>/sys</code> is a read-only bind of the host's <code>sysfs</code> rather than a fresh mount, because mounting <code>sysfs</code> needs privilege the namespace does not confer.</p></li>
+
+<li>Run it, with no <code>sudo</code> anywhere. On a stock Ubuntu 24.04 box, this is what you get:
+<pre class="cmd">jq '.process.terminal=false | .process.args=["/bin/sh","-c","echo inside: $(id -u)"]' \
+   config.json &gt; c.tmp &amp;&amp; mv c.tmp config.json
+runc --root $XDG_RUNTIME_DIR/runc run rl-a</pre>
+<pre class="out">level=error msg="runc run failed: unable to start container process: can't get final
+child's PID from pipe: EOF; runc init error(s): nsexec-1[11522]: <b>failed to unshare
+remaining namespaces: Operation not permitted</b>"</pre>
+<p>This is <a href="i1.html#cp-i1-4">I1.4</a>'s wall, met from the other side. Confirm the mechanism directly:</p>
+<pre class="cmd">sysctl kernel.apparmor_restrict_unprivileged_userns
+unshare --user --map-root-user sh -c 'id -u'
+sudo grep -vE '^\s*(#|$)' /etc/apparmor.d/unprivileged_userns</pre>
+<pre class="out">kernel.apparmor_restrict_unprivileged_userns = 1
+unshare: <b>write failed /proc/self/uid_map: Operation not permitted</b>
+
+profile unprivileged_userns {
+     <b>audit deny capability,</b>
+     …
+     <b>allow userns,</b>
+     allow pix /** -&gt; &amp;unprivileged_userns ,
+}</pre>
+<p>Read those two lines together: the namespace <em>is</em> allowed, and every capability inside it is denied. So the <code>unshare</code> succeeds and then the very next privileged operation — writing <code>uid_map</code>, which needs <code>CAP_SETUID</code> in the parent namespace — fails, with an error that never mentions AppArmor.</p></li>
+
+<li>Take I1.4's third option: a named profile that grants <code>userns</code> to one binary, by path. This is narrower than turning the sysctl off, which would re-enable unprivileged user namespaces for everything on the box.
+<pre class="cmd">sudo tee /etc/apparmor.d/i11-rootless-runc &gt; /dev/null &lt;&lt;'EOF'
+abi &lt;abi/4.0&gt;,
+include &lt;tunables/global&gt;
+
+profile i11-rootless-runc /usr/local/sbin/runc flags=(unconfined) {
+  userns,
+  include if exists &lt;local/i11-rootless-runc&gt;
+}
+
+profile i11-unshare /usr/bin/unshare flags=(unconfined) {
+  userns,
+  include if exists &lt;local/i11-unshare&gt;
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/i11-rootless-runc
+unshare --user --map-root-user sh -c 'echo "inside uid: $(id -u)"; grep CapEff /proc/self/status; cat /proc/self/uid_map'</pre>
+<pre class="out">inside uid: <b>0</b>
+CapEff:	<b>000001ffffffffff</b>
+         0       1000          1</pre>
+<p>Full capabilities — inside that namespace, and worth nothing outside it.</p></li>
+
+<li>Now the container runs. Watch it from both sides at once: the container reports its own uid, and a <code>ps</code> on the host reports the same process.
+<pre class="cmd">jq '.process.args=["/bin/sh","-c","echo inside: uid=$(id -u) gid=$(id -g); echo uid_map: $(cat /proc/self/uid_map); grep -E \"^Cap(Eff|Bnd)\" /proc/self/status; sleep 4"]' \
+   config.json &gt; c.tmp &amp;&amp; mv c.tmp config.json
+runc --root $XDG_RUNTIME_DIR/runc run rl-a &amp;
+sleep 2; ps -eo pid,user,uid,args | grep '[s]leep 4'; wait</pre>
+<pre class="out">      12329 <b>ubuntu    1000</b> sleep 4          ← the host's view
+
+inside: uid=<b>0</b> gid=0
+uid_map: <b>0 1000 1</b>
+CapEff:	0000000020000420
+CapBnd:	0000000020000420</pre>
+<p>Root inside, <code>ubuntu</code> outside — the whole point, in two lines. Note also that the capability set is still I11.1's default three: the user namespace gives you every capability <em>within</em> it, and then the OCI config takes them away again. The two mechanisms compose.</p>
+<p>The state directory moved too: <code>$XDG_RUNTIME_DIR/runc</code>, i.e. <code>/run/user/1000/runc</code>, rather than <code>/run/runc</code>.</p></li>
+
+<li>Try to widen the mapping to your <code>/etc/subuid</code> range — the thing the tracker's checkpoint asks for — and find the wall.
+<pre class="cmd">grep ubuntu /etc/subuid
+jq '.linux.uidMappings=[{"containerID":0,"hostID":100000,"size":65536}] |
+    .linux.gidMappings=[{"containerID":0,"hostID":100000,"size":65536}]' \
+   config.json &gt; c.tmp &amp;&amp; mv c.tmp config.json
+runc --root $XDG_RUNTIME_DIR/runc run rl-b</pre>
+<pre class="out">ubuntu:100000:65536
+level=error msg="runc run failed: <b>fchown fd 7: operation not permitted</b>"</pre>
+<p>Chowning the rootfs into the range first does not help, and the reason is one command away:</p>
+<pre class="cmd">touch ~/chowntest; chown 100000:100000 ~/chowntest</pre>
+<pre class="out">chown: changing ownership of '/home/ubuntu/chowntest': <b>Operation not permitted</b></pre>
+<p>To hand a file to uid 100000 you need <code>CAP_CHOWN</code>, and you are an ordinary user. <code>runc</code> has the same problem with its own state files. A subuid-backed container therefore requires that <em>something else</em> create the user namespace first, using the setuid <code>newuidmap</code>, and run <code>runc</code> inside it — which is precisely the job description of <code>rootlesskit</code>.</p></li>
+
+<li>Prove that the wider mapping does what the checkpoint claims, using <code>unshare</code>'s <code>--map-users</code>, which calls <code>newuidmap</code> for you. The <code>ps</code> must run <strong>outside</strong> the namespace: run it inside and you see uid 0, because <code>ps</code> translates through the namespace's own map.
+<pre class="cmd">unshare --user --map-users=100000,0,65536 --map-groups=100000,0,65536 \
+        --setuid 0 --setgid 0 -- sh -c 'sleep 6' &amp;
+sleep 1
+ps -eo pid,uid,user,args | grep '[s]leep 6'</pre>
+<pre class="out">  13639 <b>100000 100000</b>  sh -c sleep 6
+  13643 <b>100000 100000</b>  sleep 6</pre>
+<p>Container uid 0, host uid 100000, a uid that owns nothing on this machine and has no entry in <code>/etc/passwd</code> — which is why <code>ps</code> prints the number in the <code>USER</code> column.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can run a container end to end as an unprivileged user, read the mapping from both sides, and explain from first principles why <code>runc spec --rootless</code> maps exactly one id rather than a subuid range.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>On Ubuntu 24.04 the first failure is AppArmor, and says so nowhere.</strong> <code>failed to unshare remaining namespaces: Operation not permitted</code> and <code>write failed /proc/self/uid_map</code> are both downstream of <code>audit deny capability</code> in the stock <code>unprivileged_userns</code> profile. A named profile granting <code>userns</code> for one binary is narrower than clearing the sysctl.</li>
+<li><strong><code>ps</code> inside a user namespace lies to you, correctly.</strong> It reads <code>/proc</code> through the namespace's mapping, so it shows uid 0. Any check of "what does the host see" has to run outside.</li>
+<li><strong>Rootless means no cgroup limits from <code>runc</code> alone.</strong> <code>runc spec --rootless</code> emits no <code>resources</code> block at all. Limits need a delegated cgroup, which needs systemd — see the next checkpoint, where they work.</li>
+<li><strong>No network namespace by default.</strong> The rootless bundle drops it, so the container shares the host's network stack. That is more exposure than a normal container, not less, until something like <code>slirp4netns</code> puts a namespace back.</li>
+<li><strong>A root-owned rootfs is unusable.</strong> Extract with <code>--no-same-owner</code>, or you get permission errors that look like a broken image.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes' own version of this is <code>pod.spec.hostUsers: false</code>, which puts the pod in a user namespace, with the kubelet allocating a subuid range per pod rather than per user. Check the version carefully: it has been <em>enabled by default</em> since v1.33 but only reached <strong>GA in v1.36</strong>, so on the exam's v1.35 it is an on-by-default beta. The mapping you read out of <code>/proc/self/uid_map</code> in step 5 is exactly what a pod with <code>hostUsers: false</code> shows. This is separate from <code>runAsUser</code>, which changes the uid without changing what that uid <em>is</em> on the host. The advanced track has no lesson on either field.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 7 user_namespaces</code>, especially "User and group ID mappings"; <code>man 1 newuidmap</code> and <code>man 5 subuid</code>; runc's <em>docs/rootless.md</em>; and <a href="i1.html#cp-i1-4">I1.4</a>, which enumerates the three honest ways past Ubuntu's AppArmor restriction.</p>
+</article>
+<article class="lesson" id="cp-i11-7" data-id="i11-7">
+<div class="lesson-head"><span class="cp-id">I11.7</span><h4>The whole stack under your uid, and the five things that change</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>I11.6 ran one container as you. Running the <em>daemon</em> as you is a different exercise, because containerd wants to write to <code>/var/lib/containerd</code>, listen on <code>/run/containerd/containerd.sock</code>, create network namespaces and set cgroup limits — and an unprivileged process may do none of those things. Watching how <code>rootlesskit</code> arranges for all four to appear to work anyway is the most instructive half hour in this module, and it produces a precise list of what you give up.</p>
+
+<h5>The concept</h5>
+<p>The trick is a single user namespace with a mount namespace inside it, created once at startup by <code>rootlesskit</code> using <code>newuidmap</code>. Inside that namespace you are uid 0, so <code>/run/containerd</code> and <code>/var/lib/containerd</code> are writable — but they are <em>different directories</em> from the host's, because <code>rootlesskit</code> "copies up" each one onto a fresh <code>tmpfs</code> before containerd looks. Every path containerd knows is the path it always was; only the namespace changed.</p>
+<p>Networking is the part that cannot be faked with mounts. A user namespace lets you create a network namespace, but it does not let you attach a <code>veth</code> to a host bridge or write a NAT rule in the host's tables — those need <code>CAP_NET_ADMIN</code> <em>on the host</em>. So rootless stacks run a <strong>userspace network stack</strong>: <code>slirp4netns</code> holds one end of a TAP device inside the namespace and translates the container's packets into ordinary sockets opened as your user. That is why the container's addresses come from a private range that exists nowhere on the host, and why published ports are proxied rather than DNAT'd.</p>
+<p>Cgroups are the one thing that works properly, and only because systemd already solved it: <code>user@1000.service</code> gets a delegated subtree, so limits set inside it are real kernel limits. This is the same delegation <a href="i1.html#cp-i1-6">I1.6</a> ran into, and what is delegated has grown — measure it rather than assuming.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Install the prerequisites and run the setup tool from the nerdctl distribution. <code>rootlesskit</code> also needs the <code>userns</code> grant from I11.6, so add it to the same AppArmor profile first.
+<pre class="cmd">curl -fsSL -o rk.tgz https://github.com/rootless-containers/rootlesskit/releases/download/v3.0.2/rootlesskit-x86_64.tar.gz
+tar xzf rk.tgz &amp;&amp; sudo install -m0755 rootlesskit /usr/local/bin/
+sudo apt-get install -y slirp4netns uidmap
+for f in containerd-rootless.sh containerd-rootless-setuptool.sh; do
+  curl -fsSL -o /tmp/$f https://raw.githubusercontent.com/containerd/nerdctl/v2.3.5/extras/rootless/$f
+  sudo install -m0755 /tmp/$f /usr/local/bin/$f
+done
+# add to /etc/apparmor.d/i11-rootless-runc:
+#   profile i11-rootlesskit /usr/local/bin/rootlesskit flags=(unconfined) { userns, }
+sudo apparmor_parser -r /etc/apparmor.d/i11-rootless-runc
+containerd-rootless-setuptool.sh install</pre>
+<pre class="out">[INFO] Installed "containerd.service" successfully.
+[INFO] Use `nerdctl` to connect to the rootless containerd.
+[INFO] You do NOT need to specify $CONTAINERD_ADDRESS explicitly.</pre></li>
+
+<li>Look at what the unit actually runs, because the process tree is the lesson.
+<pre class="cmd">systemctl --user status containerd.service</pre>
+<pre class="out">● containerd.service - containerd (Rootless)
+     Active: active (running)
+   <b>Main PID: 14197 (rootlesskit)</b>
+     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/containerd.service
+             ├─14197 <b>rootlesskit</b> --state-dir=/run/user/1000/containerd-rootless
+             │        <b>--net=slirp4netns</b> --mtu=65520 --slirp4netns-sandbox=auto
+             │        --disable-host-loopback --port-driver=builtin
+             │        <b>--copy-up=/etc --copy-up=/run --copy-up=/var/lib</b>
+             │        --propagation=rslave --detach-netns /usr/local/bin/containerd-rootless.sh
+             ├─14213 /proc/self/exe --state-dir=…
+             ├─14236 <b>slirp4netns</b> --mtu 65520 -r 3 --disable-host-loopback --enable-seccomp
+             │        --userns-path=/proc/14213/ns/user --netns-type=path …/netns tap0
+             └─14245 <b>containerd</b>
+
+containerd-rootless.sh[14245]: msg="starting GRPC server"
+  <b>address=/run/containerd/containerd.sock gid=0 uid=0</b></pre>
+<p>Four processes where you expected one. The unit's main process is <code>rootlesskit</code>; containerd is its grandchild. The three <code>--copy-up</code> flags are the mount trick; <code>--net=slirp4netns</code> is the network trick. And read the last line carefully: containerd believes it is uid 0 serving <code>/run/containerd/containerd.sock</code> — the same string the root daemon uses, and a completely different file.</p></li>
+
+<li>Run something, and read the mapping.
+<pre class="cmd">nerdctl run --rm alpine:3.21 sh -c 'echo "inside: uid=$(id -u)"; cat /proc/self/uid_map'</pre>
+<pre class="out">inside: uid=<b>0</b>
+         0       1000          1
+         1     100000      65536</pre>
+<p><strong>Two</strong> lines, where I11.6's hand-built container had one. Container uid 0 is you; container uids 1 upward come out of your <code>/etc/subuid</code> range. That is the mapping <code>newuidmap</code> was needed for, and <code>rootlesskit</code> installed it once at startup so nothing downstream has to.</p></li>
+
+<li>The first limitation, with the most helpful error message in this module.
+<pre class="cmd">nerdctl run --rm -p 80:80 alpine:3.21 true</pre>
+<pre class="out">level=fatal msg="failed to expose ports in rootless mode: <b>cannot expose privileged
+port 80</b>, you can add 'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf
+(currently 1024), or set CAP_NET_BIND_SERVICE on rootlesskit binary, or choose a
+larger port number (&gt;= 1024): listen tcp 0.0.0.0:80: bind: permission denied"</pre>
+<p>Note where the failure is: not in the container, but in the port-forwarding proxy that <code>rootlesskit</code> runs <em>as you</em> on the host. <code>CAP_NET_BIND_SERVICE</code> inside the container is irrelevant — the socket that needs it is outside. Above 1024 it works end to end:</p>
+<pre class="cmd">nerdctl run -d --name rlweb -p 8080:8080 alpine:3.21 sh -c \
+  'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhi\n" | nc -l -p 8080; done'
+curl -s http://127.0.0.1:8080/</pre>
+<pre class="out">hi</pre></li>
+
+<li>The second limitation: the network the container is on does not exist on the host.
+<pre class="cmd">nerdctl exec rlweb sh -c 'ip -4 -o addr show; ip route'</pre>
+<pre class="out">1: lo    inet 127.0.0.1/8 scope host lo
+2: eth0  inet <b>10.4.0.4/24</b> brd 10.4.0.255 scope global eth0
+default via <b>10.4.0.1</b> dev eth0</pre>
+<p>10.4.0.0/24 is <code>slirp4netns</code>'s private range, and 10.4.0.1 is <code>slirp4netns</code> itself — a userspace process, not a bridge and not a router. Outbound packets are re-emitted as ordinary sockets owned by your uid, which is both the security win and the performance cost. Anything that expects to see container traffic on a host interface, or to write iptables rules about it, does not work here.</p></li>
+
+<li>The third area — cgroups — is where the folklore is out of date. Measure the delegation rather than assuming it.
+<pre class="cmd">cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.controllers
+nerdctl run --rm --memory 64m       alpine:3.21 cat /sys/fs/cgroup/memory.max
+nerdctl run --rm --cpuset-cpus 0    alpine:3.21 cat /sys/fs/cgroup/cpuset.cpus.effective
+nerdctl run --rm --pids-limit 16    alpine:3.21 cat /sys/fs/cgroup/pids.max
+nerdctl run --rm                    alpine:3.21 cat /proc/self/cgroup</pre>
+<pre class="out"><b>cpuset cpu io memory hugetlb pids rdma misc</b>
+<b>67108864</b>
+<b>0</b>
+<b>16</b>
+0::/</pre>
+<p>Everything delegated, and every limit real — including <code>cpuset</code> and <code>io</code>, which older writing on rootless says you do not get. The container's own <code>/proc/self/cgroup</code> reads <code>0::/</code> because it is in a cgroup namespace and sees its own subtree as the root.</p></li>
+
+<li>Now the payoff. Repeat <a href="i7.html#cp-i7-13">I7.13</a>'s demonstration that the containerd socket is node root, and then repeat it rootless.
+<pre class="cmd">sudo ctr -n default run --rm --mount type=bind,src=/,dst=/host,options=rbind:ro \
+     docker.io/library/alpine:3.21 shadowtest head -1 /host/etc/shadow
+nerdctl run --rm -v /:/host:ro alpine:3.21 head -1 /host/etc/shadow</pre>
+<pre class="out">root:*:20639:0:99999:7:::                       ← root containerd
+head: /host/etc/shadow: <b>Permission denied</b>      ← rootless containerd</pre>
+<p>Same image, same bind mount, same request. The first one is a full node compromise in one command; the second is an ordinary user hitting an ordinary permission bit. This single pair is the argument for rootless, and it is worth keeping the two lines side by side.</p></li>
+
+<li>Finally, look at what <code>rootlesskit</code> keeps, so the machinery is not a black box.
+<pre class="cmd">ls /run/user/1000/containerd-rootless</pre>
+<pre class="out">api.sock  child_pid  hosts  lock  <b>netns</b>  resolv.conf</pre>
+<p><code>netns</code> is the pinned network namespace (<a href="i8.html#cp-i8-7">I8.7</a>'s bind-mount trick, again), <code>child_pid</code> is the process whose <code>/proc/&lt;pid&gt;/ns/user</code> everything else joins, and <code>resolv.conf</code> and <code>hosts</code> are the copies containerd bind-mounts into each sandbox.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can list, from having hit them, the five things that change when the stack goes rootless — privileged ports, the network stack, the socket's identity, the state directories, and what a bind mount of <code>/</code> gets you — and say which of them is the reason to do it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The socket path is identical and the socket is not.</strong> <code>/run/containerd/containerd.sock</code> means one file to <code>sudo ctr</code> and a different one to your <code>nerdctl</code>, because the second is inside <code>rootlesskit</code>'s mount namespace. Images, containers and snapshots do not cross between them — a rootless <code>nerdctl images</code> starts empty however full the root store is. This is I7.5's namespace confusion one level up.</li>
+<li><strong>The privileged-port failure is on the host side.</strong> Nothing you set in the container's capabilities fixes it; the three fixes the error names are all outside the container.</li>
+<li><strong>Rootless is not a network security boundary.</strong> The container still reaches every service the host can reach, including anything bound to the host's own addresses. It removes filesystem and uid power, not network reach.</li>
+<li><strong>It does not survive logout without lingering.</strong> The unit lives in your systemd user session; <code>sudo loginctl enable-linger &lt;user&gt;</code> is what keeps it running when you are not logged in. Forgetting it produces containers that vanish when an SSH session ends.</li>
+<li><strong><code>nsenter</code> into the rootlesskit namespace needs root.</strong> <code>nsenter -m -t &lt;pid&gt;</code> as your own user returns <code>Operation not permitted</code> even though you own the process — joining a mount namespace requires <code>CAP_SYS_ADMIN</code> in it. Inspect from <code>/proc/&lt;pid&gt;/root/</code> as root instead.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes has no rootless kubelet, and the CKA cluster runs containerd as root — so this is background rather than exam material. Where it does bear directly is <code>hostUsers: false</code> (I11.6's <code>.k8s-link</code>), which brings the per-pod user namespace without moving the daemon, and the container-socket exposure in step 7, which is why mounting <code>/run/containerd/containerd.sock</code> or <code>/var/run/docker.sock</code> into a pod is equivalent to granting node root — see <a href="w7.html#cp-7-6">W7.6</a> for the RBAC side of the same argument, and <a href="w1.html#cp-1-2">W1.2</a> for what already runs privileged on a node.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <em>rootlesscontaine.rs</em> for the umbrella documentation; <code>rootlesskit --help</code> for the <code>--copy-up</code> and <code>--net</code> options; <code>man 1 slirp4netns</code>; <code>man 5 systemd.resource-control</code> under <code>Delegate=</code>; and <a href="i1.html#cp-i1-6">I1.6</a> for cgroup delegation from the other end.</p>
+</article>
+<article class="lesson" id="cp-i11-8" data-id="i11-8">
+<div class="lesson-head"><span class="cp-id">I11.8</span><h4>The honest table: what each control actually stops</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Seven checkpoints have each turned on one control and proved it works. That is not the same as knowing what your container is protected from, because the interesting question is never "does this control work" — it is "given this attack, which of my controls is the one that stops it, and is there one?" This checkpoint builds the grid, and the discipline it demands is being willing to write <em>nothing</em> in a cell. A control matrix with no empty cells is a control matrix nobody checked.</p>
+
+<h5>The concept</h5>
+<p><a href="b12.html#cp-b12-1">B12.1</a> gave the method: name the assets, name the actors, draw the trust boundaries, and only then talk about mechanisms. Applied to a container the assets are the node's filesystem and credentials, the other containers on it, the node's capacity, and the cluster API. The actor to assume is <em>code running inside the container</em>, because that is what an application vulnerability gets you and it requires no container bug at all.</p>
+<p>That framing is what makes the table below uncomfortable. Most container controls constrain a process that is <em>already inside</em>, and most of them constrain it in exactly one dimension. The three that change the shape of the problem rather than trimming it are the user namespace, the absence of a host mount, and the absence of the container socket — and only the first is a control you turn on rather than a thing you refrain from doing.</p>
+<p>One term to keep straight, because the rest of the table depends on it. <strong>Escape to host</strong> means obtaining host-root code execution. <strong>Read host secrets</strong> means getting at a file like <code>/etc/shadow</code> or a kubelet credential, which usually does <em>not</em> require an escape — it requires a mount. Conflating the two is the most common error in these discussions, and it is why "we dropped all capabilities" is offered as an answer to a question about a <code>hostPath</code>.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build the grid from the results this module already produced. Each cell says what the control does <em>on its own</em>, against an attacker who already has code execution in the container.
+<table class="langpair">
+<thead><tr><th>Control</th><th>Escape to host</th><th>Read another container's data</th><th>Read host secrets</th><th>Exhaust the node</th><th>Reach the API server</th></tr></thead>
+<tbody>
+<tr><td><strong>drop capabilities</strong></td><td>removes the usual routes (<code>CAP_SYS_ADMIN</code>, <code>CAP_SYS_MODULE</code>) — not all</td><td>nothing</td><td>nothing, if a mount is present</td><td>nothing</td><td>nothing</td></tr>
+<tr><td><strong>non-root uid</strong></td><td>partial — and I11.2 showed a setuid file undoes it</td><td>nothing</td><td>partial: normal file permissions apply</td><td>nothing</td><td>nothing</td></tr>
+<tr><td><strong>user namespace</strong></td><td><b>yes</b> — escape lands as an unprivileged host uid</td><td><b>yes</b>, if per-container ranges</td><td><b>yes</b> — measured: <code>Permission denied</code> on <code>/etc/shadow</code> through a bind of <code>/</code></td><td>nothing</td><td>nothing</td></tr>
+<tr><td><strong>seccomp</strong></td><td>narrows the kernel attack surface; no guarantee</td><td>nothing</td><td>nothing — it cannot see paths</td><td>nothing</td><td>nothing</td></tr>
+<tr><td><strong>AppArmor / SELinux</strong></td><td>narrows it, by path or label</td><td><b>yes</b> for SELinux categories; only if written for it under AppArmor</td><td><b>yes</b>, if the policy names the path</td><td>nothing</td><td>nothing</td></tr>
+<tr><td><strong>read-only rootfs</strong></td><td>nothing</td><td>nothing</td><td>nothing — reads are unaffected, and writable mounts still write</td><td>nothing</td><td>nothing</td></tr>
+<tr><td><strong>no host mounts</strong></td><td>partial</td><td><b>yes</b></td><td><b>yes</b> — this is the control that matters here</td><td>partial (no filling a host filesystem)</td><td>partial (no reading a kubeconfig off disk)</td></tr>
+<tr><td><strong>no host network</strong></td><td>nothing</td><td>nothing</td><td>nothing</td><td>nothing</td><td>nothing — a pod network reaches the API server too</td></tr>
+<tr><td><strong>no container socket</strong></td><td><b>yes</b> — measured: with it, one command reads <code>/etc/shadow</code></td><td><b>yes</b></td><td><b>yes</b></td><td><b>yes</b></td><td><b>yes</b> — via any credential on the node</td></tr>
+<tr><td><strong>cgroup limits</strong></td><td>nothing</td><td>nothing</td><td>nothing</td><td><b>yes</b> — the only control in this column</td><td>nothing</td></tr>
+</tbody>
+</table>
+<p>Read the columns rather than the rows. "Exhaust the node" has exactly one non-empty answer among the nine controls the checkpoint lists, and it is not one of them — it is cgroup limits, which nobody thinks of as a security control. "Reach the API server" has none at all at this layer; that is RBAC's column, not the runtime's.</p></li>
+
+<li>Check the strongest claim in the table rather than believing it. This is the pair from <a href="#cp-i11-7">I11.7</a>, and it is the whole argument for the user namespace row:
+<pre class="cmd">sudo ctr -n default run --rm --mount type=bind,src=/,dst=/host,options=rbind:ro \
+     docker.io/library/alpine:3.21 t1 head -1 /host/etc/shadow
+nerdctl run --rm -v /:/host:ro alpine:3.21 head -1 /host/etc/shadow</pre>
+<pre class="out">root:*:20639:0:99999:7:::
+head: /host/etc/shadow: <b>Permission denied</b></pre></li>
+
+<li>Now check a claim in the other direction — one of the <em>nothing</em> cells — because those are the ones people dispute. A read-only rootfs against a writable mount:
+<pre class="cmd">run E '.root.readonly=true | .mounts += [{"destination":"/host-data",
+       "source":"/home/ubuntu/i11/hostdata","type":"bind","options":["rbind","rw"]}]' \
+      '["/bin/sh","-c","touch /host-data/escaped &amp;&amp; echo wrote-to-host; touch /nope"]'</pre>
+<pre class="out"><b>wrote-to-host</b>
+touch: /nope: Read-only file system</pre>
+<p>And capabilities against the setuid route, from I11.2 — an empty bounding set with <code>noNewPrivileges</code> off:</p>
+<pre class="out">ruid=1000 <b>euid=0</b>
+CapBnd:	0000000000000000</pre>
+<p>Both cells earn their <em>nothing</em>. This is the exercise worth repeating on your own list: for each control you rely on, construct the thing it does not stop.</p></li>
+
+<li>Finally, order the controls by what they cost you, because that is the argument you will actually have to make. From this module's measurements:
+<table class="langpair">
+<thead><tr><th>Control</th><th>What it cost, measured here</th></tr></thead>
+<tbody>
+<tr><td>drop capabilities to none</td><td>nothing, for a workload that does not need one — and I11.1 showed the default is only three anyway</td></tr>
+<tr><td><code>noNewPrivileges</code></td><td>nothing, unless a setuid helper is on the critical path</td></tr>
+<tr><td>read-only rootfs + <code>tmpfs</code></td><td>two mount entries for a well-behaved app; a rebuild for anything that writes to its own install tree</td></tr>
+<tr><td>seccomp, runtime default</td><td>nothing</td></tr>
+<tr><td>seccomp, hand-written allow-list</td><td>four rounds and 74 syscall names to run <code>echo</code></td></tr>
+<tr><td>AppArmor profile</td><td>a file that must be installed on every node, and a policy language to learn</td></tr>
+<tr><td>user namespace</td><td>a subuid range per pod, and no privileged ports without extra configuration</td></tr>
+<tr><td>rootless daemon</td><td>userspace networking, a separate image store, and no ports below 1024</td></tr>
+</tbody>
+</table>
+<p>The top four are free. That is the practical conclusion of the whole first half of this module: the controls that cost nothing are off by default, and the ones that cost something are the ones people argue about instead.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a proposed hardening change, you can say which column of the table it moves and which it does not — and you can name the one control in the list that, if present, makes every other row irrelevant.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The container socket dominates everything.</strong> A pod with the containerd or Docker socket mounted is node root, whatever else is set. Every other row in the table is conditional on that one being absent.</li>
+<li><strong>"Not privileged" is not a control.</strong> It is the absence of one particular disaster. A default container still has three capabilities, a writable rootfs unless you say otherwise, no seccomp profile under bare <code>runc</code>, and whatever mounts you gave it.</li>
+<li><strong>Controls that look adjacent do not compose the way you expect.</strong> Dropping capabilities does not close the setuid route; <code>noNewPrivileges</code> does not drop capabilities; a read-only rootfs does not affect volumes. Each was measured separately in this module precisely because the intuition is wrong.</li>
+<li><strong>Defence in depth is not "turn on everything".</strong> It is a claim that each layer stops a different thing. If two controls fill the same cell and none fills another, you have redundancy where you did not need it and a gap where you did — which is what the empty columns above are for.</li>
+</ul>
+
+<div class="k8s-link">
+<p>In Kubernetes these rows become Pod Security Standards profiles: <em>Baseline</em> removes the host namespaces, <code>hostPath</code>, privileged mode and most <code>hostPort</code> use — i.e. the "no host mounts" and "no container socket" rows; <em>Restricted</em> adds non-root, <code>allowPrivilegeEscalation: false</code>, <code>drop: ["ALL"]</code> and a seccomp profile. The advanced track has no lesson on either, so the mapping is worth writing down yourself. The two columns Kubernetes answers elsewhere are "exhaust the node" — <a href="w3.html#cp-3-16">W3.16</a>'s requests and limits — and "reach the API server", which is entirely <a href="w7.html#cp-7-6">W7.6</a>'s RBAC and the ServiceAccount token every pod gets by default.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the Kubernetes <em>Pod Security Standards</em> page, read as a control matrix rather than a config reference; NIST SP 800-190 (<em>Application Container Security Guide</em>) for the same exercise done formally; and <a href="b12.html#cp-b12-1">B12.1</a> and <a href="b12.html#cp-b12-2">B12.2</a>, where you built one of these without containers in the picture.</p>
+</article>
+</div><!-- /g-rootless -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
