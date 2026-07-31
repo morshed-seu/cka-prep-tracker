@@ -1367,9 +1367,9 @@ Signing artifact...
 <li>One thing to check, which people routinely get wrong: verification succeeds if <em>any</em> attestation matches, so ask for the type you care about.
 <pre class="cmd">cosign verify-attestation --key cosign.pub --allow-http-registry \
   --insecure-ignore-tlog=true --type cyclonedx $R/i11/app:v1 2&gt;&amp;1 | tail -2</pre>
-<pre class="out">Error: <b>no matching attestations</b>: none of the attestations matched the predicate type:
-https://cyclonedx.org/bom</pre>
-<p>Which is what you want: a policy that says "must have provenance" has to name the predicate type, or it accepts an image whose only attestation is a test report.</p></li>
+<pre class="out">Error: <b>none of the attestations matched the predicate type: cyclonedx</b>, found:
+https://sigstore.dev/cosign/sign/v1,https://slsa.dev/provenance/v1</pre>
+<p>Which is what you want, and the error is unusually helpful: it lists what <em>is</em> attached. Note that the signature itself shows up in that list as <code>https://sigstore.dev/cosign/sign/v1</code> — signature and attestation really are the same mechanism. A policy that says "must have provenance" has to name the predicate type, or it accepts an image whose only attestation is a test report.</p></li>
 </ol>
 
 <h5 class="verify">Verify</h5>
@@ -1389,6 +1389,366 @@ https://cyclonedx.org/bom</pre>
 </div>
 
 <p class="docs-links"><b>Docs:</b> the in-toto Attestation specification (<em>Statement</em> and <em>predicate</em> layers); SLSA v1.0's <em>Provenance</em> schema and its levels; the DSSE envelope specification; and <code>cosign attest --help</code> for the built-in predicate types.</p>
+</article>
+<article class="lesson" id="cp-i11-11" data-id="i11-11">
+<div class="lesson-head"><span class="cp-id">I11.11</span><h4>An SBOM, and the question it exists to answer in minutes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A serious vulnerability lands in a widely-used library on a Friday afternoon. The only question that matters for the next hour is <em>do we ship it, and where</em>. Without an inventory that question is answered by pulling every image and grepping, which takes a day and misses things. With one it is a <code>jq</code> filter over files you already have. That is the entire value proposition of a software bill of materials, and it is worth building the reflex on five images before you need it on five hundred.</p>
+
+<h5>The concept</h5>
+<p>An SBOM is a list of the components in an artifact, with versions and enough identity to match against a vulnerability database. Generating one from an image is not guesswork: the tool unpacks the layers and reads the package managers' own databases — <code>/lib/apk/db/installed</code> for Alpine, <code>/var/lib/dpkg/status</code> for Debian, plus language-level manifests like <code>*.dist-info</code> for Python and <code>go.mod</code> data embedded in Go binaries. Each finding records <em>which cataloger</em> found it and <em>at which path</em>, so a surprising entry can always be traced back.</p>
+<p>The identity that makes the whole thing work is the <strong>purl</strong> (package URL): <code>pkg:apk/alpine/zlib@1.3.2-r0?arch=x86_64&amp;distro=alpine-3.21.7</code>. It encodes ecosystem, namespace, name, version and qualifiers in one string, so matching against an advisory does not depend on string-comparing human-written package names.</p>
+<p>Three formats are in circulation and you will meet all of them. <strong>SPDX</strong> is the ISO-standardised one, licensing-oriented in origin. <strong>CycloneDX</strong> comes from OWASP and is security-oriented. <strong>syft-json</strong> is the tool's native format and is the most detailed. They describe the same image and — as the lab shows — report different <em>counts</em>, which is the first thing to understand before anyone builds a metric on top of one.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Generate one straight from the registry — no pull, no daemon, no unpacking on your part.
+<pre class="cmd">cd ~/i11cs
+export SYFT_REGISTRY_INSECURE_USE_HTTP=true
+syft -q -o syft-json registry:127.0.0.1:5000/i11/app:v1 &gt; app.syft.json
+jq '{artifacts: (.artifacts|length), distro: .distro.prettyName,
+     tool: .descriptor.name, ver: .descriptor.version, schema: .schema.version}' app.syft.json</pre>
+<pre class="out">{
+  "artifacts": <b>15</b>,
+  "distro": "Alpine Linux v3.21",
+  "tool": "syft",
+  "ver": "1.50.0",
+  "schema": "16.1.10"
+}</pre></li>
+
+<li>Read one entry in full, because the fields are the whole design.
+<pre class="cmd">jq '.artifacts[0] | {name, version, type, purl, foundBy, locations: [.locations[].path]}' app.syft.json</pre>
+<pre class="out">{
+  "name": "alpine-baselayout",
+  "version": "3.6.8-r1",
+  "type": "apk",
+  "purl": "<b>pkg:apk/alpine/alpine-baselayout@3.6.8-r1?arch=x86_64&amp;distro=alpine-3.21.7</b>",
+  "foundBy": "<b>apk-db-cataloger</b>",
+  "locations": [ "<b>/lib/apk/db/installed</b>" ]
+}</pre>
+<p><code>foundBy</code> and <code>locations</code> are what make an SBOM auditable rather than an assertion. If an entry looks wrong you can go and read the file it came from.</p></li>
+
+<li>Emit the same image in the other two formats and compare the totals.
+<pre class="cmd">syft -q -o spdx-json      registry:127.0.0.1:5000/i11/app:v1 | jq '{spdxVersion, dataLicense, packages: (.packages|length)}'
+syft -q -o cyclonedx-json registry:127.0.0.1:5000/i11/app:v1 | jq '{bomFormat, specVersion, components: (.components|length)}'</pre>
+<pre class="out">{ "spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "packages": <b>16</b> }
+{ "bomFormat": "CycloneDX", "specVersion": "1.7", "components": <b>98</b> }</pre>
+<p>15, 16 and 98 for one image. Before assuming a tool is broken, ask it what it counted:</p>
+<pre class="cmd">syft -q -o cyclonedx-json registry:127.0.0.1:5000/i11/app:v1 \
+  | jq -r '[.components[].type] | group_by(.) | map("\(.[0]): \(length)") | .[]'</pre>
+<pre class="out">file: <b>82</b>
+library: <b>15</b>
+operating-system: 1</pre>
+<p>The 15 libraries are the packages; CycloneDX additionally lists 82 individual files, and SPDX's extra entry is the image itself described as a package. <strong>Never compare component counts across formats</strong>, and be suspicious of any dashboard that does.</p></li>
+
+<li>Now build the inventory the checkpoint is actually about — one SBOM per image on this box.
+<pre class="cmd">for img in alpine:3.21 ubuntu:24.04 python:3.13 \
+           gcr.io/distroless/static-debian12:latest gcr.io/distroless/base-debian12:latest; do
+  f=$(echo "$img" | tr '/:.' '____').syft.json
+  syft -q -o syft-json "$img" &gt; "$f"
+  printf '%-46s %5s packages\n' "$img" "$(jq '.artifacts|length' $f)"
+done</pre>
+<pre class="out">alpine:3.21                                       <b>15</b> packages
+ubuntu:24.04                                      <b>92</b> packages
+python:3.13                                      <b>479</b> packages
+gcr.io/distroless/static-debian12:latest           <b>4</b> packages
+gcr.io/distroless/base-debian12:latest             <b>6</b> packages</pre>
+<p>Keep that column. It is the same ordering that decides the vulnerability counts in the next checkpoint, and it is the honest reason distroless works: not a clever scanner configuration, just a hundred times fewer things to be wrong about.</p></li>
+
+<li>Answer the Friday-afternoon question. Two <code>jq</code> filters over files you already have.
+<pre class="cmd">printf '%-34s %-26s %s\n' SBOM zlib openssl
+for f in *.syft.json; do
+  z=$(jq -r '[.artifacts[] | select(.name|test("^zlib")) | "\(.name)@\(.version)"] | join(",")' "$f")
+  o=$(jq -r '[.artifacts[] | select(.name|test("openssl|libssl")) | "\(.name)@\(.version)"] | join(",")' "$f")
+  printf '%-34s %-26s %s\n' "$f" "${z:-(none)}" "${o:-(none)}"
+done</pre>
+<pre class="out">SBOM                                  zlib                              openssl
+alpine_3_21.syft.json                 zlib@1.3.2-r0                     libssl3@3.3.7-r0
+app.syft.json                         zlib@1.3.2-r0                     libssl3@3.3.7-r0
+…distroless_base-debian12….syft.json  (none)                            libssl3@<b>3.0.20</b>-1~deb12u2
+…distroless_static-debian12….json     (none)                            <b>(none)</b>
+python_3_13.syft.json                 zlib1g@1:1.3.dfsg+really1.3.1-1+b1,   openssl@<b>3.5.6</b>-1~deb13u2,
+                                      <b>zlib1g-dev</b>@1:1.3.dfsg+really1.3.1-1+b1  libssl3t64@3.5.6-1~deb13u2,
+                                                                        <b>libssl-dev</b>@3.5.6-1~deb13u2,
+                                                                        libcurl4-openssl-dev@8.14.1-2+deb13u4
+ubuntu_24_04.syft.json                zlib1g@1:1.3.dfsg-3.1ubuntu2.1    libssl3t64@<b>3.0.13</b>-0ubuntu3.11</pre>
+<p>Seconds, not a day — and note what it surfaces beyond a yes/no. Three <em>different</em> OpenSSL major versions across five images (3.0, 3.3, 3.5), so an advisory affecting one may not affect the others; and <code>python:3.13</code> shipping <code>zlib1g-dev</code> and <code>libssl-dev</code>, which are build-time packages that have no business in a runtime image and which show up again in the next checkpoint as findings nothing executes.</p></li>
+
+<li>Finally, close the loop with I11.10 — an SBOM is a predicate, so it can be attached to the image and signed.
+<pre class="cmd">syft -q -o cyclonedx-json registry:127.0.0.1:5000/i11/app:v1 &gt; app.cdx.json
+cosign attest --key cosign.key --signing-config sc-notlog.json --allow-http-registry \
+  --type cyclonedx --predicate app.cdx.json -y $R/i11/app@$DIG
+cosign verify-attestation --key cosign.pub --allow-http-registry \
+  --insecure-ignore-tlog=true --type cyclonedx $R/i11/app:v1 | head -2
+curl -s -H 'Accept: application/vnd.oci.image.index.v1+json' \
+  "http://$R/v2/i11/app/manifests/sha256-${DIG#sha256:}" | jq '.manifests | length'</pre>
+<pre class="out">Using payload from: app.cdx.json
+Signing artifact...
+
+Verification for 127.0.0.1:5000/i11/app:v1 --
+  - The signatures were verified against the specified public key
+
+<b>3</b></pre>
+<p>Three referrers on one image now: the signature, the provenance attestation and the SBOM attestation — all the same <code>artifactType</code>, told apart only by their predicate types. Now the inventory travels with the artifact and cannot be quietly edited. That is the difference between an SBOM you generated and an SBOM you can rely on: the first tells you what <em>you</em> think is in there, the second is a signed claim from whoever built it.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can produce an SBOM for an image you have never pulled, explain why three formats report three different counts for it, and answer "do we ship package X anywhere" across your images with one loop.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Counts are not comparable across formats.</strong> 15 / 16 / 98 for one image, measured above. The difference is what counts as a component, not what is installed.</li>
+<li><strong>An SBOM records what the package managers know.</strong> A binary dropped into the image by <code>COPY</code>, a vendored library compiled into an executable, or something installed by <code>curl | sh</code> is invisible to the database catalogers. Go binaries are the exception — syft reads their embedded module list — and that exception is why Go images often <em>gain</em> findings.</li>
+<li><strong>An SBOM generated after the fact is weaker than one generated by the build.</strong> Scanning the finished image cannot see what was removed in a multi-stage build or which source produced a file. This is the same gap <a href="i6.html#cp-i6-10">I6.10</a> found in <code>history</code>: the best-built images have the thinnest audit trail.</li>
+<li><strong>It goes stale the moment the image is rebuilt.</strong> An SBOM is bound to a digest. Store it against the digest, not the tag, for the reason <a href="#cp-i11-13">I11.13</a> spells out.</li>
+<li><strong>Nothing about an SBOM is a security control.</strong> It does not stop, detect or fix anything. It shortens the time between learning about a problem and knowing whether you have it — which is worth a lot, and is not the same claim.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Kubernetes has no SBOM concept, and the CKA does not ask about one. Where it lands in practice is the admission and registry layers: an SBOM attestation attached to the image (step 6) is what lets a cluster policy require "images must carry a signed inventory", and the per-image package counts in step 4 are the argument you will make when someone proposes <code>ubuntu:24.04</code> as a base for a Go service that needs no packages at all. For the runtime side of the same argument, the unpacked-on-disk cost is in <a href="i7.html#cp-i7-12">I7.12</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the <em>purl</em> specification, which is the only part of this you should memorise; SPDX 2.3 and CycloneDX 1.7 schema references; <code>syft cataloger list</code> to see what it knows how to read; and <a href="i4.html#cp-i4-9">I4.9</a>, where you first unpacked an image's layers by hand.</p>
+</article>
+<article class="lesson" id="cp-i11-12" data-id="i11-12">
+<div class="lesson-head"><span class="cp-id">I11.12</span><h4>Scanning, the arithmetic that changes behaviour, and two tools that disagree</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A vulnerability scanner is the most-deployed and least-understood tool in this whole area. It is treated as a measurement — "the image has four criticals" — when it is really a join between an inventory you generated and a database somebody else curates, with severity opinions attached. This checkpoint runs two scanners over the same five images and shows both what the numbers are good for (choosing a base image; the effect is enormous) and what they are not (a gate on a count).</p>
+
+<h5>The concept</h5>
+<p>A scan is three steps. Build an SBOM. Match each <code>purl</code> against advisories. Report. Everything interesting happens in the second and third steps, because the databases and the severity opinions differ:</p>
+<ul>
+<li><strong>The advisory source.</strong> A CVE has an upstream NVD record with a CVSS score. Distributions <em>also</em> publish their own assessment — Debian's security tracker, Ubuntu's CVE database, Alpine's secdb — which may say "does not affect our build", "fixed in this version", or "minor issue, will not fix". A scanner that prefers the vendor's view and one that prefers NVD's will report the same package very differently.</li>
+<li><strong>Fixed versus unfixed.</strong> Many findings have no fix available. Counting them makes the number bigger and the action smaller.</li>
+<li><strong>Reachability.</strong> A package being installed is not the same as its vulnerable code being on any path your process executes. Scanners at this level do not know the difference, and the gap is where most of the noise lives.</li>
+</ul>
+<p>Which leaves one thing a scan measures reliably: <strong>how much software is in the image</strong>. That is a decision you control completely, and it is where the leverage is.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Scan the five images from I11.11 and put the numbers next to the package counts.
+<pre class="cmd">for img in ubuntu:24.04 alpine:3.21 python:3.13 \
+           gcr.io/distroless/base-debian12:latest gcr.io/distroless/static-debian12:latest; do
+  f=$(echo "$img" | tr '/:.' '____').triv.json
+  trivy image --scanners vuln -q -f json -o "$f" "$img"
+  jq -r --arg i "$img" '[.Results[]?.Vulnerabilities[]?.Severity] as $s |
+    "\($i)  CRIT \($s|map(select(.=="CRITICAL"))|length)  HIGH \($s|map(select(.=="HIGH"))|length)
+     MED \($s|map(select(.=="MEDIUM"))|length)  LOW \($s|map(select(.=="LOW"))|length)
+     TOTAL \($s|length)"' "$f"
+done</pre>
+<table class="langpair">
+<thead><tr><th>Image</th><th>packages</th><th>CRIT</th><th>HIGH</th><th>MED</th><th>LOW</th><th>TOTAL</th></tr></thead>
+<tbody>
+<tr><td><code>gcr.io/distroless/static-debian12</code></td><td>4</td><td>0</td><td>0</td><td>0</td><td>0</td><td><b>0</b></td></tr>
+<tr><td><code>alpine:3.21</code></td><td>15</td><td>0</td><td>0</td><td>0</td><td>0</td><td><b>0</b></td></tr>
+<tr><td><code>gcr.io/distroless/base-debian12</code></td><td>6</td><td>0</td><td>0</td><td>4</td><td>9</td><td><b>13</b></td></tr>
+<tr><td><code>ubuntu:24.04</code></td><td>92</td><td>0</td><td>0</td><td>32</td><td>10</td><td><b>42</b></td></tr>
+<tr><td><code>python:3.13</code></td><td>479</td><td><b>60</b></td><td><b>380</b></td><td>893</td><td>1214</td><td><b>2594</b></td></tr>
+</tbody>
+</table>
+<p>This is the arithmetic that changes behaviour, and it is not subtle: 0, 0, 13, 42, 2594. The ordering is the package-count ordering, exactly. Nothing about <code>python:3.13</code> is badly maintained — it is an excellent image that happens to contain a Debian userland plus a compiler toolchain, and every one of those packages is something an advisory can be written about.</p></li>
+
+<li>Now run a second scanner over the same images, which is the step almost nobody takes.
+<pre class="cmd">for img in ubuntu:24.04 python:3.13 gcr.io/distroless/base-debian12:latest; do
+  g=$(echo "$img" | tr '/:.' '____').grype.json
+  grype -q -o json "$img" &gt; "$g"
+  jq -r --arg i "$img" '[.matches[].vulnerability.severity] as $s |
+    "\($i)  CRIT \($s|map(select(.=="Critical"))|length)  HIGH \($s|map(select(.=="High"))|length)  TOTAL \($s|length)"' "$g"
+done</pre>
+<table class="langpair">
+<thead><tr><th>Image</th><th>trivy CRIT / HIGH / total</th><th>grype CRIT / HIGH / total</th></tr></thead>
+<tbody>
+<tr><td><code>ubuntu:24.04</code></td><td>0 / 0 / <b>42</b></td><td>0 / 0 / <b>109</b></td></tr>
+<tr><td><code>gcr.io/distroless/base-debian12</code></td><td><b>0</b> / <b>0</b> / 13</td><td><b>1</b> / <b>2</b> / 13</td></tr>
+<tr><td><code>python:3.13</code></td><td>60 / 380 / <b>2594</b></td><td>91 / 353 / <b>1946</b></td></tr>
+</tbody>
+</table>
+<p>Look at the distroless row. <strong>Identical totals, incompatible severities.</strong> One tool says this image has nothing critical; the other says it has one critical and two highs. Both are scanning the same six packages.</p></li>
+
+<li>Find out why, by asking both tools about the same CVE ids.
+<pre class="cmd">jq -r '[.matches[] | select(.vulnerability.severity=="Critical" or .vulnerability.severity=="High")]
+       | .[] | "\(.vulnerability.severity)  \(.vulnerability.id)  \(.artifact.name)@\(.artifact.version)"' \
+   gcr_io_distroless_base-debian12_latest.grype.json
+for id in CVE-2026-5450 CVE-2026-5928 CVE-2026-5435; do
+  jq -r --arg i "$id" '[.Results[]?.Vulnerabilities[]? | select(.VulnerabilityID==$i)]
+         | .[] | "\(.Severity)  \(.VulnerabilityID)  \(.PkgName)  status=\(.Status)"' \
+     gcr_io_distroless_base-debian12_latest.triv.json
+done</pre>
+<pre class="out">grype:
+  <b>Critical</b>  CVE-2026-5450  libc6@2.36-9+deb12u14
+  <b>High</b>      CVE-2026-5928  libc6@2.36-9+deb12u14
+  <b>High</b>      CVE-2026-5435  libc6@2.36-9+deb12u14
+
+trivy:
+  <b>MEDIUM</b>  CVE-2026-5450  libc6  status=affected
+  <b>MEDIUM</b>  CVE-2026-5928  libc6  status=affected
+  <b>MEDIUM</b>  CVE-2026-5435  libc6  status=affected</pre>
+<p>Same three CVEs, same package, same version. grype is reporting NVD's CVSS-derived severity; trivy is preferring Debian's own assessment of how those bugs behave in Debian's build. Neither is wrong, and neither number means what a policy of "block on any critical" assumes it means. If you gate on a count, you are gating on a vendor's opinion — so pick the tool deliberately and know which opinion you bought.</p></li>
+
+<li>Take one "critical" all the way down and ask whether the code is even present.
+<pre class="cmd">jq -r '[.matches[] | select(.vulnerability.severity=="Critical")] | .[0]
+       | "\(.vulnerability.id) in \(.artifact.name)\nlocations: \([.artifact.locations[].path] | join(" "))"' \
+   python_3_13.grype.json</pre>
+<pre class="out">CVE-2026-49261 in <b>libmariadb-dev</b>
+locations: /var/lib/dpkg/status /usr/share/doc/libmariadb-dev/copyright
+           /var/lib/dpkg/info/libmariadb-dev.md5sums /var/lib/dpkg/info/libmariadb-dev.list</pre>
+<p>Read the locations. Every one of them is dpkg <em>bookkeeping</em> — the package database, a copyright file, a checksum list. Nothing points at a shared library. And the package name ends in <code>-dev</code>: headers and a static archive, present because <code>python:3.13</code> ships a build toolchain so that <code>pip install</code> can compile extensions. Confirm what actually links:</p>
+<pre class="cmd">nerdctl run --rm python:3.13 sh -c 'ldd /usr/local/bin/python3.13'</pre>
+<pre class="out">	linux-vdso.so.1
+	libpython3.13.so.1.0 =&gt; /usr/local/bin/../lib/libpython3.13.so.1.0
+	libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6
+	libm.so.6 =&gt; /lib/x86_64-linux-gnu/libm.so.6
+	/lib64/ld-linux-x86-64.so.2</pre>
+<p>Four libraries, none of them MariaDB's. The finding is <em>true</em> — that package is installed, and the CVE is real — and the vulnerable code is on no path this image executes. That is not an argument for ignoring it; it is an argument for <strong>removing the package</strong>, which is the same conclusion the counts in step 1 already pointed at. <code>python:3.13-slim</code> or a multi-stage build that copies the wheel into a runtime image deletes the finding and the toolchain together.</p></li>
+
+<li>Prove the conclusion rather than asserting it: scan the image you built in <a href="i6.html">I6</a> and the one you signed in I11.9.
+<pre class="cmd">TRIVY_INSECURE=true trivy image --scanners vuln -q -f json -o app.triv.json 127.0.0.1:5000/i11/app:v1
+jq '[.Results[]?.Vulnerabilities[]?] | length' app.triv.json</pre>
+<pre class="out"><b>0</b></pre>
+<p>Fifteen packages, zero findings, and the reason is the number 15.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can produce the package-count-versus-finding-count table for your own base images, and when someone reports a critical you can determine, from the SBOM's <code>locations</code> and one <code>ldd</code>, whether the vulnerable code is in an executed path — and say what you would do either way.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Two scanners give different severities for the same CVE in the same package.</strong> Measured: Critical/High/High under grype, MEDIUM/MEDIUM/MEDIUM under trivy, for three CVEs in one <code>libc6</code>. Any threshold policy inherits the tool's choice of advisory source.</li>
+<li><strong>Totals can match while the breakdown does not.</strong> Both tools found 13 findings in <code>distroless/base</code>. Only one of them would have failed a "no criticals" gate.</li>
+<li><strong>The scanner's database changes under you.</strong> The same image scanned a week apart gives different numbers with no rebuild. A pipeline that fails on new findings will fail on a day you changed nothing — which is correct behaviour and needs to be planned for, not treated as a flake.</li>
+<li><strong>"0 findings" means "0 known findings in packages the cataloger could see".</strong> <code>distroless/static</code> scoring zero is partly its four packages and partly that a statically-linked binary copied into it is invisible to a dpkg cataloger. Compare with the SBOM, not with hope.</li>
+<li><strong>Alpine scoring 0 is a snapshot, not a property.</strong> It was 0 on the day this ran. The durable claim is the package count, not the finding count.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Scanning is not a Kubernetes feature and the CKA does not test it. Where it meets the cluster is admission — the same webhooks from I11.9 can require a signed scan attestation no older than N days — and the base-image decision, which is the one thing in this checkpoint that changes a cluster's exposure permanently. The runtime-side argument for the same decision is disk: <a href="i7.html#cp-i7-12">I7.12</a> measured the snapshotter holding roughly three times the compressed image size per node.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the Debian and Ubuntu security trackers, to see a distribution's own assessment of a CVE; <code>trivy image --help</code> for <code>--ignore-unfixed</code> and <code>--severity</code>; grype's <em>severity</em> and <em>ignore rules</em> documentation; and the VEX specification, which exists to record exactly the "installed but not reachable" judgement made in step 4.</p>
+</article>
+<article class="lesson" id="cp-i11-13" data-id="i11-13">
+<div class="lesson-head"><span class="cp-id">I11.13</span><h4>A tag is a mutable pointer, and everything above assumed it was not</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everything in the last four checkpoints binds to a digest. The signature's payload names a digest. The attestation's <code>subject</code> is a digest. The SBOM and the scan describe the bytes behind a digest. Meanwhile every deployment you have ever written names a <em>tag</em> — and a tag is a name a registry lets anyone with push access repoint at any moment. This checkpoint closes that gap by moving one, and watching four things quietly stop being true.</p>
+
+<h5>The concept</h5>
+<p><a href="i5.html#cp-i5-2">I5.2</a> established the two ways to name a manifest in the distribution API: <code>&lt;name&gt;:&lt;tag&gt;</code> and <code>&lt;name&gt;@&lt;digest&gt;</code>. They are different in kind, not in style. The digest form is a <em>content address</em>: the registry computes the SHA-256 of the manifest bytes and compares, so the reference either resolves to exactly those bytes or fails. The tag form is a <em>lookup</em> in a mutable table.</p>
+<p>Nothing in the specification prevents re-pushing a tag; it is an ordinary <code>PUT</code>, and the registry answers <code>201 Created</code> with a new <code>Docker-Content-Digest</code>. Some registries offer immutability as a policy feature, but it is a policy, not a property of the format, and it is off by default in the reference implementation.</p>
+<p>So a digest-pinned reference gives you three things a tag cannot: the bytes cannot change under you, a mirror or proxy cannot substitute different content, and any signature, attestation, SBOM or scan result about that digest stays about the thing you are running. That last one is the point — the supply-chain machinery is only load-bearing at the digest level, and a tag re-push silently unhooks all of it.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Push an image and record what the tag currently means.
+<pre class="cmd">cd ~/i11cs; R=127.0.0.1:5000
+skopeo copy --dest-tls-verify=false oci:$HOME/i11/oci:3.21 docker://$R/i11/mutable:v1
+D1=$(skopeo inspect --tls-verify=false docker://$R/i11/mutable:v1 | jq -r .Digest)
+echo "$D1"</pre>
+<pre class="out">sha256:<b>f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</b></pre></li>
+
+<li>Build genuinely different content and push it to the <em>same tag</em>. Doing this by hand with <code>curl</code> rather than with a build tool makes it obvious how little ceremony is involved: two blob uploads and a manifest <code>PUT</code>.
+<pre class="cmd">mkdir -p alt/rootfs &amp;&amp; cd alt
+echo "this is not alpine" &gt; rootfs/IMPOSTOR
+tar czf layer.tar.gz -C rootfs .
+LD=$(sha256sum layer.tar.gz | cut -d' ' -f1)
+DIFF=$(gzip -dc layer.tar.gz | sha256sum | cut -d' ' -f1)
+cat &gt; cfg.json &lt;&lt;J
+{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/sh"]},
+ "rootfs":{"type":"layers","diff_ids":["sha256:$DIFF"]},"history":[{"created_by":"i11 impostor"}]}
+J
+CD=$(sha256sum cfg.json | cut -d' ' -f1)
+# two blob uploads (the Location header is absolute and already carries ?_state=, so append with &amp;)
+L=$(curl -s -X POST "http://$R/v2/i11/mutable/blobs/uploads/" -D - -o /dev/null | tr -d '\r' | sed -n 's/^[Ll]ocation: //p')
+curl -s -X PUT "$L&amp;digest=sha256:$CD" -H 'Content-Type: application/octet-stream' --data-binary @cfg.json -w '%{http_code}\n' -o /dev/null
+L=$(curl -s -X POST "http://$R/v2/i11/mutable/blobs/uploads/" -D - -o /dev/null | tr -d '\r' | sed -n 's/^[Ll]ocation: //p')
+curl -s -X PUT "$L&amp;digest=sha256:$LD" -H 'Content-Type: application/octet-stream' --data-binary @layer.tar.gz -w '%{http_code}\n' -o /dev/null
+# and the manifest, straight onto :v1
+cat &gt; man.json &lt;&lt;J
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+ "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:$CD","size":$(stat -c%s cfg.json)},
+ "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:$LD","size":$(stat -c%s layer.tar.gz)}]}
+J
+curl -s -X PUT "http://$R/v2/i11/mutable/manifests/v1" \
+  -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @man.json -D - -o /dev/null \
+  | tr -d '\r' | grep -iE '^HTTP|^docker-content-digest'</pre>
+<pre class="out">201
+201
+<b>HTTP/1.1 201 Created</b>
+Docker-Content-Digest: sha256:<b>67cba4faf3b5730d90988d09ec638c7c36defd859dec41960790927a13317575</b></pre>
+<p>No warning, no version conflict, no confirmation. The registry did exactly what it was asked.</p></li>
+
+<li>Ask what <code>:v1</code> means now, and what the old digest means.
+<pre class="cmd">D2=$(skopeo inspect --tls-verify=false docker://$R/i11/mutable:v1 | jq -r .Digest)
+echo ":v1 was  $D1"; echo ":v1 is   $D2"
+skopeo inspect --tls-verify=false docker://$R/i11/mutable@$D1 | jq -c '{Digest, Layers: (.Layers|length)}'
+skopeo inspect --tls-verify=false docker://$R/i11/mutable@$D2 | jq -c '{Digest, Layers: (.Layers|length)}'</pre>
+<pre class="out">:v1 was  sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+:v1 is   sha256:<b>67cba4faf3b5730d90988d09ec638c7c36defd859dec41960790927a13317575</b>
+
+{"Digest":"sha256:f27cad91…","Layers":1}   ← still exactly what it always was
+{"Digest":"sha256:67cba4fa…","Layers":1}   ← what the tag now points at</pre>
+<p><code>myapp:v1</code> means something else. <code>myapp@sha256:f27cad91…</code> means what it always did, and will continue to as long as the blobs are not garbage-collected. That is the whole checkpoint, and everything below is a consequence of it.</p></li>
+
+<li>Now the consequence that matters. Sign the <em>original</em> digest — the correct, careful thing to do — and then verify the way a deployment does.
+<pre class="cmd">cosign sign --key cosign.key --signing-config sc-notlog.json --allow-http-registry -y $R/i11/mutable@$D1
+echo "--- verify by digest (the thing that was signed):"
+cosign verify --key cosign.pub --allow-http-registry --insecure-ignore-tlog=true $R/i11/mutable@$D1
+echo "--- verify by tag (what a deployment does):"
+cosign verify --key cosign.pub --allow-http-registry --insecure-ignore-tlog=true $R/i11/mutable:v1</pre>
+<pre class="out">--- verify by digest (the thing that was signed):
+Verification for 127.0.0.1:5000/i11/mutable@sha256:f27cad91… --
+  - <b>The signatures were verified against the specified public key</b>
+
+--- verify by tag (what a deployment does):
+Error: <b>no signatures found</b>
+error during command execution: no signatures found</pre>
+<p>Sit with that error message for a moment, because it is the second fault in <a href="#cp-i11-15">I11.15</a> and it is actively misleading. <em>No signatures found</em> reads as "signing never happened" or "the key is wrong". Both are false. The signing worked, the key is right, the signature is still sitting in the registry — it is about a digest the tag no longer resolves to. The image is fine, the signature is fine, and they are no longer about the same bytes.</p></li>
+
+<li>Enumerate what else just broke, because it is the same list every time:
+<table class="langpair">
+<thead><tr><th>Artefact</th><th>Bound to</th><th>After the re-push</th></tr></thead>
+<tbody>
+<tr><td>signature</td><td>digest, in the signed payload</td><td>orphaned — verification by tag fails</td></tr>
+<tr><td>attestation / provenance</td><td>digest, in <code>subject</code></td><td>orphaned, same way</td></tr>
+<tr><td>SBOM</td><td>digest</td><td>describes packages that may not be in the running image</td></tr>
+<tr><td>scan result</td><td>digest</td><td>a clean scan that no longer applies</td></tr>
+<tr><td>a node that already pulled <code>:v1</code></td><td>whatever it cached</td><td>runs the old bytes; a new node runs the new ones</td></tr>
+</tbody>
+</table>
+<p>That last row is the operational sting. After a tag re-push, a cluster runs <em>two different images</em> under one name, and which nodes have which depends on when each last pulled. <code>imagePullPolicy: Always</code> converges them — onto the new content, without telling you.</p></li>
+
+<li>The fix is one substitution, and it is worth internalising the shape.
+<pre class="cmd">skopeo inspect --tls-verify=false docker://$R/i11/app:v1 | jq -r .Digest</pre>
+<pre class="out">sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</pre>
+<pre class="cmd"># in the pod spec, not this:
+#   image: registry.example.com/i11/app:v1
+# but this:
+#   image: registry.example.com/i11/app@sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339</pre>
+<p>Unreadable, and that is the trade. Digests are for machines to write — a CI pipeline resolves the tag once, records the digest, and every downstream manifest carries the digest. The tag stays as a human-readable annotation next to it.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state which of your supply-chain artefacts survive a tag re-push (none of them, by tag) and recognise <code>no signatures found</code> as a possible symptom of a moved tag rather than of a signing failure.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The failure message names the wrong problem.</strong> <em>no signatures found</em> sends people to check their key, their signing job and their registry credentials. The check that actually finds it is comparing the digest the tag resolves to now against the digest in the signature payload.</li>
+<li><strong>Digest pinning does not stop deletion.</strong> It guarantees "these bytes or an error", not "these bytes forever". A garbage collection that drops the old manifest turns the pinned reference into a pull failure — which is loud, and therefore fine.</li>
+<li><strong>A digest does not pin a multi-platform image to a platform.</strong> Pinning an index digest still selects by platform at pull time. <a href="i4.html#cp-i4-8">I4.8</a> is where that distinction bit.</li>
+<li><strong>Registry immutability settings are per-registry and mostly off.</strong> <code>registry:2</code> allows re-push by default, as measured. Turning immutability on where your registry supports it is a better control than any convention about not re-pushing.</li>
+<li><strong>Nothing stops <code>:latest</code> from moving twice during one rollout.</strong> That is why a verifying admission webhook must rewrite the reference to the digest it verified, rather than admitting the tag and letting the kubelet resolve it again later.</li>
+</ul>
+
+<div class="k8s-link">
+<p>A pod's <code>image:</code> field accepts the digest form, and <code>kubectl get pod -o jsonpath='{.status.containerStatuses[*].imageID}'</code> shows the digest a running container was actually started from — which is how you check whether two pods of one Deployment are running the same bytes. This is also the mechanism behind <a href="w3.html#cp-3-23">W3.23</a>'s point that what is in the cluster is not always what you think you put there. The tag-versus-digest distinction is why every serious admission policy mutates the reference rather than merely approving it.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the OCI distribution spec's <em>Pulling manifests</em> and <em>Pushing manifests</em> sections, and the <code>Docker-Content-Digest</code> header; your registry's documentation for tag immutability; and <a href="i5.html#cp-i5-2">I5.2</a>, where the two reference forms were first taken apart.</p>
 </article>
 </div><!-- /g-supply-chain -->
 
