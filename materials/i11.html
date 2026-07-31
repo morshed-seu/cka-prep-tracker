@@ -330,6 +330,437 @@ ruid=1000 <b>euid=1000</b></pre>
 
 <p class="docs-links"><b>Docs:</b> the kernel's <em>no_new_privs.rst</em>; <code>man 2 prctl</code> under <code>PR_SET_NO_NEW_PRIVS</code>; <code>man 8 mount</code> for <code>nosuid</code>; and <a href="b4.html#cp-b4-15">B4.15</a>, whose debugging drill is a copied setuid binary.</p>
 </article>
+<article class="lesson" id="cp-i11-3" data-id="i11-3">
+<div class="lesson-head"><span class="cp-id">I11.3</span><h4>A seccomp profile, written by hand, and the SIGSYS it produces</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Capabilities decide which privileged <em>operations</em> a process may perform. Seccomp decides which <em>system calls</em> it may make at all — a finer instrument in one sense and a blunter one in another. It is the control that stops a container reaching a kernel bug in a syscall it never needed, and it is the control most likely to break a workload in a way whose error message names nothing useful. Both halves of that sentence are things you should see happen rather than read about, which is what this lesson does.</p>
+
+<h5>The concept</h5>
+<p>A seccomp filter is a small program the kernel runs before every system call the process makes. It looks at the syscall number and, optionally, at the raw integer arguments, and returns an action: allow it, fail it with an errno, log it, or kill something. The filter is installed once and is <strong>irreversible</strong> and inherited — the same one-way property as <code>no_new_privs</code>, and in fact installing a filter requires either <code>CAP_SYS_ADMIN</code> or the <code>no_new_privs</code> bit, so the two travel together.</p>
+<p><a href="b12.html#cp-b12-14">B12.14</a> installed one of these by hand, and <a href="i1.html#cp-i1-9">I1.9</a> got killed by one on purpose. The OCI config expresses the same thing as JSON under <code>linux.seccomp</code>: a <code>defaultAction</code> that applies to every syscall not otherwise mentioned, then an array of <code>syscalls</code> entries, each with a list of <code>names</code>, an <code>action</code>, and optionally <code>args</code> to match on argument values.</p>
+<p>That gives you two ways to write a profile, and they fail very differently:</p>
+<ul>
+<li>A <strong>deny-list</strong> — <code>defaultAction: SCMP_ACT_ALLOW</code> plus entries blocking specific syscalls. Easy to write, impossible to make complete, and the right shape when you want to remove one known-dangerous call.</li>
+<li>An <strong>allow-list</strong> — <code>defaultAction: SCMP_ACT_ERRNO</code> plus an enumeration of everything permitted. Genuinely restrictive, and much harder than it looks: the enumeration must cover the syscalls the <em>runtime</em> makes while setting the container up, not just the ones your program makes. You will watch that fail four times below before it works.</li>
+</ul>
+<p>One structural detail that decides whether a profile does what you meant: <code>args</code> matches on the raw register values, and it cannot follow pointers. So you can filter <code>chmod</code> by <em>mode</em> but never by <em>path</em> — the path is a pointer, and the filter sees only the address. This is not a limitation of the OCI schema, it is a limitation of the kernel's filter, and it is why "block writes to <code>/etc</code>" is not a thing seccomp can do.</p>
+
+<div class="specref">
+<p>The schema is small enough to hold in your head. Note that <code>defaultAction</code> is the only REQUIRED field, and note the warning the spec itself attaches to an empty allow-list.</p>
+<blockquote><b>defaultAction</b> <em>(string, REQUIRED)</em> - the default action for seccomp. Allowed values are the same as <code>syscalls[].action</code>.<br>
+<b>defaultErrnoRet</b> <em>(uint, OPTIONAL)</em> - the errno return code to use. […] The default is <code>EPERM</code>.<br>
+<b>architectures</b> <em>(array of strings, OPTIONAL)</em> - the architecture used for system calls.<br>
+<b>syscalls</b> <em>(array of objects, OPTIONAL)</em> - match a syscall in seccomp. While this property is OPTIONAL, some values of <code>defaultAction</code> are not useful without <code>syscalls</code> entries. For example, if <code>defaultAction</code> is <code>SCMP_ACT_KILL</code> and <code>syscalls</code> is empty or unset, the kernel will kill the container process on its first syscall.<br>
+ · <b>names</b> <em>(array of strings, REQUIRED)</em> - the names of the syscalls. <code>names</code> MUST contain at least one entry.<br>
+ · <b>action</b> <em>(string, REQUIRED)</em> - the action for seccomp rules.<br>
+ · <b>args</b> <em>(array of objects, OPTIONAL)</em> — with <b>index</b>, <b>value</b>, <b>valueTwo</b> and <b>op</b>.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Linux Configuration</em> § Seccomp — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#seccomp">config-linux.md</a></cite>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>First, establish that there is nothing here by default.
+<pre class="cmd">cd ~/i11 &amp;&amp; rm -f config.json &amp;&amp; runc spec
+jq '.linux | has("seccomp")' config.json</pre>
+<pre class="out"><b>false</b></pre>
+<p>A bare bundle has <em>no</em> seccomp filter at all. The "runtime default profile" people talk about belongs to containerd and Docker, not to runc — which is why a container started by <code>runc</code> directly is less confined than the same image under <code>ctr</code>.</p></li>
+
+<li>Write the smallest real profile: allow everything, refuse to make directories.
+<pre class="cmd">cat &gt; seccomp-errno.json &lt;&lt;'EOF'
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"],
+  "syscalls": [
+    { "names": ["mkdir", "mkdirat"], "action": "SCMP_ACT_ERRNO" }
+  ]
+}
+EOF</pre>
+<p>Extend the <code>run</code> helper to splice a profile file into the config:</p>
+<pre class="cmd">runsec() {   # runsec &lt;name&gt; &lt;profile.json&gt; &lt;args-json&gt;
+  rm -f config.json; runc spec
+  jq --slurpfile s "$2" ".process.terminal=false | .process.args=$3 |
+      .linux.namespaces |= map(select(.type!=\"network\")) |
+      .root.readonly=false | .linux.seccomp = \$s[0]" config.json &gt; c.tmp &amp;&amp; mv c.tmp config.json
+  sudo dmesg -C
+  sudo runc --root /run/runc-i11 run "i11$1"
+  sudo runc --root /run/runc-i11 delete -f "i11$1" 2&gt;/dev/null
+  sudo dmesg | tail -3
+}
+runsec A seccomp-errno.json '["/bin/sh","-c","mkdir /d; echo rc=$?"]'</pre>
+<pre class="out">mkdir: can't create directory '/d': <b>Operation not permitted</b>
+rc=1</pre></li>
+
+<li>Change the errno the filter returns. <code>38</code> is <code>ENOSYS</code>.
+<pre class="cmd">jq '.syscalls[0].errnoRet = 38' seccomp-errno.json &gt; seccomp-enosys.json
+runsec B seccomp-enosys.json '["/bin/sh","-c","mkdir /d; echo rc=$?"]'</pre>
+<pre class="out">mkdir: can't create directory '/d': <b>Function not implemented</b></pre>
+<p>This is not a curiosity. <code>ENOSYS</code> is what a kernel returns for a syscall it does not have, so libraries treat it as "try the older way" rather than "you are not allowed". Returning it is how a profile blocks a modern syscall without breaking a program that has a fallback — and it is also how a blocked syscall can present as a mysterious performance regression rather than an error.</p></li>
+
+<li>Now make the kernel kill rather than lie.
+<pre class="cmd">jq '.syscalls[0].action = "SCMP_ACT_KILL_PROCESS" | del(.syscalls[0].errnoRet)' \
+   seccomp-errno.json &gt; seccomp-kill.json
+runsec C seccomp-kill.json '["/bin/sh","-c","echo alive; mkdir /d; echo still-here"]'</pre>
+<pre class="out">alive
+still-here
+<b>Bad system call (core dumped)</b>
+
+[  838.508910] audit: type=1326 audit(1785487832.840:122): auid=1000 uid=0 gid=0
+  ses=41 subj=unconfined pid=7157 <b>comm="mkdir"</b> exe="/bin/busybox" <b>sig=31</b>
+  arch=c000003e <b>syscall=83</b> compat=0 ip=0x7ae5397ce9ff <b>code=0x80000000</b></pre>
+<p>Read that carefully, because two things are not what you would guess. <code>still-here</code> printed: <code>SCMP_ACT_KILL_PROCESS</code> killed the <em>process that made the syscall</em>, which was the forked <code>mkdir</code>, not the shell that forked it — the container survived and exited 0. And the only place the reason is written down is the kernel audit record: <code>sig=31</code> is <code>SIGSYS</code>, <code>syscall=83</code> is <code>mkdir</code> on x86-64, and <code>code=0x80000000</code> is <code>SECCOMP_RET_KILL_PROCESS</code>. Nothing in the container's own output says "seccomp".</p></li>
+
+<li>Filter on an argument. Block <code>chmod</code> only when the setuid bit (<code>04000</code> = 2048) is being set, and leave ordinary mode changes alone. <code>SCMP_CMP_MASKED_EQ</code> tests <code>(arg &amp; value) == valueTwo</code>.
+<pre class="cmd">cat &gt; seccomp-masked.json &lt;&lt;'EOF'
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [
+    { "names": ["chmod"],
+      "action": "SCMP_ACT_ERRNO",
+      "args": [ { "index": 1, "value": 2048, "valueTwo": 2048, "op": "SCMP_CMP_MASKED_EQ" } ] },
+    { "names": ["fchmodat", "fchmodat2"],
+      "action": "SCMP_ACT_ERRNO",
+      "args": [ { "index": 2, "value": 2048, "valueTwo": 2048, "op": "SCMP_CMP_MASKED_EQ" } ] }
+  ]
+}
+EOF
+runsec D seccomp-masked.json '["/bin/sh","-c","touch /sf; chmod 0755 /sf; echo plain_rc=$?; chmod 4755 /sf; echo setuid_rc=$?; ls -l /sf"]'</pre>
+<pre class="out">plain_rc=<b>0</b>
+chmod: /sf: Operation not permitted
+setuid_rc=<b>1</b>
+-rwxr-xr-x    1 root     root             0 Jul 31 08:51 /sf</pre>
+<p><strong>Why two entries and not one.</strong> The first attempt at this profile put all three names in a single entry with <code>index: 2</code>, and the setuid <code>chmod</code> sailed straight through. The reason is that the mode argument is not in the same position for all three: <code>chmod(path, mode)</code> has it at index 1, <code>fchmodat(dirfd, path, mode, flags)</code> at index 2. Alpine's musl calls <code>chmod</code>; glibc's coreutils calls <code>fchmodat</code>. One <code>args</code> block applies to every name in its entry, so grouping syscalls whose arguments differ produces a rule that is silently wrong for some of them.</p>
+<pre class="cmd">strace -e trace=chmod,fchmodat chroot rootfs /bin/chmod 4755 /sf   # musl
+strace -e trace=chmod,fchmodat chmod 4755 /tmp/probe               # glibc</pre>
+<pre class="out">chmod("/sf", 04755)                        = 0
+fchmodat(AT_FDCWD, "/tmp/probe", 04755)    = 0</pre></li>
+
+<li>Test what <code>architectures</code> does, because it is almost universally misread. Write a profile whose <code>architectures</code> lists only ARM, and run it on this x86-64 box.
+<pre class="cmd">jq '.architectures = ["SCMP_ARCH_ARM","SCMP_ARCH_AARCH64"]' seccomp-errno.json &gt; seccomp-wrongarch.json
+runsec E seccomp-wrongarch.json '["/bin/sh","-c","mkdir /d; echo rc=$?"]'</pre>
+<pre class="out">mkdir: can't create directory '/d': <b>Operation not permitted</b></pre>
+<p>The rule fired anyway. <code>architectures</code> <strong>adds</strong> architectures to the filter; the native one is always included. It is not a selector, and you cannot use it to scope a rule to one platform.</p></li>
+
+<li>Finally, try the allow-list, and find out why nobody hand-writes one. Start with 29 syscalls covering everything a <code>sh -c 'echo hello'</code> obviously needs.
+<pre class="cmd">printf '{ "defaultAction": "SCMP_ACT_ERRNO", "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [ { "names": ["execve","exit","exit_group","write","read","close","brk",
+  "mmap","munmap","mprotect","arch_prctl","set_tid_address","rt_sigaction",
+  "rt_sigprocmask","ioctl","fstat","openat","readlink","getpid","wait4","clone",
+  "nanosleep","set_robust_list","prlimit64","getrandom","futex","uname","readlinkat",
+  "statx"], "action": "SCMP_ACT_ALLOW" } ] }\n' &gt; allow-29.json
+runsec F allow-29.json '["/bin/sh","-c","echo hello from inside"]'</pre>
+<pre class="out">reopen exec fifo: duplicate handle fd: <b>fcntl(F_DUPFD_CLOEXEC): operation not permitted</b>
+level=error msg="runc run failed: container process is already dead"</pre>
+<p>The container never ran a single instruction of your program. The filter is installed by <code>runc init</code> <em>before</em> it execs your process, so <code>runc</code>'s own remaining setup syscalls are subject to it — and <code>fcntl</code> was not on the list.</p></li>
+
+<li>The error above at least names <code>fcntl</code>. Switch <code>defaultAction</code> to <code>SCMP_ACT_KILL_PROCESS</code> and you get a much better diagnostic, from the kernel:
+<pre class="cmd">jq '.defaultAction = "SCMP_ACT_KILL_PROCESS"' allow-29.json &gt; allow-29-kill.json
+runsec G allow-29-kill.json '["/bin/sh","-c","echo hello from inside"]'</pre>
+<pre class="out">level=error msg="runc run failed: container process is already dead"
+
+[  933.706882] audit: type=1326 audit(1785487928.040:123): auid=1000 uid=0 gid=0
+  ses=50 subj=unconfined pid=8326 <b>comm="runc:[2:INIT]"</b> exe="/runc" sig=31
+  arch=c000003e <b>syscall=72</b> compat=0 ip=0x7a18954fabee code=0x80000000</pre>
+<p><code>syscall=72</code> is <code>fcntl</code>, and <code>comm="runc:[2:INIT]"</code> names the runtime's own init process rather than your workload. Remember this pairing — it is the whole technique for the first fault in <a href="#cp-i11-15">I11.15</a>.</p></li>
+
+<li>Add <code>fcntl</code> and it still dies, differently — this time inside the runtime's path-resolution library:
+<pre class="out">thread '&lt;unnamed&gt;' panicked at src/procfs.rs:200:14:
+at least one candidate /proc/thread-self path should work</pre>
+<p>That is <code>libpathrs</code> missing <code>openat2</code> and <code>statfs</code>. Adding those plus the rest of what <code>runc init</code> touches — <code>mount</code>, <code>umount2</code>, <code>pivot_root</code>, <code>capset</code>, <code>setresuid</code>, <code>prctl</code>, <code>keyctl</code>, <code>dup3</code>, <code>getdents64</code> and around thirty more — finally works at <strong>74 names</strong>:</p>
+<pre class="out">### H1  defaultAction=SCMP_ACT_ERRNO  allowed=74
+<b>hello from inside</b>
+[exit 0]</pre>
+<p>Four rounds, 29 → 30 → 71 → 74 syscalls, to run <code>echo</code>. That is the honest measurement of what an allow-list costs, and the reason the runtime default profile is an allow-list of some 442 names maintained upstream rather than one you write per workload (<a href="i1.html#cp-i1-10">I1.10</a> read that profile, which now lives at <code>github.com/moby/profiles</code>).</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can write a <code>linux.seccomp</code> object from memory, choose between <code>SCMP_ACT_ERRNO</code> and a killing action for a given purpose, and — given a container that dies before its first instruction — go straight to <code>dmesg</code> for a <code>type=1326</code> record and read the syscall number out of it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>One <code>args</code> block, many <code>names</code>, different argument positions.</strong> Measured above: grouping <code>chmod</code> with <code>fchmodat</code> under <code>index: 2</code> produced a rule that silently did not fire. Group syscalls by argument layout, not by what they are called.</li>
+<li><strong><code>architectures</code> adds, it does not select.</strong> A profile listing only ARM still filters on x86-64.</li>
+<li><strong>The filter covers the runtime's setup, not just your program.</strong> An allow-list that omits <code>fcntl</code>, <code>openat2</code> or <code>statfs</code> fails with an error about file descriptors or a Rust panic, never about seccomp.</li>
+<li><strong>A killing action kills the calling process, which is often not the container.</strong> The shell survived its <code>mkdir</code> child and the container exited 0 — so a seccomp violation can leave a "successful" container that silently did not do its job.</li>
+<li><strong>Seccomp cannot see paths.</strong> Arguments are matched as integers and pointers are never dereferenced, so any rule of the form "block this syscall on that file" is impossible. That is what AppArmor and SELinux are for, next.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>securityContext.seccompProfile.type: RuntimeDefault</code> asks the kubelet to hand the container runtime's built-in profile to the runtime — the deny-list, not one of yours. <code>type: Localhost</code> plus <code>localhostProfile: my.json</code> points at a file under the kubelet's seccomp root, and the JSON in that file is exactly the <code>linux.seccomp</code> object above. <code>type: Unconfined</code> is no filter at all, and it is the default for pods outside a namespace with Pod Security Standards enforcement. The advanced track has no lesson on this field; the closest live material is <a href="i8.html#cp-i8-1">I8.1</a>, where you watch the kubelet hand a container config to the runtime in the first place.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 seccomp</code> and the kernel's <em>userspace-api/seccomp_filter.rst</em> for the actions and the <code>SECCOMP_RET_*</code> codes; the runtime spec's <em>config-linux.md § Seccomp</em>; and <a href="i1.html#cp-i1-9">I1.9</a> and <a href="i1.html#cp-i1-10">I1.10</a>, where you wrote a filter with no container around it and compared the two profile shapes.</p>
+</article>
+<article class="lesson" id="cp-i11-4" data-id="i11-4">
+<div class="lesson-head"><span class="cp-id">I11.4</span><h4>Two fields that delegate to something outside the container</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Seccomp cannot see file paths. Capabilities cannot express "this program, and only this program, may write to that directory". Mandatory access control can do both, and the OCI config reaches it through two one-line string fields — <code>process.apparmorProfile</code> and <code>linux.selinuxLabel</code>. What makes them different from every other field in this module is that the string is a <em>name</em>, and the thing it names lives on the host, outside the bundle entirely. Ship the config without shipping the profile and the container does not start.</p>
+
+<h5>The concept</h5>
+<p>Discretionary access control — the owner/group/other bits from <a href="b4.html#cp-b4-5">B4.5</a> — is called <em>discretionary</em> because the owner of a file decides who may touch it. Mandatory access control sits above that: an administrator writes a policy, the kernel enforces it on every access, and no file owner and no root process can override it. The two checks are independent and both must pass, so MAC can only ever remove permissions the DAC bits would have granted.</p>
+<p>Linux ships two implementations, and which one you get is decided by your distribution rather than by you. <strong>AppArmor</strong> (Debian, Ubuntu, SUSE) attaches policy to executables <em>by path</em> and is written as readable rules over paths and capabilities. <strong>SELinux</strong> (RHEL, Fedora, CentOS) attaches a <em>label</em> to every process and every file and consults a compiled policy about which label may touch which. For containers, SELinux's category mechanism (the <code>c124,c675</code> at the end of a label) is what keeps two containers on one host from reading each other's files even when the uid is the same.</p>
+<p>The OCI config sets one string each way. Both are OPTIONAL, both default to unset, and a bare <code>runc spec</code> bundle sets neither — which means the honest default for a hand-built container is <em>no mandatory access control at all</em>.</p>
+
+<div class="specref">
+<p>Two bullets, one for each, and both defer entirely to the host system.</p>
+<blockquote><b>apparmorProfile</b> (string, OPTIONAL) specifies the name of the AppArmor profile for the process. For more information about AppArmor, see AppArmor documentation.<br><br>
+<b>selinuxLabel</b> (string, OPTIONAL) specifies the SELinux label for the process. For more information about SELinux, see SELinux documentation.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Configuration</em> § User — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#user">config.md</a></cite>
+</div>
+<p>The spec's own example config uses <code>"apparmorProfile": "acme_secure_profile"</code> and <code>"selinuxLabel": "system_u:system_r:svirt_lxc_net_t:s0:c124,c675"</code>. Neither string means anything without a host that already knows it.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a profile. This one permits everything a container normally does and then denies exactly one path — which is the shape you want, because an AppArmor profile is an allow-list and omitting a permission you need breaks the container in a way that looks like a filesystem bug.
+<pre class="cmd">sudo tee /etc/apparmor.d/i11-deny-secrets &gt; /dev/null &lt;&lt;'EOF'
+#include &lt;tunables/global&gt;
+
+profile i11-deny-secrets flags=(attach_disconnected,mediate_deleted) {
+  #include &lt;abstractions/base&gt;
+
+  file,
+  network,
+  capability,
+  mount,
+  umount,
+  pivot_root,
+  signal,
+  ptrace,
+
+  # everything above is permitted; these two lines are the whole point
+  deny /data/secret.txt w,
+  deny /data/secret.txt a,
+}
+EOF
+sudo apparmor_parser -r -W /etc/apparmor.d/i11-deny-secrets
+sudo aa-status | grep i11-deny-secrets</pre>
+<pre class="out">   <b>i11-deny-secrets</b></pre></li>
+
+<li>Set up a target that the ordinary permission bits would happily allow: a file owned by root, mode 666, in a root-owned directory, with the container running as root.
+<pre class="cmd">cd ~/i11
+sudo sh -c 'mkdir -p rootfs/data; chown -R root:root rootfs/data
+            printf "top secret\n" &gt; rootfs/data/secret.txt
+            chmod 666 rootfs/data/secret.txt'</pre></li>
+
+<li>Run with no profile first, to see the baseline. Both writes succeed, and the process reports itself <code>unconfined</code>.
+<pre class="cmd">A='["/bin/sh","-c","cat /proc/self/attr/current; echo ---; echo pwned &gt;&gt; /data/secret.txt; echo secret_write_rc=$?; echo ok &gt; /data/other.txt; echo other_write_rc=$?"]'
+run A '.' "$A"</pre>
+<pre class="out"><b>unconfined</b>
+---
+secret_write_rc=<b>0</b>
+other_write_rc=<b>0</b></pre></li>
+
+<li>Now attach the profile with one field.
+<pre class="cmd">run B '.process.apparmorProfile="i11-deny-secrets"' "$A"</pre>
+<pre class="out"><b>i11-deny-secrets (enforce)</b>
+---
+/bin/sh: can't create /data/secret.txt: <b>Permission denied</b>
+secret_write_rc=<b>1</b>
+other_write_rc=<b>0</b></pre>
+<p>Root, on a mode-666 file, refused — and the file next to it still writable, so this is policy and not a broken mount. <code>/proc/self/attr/current</code> is where a process can always read which profile it is under, and <code>(enforce)</code> distinguishes it from <code>(complain)</code> mode, which logs and permits.</p></li>
+
+<li>Go looking for that denial in the audit log, because the obvious expectation is wrong.
+<pre class="cmd">sudo dmesg | grep -o 'apparmor="[^"]*".*' | tail -2</pre>
+<pre class="out">(nothing)</pre>
+<p>An AppArmor <code>deny</code> rule is <strong>silent by default</strong>. It suppresses the audit message as well as the access — which is deliberate, so that a policy denying something noisy and expected does not fill the log. Write the same rule with the <code>audit</code> keyword and the record appears:</p>
+<pre class="cmd">sudo tee /etc/apparmor.d/i11-audit-secrets &gt; /dev/null &lt;&lt;'EOF'
+#include &lt;tunables/global&gt;
+
+profile i11-audit-secrets flags=(attach_disconnected,mediate_deleted) {
+  #include &lt;abstractions/base&gt;
+
+  file, network, capability, mount, umount, pivot_root, signal, ptrace,
+
+  audit deny /data/secret.txt w,
+  audit deny /data/secret.txt a,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/i11-audit-secrets
+run B2 '.process.apparmorProfile="i11-audit-secrets"' "$A"</pre>
+<pre class="out">i11-audit-secrets (enforce)
+/bin/sh: can't create /data/secret.txt: Permission denied
+secret_write_rc=1
+
+<b>apparmor="DENIED"</b> operation="open" class="file" profile="i11-audit-secrets"
+  name="/data/secret.txt" pid=10033 comm="sh" <b>requested_mask="ac" denied_mask="ac"</b> fsuid=0 ouid=0</pre>
+<p>Same block, same error inside the container, and only now is there any evidence on the host. If you are building detection on top of a MAC policy, <code>deny</code> versus <code>audit deny</code> is the difference between a control you can see working and one you have to take on faith.</p></li>
+
+<li>Name a profile that is not loaded, and see how it fails.
+<pre class="cmd">run C '.process.apparmorProfile="i11-does-not-exist"' '["/bin/sh","-c","echo reached"]'</pre>
+<pre class="out">level=error msg="runc run failed: unable to start container process: error during
+container init: unable to apply apparmor profile: apparmor failed to apply profile:
+write /1/task/1/attr/apparmor/exec: <b>no such file or directory</b>"
+
+apparmor="DENIED" operation="change_onexec" class="file" <b>info="label not found"</b>
+  error=-2 profile="unconfined" name="i11-does-not-exist" pid=9415 comm="runc:[2:INIT]"</pre>
+<p>The container does not start at all, and the runtime's own message — <em>no such file or directory</em> for a path under <code>/proc</code> — is a poor description of "that profile is not loaded on this host". The kernel record is the one that says so. This is the failure mode when a workload moves to a node where somebody forgot to install the profile.</p></li>
+
+<li>The SELinux field, on a machine with no SELinux, refuses cleanly rather than being ignored.
+<pre class="cmd">run D '.process.selinuxLabel="system_u:system_r:container_t:s0:c1,c2"' '["/bin/sh","-c","echo reached"]'</pre>
+<pre class="out">level=error msg="runc run failed: <b>selinux label is specified in config, but selinux
+is disabled or not supported</b>"</pre>
+<p>Worth knowing which way round this is: a container config carrying an SELinux label is portable to an AppArmor host only in the sense that it will loudly fail there. There is no fallback and no equivalence between the two labels.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can attach a MAC policy to a container with one config field, read back from inside which profile is in force, and explain why the audit log may be empty even though the policy is working.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>deny</code> logs nothing; <code>audit deny</code> logs.</strong> Measured above with two otherwise identical profiles. Any runbook that says "check the audit log to confirm the denial" is assuming the second form.</li>
+<li><strong>The profile is not in the bundle.</strong> Both fields are names resolved on the host. A bundle, an image and a pod spec are all fully portable; the policy they name is not. Treat profile installation as part of node provisioning.</li>
+<li><strong>An AppArmor profile is an allow-list with deny overrides.</strong> The bare rules <code>file,</code> and <code>capability,</code> in the lab grant everything of that kind. Omit them and the container fails in ways that look like a corrupt image — start permissive, add denials, and use <code>complain</code> mode plus <code>aa-logprof</code> to tighten.</li>
+<li><strong><code>noNewPrivileges</code> and MAC interact.</strong> With <code>no_new_privs</code> set, the kernel refuses an <code>execve</code> that would transition to a <em>more</em> privileged profile. Profiles that rely on a transition at exec stop transitioning, silently, once you turn the flag on.</li>
+<li><strong>SELinux labels are not optional decoration.</strong> On a SELinux host, a volume mounted without the right category label is unreadable by the container even though every uid and mode is correct — the same class of confusing failure as <a href="i10.html#cp-i10-12">I10.12</a>'s uid mismatch, with a different cause.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>securityContext.appArmorProfile</code> (<code>type: RuntimeDefault | Localhost | Unconfined</code>, GA since v1.31 and replacing the old <code>container.apparmor.security.beta.kubernetes.io/&lt;container&gt;</code> annotation) and <code>securityContext.seLinuxOptions</code> (<code>user</code>, <code>role</code>, <code>type</code>, <code>level</code>) are these two fields. The kubelet passes them straight through CRI to the runtime, which writes them into the <code>config.json</code> you just edited by hand — see <a href="i8.html#cp-i8-6">I8.6</a> for how a sandbox config turns into runtime config fields. The advanced track has no lesson on either field.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 5 apparmor.d</code> for the rule syntax and the <code>audit</code>/<code>deny</code> modifiers; <code>man 8 aa-complain</code> and <code>aa-logprof</code> for building a profile from observed behaviour; <code>man 8 semanage</code> and <code>man 5 selinux_config</code> on the SELinux side; and <a href="b12.html#cp-b12-14">B12.14</a>, where AppArmor first appeared beside seccomp.</p>
+</article>
+<article class="lesson" id="cp-i11-5" data-id="i11-5">
+<div class="lesson-head"><span class="cp-id">I11.5</span><h4>A read-only rootfs, the workloads it cures and the one it cannot</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Most attacks that get a foothold in a container want to write something to it — a webshell into the document root, a modified binary on <code>PATH</code>, a cron entry. One boolean removes the whole category, and it costs nothing for a well-behaved application. The interesting part is what "well-behaved" turns out to mean, because the standard fix — a <code>tmpfs</code> over <code>/tmp</code> — cures one class of application completely and does nothing at all for another.</p>
+
+<h5>The concept</h5>
+<p><code>root.readonly</code> asks the runtime to remount the container's own root filesystem read-only after it has finished setting it up. What it covers is exactly the rootfs and nothing else: every other mount in <code>mounts</code> keeps whatever options it was given, so a writable bind mount or volume stays writable. That separation is the design — the container's <em>code</em> becomes immutable while its <em>data</em> does not.</p>
+<p><a href="i2.html#cp-i2-5">I2.5</a> read this field out of the spec; the point here is what happens to real programs. Three sources of writes have to be dealt with, and only the first two have a good answer:</p>
+<ul>
+<li><strong>Scratch space</strong> — temp files, a pid file, a unix socket, a lock. Cure: a <code>tmpfs</code> over the directory. The data was never meant to survive the process anyway, and putting it in RAM is usually an improvement.</li>
+<li><strong>State that must persist</strong> — a database, uploaded files, a cache you actually want warm. Cure: a volume. That was always the right answer; the read-only rootfs just forces the question.</li>
+<li><strong>Writes into the program's own install tree</strong> — a package manager, a plugin installer, a framework that compiles templates next to the source. There is no cure. You cannot <code>tmpfs</code> over <code>/usr</code> without deleting the program. These workloads have to be rebuilt, not reconfigured, and recognising one early saves a long afternoon.</li>
+</ul>
+<p>There is a second, quieter piece of read-only protection in every default bundle: <code>linux.readonlyPaths</code> and <code>linux.maskedPaths</code>. The first remounts specific paths read-only; the second hides them entirely by bind-mounting <code>/dev/null</code> over them. They exist because <code>/proc</code> and <code>/sys</code> have to be mounted read-write for the container to work at all, and a handful of files under them are dangerous.</p>
+
+<div class="specref">
+<p>One sentence, and a default that catches people out.</p>
+<blockquote><b>readonly</b> (bool, OPTIONAL) If true then the root filesystem MUST be read-only inside the container, defaults to <b>false</b>.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Configuration</em> § Root — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#root">config.md</a></cite>
+</div>
+<p>Defaults to false — but <code>runc spec</code> writes <code>"readonly": true</code> into the bundle it generates. As with <code>noNewPrivileges</code>, the generated default and the specified default disagree, and the labs below have been turning it <em>off</em> all module to get anything done.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Look at what a default bundle already gives you, and which paths escape it.
+<pre class="cmd">cd ~/i11 &amp;&amp; rm -f config.json &amp;&amp; runc spec
+jq -c '.root' config.json
+PROBE='["/bin/sh","-c","for p in / /tmp /var/cache /dev /dev/shm /run; do
+  if touch $p/.w 2&gt;/dev/null; then echo \"$p WRITABLE\"; rm -f $p/.w; else echo \"$p read-only\"; fi; done"]'
+run A '.root.readonly=true' "$PROBE"</pre>
+<pre class="out">{"path":"rootfs","readonly":<b>true</b>}
+
+/         read-only
+/tmp      read-only
+/var/cache read-only
+/dev      <b>WRITABLE</b>
+/dev/shm  <b>WRITABLE</b>
+/run      read-only</pre>
+<p><code>/dev</code> and <code>/dev/shm</code> are separate <code>tmpfs</code> mounts the runtime creates, so they are unaffected — worth knowing, because <code>/dev/shm</code> is a perfectly good place for an attacker to drop a file, and a perfectly good place for your application to keep a lock.</p></li>
+
+<li>Confirm it in the mount table rather than by inference.
+<pre class="cmd">run A2 '.root.readonly=true' '["/bin/sh","-c","awk \"{print \\$5, \\$6}\" /proc/self/mountinfo"]'</pre>
+<pre class="out">/          <b>ro</b>,relatime
+/proc      rw,relatime
+/dev       rw,nosuid
+/dev/shm   rw,nosuid,nodev,noexec,relatime
+/sys       <b>ro</b>,nosuid,nodev,noexec,relatime
+/proc/sys  <b>ro</b>,relatime            ← from readonlyPaths
+/proc/acpi <b>ro</b>,relatime            ← from maskedPaths</pre></li>
+
+<li>Read the two path lists, and check that masking is what it claims to be.
+<pre class="cmd">jq -c '.linux.readonlyPaths, .linux.maskedPaths' config.json
+run F '.root.readonly=false' '["/bin/sh","-c","echo 1 &gt; /proc/sys/kernel/hostname; echo sysctl_rc=$?; cat /proc/kcore | head -c 40; echo; ls -l /proc/kcore"]'</pre>
+<pre class="out">["/proc/bus","/proc/fs","/proc/irq","/proc/sys","/proc/sysrq-trigger"]
+["/proc/acpi","/proc/asound","/proc/kcore","/proc/keys","/proc/latency_stats",
+ "/proc/timer_list","/proc/timer_stats","/proc/sched_debug","/sys/firmware","/proc/scsi"]
+
+/bin/sh: can't create /proc/sys/kernel/hostname: <b>Read-only file system</b>
+sysctl_rc=1
+
+<b>crw-rw-rw-    1 root     root        1,   3</b> Jul 31 08:55 /proc/kcore</pre>
+<p>Note the rootfs was writable for that run — <code>readonlyPaths</code> is independent of <code>root.readonly</code>. And <code>/proc/kcore</code> — an image of the machine's entire physical memory — is character device <code>1, 3</code>, which is <code>/dev/null</code>. "Masked" is not a permission; it is a bind mount hiding the real file.</p></li>
+
+<li>Now a real workload. A package manager is the archetype of the third category above.
+<pre class="cmd">run C '.root.readonly=true' '["/bin/sh","-c","apk add --no-cache jq; echo apk_rc=$?"]'</pre>
+<pre class="out">ERROR: Unable to lock database: <b>Read-only file system</b>
+ERROR: Failed to open apk database: Read-only file system
+apk_rc=<b>99</b></pre></li>
+
+<li>Apply the standard fix and watch it half-work. <code>tmpfs</code> over the three paths <code>apk</code> writes for bookkeeping — its lock, its cache and its installed-package database.
+<pre class="cmd">T='{"destination":"/tmp","type":"tmpfs","source":"tmpfs","options":["nosuid","nodev","mode=1777","size=16m"]}'
+run D ".root.readonly=true | .mounts += [$T,
+  {\"destination\":\"/var/cache/apk\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"nodev\",\"size=64m\"]},
+  {\"destination\":\"/lib/apk/db\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"nodev\",\"size=16m\"]}]" \
+  '["/bin/sh","-c","apk add --no-cache jq; echo apk_rc=$?; jq --version"]'</pre>
+<pre class="out">fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz
+(1/17) Installing alpine-baselayout-data (3.6.8-r1)
+ERROR: alpine-baselayout-data-3.6.8-r1: failed to rename etc/.apk.8be7283f… to etc/fstab.apk-new.
+…
+ERROR: jq-1.7.1-r0: failed to rename usr/bin/.apk.d902db01… to <b>usr/bin/jq</b>.
+<b>17 errors; 8 MiB in 17 packages</b>
+apk_rc=<b>17</b>
+/bin/sh: <b>jq: not found</b></pre>
+<p>It downloaded, it unpacked, it updated its own database in the <code>tmpfs</code> — and then failed on all seventeen renames into <code>/usr</code>, <code>/etc</code> and <code>/sbin</code>, because those are the rootfs. The last two lines are the ones to remember: <em>"8 MiB in 17 packages"</em> is <code>apk</code> reporting success against its database while the binaries are not on disk. A partially-installed image that believes it is complete is worse than a clean failure.</p></li>
+
+<li>Contrast with a workload in the first category — one that writes only scratch files.
+<pre class="cmd">sudo tee rootfs/app.sh &gt; /dev/null &lt;&lt;'EOF'
+#!/bin/sh
+set -e
+echo "$$" &gt; /run/app.pid
+mktemp /tmp/app.XXXXXX &gt; /tmp/which
+echo "wrote pid file: $(cat /run/app.pid)"
+echo "wrote temp file: $(cat /tmp/which)"
+echo "app started OK"
+EOF
+sudo chmod 755 rootfs/app.sh
+run G1 '.root.readonly=true' '["/app.sh"]'</pre>
+<pre class="out">/app.sh: line 3: can't create /run/app.pid: <b>Read-only file system</b></pre>
+<pre class="cmd">R='{"destination":"/run","type":"tmpfs","source":"tmpfs","options":["nosuid","nodev","mode=755","size=4m"]}'
+run G2 ".root.readonly=true | .mounts += [$T, $R]" '["/app.sh"]'</pre>
+<pre class="out">wrote pid file: 1
+wrote temp file: /tmp/app.KkJkAE
+<b>app started OK</b></pre>
+<p>Two mounts, and the application is unmodified and fully confined. That is the good case, and it is the common one.</p></li>
+
+<li>Last, the boundary. A read-only rootfs says nothing about your volumes.
+<pre class="cmd">sudo mkdir -p hostdata &amp;&amp; sudo chown root:root hostdata
+run E '.root.readonly=true | .mounts += [{"destination":"/host-data",
+       "source":"/home/ubuntu/i11/hostdata","type":"bind","options":["rbind","rw"]}]' \
+      '["/bin/sh","-c","touch /host-data/escaped &amp;&amp; echo \"wrote THROUGH the bind mount\"; touch /nope"]'
+sudo ls hostdata</pre>
+<pre class="out"><b>wrote THROUGH the bind mount</b>
+touch: /nope: Read-only file system
+escaped</pre>
+<p>One container, one write refused and one write landing on the host filesystem. If you are reasoning about what a compromised container can modify, <code>root.readonly</code> is one input and the <code>mounts</code> array is the other — and the second one usually matters more.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a workload that fails on a read-only rootfs, you can tell within a minute which of the three categories it is in — by reading <em>where</em> the failed writes point — and therefore whether the fix is a <code>tmpfs</code>, a volume, or a rebuild.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A package manager reports success it did not have.</strong> Measured: <code>apk</code> printed <em>"8 MiB in 17 packages"</em> and exited 17, with none of the binaries installed. Anything that runs <code>apk</code>/<code>apt</code>/<code>pip install</code> at container start is incompatible with a read-only rootfs, and its own exit code is the only honest signal.</li>
+<li><strong><code>/dev/shm</code> and <code>/dev</code> stay writable.</strong> They are separate <code>tmpfs</code> mounts. Useful for you, and equally useful to anyone else who ends up in the container.</li>
+<li><strong>Writable mounts are unaffected, by design.</strong> The flag covers the rootfs only; a <code>rw</code> bind mount writes through to the host. Turning on the boolean while leaving a broad <code>hostPath</code> mounted changes very little.</li>
+<li><strong><code>maskedPaths</code> is <code>/dev/null</code> bind-mounted over the file.</strong> So the path still exists, <code>ls</code> shows a character device, and a program that checks for the file's presence rather than its content will happily proceed and read nothing.</li>
+<li><strong>Sizing a <code>tmpfs</code> is sizing memory.</strong> A <code>tmpfs</code> with no <code>size=</code> advertises half of RAM and is charged to the container's memory cgroup as it fills — which is <a href="i10.html#cp-i10-2">I10.2</a>'s pod that fills the node, arriving through a different door.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>securityContext.readOnlyRootFilesystem: true</code> is this field, and the <code>emptyDir: {medium: Memory}</code> volume you pair it with is the <code>tmpfs</code> from step 6 — see <a href="w5.html#cp-5-1">W5.1</a> for <code>emptyDir</code> in the advanced track. Kubernetes exposes <code>maskedPaths</code>/<code>readonlyPaths</code> only through <code>procMount</code>, whose non-default value requires a user namespace; the <code>/proc/kcore</code> masking in step 3 is what you lose by changing it.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the runtime spec's <em>config.md § Root</em> and <em>config-linux.md § Masked Paths / Readonly Paths</em>; <code>man 5 tmpfs</code> for the <code>size=</code> and <code>mode=</code> options; and <a href="i2.html#cp-i2-5">I2.5</a>, where the same field was read rather than exercised.</p>
+</article>
 </div><!-- /g-runtime-hardening -->
 
 <div class="quiz" id="quiz">
