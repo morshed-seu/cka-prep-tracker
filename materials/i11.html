@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Hardening a container through the OCI config fields, then rootless containerd, cosign signing, SBOMs and vulnerability scanning.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I11 — Container security &amp; supply chain — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I11 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4</a></li>
+    <li><a href="i5.html">I5</a></li>
+    <li><a href="i6.html">I6</a></li>
+    <li><a href="i7.html">I7</a></li>
+    <li><a href="i8.html">I8</a></li>
+    <li><a href="i9.html">I9</a></li>
+    <li><a href="i10.html">I10</a></li>
+    <li><a href="i11.html">I11 · Security &amp; supply chain</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i11">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I11 — Container security &amp; supply chain</h1>
+  <p>Two halves that are usually taught apart: hardening the container that runs here, and knowing that the image you are running is the one you meant. Every control below gets proved by attempting the thing it is supposed to forbid.</p>
+  <p>The reason to do this by hand is that almost every control here is a single JSON field, and almost every one of them behaves differently from how it reads. A capability listed in <code>effective</code> is ignored for a root container and silently dropped for a non-root one. A seccomp rule listing three syscall names applies the same argument index to all three, and the index is not the same for all three. An AppArmor <code>deny</code> rule blocks the write and logs nothing. Each of those is one measured line below, and each one is the difference between a control you have and a control you think you have.</p>
+  <div class="weights">
+    <span>Checkpoints<b>15</b></span>
+    <span>Hours<b>~6</b></span>
+    <span>Prerequisites<b>I1 · I2 · I4 · I5 · B12</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>Runtime hardening.</strong> Read and write the five capability sets, <code>noNewPrivileges</code>, a real seccomp profile, the AppArmor and SELinux fields, and <code>root.readonly</code> — and prove each one by attempting exactly what it forbids.</li>
+<li><strong>Rootless.</strong> Run <code>runc</code> and then the whole containerd stack as an unprivileged user, and measure what that buys and what it costs.</li>
+<li><strong>Supply chain.</strong> Sign an image with cosign and find where the signature is stored, attach and read back an attestation, generate an SBOM and use it to answer a question, scan for vulnerabilities and do the arithmetic that changes a base-image decision, and prove why a digest is the only immutable reference.</li>
+<li><strong>Project &amp; drill.</strong> Build <code>run-verified.sh</code> — refuse to run what does not verify, then run it locked down — and diagnose two faults whose error messages name nothing useful.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I2</strong> (the spec fields these controls are written in), <strong>I4</strong> and <strong>I5</strong> (digests and registries), <strong>I1</strong> (user namespaces, seccomp for real) and <strong>B12</strong> (threat modelling, signatures, PKI). Nothing here is a new mechanism — it is B4's and B12's mechanisms, now declarative.</p>
+<p><strong>Which machine.</strong> Everything below ran on the same <code>sandbox</code> VM the rest of this track uses — Ubuntu 24.04, kernel 6.8.0, runc 1.5.1, containerd 2.3.3, nerdctl 2.3.5 — plus four tools installed for this module: <strong>cosign v3.1.2</strong>, <strong>syft v1.50.0</strong>, <strong>trivy v0.72.0</strong> and <strong>grype v0.116.1</strong>, with <strong>rootlesskit v3.0.2</strong> and <code>slirp4netns</code> 1.2.1 for the rootless half. The registry is the local <code>registry:2</code> from <a href="i5.html">I5</a>.</p>
+</div>
+
+
+<!-- ---------------- Runtime hardening ---------------- --><div class="grp" id="g-runtime-hardening"><h3>Runtime hardening</h3>
+<article class="lesson" id="cp-i11-1" data-id="i11-1">
+<div class="lesson-head"><span class="cp-id">I11.1</span><h4>Five capability sets, three of which are usually lies</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>"Root" on Linux is not one switch. It is a bag of about forty separate permits — bind a low port, change a file's owner, open a raw socket, load a kernel module — and <a href="b4.html#cp-b4-10">B4.10</a> took that bag apart by hand. A container config declares which permits the process gets, in five arrays. The trap is that only one of those five arrays reliably does what its name suggests, and which one that is depends on whether the container runs as root. Get this wrong and you write a config that <em>reads</em> like least privilege and grants everything, or one that grants a capability the process never receives.</p>
+
+<h5>The concept</h5>
+<p><a href="i2.html#cp-i2-4">I2.4</a> read these five arrays out of the spec and watched one of them override another. This lesson asks the next question: for a given container, which of the five does the kernel actually honour? The answer is rarely more than two.</p>
+<p>Every Linux process carries five capability sets, and the kernel recomputes four of them on every <code>execve</code>. That recomputation is the whole story:</p>
+<ul>
+<li><strong>bounding</strong> is a ceiling. Nothing in the container can ever raise a capability that is not in it, including a process that later becomes uid 0. It is the only set that is a real containment boundary.</li>
+<li><strong>permitted</strong> is what the process may switch on. For a process running as <strong>uid 0</strong>, <code>execve</code> recomputes permitted from the bounding set — so listing a capability here is redundant. For a process running as <strong>any other uid</strong>, <code>execve</code> recomputes it to <em>empty</em> unless the capability is also ambient.</li>
+<li><strong>effective</strong> is what is switched on right now. For uid 0 the kernel sets it equal to permitted at <code>execve</code>. So for a root container the <code>effective</code> array in <code>config.json</code> is <em>ignored</em> — you can leave a capability out of it and the process still has it.</li>
+<li><strong>inheritable</strong> survives <code>execve</code> only in combination with a file's own inheritable set, which container images essentially never use. On its own it does nothing.</li>
+<li><strong>ambient</strong> is the one that makes a non-root process keep a capability across <code>execve</code>. The kernel refuses to raise an ambient capability that is not also in <em>both</em> permitted and inheritable, so ambient is really a three-field setting.</li>
+</ul>
+<p>Put plainly: <strong>for a root container, only <code>bounding</code> matters.</strong> For a non-root container, only <code>bounding</code> (as a ceiling) and <code>ambient</code> (plus its two prerequisites) matter. The other arrays are documentation.</p>
+<p>The second surprise is the default. A bare <code>runc spec</code> bundle grants <strong>three</strong> capabilities, not the dozen-and-a-half that Docker made famous — and <code>CAP_NET_RAW</code>, <code>CAP_CHOWN</code> and <code>CAP_DAC_OVERRIDE</code> are all absent. That is why several perfectly ordinary commands fail in the labs below with errors that never mention capabilities.</p>
+
+<div class="specref">
+<p>The runtime spec defines the object and its five arrays, and — importantly for a gotcha further down — tells runtimes to <em>warn rather than fail</em> on a capability they cannot grant.</p>
+<blockquote><b>capabilities</b> (object, OPTIONAL) is an object containing arrays that specifies the sets of capabilities for the process. Valid values are defined in the capabilities(7) man page, such as <code>CAP_CHOWN</code>. Any value which cannot be mapped to a relevant kernel interface, or cannot be granted otherwise MUST be logged as a warning by the runtime. Runtimes SHOULD NOT fail if the container configuration requests capabilities that cannot be granted […]<br><br>
+<b>effective</b> […] the <code>effective</code> field is an array of effective capabilities that are kept for the process.<br>
+<b>bounding</b> […] the <code>bounding</code> field is an array of bounding capabilities that are kept for the process.<br>
+<b>inheritable</b> […] the <code>inheritable</code> field is an array of inheritable capabilities that are kept for the process.<br>
+<b>permitted</b> […] the <code>permitted</code> field is an array of permitted capabilities that are kept for the process.<br>
+<b>ambient</b> […] the <code>ambient</code> field is an array of ambient capabilities that are kept for the process.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Configuration</em> § User — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#user">config.md</a></cite>
+</div>
+<p>Notice what the spec does <em>not</em> say: it describes each array as capabilities "kept for the process" and says nothing about the kernel's <code>execve</code> rules. Everything in the concept section above is kernel behaviour that the spec leaves entirely implicit — which is exactly why the arrays mislead.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Build a bundle and read the default. Use the alpine rootfs from <a href="i2.html">I2</a>; the only edits are turning off the TTY (so the container runs unattended) and dropping the network namespace (so <code>ping 127.0.0.1</code> has a working loopback — a fresh netns has none, as <a href="i9.html#cp-i9-11">I9.11</a> showed).
+<pre class="cmd">mkdir -p ~/i11 &amp;&amp; cd ~/i11        # rootfs/ already unpacked here
+runc spec
+jq '.process.capabilities' config.json</pre>
+<pre class="out">{
+  "bounding":  [ "CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE" ],
+  "effective": [ "CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE" ],
+  "permitted": [ "CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE" ]
+}</pre>
+<p><b>Three</b> sets, not five — <code>inheritable</code> and <code>ambient</code> are simply absent — and three capabilities in each.</p></li>
+
+<li>Define a small helper so each experiment is one line. It rewrites <code>config.json</code> from scratch every time, applies one <code>jq</code> filter, and runs the result.
+<pre class="cmd">run() {   # run &lt;name&gt; &lt;jq-filter&gt; &lt;args-json&gt;
+  rm -f config.json; runc spec
+  jq "$2 | .process.terminal=false | .process.args=$3 |
+      .linux.namespaces |= map(select(.type!=\"network\")) |
+      .root.readonly=false" config.json &gt; c.tmp &amp;&amp; mv c.tmp config.json
+  sudo runc --root /run/runc-i11 run "i11$1"
+  sudo runc --root /run/runc-i11 delete -f "i11$1" 2&gt;/dev/null
+}</pre></li>
+
+<li>Read the sets from inside, as the process actually holds them.
+<pre class="cmd">run A '.' '["/bin/sh","-c","grep -E \"^Cap(Prm|Eff|Bnd|Amb|Inh)\" /proc/self/status; id"]'</pre>
+<pre class="out">CapInh:	0000000000000000
+CapPrm:	<b>0000000020000420</b>
+CapEff:	<b>0000000020000420</b>
+CapBnd:	<b>0000000020000420</b>
+CapAmb:	0000000000000000
+uid=0(root) gid=0(root)</pre>
+<p><code>0x20000420</code> is bits 29, 10 and 5 — <code>CAP_AUDIT_WRITE</code>, <code>CAP_NET_BIND_SERVICE</code>, <code>CAP_KILL</code>. Root, with three of forty permits.</p></li>
+
+<li>Prove a missing capability by using it. <code>ping</code> needs <code>CAP_NET_RAW</code> to open a raw ICMP socket.
+<pre class="cmd">run B '.' '["/bin/ping","-c1","-W1","127.0.0.1"]'</pre>
+<pre class="out">PING 127.0.0.1 (127.0.0.1): 56 data bytes
+ping: <b>permission denied (are you root?)</b></pre>
+<p>It <em>is</em> root. The message is busybox guessing, and it is guessing wrong — the single most common way this failure gets misdiagnosed. Add the capability to all three sets and it works:</p>
+<pre class="cmd">run C '.process.capabilities.bounding  += ["CAP_NET_RAW"] |
+       .process.capabilities.effective += ["CAP_NET_RAW"] |
+       .process.capabilities.permitted += ["CAP_NET_RAW"]' \
+      '["/bin/ping","-c1","-W1","127.0.0.1"]'</pre>
+<pre class="out">64 bytes from 127.0.0.1: seq=0 ttl=64 time=0.044 ms
+1 packets transmitted, 1 packets received, 0% packet loss</pre></li>
+
+<li>Same shape, different capability, different error text. <code>chown</code> needs <code>CAP_CHOWN</code>.
+<pre class="cmd">CH='["/bin/sh","-c","touch /f &amp;&amp; echo touch=ok; chown 99:99 /f; echo chown_rc=$?"]'
+run D '.' "$CH"
+run E '.process.capabilities.bounding  += ["CAP_CHOWN"] |
+       .process.capabilities.effective += ["CAP_CHOWN"] |
+       .process.capabilities.permitted += ["CAP_CHOWN"]' "$CH"</pre>
+<pre class="out">### D            ### E
+touch=ok         touch=ok
+chown: /f: <b>Operation not permitted</b>
+chown_rc=1       <b>chown_rc=0</b></pre>
+<p>Two capability failures, two different messages — <em>permission denied</em> and <em>operation not permitted</em>. Neither says "capability".</p></li>
+
+<li>Now the first lie. Add <code>CAP_CHOWN</code> to <code>bounding</code> and <code>permitted</code> but <strong>deliberately leave it out of <code>effective</code></strong>.
+<pre class="cmd">run F '.process.capabilities.bounding  += ["CAP_CHOWN"] |
+       .process.capabilities.permitted += ["CAP_CHOWN"]' "$CH"</pre>
+<pre class="out">CapPrm:	0000000020000421
+CapEff:	<b>0000000020000421</b>     ← the config said 0x…420
+CapBnd:	0000000020000421
+touch=ok
+<b>chown_rc=0</b></pre>
+<p>The capability is effective anyway, and the <code>chown</code> succeeds. The kernel's rule for a uid-0 <code>execve</code> is <em>effective′ = permitted′</em>, so whatever <code>config.json</code> said about <code>effective</code> was overwritten before the first instruction ran.</p></li>
+
+<li>The second lie, and it fails the other way. Same three-set grant, but run as uid 1000.
+<pre class="cmd">run F2 '.process.user.uid=1000 | .process.user.gid=1000 |
+        .process.capabilities.bounding  += ["CAP_CHOWN"] |
+        .process.capabilities.permitted += ["CAP_CHOWN"] |
+        .process.capabilities.effective += ["CAP_CHOWN"]' \
+       '["/bin/sh","-c","id; grep -E \"^Cap(Prm|Eff|Bnd|Amb)\" /proc/self/status; chown 99:99 /data/owned; echo chown_rc=$?"]'</pre>
+<pre class="out">uid=1000 gid=1000
+CapPrm:	<b>0000000000000000</b>
+CapEff:	<b>0000000000000000</b>
+CapBnd:	0000000020000421     ← the ceiling survived
+CapAmb:	0000000000000000
+chown: /data/owned: Operation not permitted
+chown_rc=1</pre>
+<p>Permitted and effective were both wiped. This is the exact shape of a Kubernetes pod that sets <code>runAsNonRoot</code> alongside <code>capabilities.add</code> — the add is silently void.</p></li>
+
+<li>Fix it the only way that works: <code>ambient</code>, with its two prerequisites.
+<pre class="cmd">run J '.process.user.uid=1000 | .process.user.gid=1000 |
+       .process.capabilities.bounding    += ["CAP_CHOWN"] |
+       .process.capabilities.permitted   += ["CAP_CHOWN"] |
+       .process.capabilities.effective   += ["CAP_CHOWN"] |
+       .process.capabilities.inheritable  = ["CAP_CHOWN"] |
+       .process.capabilities.ambient      = ["CAP_CHOWN"]' \
+      '["/bin/sh","-c","id; grep -E \"^Cap(Prm|Eff|Amb|Inh)\" /proc/self/status; chown 99:99 /data/owned; echo chown_rc=$?"]'</pre>
+<pre class="out">uid=1000 gid=1000
+CapInh:	0000000000000001
+CapPrm:	<b>0000000000000001</b>
+CapEff:	<b>0000000000000001</b>
+CapAmb:	<b>0000000000000001</b>
+<b>chown_rc=0</b></pre>
+<p>Drop just the <code>inheritable</code> line and runc tells you, before the container starts:</p>
+<pre class="out">level=warning msg="can't raise ambient capability CAP_CHOWN: operation not permitted"
+CapAmb:	0000000000000000
+chown: /data/owned: Operation not permitted</pre></li>
+
+<li>Finally, the ceiling. Empty the bounding set and nothing can climb back.
+<pre class="cmd">run G '.process.capabilities.bounding=[] | .process.capabilities.effective=[] |
+       .process.capabilities.permitted=[]' \
+      '["/bin/sh","-c","grep -E \"^Cap(Prm|Eff|Bnd)\" /proc/self/status; id -u"]'</pre>
+<pre class="out">CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	<b>0000000000000000</b>
+0</pre>
+<p>uid 0 with an empty bounding set: root by name, with no permits at all. That is what <code>drop: ["ALL"]</code> compiles to.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can look at a <code>config.json</code> capability block and say which arrays will actually take effect, given the <code>process.user.uid</code> beside them — and you can name the one array (<code>bounding</code>) that is a containment boundary rather than a request.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>The <code>effective</code> array is dead weight for a root container.</strong> The kernel recomputes it from <code>permitted</code> at <code>execve</code>. Reviewers who check that a capability was left out of <code>effective</code> are checking nothing.</li>
+<li><strong><code>permitted</code> is dead weight for a non-root container.</strong> Measured above: uid 1000 came out with <code>CapPrm 0</code> despite the config listing <code>CAP_CHOWN</code> in all three arrays. Non-root plus <code>capabilities.add</code> needs <code>ambient</code>, and Kubernetes has no field for it.</li>
+<li><strong>A misspelled capability is a warning, not an error.</strong> Adding <code>CAP_NOT_A_REAL_CAP</code> produced <code>level=warning msg="ignoring unknown or unavailable capabilities: [CAP_NOT_A_REAL_CAP]"</code> and a container with the unchanged default set. The spec explicitly asks for exactly this (<em>"Runtimes SHOULD NOT fail"</em>), so a typo in a hardening config fails open and the container starts.</li>
+<li><strong><code>CAP_DAC_OVERRIDE</code> is not in the default set, and its absence looks like a storage bug.</strong> Container root could not create a file in a directory owned by uid 1000 — <code>touch: /data/x: Permission denied</code> — until <code>CAP_DAC_OVERRIDE</code> was added. Nothing in that message suggests capabilities; see <a href="i10.html#cp-i10-12">I10.12</a>, where the same absence surfaces as a volume-permissions fault.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>securityContext.capabilities.drop: ["ALL"]</code> becomes exactly the empty-bounding-set container from step 9, and <code>add: ["NET_BIND_SERVICE"]</code> becomes the three-array grant from step 4 — note the <code>CAP_</code> prefix is stripped in Kubernetes and required in the OCI config. The <code>runAsNonRoot</code> + <code>add</code> combination in step 7 is the trap worth remembering, because the pod starts and the capability simply is not there. The advanced track has no <code>securityContext</code> lesson to link — the nearest relatives are least privilege as a principle in <a href="w7.html#cp-7-6">W7.6</a>'s RBAC matrix, and <a href="w1.html#cp-1-2">W1.2</a>, where you look at what actually runs privileged on a node.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 7 capabilities</code> — the "Transformation of capabilities during execve()" section is the rulebook for everything above; the runtime spec's <em>config.md § User</em>; and <a href="b4.html#cp-b4-12">B4.12</a>, where you read these same sets out of <code>/proc/self/status</code> without a container.</p>
+</article>
+<article class="lesson" id="cp-i11-2" data-id="i11-2">
+<div class="lesson-head"><span class="cp-id">I11.2</span><h4>noNewPrivileges, and the escape hatch it welds shut</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You have carefully set the container to run as an unprivileged user. Then the image ships a single file with the setuid bit on it — <code>/usr/bin/passwd</code>, <code>ping</code>, an old <code>mount</code> helper, or something a base image dragged in — and any process in the container can exec that file and come out as root. <code>noNewPrivileges</code> is a one-bit promise to the kernel that closes this, permanently, for the process and every descendant. It is one of the very few security fields that has no downside worth discussing, and one of the few that <code>runc spec</code> already turns on for you.</p>
+
+<h5>The concept</h5>
+<p><a href="b4.html#cp-b4-9">B4.9</a> covered the setuid bit: a file marked <code>u+s</code> and owned by root runs with the <em>effective</em> uid of its owner, not its caller. That is how an ordinary user changes their own password. Inside a container it is a privilege-escalation primitive sitting in the filesystem, and it needs no bug to use — it is the documented behaviour of <code>execve</code>.</p>
+<p><code>noNewPrivileges</code> maps to the kernel's <code>no_new_privs</code> bit, set with <code>prctl(PR_SET_NO_NEW_PRIVS, 1)</code>. Once set, the kernel guarantees that no <code>execve</code> from this process onward can raise privilege: setuid and setgid bits are ignored, file capabilities are ignored, and an AppArmor or SELinux transition to a more-privileged profile is refused. The bit is <strong>one-way</strong> — nothing can clear it — and it is inherited by every child. That one-wayness is what makes it trustworthy: a compromised process cannot turn it off before exploiting the setuid file.</p>
+<p>Two things it is often confused with. It is <em>not</em> a capability control — the escalating process gains uid 0, not capabilities, and those are separate mechanisms (you will see both outcomes side by side below). And it is <em>not</em> the only lever: the <code>nosuid</code> mount option does the same job per-filesystem rather than per-process, which is why it appears on almost every mount in a default bundle.</p>
+
+<div class="specref">
+<p>The spec gives it two sentences and points at the kernel, which is honest — the semantics are entirely the kernel's.</p>
+<blockquote><b>noNewPrivileges</b> (bool, OPTIONAL) setting <code>noNewPrivileges</code> to true prevents the process from gaining additional privileges. As an example, the <code>no_new_privs</code> article in the kernel documentation has information on how this is achieved using a <code>prctl</code> system call on Linux.</blockquote>
+<cite>OCI Runtime Specification v1.3.0, <em>Configuration</em> § User — <a href="https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#user">config.md</a></cite>
+</div>
+<p>OPTIONAL, and defaulting to false when absent. <code>runc spec</code> writes <code>"noNewPrivileges": true</code> into the bundle it generates, so the <em>generated default</em> is safe and the <em>specified default</em> is not. A hand-built config that simply omits the field gets the unsafe one.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>You need a setuid-root binary that reports what the kernel gave it. Busybox will not do — it dispatches on <code>argv[0]</code>, so a renamed copy is inert — so compile four lines of C. Statically linked, because the rootfs is musl and the host is glibc.
+<pre class="cmd">cat &gt; ~/whoareyou.c &lt;&lt;'EOF'
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+int main(void) {
+    printf("ruid=%d euid=%d rgid=%d egid=%d\n",
+           getuid(), geteuid(), getgid(), getegid());
+    return 0;
+}
+EOF
+cd ~/i11
+gcc -static -O2 -o whoareyou ~/whoareyou.c
+sudo install -o root -g root -m 4755 whoareyou rootfs/bin/whoareyou
+sudo ls -l rootfs/bin/whoareyou</pre>
+<pre class="out"><b>-rwsr-xr-x</b> 1 root root 785536 Jul 31 14:49 rootfs/bin/whoareyou</pre>
+<p>The <code>s</code> in <code>-rwsr-xr-x</code> is the whole experiment.</p></li>
+
+<li>Run as uid 1000 with the flag <strong>off</strong>, using the <code>run</code> helper from I11.1. The shell reports its own uid, then the <code>no_new_privs</code> bit, then execs the setuid binary.
+<pre class="cmd">A='["/bin/sh","-c","echo shell: $(id -u); grep NoNewPrivs /proc/self/status; /bin/whoareyou"]'
+run A '.process.user.uid=1000 | .process.user.gid=1000 |
+       .process.noNewPrivileges=false' "$A"</pre>
+<pre class="out">shell: 1000
+NoNewPrivs:	<b>0</b>
+ruid=1000 <b>euid=0</b> rgid=1000 egid=1000</pre>
+<p>The container was configured to run as an unprivileged user, and one <code>execve</code> later the effective uid is 0.</p></li>
+
+<li>Change exactly one boolean.
+<pre class="cmd">run B '.process.user.uid=1000 | .process.user.gid=1000 |
+       .process.noNewPrivileges=true' "$A"</pre>
+<pre class="out">shell: 1000
+NoNewPrivs:	<b>1</b>
+ruid=1000 <b>euid=1000</b> rgid=1000 egid=1000</pre>
+<p>The binary still runs — it is not blocked, it simply does not get the uid. That distinction matters when you are reading a bug report: the symptom is a permission error deep inside a tool, not a refusal to start.</p></li>
+
+<li>Show that this is orthogonal to capabilities. Flag off, but every capability stripped from the bounding set.
+<pre class="cmd">run C '.process.user.uid=1000 | .process.user.gid=1000 |
+       .process.noNewPrivileges=false |
+       .process.capabilities.bounding=[] | .process.capabilities.effective=[] |
+       .process.capabilities.permitted=[]' \
+      '["/bin/sh","-c","/bin/whoareyou; grep -E \"^Cap(Prm|Eff|Bnd)\" /proc/self/status"]'</pre>
+<pre class="out">ruid=1000 <b>euid=0</b> rgid=1000 egid=1000
+CapPrm:	<b>0000000000000000</b>
+CapEff:	<b>0000000000000000</b>
+CapBnd:	<b>0000000000000000</b></pre>
+<p>uid 0 with an empty bounding set. The escalation happened; it just arrived with nothing in its hands. Dropping capabilities does not close the setuid hole, and closing the setuid hole does not drop capabilities — you want both.</p></li>
+
+<li>The other lever, for comparison: <code>nosuid</code> on the mount rather than the process. Bind-mount the same directory a second time with <code>nosuid</code> and run the same binary through both paths, with the flag still off.
+<pre class="cmd">run D '.process.user.uid=1000 | .process.user.gid=1000 |
+       .process.noNewPrivileges=false |
+       .mounts += [{"destination":"/mnt","source":"/home/ubuntu/i11/rootfs/bin",
+                    "type":"bind","options":["rbind","nosuid","ro"]}]' \
+      '["/bin/sh","-c","echo via-rootfs:; /bin/whoareyou; echo via-nosuid-bind:; /mnt/whoareyou"]'</pre>
+<pre class="out">via-rootfs:
+ruid=1000 <b>euid=0</b>
+via-nosuid-bind:
+ruid=1000 <b>euid=1000</b></pre>
+<p>One binary, one inode, two mount paths, two outcomes. This is why <code>nosuid</code> is on nearly every mount in the default bundle, and why a hand-written mount entry that omits it quietly re-opens the door on that path.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can state what <code>noNewPrivileges</code> stops (a uid change at <code>execve</code>) and what it does not (anything to do with capabilities the process already holds), and you can name the second, mount-level control that produces the same result for one filesystem.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Absent is false.</strong> The field is OPTIONAL and the spec's default is off. <code>runc spec</code> happens to write <code>true</code>; a config assembled by hand or by a tool that only sets the fields it cares about will not. Check for the field's presence, not just its value.</li>
+<li><strong>It breaks tools that legitimately escalate.</strong> Anything relying on a setuid helper — <code>ping</code> on some distributions, <code>sudo</code>, <code>newuidmap</code>, some FUSE mounts — stops working with an error from inside the tool. If a container works without the flag and fails with it, look for a setuid bit before looking anywhere else: <code>find / -perm -4000 -type f</code>.</li>
+<li><strong>It cannot be turned off, including by you.</strong> There is no way to run a privileged helper "just once" after the bit is set. If a container genuinely needs one, that is an argument for a different container, not for clearing the bit.</li>
+<li><strong>It does not stop a container that is already root.</strong> Everything above assumed a non-root uid. A root container has nothing to escalate <em>to</em>; the flag is close to a no-op there, which is why it belongs with a non-root uid rather than instead of one.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>securityContext.allowPrivilegeEscalation: false</code> is this exact field, and the Pod Security Standards' <em>Restricted</em> profile requires it. Note it is a <em>separate</em> field from <code>runAsNonRoot</code> and is not implied by it — step 2 is what a pod with <code>runAsNonRoot: true</code> and the default <code>allowPrivilegeEscalation</code> looks like. The advanced track has no Pod Security Standards lesson to link into; the closest existing material is <a href="w1.html#cp-1-2">W1.2</a>, where you inspect what the control-plane containers on a node actually run as.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the kernel's <em>no_new_privs.rst</em>; <code>man 2 prctl</code> under <code>PR_SET_NO_NEW_PRIVS</code>; <code>man 8 mount</code> for <code>nosuid</code>; and <a href="b4.html#cp-b4-15">B4.15</a>, whose debugging drill is a copied setuid binary.</p>
+</article>
+</div><!-- /g-runtime-hardening -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>TODO — 8+ questions, one per hard idea.
+<details class="reveal"><summary>Answer</summary><p>TODO</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>TODO one line per objective, in the past tense of capability.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html">TODO go-deep link →</a></div>
+
+<nav class="pager"><a href="i10.html">← I10</a><a href="../intermediate.html#i12">I12 · TODO →</a></nav>
+
+<footer>
+TODO authored-against line: distro, kernel, tool versions, verification date,
+and every version-sensitive finding the live run produced.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>

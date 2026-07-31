@@ -1,0 +1,179 @@
+# captured 2026-07-31T08:52:07Z on sandbox
+# --- snippet ---
+# bash ~/i11-sec4.sh
+# --- output ---
+=== G1. same allow-list, but defaultAction = SCMP_ACT_KILL_PROCESS ===
+### G1  defaultAction=SCMP_ACT_KILL_PROCESS  allowed=29
+    time="2026-07-31T14:52:08+06:00" level=error msg="runc run failed: container process is already dead"
+    [exit 1]
+    --- dmesg ---
+    [  933.706882] audit: type=1326 audit(1785487928.040:123): auid=1000 uid=0 gid=0 ses=50 subj=unconfined pid=8326 comm="runc:[2:INIT]" exe="/runc" sig=31 arch=c000003e syscall=72 compat=0 ip=0x7a18954fabee code=0x80000000
+
+=== G2. + fcntl ===
+### G2  defaultAction=SCMP_ACT_ERRNO  allowed=30
+    
+    thread '<unnamed>' panicked at src/procfs.rs:200:14:
+    at least one candidate /proc/thread-self path should work
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    time="2026-07-31T14:52:08+06:00" level=error msg="runc run failed: container process is already dead"
+    [exit 1]
+    --- dmesg ---
+
+=== G3. + the syscalls runc init itself needs ===
+### G3  defaultAction=SCMP_ACT_ERRNO  allowed=71
+    
+    thread '<unnamed>' panicked at src/procfs.rs:200:14:
+    at least one candidate /proc/thread-self path should work
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    SIGABRT: abort
+    PC=0x7666fad4172c m=0 sigcode=18446744073709551610
+    signal arrived during cgo execution
+    
+    goroutine 1 gp=0xc000002380 m=0 mp=0x7666fb2aa6a0 [syscall, locked to thread]:
+    runtime.cgocall(0x7666faca1e50, 0xc0000f9520)
+    	runtime/cgocall.go:167 +0x4b fp=0xc0000f94f8 sp=0xc0000f94c0 pc=0x7666fa934b2b
+    cyphar.com/go-pathrs/internal/libpathrs._Cfunc_pathrs_reopen(0x4, 0x80001)
+    	_cgo_gotypes.go:459 +0x4a fp=0xc0000f9520 sp=0xc0000f94f8 pc=0x7666faabdcaa
+    cyphar.com/go-pathrs/internal/libpathrs.Reopen(0x7666fa9b38d7?, 0xc0000f95b8?)
+    	cyphar.com/go-pathrs@v0.2.5/internal/libpathrs/libpathrs_linux.go:64 +0x1b fp=0xc0000f9550 sp=0xc0000f9520 pc=0x7666faabe03b
+    cyphar.com/go-pathrs.(*Handle).OpenFile.func1(0x7666fa9b3940?)
+    	cyphar.com/go-pathrs@v0.2.5/handle_linux.go:78 +0x25 fp=0xc0000f9580 sp=0xc0000f9550 pc=0x7666faabf165
+    cyphar.com/go-pathrs/internal/fdutils.WithFileFd[...].func1()
+    	cyphar.com/go-pathrs@v0.2.5/internal/fdutils/fd_linux.go:47 +0x2c fp=0xc0000f95a8 sp=0xc0000f9580 pc=0x7666faabef2c
+    internal/poll.(*FD).RawControl(0x28?, 0x7666faf90040?)
+    	internal/poll/fd_posix.go:61 +0xe2 fp=0xc0000f95f8 sp=0xc0000f95a8 pc=0x7666fa9b38c2
+    os.(*rawConn).Control(0xc00004ad80, 0xc0000f9650?)
+    	os/rawconn.go:22 +0x4a fp=0xc0000f9620 sp=0xc0000f95f8 pc=0x7666fa9c504a
+    cyphar.com/go-pathrs/internal/fdutils.WithFileFd[...](0xc00004ad70, 0xc000120768?)
+    	cyphar.com/go-pathrs@v0.2.5/internal/fdutils/fd_linux.go:46 +0x143 fp=0xc0000f9660 sp=0xc0000f9620 pc=0x7666faabee83
+    cyphar.com/go-pathrs.(*Handle).OpenFile(0xc00004ad78, 0x80001)
+    	cyphar.com/go-pathrs@v0.2.5/handle_linux.go:77 +0x6c fp=0xc0000f9688 sp=0xc0000f9660 pc=0x7666faabf10c
+    github.com/cyphar/filepath-securejoin/pathrs-lite.Reopen(0xd96faca431?, 0x80001)
+    	github.com/cyphar/filepath-securejoin@v0.7.0/pathrs-lite/open_libpathrs.go:56 +0x85 fp=0xc0000f96e0 sp=0xc0000f9688 pc=0x7666faabfc25
+    github.com/opencontainers/runc/internal/pathrs.Reopen.func1()
+    	github.com/opencontainers/runc/internal/pathrs/procfs_pathrslite.go:106 +0x1b fp=0xc0000f9700 sp=0xc0000f96e0 pc=0x7666faac285b
+    github.com/opencontainers/runc/internal/pathrs.retryEAGAIN[...](0xc0000f9790?)
+    	github.com/opencontainers/runc/internal/pathrs/retry.go:42 +0x3a fp=0xc0000f9780 sp=0xc0000f9700 pc=0x7666faac347a
+    github.com/opencontainers/runc/internal/pathrs.Reopen(0xc000074f60?, 0x7?)
+    	github.com/opencontainers/runc/internal/pathrs/procfs_pathrslite.go:105 +0x35 fp=0xc0000f97b8 sp=0xc0000f9780 pc=0x7666faac2815
+    github.com/opencontainers/runc/libcontainer.(*linuxStandardInit).Init(0xc0000f9a70)
+    	github.com/opencontainers/runc/libcontainer/standard_init_linux.go:266 +0x1115 fp=0xc0000f9a40 sp=0xc0000f97b8 pc=0x7666fabeae35
+    github.com/opencontainers/runc/libcontainer.containerInit({0xc00002a017, 0x8}, 0xc0000c4120, 0xc00002c350, 0x0, 0x0, 0xc00004a0c8, 0xc00004a0c0)
+    	github.com/opencontainers/runc/libcontainer/init_linux.go:266 +0x1b6 fp=0xc0000f9af0 sp=0xc0000f9a40 pc=0x7666fabd0696
+    github.com/opencontainers/runc/libcontainer.startInitialization()
+    	github.com/opencontainers/runc/libcontainer/init_linux.go:238 +0x8a5 fp=0xc0000f9dd0 sp=0xc0000f9af0 pc=0x7666fabcff85
+    github.com/opencontainers/runc/libcontainer.Init()
+    	github.com/opencontainers/runc/libcontainer/init_linux.go:110 +0x25 fp=0xc0000f9e18 sp=0xc0000f9dd0 pc=0x7666fabcf685
+    main.init.0()
+    	github.com/opencontainers/runc/init.go:14 +0x33 fp=0xc0000f9e28 sp=0xc0000f9e18 pc=0x7666fac83333
+    runtime.doInit1(0x7666fb299490)
+    	runtime/proc.go:7670 +0xd7 fp=0xc0000f9f50 sp=0xc0000f9e28 pc=0x7666fa912737
+    runtime.doInit(...)
+    	runtime/proc.go:7637
+    runtime.main()
+    	runtime/proc.go:256 +0x350 fp=0xc0000f9fe0 sp=0xc0000f9f50 pc=0x7666fa9034b0
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc0000f9fe8 sp=0xc0000f9fe0 pc=0x7666fa93fe81
+    
+    goroutine 2 gp=0xc000002e00 m=nil [force gc (idle)]:
+    runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+    	runtime/proc.go:460 +0xce fp=0xc000046fa8 sp=0xc000046f88 pc=0x7666fa93800e
+    runtime.goparkunlock(...)
+    	runtime/proc.go:466
+    runtime.forcegchelper()
+    	runtime/proc.go:373 +0xb8 fp=0xc000046fe0 sp=0xc000046fa8 pc=0x7666fa903738
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc000046fe8 sp=0xc000046fe0 pc=0x7666fa93fe81
+    created by runtime.init.7 in goroutine 1
+    	runtime/proc.go:361 +0x1a
+    
+    goroutine 3 gp=0xc000003340 m=nil [GC sweep wait]:
+    runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+    	runtime/proc.go:460 +0xce fp=0xc000047780 sp=0xc000047760 pc=0x7666fa93800e
+    runtime.goparkunlock(...)
+    	runtime/proc.go:466
+    runtime.bgsweep(0xc000070000)
+    	runtime/mgcsweep.go:279 +0x94 fp=0xc0000477c8 sp=0xc000047780 pc=0x7666fa8ed4f4
+    runtime.gcenable.gowrap1()
+    	runtime/mgc.go:212 +0x25 fp=0xc0000477e0 sp=0xc0000477c8 pc=0x7666fa8e14c5
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc0000477e8 sp=0xc0000477e0 pc=0x7666fa93fe81
+    created by runtime.gcenable in goroutine 1
+    	runtime/mgc.go:212 +0x66
+    
+    goroutine 4 gp=0xc000003500 m=nil [GC scavenge wait]:
+    runtime.gopark(0xc000070000?, 0x7666fae72de0?, 0x1?, 0x0?, 0xc000003500?)
+    	runtime/proc.go:460 +0xce fp=0xc000047f78 sp=0xc000047f58 pc=0x7666fa93800e
+    runtime.goparkunlock(...)
+    	runtime/proc.go:466
+    runtime.(*scavengerState).park(0x7666fb2a93c0)
+    	runtime/mgcscavenge.go:425 +0x49 fp=0xc000047fa8 sp=0xc000047f78 pc=0x7666fa8eafc9
+    runtime.bgscavenge(0xc000070000)
+    	runtime/mgcscavenge.go:653 +0x3c fp=0xc000047fc8 sp=0xc000047fa8 pc=0x7666fa8eb55c
+    runtime.gcenable.gowrap2()
+    	runtime/mgc.go:213 +0x25 fp=0xc000047fe0 sp=0xc000047fc8 pc=0x7666fa8e1465
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc000047fe8 sp=0xc000047fe0 pc=0x7666fa93fe81
+    created by runtime.gcenable in goroutine 1
+    	runtime/mgc.go:213 +0xa5
+    
+    goroutine 5 gp=0xc000003a40 m=nil [GOMAXPROCS updater (idle)]:
+    runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+    	runtime/proc.go:460 +0xce fp=0xc000048788 sp=0xc000048768 pc=0x7666fa93800e
+    runtime.goparkunlock(...)
+    	runtime/proc.go:466
+    runtime.updateMaxProcsGoroutine()
+    	runtime/proc.go:6720 +0xe7 fp=0xc0000487e0 sp=0xc000048788 pc=0x7666fa911767
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc0000487e8 sp=0xc0000487e0 pc=0x7666fa93fe81
+    created by runtime.defaultGOMAXPROCSUpdateEnable in goroutine 1
+    	runtime/proc.go:6708 +0x37
+    
+    goroutine 6 gp=0xc000094000 m=nil [finalizer wait]:
+    runtime.gopark(0x7666fa912737?, 0x7666fa8d8c45?, 0xb8?, 0x1?, 0xc000002380?)
+    	runtime/proc.go:460 +0xce fp=0xc000046620 sp=0xc000046600 pc=0x7666fa93800e
+    runtime.runFinalizers()
+    	runtime/mfinal.go:210 +0x107 fp=0xc0000467e0 sp=0xc000046620 pc=0x7666fa8e0347
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc0000467e8 sp=0xc0000467e0 pc=0x7666fa93fe81
+    created by runtime.createfing in goroutine 1
+    	runtime/mfinal.go:172 +0x3d
+    
+    goroutine 7 gp=0xc0000941c0 m=nil [cleanup wait]:
+    runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+    	runtime/proc.go:460 +0xce fp=0xc000048f68 sp=0xc000048f48 pc=0x7666fa93800e
+    runtime.goparkunlock(...)
+    	runtime/proc.go:466
+    runtime.(*cleanupQueue).dequeue(0x7666fb2a9660)
+    	runtime/mcleanup.go:439 +0xc5 fp=0xc000048fa0 sp=0xc000048f68 pc=0x7666fa8dd425
+    runtime.runCleanups()
+    	runtime/mcleanup.go:635 +0x45 fp=0xc000048fe0 sp=0xc000048fa0 pc=0x7666fa8ddae5
+    runtime.goexit({})
+    	runtime/asm_amd64.s:1693 +0x1 fp=0xc000048fe8 sp=0xc000048fe0 pc=0x7666fa93fe81
+    created by runtime.(*cleanupQueue).createGs in goroutine 1
+    	runtime/mcleanup.go:589 +0xa5
+    
+    rax    0x0
+    rbx    0x1
+    rcx    0x7666fad4172c
+    rdx    0x6
+    rdi    0x1
+    rsi    0x1
+    rbp    0x7ffd7f635ca0
+    rsp    0x7ffd7f635b90
+    r8     0x0
+    r9     0x0
+    r10    0x0
+    r11    0x246
+    r12    0x8ce0a401
+    r13    0x6
+    r14    0x55558ce0a440
+    r15    0x2
+    rip    0x7666fad4172c
+    rflags 0x246
+    cs     0x33
+    fs     0x0
+    gs     0x0
+    time="2026-07-31T14:52:08+06:00" level=error msg="runc run failed: container process is already dead"
+    [exit 1]
+    --- dmesg ---

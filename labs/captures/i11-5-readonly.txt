@@ -1,0 +1,72 @@
+# captured 2026-07-31T08:54:30Z on sandbox
+# --- snippet ---
+# mkdir -p ~/i11/hostdata; bash ~/i11-ro.sh
+# --- output ---
+=== A. root.readonly = true (the runc spec DEFAULT) ===
+### A  root={"path":"rootfs","readonly":true}
+    / ro,relatime
+    /proc rw,relatime
+    /dev rw,nosuid
+    /dev/pts rw,nosuid,noexec,relatime
+    /dev/shm rw,nosuid,nodev,noexec,relatime
+    /dev/mqueue rw,nosuid,nodev,noexec,relatime
+    /sys ro,nosuid,nodev,noexec,relatime
+    /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime
+    /proc/sys ro,relatime
+    /proc/acpi ro,relatime
+    /sys/firmware ro,relatime
+    /proc/scsi ro,relatime
+    ---
+    / read-only
+    /tmp read-only
+    /var/cache read-only
+    /dev WRITABLE
+    /dev/shm WRITABLE
+    /run read-only
+    [exit 0]
+
+=== B. root.readonly = true + a tmpfs on /tmp ===
+### B  root={"path":"rootfs","readonly":true}
+    / ro,relatime
+    /proc rw,relatime
+    /dev rw,nosuid
+    /dev/pts rw,nosuid,noexec,relatime
+    /dev/shm rw,nosuid,nodev,noexec,relatime
+    /dev/mqueue rw,nosuid,nodev,noexec,relatime
+    /sys ro,nosuid,nodev,noexec,relatime
+    /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime
+    /tmp rw,nosuid,nodev,noexec,relatime
+    /proc/sys ro,relatime
+    /proc/acpi ro,relatime
+    /sys/firmware ro,relatime
+    /proc/scsi ro,relatime
+    ---
+    / read-only
+    /tmp WRITABLE
+    /var/cache read-only
+    /dev WRITABLE
+    /dev/shm WRITABLE
+    /run read-only
+    [exit 0]
+
+=== C. a real workload: apk update on a read-only rootfs ===
+### C  root={"path":"rootfs","readonly":true}
+    ERROR: Unable to lock database: Read-only file system
+    ERROR: Failed to open apk database: Read-only file system
+    apk_rc=0
+    [exit 0]
+
+=== D. same, with tmpfs over every path apk writes ===
+### D  root={"path":"rootfs","readonly":true}
+    fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz
+    WARNING: updating and opening https://dl-cdn.alpinelinux.org/alpine/v3.21/main: temporary error (try again later)
+    fetch https://dl-cdn.alpinelinux.org/alpine/v3.21/community/x86_64/APKINDEX.tar.gz
+    WARNING: updating and opening https://dl-cdn.alpinelinux.org/alpine/v3.21/community: temporary error (try again later)
+    apk_rc=0
+    [exit 0]
+
+=== E. read-only rootfs does NOT make a bind mount read-only ===
+### E  root={"path":"rootfs","readonly":true}
+    touch: /host-data/escaped: Permission denied
+    touch: /nope: Read-only file system
+    [exit 1]

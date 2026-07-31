@@ -1,0 +1,48 @@
+# captured 2026-07-31T08:53:29Z on sandbox
+# --- snippet ---
+# bash ~/i11-aa.sh
+# --- output ---
+profile loaded
+       i11-deny-secrets
+host view: -rw-rw-rw- 1 root root 11 Jul 31 14:53 rootfs/data/secret.txt
+
+=== A. no AppArmor profile (the runc spec default) ===
+### A  apparmorProfile="(unset)"
+    unconfined
+    0
+    ---
+    top secret
+    ---
+    write_rc=0
+    /bin/sh: can't create /data/other.txt: Permission denied
+    other_rc=1
+    [exit 0]
+    --- kernel audit ---
+
+=== B. process.apparmorProfile = i11-deny-secrets ===
+### B  apparmorProfile="i11-deny-secrets"
+    i11-deny-secrets (enforce)
+    0
+    ---
+    top secret
+    pwned
+    /bin/sh: can't create /data/secret.txt: Permission denied
+    /bin/sh: can't create /data/other.txt: Permission denied
+    ---
+    write_rc=1
+    other_rc=1
+    [exit 0]
+    --- kernel audit ---
+
+=== C. a profile name that is not loaded ===
+### C  apparmorProfile="i11-does-not-exist"
+    time="2026-07-31T14:53:30+06:00" level=error msg="runc run failed: unable to start container process: error during container init: unable to apply apparmor profile: apparmor failed to apply profile: write /1/task/1/attr/apparmor/exec: no such file or directory"
+    [exit 1]
+    --- kernel audit ---
+    apparmor="DENIED" operation="change_onexec" class="file" info="label not found" error=-2 profile="unconfined" name="i11-does-not-exist" pid=9415 comm="runc:[2:INIT]"
+
+=== D. selinuxLabel on a box with no SELinux ===
+### D  apparmorProfile="(unset)"
+    time="2026-07-31T14:53:30+06:00" level=error msg="runc run failed: selinux label is specified in config, but selinux is disabled or not supported"
+    [exit 1]
+    --- kernel audit ---
