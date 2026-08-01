@@ -460,3 +460,266 @@ def umount_rootfs(bundle):
     return False
 
 
+# =========================================================================
+# layer 3 - run
+#
+# The translation that IS "running an image": an image config (what the author
+# wanted) becomes a runtime config (what the kernel is told). The two are
+# separate specifications precisely because this step exists, and it is
+# roughly forty lines long.
+# =========================================================================
+
+CAPS = ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]   # runc's own default set
+
+
+def lookup_user(rootfs, spec):
+    """Resolve an image's User field against the CONTAINER's /etc/passwd.
+
+    A numeric uid always works, even if no such user exists in the image
+    (I2.11: it starts, and fails later with a permission error). A NAME has to
+    be looked up in the rootfs, which is why `ctr run --user appuser` answers
+    "no users found" - it is reading a file inside an image it has not mounted.
+    """
+    if not spec or spec == "root":
+        return 0, 0
+    user, _, group = spec.partition(":")
+    def resolve_one(field, path, default):
+        if field.isdigit():
+            return int(field)
+        try:
+            with open(os.path.join(rootfs, path)) as f:
+                for line in f:
+                    parts = line.split(":")
+                    if parts[0] == field:
+                        return int(parts[2])
+        except OSError:
+            pass
+        die(f"user {spec!r}: no entry for {field!r} in the image's /etc/{path.split('/')[-1]}")
+    uid = resolve_one(user, "etc/passwd", 0)
+    gid = resolve_one(group, "etc/group", 0) if group else uid
+    return uid, gid
+
+
+def make_spec(image_cfg, opts, rootfs, netns_path, cid):
+    """Build config.json. Every key below is runtime-spec v1.3.0."""
+    c = image_cfg.get("config") or {}
+    if opts["entrypoint"] is not None:
+        # I4.14: overriding the entrypoint DISCARDS the image's Cmd unless args
+        # are also given. That is exactly a pod spec with command: and no args:.
+        argv = opts["entrypoint"] + opts["args"]
+    else:
+        argv = (c.get("Entrypoint") or []) + (opts["args"] or c.get("Cmd") or [])
+    if not argv:
+        die("no command: the image declares neither Entrypoint nor Cmd")
+    uid, gid = lookup_user(rootfs, opts["user"] or c.get("User", ""))
+    ns = [{"type": t} for t in ("pid", "ipc", "uts", "mount", "cgroup")]
+    ns.append({"type": "network", **({"path": netns_path} if netns_path else {})})
+    mounts = [
+        {"destination": "/proc", "type": "proc", "source": "proc"},
+        {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+         "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+        {"destination": "/dev/pts", "type": "devpts", "source": "devpts",
+         "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]},
+        {"destination": "/dev/shm", "type": "tmpfs", "source": "shm",
+         "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]},
+        {"destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
+         "options": ["nosuid", "noexec", "nodev"]},
+        {"destination": "/sys", "type": "sysfs", "source": "sysfs",
+         "options": ["nosuid", "noexec", "nodev", "ro"]},
+    ]
+    for name, dest in opts["volumes"]:
+        src = f"{VOLUMES}/{name}"
+        os.makedirs(src, exist_ok=True)
+        mounts.append({"destination": dest, "type": "bind", "source": src,
+                       "options": ["rbind", "rw"]})
+    resources = {}
+    if opts["memory"]:
+        resources["memory"] = {"limit": opts["memory"]}
+    if opts["cpus"]:
+        resources["cpu"] = {"quota": int(opts["cpus"] * 100000), "period": 100000}
+    return {
+        "ociVersion": "1.3.0",
+        "process": {
+            "terminal": False,
+            "user": {"uid": uid, "gid": gid},
+            "args": argv,
+            "env": (c.get("Env") or ["PATH=/usr/local/sbin:/usr/local/bin:"
+                                     "/usr/sbin:/usr/bin:/sbin:/bin"]) + opts["env"],
+            "cwd": opts["workdir"] or c.get("WorkingDir") or "/",
+            "capabilities": {k: list(CAPS) for k in
+                             ("bounding", "effective", "permitted")},
+            "noNewPrivileges": True,
+        },
+        "root": {"path": "rootfs", "readonly": bool(opts["read_only"])},
+        "hostname": opts["hostname"] or cid[:12],
+        "mounts": mounts,
+        "linux": {
+            "namespaces": ns,
+            "resources": resources,
+            "cgroupsPath": f"/minidock/{cid[:12]}",
+            "maskedPaths": ["/proc/kcore", "/proc/keys", "/proc/timer_list",
+                            "/sys/firmware"],
+            "readonlyPaths": ["/proc/asound", "/proc/bus", "/proc/sys",
+                              "/proc/sysrq-trigger"],
+        },
+    }
+
+
+# =========================================================================
+# layer 4 - network
+#
+# minidock contains no networking code. It execs a binary, writes JSON to its
+# stdin and parses JSON from its stdout - which is the entire CNI contract, and
+# which means the reference `bridge` plugin can be dropped in by editing one
+# string. That substitution is the proof that this implements a contract and
+# not a special case.
+# =========================================================================
+
+
+def cni(command, cid, netns, conf=None, ifname="eth0"):
+    conf = conf or NETCONF
+    env = dict(os.environ,
+               CNI_COMMAND=command, CNI_CONTAINERID=cid, CNI_NETNS=netns,
+               CNI_IFNAME=ifname, CNI_PATH=CNI_BIN,
+               CNI_ARGS="IgnoreUnknown=1;K8S_POD_NAME=" + cid[:12])
+    plugin = os.path.join(CNI_BIN, conf["type"])
+    p = subprocess.run([plugin], input=json.dumps(conf), env=env,
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        try:
+            e = json.loads(p.stdout)
+            raise RuntimeError(f"CNI {command} failed: code {e.get('code')} "
+                               f"{e.get('msg')} - {e.get('details', '')}")
+        except json.JSONDecodeError:
+            raise RuntimeError(f"CNI {command} failed ({p.returncode}): "
+                               f"{p.stderr.strip() or p.stdout.strip()}")
+    return json.loads(p.stdout) if p.stdout.strip() else {}
+
+
+def net_up(cid):
+    """Create the namespace, then attach it. Order matters and is CRI's order.
+
+    I8.5 measured this: the sandbox's network namespace is created and wired
+    BEFORE anything runs in it. There is no process here yet - the namespace is
+    kept alive by a bind mount, which is what `ip netns add` makes.
+    """
+    name = "md-" + cid[:12]
+    path = f"{NETNS_DIR}/{name}"
+    sh("ip", "netns", "add", name)
+    cni("ADD", cid, path, LOOPCONF, ifname="lo")   # I9.10: no lo, no 127.0.0.1
+    result = cni("ADD", cid, path)
+    ip = (result.get("ips") or [{}])[0].get("address", "?")
+    return path, ip, result
+
+
+def net_down(cid, path):
+    """DEL, then remove the namespace. Idempotent both times, by contract."""
+    ok = True
+    for conf, ifname in ((NETCONF, "eth0"), (LOOPCONF, "lo")):
+        try:
+            cni("DEL", cid, path or "", conf, ifname=ifname)
+        except RuntimeError as e:
+            print(f"minidock: {e}", file=sys.stderr)
+            ok = False
+    subprocess.run(["ip", "netns", "delete", "md-" + cid[:12]],
+                   capture_output=True)
+    return ok
+
+
+# =========================================================================
+# layer 5 - logs
+#
+# The CRI log format, written by hand this time. One line per record:
+#
+#     <RFC3339Nano> <stdout|stderr> <P|F> <text>
+#
+# P means partial - the line was longer than MAX_LINE and continues on the
+# next record. Producing that tag is easy; the half most log shippers get
+# wrong is consuming it, which `minidock logs` below has to do.
+# =========================================================================
+
+
+def stamp():
+    ns = time.time_ns()
+    s, rem = divmod(ns, 10 ** 9)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(s)) + f".{rem:09d}Z"
+
+
+class CriLog:
+    def __init__(self, path, max_bytes=1 << 20, max_files=3):
+        self.path, self.max_bytes, self.max_files = path, max_bytes, max_files
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.f = open(path, "ab", buffering=0)
+        self.size = os.path.getsize(path)
+        self.buf = {"stdout": b"", "stderr": b""}
+
+    def feed(self, stream, data):
+        self.buf[stream] += data
+        while True:
+            nl = self.buf[stream].find(b"\n")
+            if nl >= 0 and nl <= MAX_LINE:
+                self._emit(stream, "F", self.buf[stream][:nl])
+                self.buf[stream] = self.buf[stream][nl + 1:]
+            elif len(self.buf[stream]) > MAX_LINE:
+                self._emit(stream, "P", self.buf[stream][:MAX_LINE])
+                self.buf[stream] = self.buf[stream][MAX_LINE:]
+            else:
+                return
+
+    def close(self):
+        for s in ("stdout", "stderr"):
+            if self.buf[s]:
+                self._emit(s, "F", self.buf[s])
+                self.buf[s] = b""
+        self.f.close()
+
+    def _emit(self, stream, tag, text):
+        line = f"{stamp()} {stream} {tag} ".encode() + text + b"\n"
+        self.f.write(line)
+        self.size += len(line)
+        if self.size >= self.max_bytes:
+            self._rotate()
+
+    def _rotate(self):
+        """Rotate, and notice what it costs: history, permanently.
+
+        There is no third option. Keep everything and a chatty container fills
+        the disk (I12.10 measured a 300 MB log that `rm` could not reclaim);
+        rotate and `minidock logs` cannot show you last Tuesday. The kubelet
+        makes the same trade with containerLogMaxSize x containerLogMaxFiles.
+        """
+        self.f.close()
+        for i in range(self.max_files - 1, 0, -1):
+            src, dst = f"{self.path}.{i}", f"{self.path}.{i + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst) if i + 1 < self.max_files else os.unlink(src)
+        os.replace(self.path, self.path + ".1")
+        self.f = open(self.path, "ab", buffering=0)
+        self.size = 0
+
+
+def read_cri_log(path, tail=None, streams=("stdout", "stderr")):
+    """Consume the format: reassemble P chunks, keep the stream separation."""
+    files = [f"{path}.{i}" for i in range(3, 0, -1)] + [path]
+    out, pend = [], {"stdout": "", "stderr": ""}
+    for p in files:
+        if not os.path.exists(p):
+            continue
+        with open(p, "r", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(" ", 3)
+                if len(parts) < 4:
+                    continue
+                ts, stream, tag, text = parts
+                if stream not in streams:
+                    continue
+                pend[stream] += text
+                if tag == "F":
+                    out.append((ts, stream, pend[stream]))
+                    pend[stream] = ""
+    for stream, rest in pend.items():
+        if rest:
+            out.append(("", stream, rest))
+    return out[-tail:] if tail else out
+
+
