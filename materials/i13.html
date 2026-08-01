@@ -717,6 +717,343 @@ started at 07:49:50
 </article>
 </div><!-- /g-capstone-minidock-one-la -->
 
+<!-- ---------------- The debugging gauntlet ---------------- --><div class="grp" id="g-the-debugging-gauntlet"><h3>The debugging gauntlet</h3>
+<article class="lesson drill" id="cp-i13-7" data-id="i13-7">
+<div class="lesson-head"><span class="cp-id">I13.7</span><h4>Run 1 — eight faults, 60 minutes</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>You have built the stack. That is not the same as being able to fix it. Building is done with the whole design in your head and the machine cooperating; fixing is done with a symptom, a stranger's configuration, and no idea which layer is lying to you. The gauntlet exists because those are different skills and only one of them is what a bad afternoon actually requires.</p>
+
+<h5>The concept</h5>
+<p>Eight faults, one per layer, planted by <code>labs/intermediate/i13-*.sh</code> and driven by <code>i13-gauntlet.sh</code>. Each script names the symptom and nothing else — no solution appears in its output. They are planted across the whole node rather than only inside <code>minidock</code>, because that is how a real one arrives: you meet the fault through whichever tool you reached for first, and part of the exercise is noticing that <code>crictl</code> and your own CLI can be broken by the same underlying cause and say completely different things about it.</p>
+<p>The eight, and the layer each belongs to:</p>
+<table class="langpair">
+<thead><tr><th>Layer</th><th>Fault</th><th>What it will look like</th></tr></thead>
+<tbody>
+<tr><td>1 · distribution</td><td>registry auth</td><td>a pull that fails with a status code, on one registry only</td></tr>
+<tr><td>1 · content store</td><td>corrupted blob, digest mismatch</td><td>a pull that succeeds and a run that does not</td></tr>
+<tr><td>3 · runtime</td><td>malformed <code>config.json</code></td><td>a container that never starts, with an error from runc</td></tr>
+<tr><td>3 · shim</td><td>orphaned shim</td><td>something running that no tool will admit to</td></tr>
+<tr><td>4 · network</td><td>CNI IPAM exhaustion</td><td>containers that start fine until suddenly none do</td></tr>
+<tr><td>6 · platform</td><td>cgroup-driver mismatch</td><td>everything works and no limit is enforced</td></tr>
+<tr><td>2 · snapshotter</td><td>snapshotter / GC leak</td><td>a full disk that no image list explains</td></tr>
+<tr><td>5 · security</td><td>seccomp over-restriction</td><td>a container that dies on a syscall nobody named</td></tr>
+</tbody>
+</table>
+<p><strong>Rules of engagement.</strong> Sixty minutes for all eight. Fix them in any order — choosing an order is itself part of the exercise. Take notes <em>as you go</em>, not afterwards, because the thing you want to remember is what you tried that did not work and you will have edited that out of the story within an hour. And do not open a hint until you have spent five real minutes on a fault: the hints below are three-stage on purpose, and a hint taken too early costs you the exact skill the run was meant to build.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Read the runner's banner and check the guard. Every fault script in this repository refuses to run on the wrong machine, and this set is no exception — it requires the sandbox host and the absence of <code>/etc/kubernetes</code>, so it can never be pointed at a cluster.</li>
+<li>Start a timer you can actually see. Sixty minutes with no clock becomes ninety without anyone noticing.</li>
+<li>For each fault, write four things down before you move on: the symptom you saw first, the layer you suspected, what it actually was, and the single command that would have found it fastest. That fourth column is the deliverable in I13.8, and it is much harder to reconstruct later.</li>
+<li>When you are done, run every layer's happy path once more — pull, run, network, logs, restart — because a fix that broke something quieter is the most common way a repair fails review.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>All eight faults fixed, the happy path green afterwards, and four lines of notes per fault. If you finished in under sixty minutes on the first attempt, you either know this stack well or you opened hints early; either way I13.9's second run is where the honest number comes from.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Two faults can look like each other.</strong> A missing image and a corrupted blob both present as "this container will not start", and only one of them fails at pull time.</li>
+<li><strong>The tool you reach for shapes the symptom.</strong> The same broken socket is <code>connection refused</code> to one client and a ten-second timeout to another; neither message names the cause.</li>
+<li><strong>Do not fix two things at once.</strong> If you change three things and the symptom clears, you have learned nothing and you have possibly left two new faults behind.</li>
+</ul>
+
+<h5>Hints and solutions</h5>
+<p>Three stages each: a nudge, then where to look, then the fix. Take them in order and stop as soon as you can proceed.</p>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 1 — registry auth · nudge</summary><p>The failure is a status code, and the status code already says what happened. Get it out of whatever tool is hiding it — <code>curl -i</code> against <code>/v2/</code> is faster than reading any log.</p></details>
+<details class="reveal"><summary>Fault 1 — where to look</summary><p>Two different 401s exist and they mean opposite things. A <strong>Bearer</strong> challenge from the registry means you never authenticated; a <strong>Basic</strong> challenge from the auth service, with a body like <code>{"details":"incorrect username or password"}</code>, means your credentials were rejected. "Challenge or no challenge" is not the discriminator — both carry one (I5.15). Also check <em>which</em> registry: containerd's pull path reads <code>config_path</code> under <code>plugins.'io.containerd.cri.v1.images'.registry</code>, and there is a second, non-interchangeable one under the transfer plugin that <code>ctr</code> and <code>nerdctl</code> use.</p></details>
+<details class="reveal"><summary>Fault 1 — solution</summary><p>The credential file the pull path actually reads is wrong or absent. Fix the file the <em>CRI images plugin</em> points at, not the one your CLI happens to use, then re-pull. Proving the fix means pulling through the same path that failed — a successful <code>ctr</code> pull proves nothing about pods.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 2 — corrupted blob · nudge</summary><p>The pull succeeded. That is the clue, not a distraction: it means the bytes arrived after the last time anything checked them.</p></details>
+<details class="reveal"><summary>Fault 2 — where to look</summary><p>The error will come from inside a tar reader — "invalid compressed data" or a gzip complaint — and will name a file path, not a digest. Content stores verify on write and then trust the filename forever, so the check you need is the one nothing runs automatically: re-hash the blob and compare it to its own name.</p></details>
+<details class="reveal"><summary>Fault 2 — solution</summary><p><code>minidock verify</code> (or <code>sha256sum</code> against the filename) identifies the blob. Delete just that blob and pull again — the content store is the one store here with an upstream to rebuild from, which is exactly why it lives in its own directory. Do not delete the name index; you will then have to re-resolve every tag for no reason.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 3 — malformed config.json · nudge</summary><p>runc's error message is unusually good here. Read it literally, including the part that looks like noise.</p></details>
+<details class="reveal"><summary>Fault 3 — where to look</summary><p>The bundle is a directory with two things in it, and only one is JSON. Validate it (<code>jq . config.json</code>) before reading it — a truncated file and a semantically wrong one fail very differently. If the JSON parses, suspect the mount list: I2.6 found that deleting the <code>/proc</code> mount makes runc <em>fail to create the container</em> with a libpathrs panic and <code>procReady not received</code>, rather than merely breaking <code>ps</code>, and that mounting any non-procfs at <code>/proc</code> is refused outright by a proc-safety check.</p></details>
+<details class="reveal"><summary>Fault 3 — solution</summary><p>Repair the offending key and re-create the container. Note that <code>runc update</code> writes to the kernel only — neither the bundle nor <code>state.json</code> records it (I3.12) — so if the fault was a limit rather than a mount, re-creating silently reverts your fix unless you also edit the bundle.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 4 — orphaned shim · nudge</summary><p>Something is running that no container list mentions. Start from the process table, not from the tool.</p></details>
+<details class="reveal"><summary>Fault 4 — where to look</summary><p><code>ps -eo pid,ppid,comm</code> and look for a workload whose parent is PID 1. Then decide which orphan you have, because there are two and they need different repairs: a dead <em>runc</em> supervisor leaves the container running and re-parented (I3.14), while a dead <em>shim</em> under containerd does <strong>not</strong> — containerd watches the shim's socket and reaps it within about two seconds, leaving only a stale container <em>record</em> (I7.14). Under <code>minidock</code>, which has no such monitor, the orphan is permanent and the metadata store says <code>running</code> forever.</p></details>
+<details class="reveal"><summary>Fault 4 — solution</summary><p>Kill the workload, then clear the record. <code>runc delete --force &lt;id&gt;</code> against the right <code>--root</code>, or <code>ctr container rm</code>, or <code>minidock rm -f</code>. Do not <code>rm -rf</code> the state directory: I3.13 measured that it appears to work and leaks the cgroup.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 5 — IPAM exhaustion · nudge</summary><p>Containers used to start and now none do. Whatever is exhausted was being consumed one container at a time and not given back.</p></details>
+<details class="reveal"><summary>Fault 5 — where to look</summary><p>The IPAM store is a directory of files named after addresses. Count them, then count your running containers. A gap means DEL was not called, or was called after the namespace had already gone — and a plugin that reads the address out of the namespace returns success in that case while reclaiming nothing (I9.9). Note that <code>host-local</code> allocates forward and never backfills, so a leaked reservation at the bottom of the range costs you the whole pool eventually.</p></details>
+<details class="reveal"><summary>Fault 5 — solution</summary><p>Release the stale reservations for containers that no longer exist. Do not expect CNI's <code>GC</code> verb to do it for you: not one of the ten reference plugins registers a GC handler (I9.14), so <code>GC</code> is a well-formed no-op and the field repair really is <code>rm</code> on a directory. Then fix the teardown order that caused it — DEL first, delete the namespace second.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 6 — cgroup-driver mismatch · nudge</summary><p>Nothing errors. That is the fault. Ask where the limits you set actually ended up.</p></details>
+<details class="reveal"><summary>Fault 6 — where to look</summary><p>Two cgroup trees, both present, no message anywhere. I8.15 measured a mismatched node with <code>/sys/fs/cgroup/kubepods.slice</code> present and <code>/sys/fs/cgroup/kubepods</code> absent, and vice versa. <code>SystemdCgroup=false</code> produces <code>cgroupsPath = /&lt;parent&gt;/&lt;id&gt;</code>; <code>true</code> produces <code>kubepods-besteffort.slice:cri-containerd:&lt;id&gt;</code> plus a real <code>cri-containerd-&lt;id&gt;.scope</code> unit. Find the container's cgroup path in its generated config and then check whether that path exists.</p></details>
+<details class="reveal"><summary>Fault 6 — solution</summary><p>Make the runtime's driver agree with the init system's — on a systemd host, that means <code>SystemdCgroup = true</code> under the CRI runtime plugin, followed by a containerd restart. Verify by finding the container's cgroup on disk and reading its <code>memory.max</code>, not by the absence of errors: there were never any errors.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 7 — snapshotter / GC leak · nudge</summary><p>The disk is full and the image list is small. Those two facts are compatible and the reason is a directory you have already met.</p></details>
+<details class="reveal"><summary>Fault 7 — where to look</summary><p>Unpacked layers are roughly three times their compressed size — I7.11 measured a 691 MB content store against a 2.2 GB snapshotter — and <code>crictl imagefsinfo</code> only counts what the CRI created, so storage written through another client is invisible to it (I10.4 measured 300 MB moving that number by exactly zero). Compare <code>du</code> on the snapshot directory against what any tool claims. Also check for a snapshot with no image referencing it, and for a deleted-but-open log file: I12.10 measured a 300 MB deletion freeing 0 K because the runtime still held the descriptor.</p></details>
+<details class="reveal"><summary>Fault 7 — solution</summary><p>Delete the image <em>name</em> so the content becomes collectible, then let the collector run — I7.13 measured collection in under five seconds once nothing referenced the blob, not the "thirty seconds later" of folklore. For an orphaned snapshot with no owner, remove the directory. For a deleted-but-open file, the space returns only when the last descriptor closes.</p></details>
+</div>
+
+<div class="reveal-group">
+<details class="reveal"><summary>Fault 8 — seccomp over-restriction · nudge</summary><p>The container dies without saying why, and the exit tells you less than you expect. The kernel does know; it just did not tell the process.</p></details>
+<details class="reveal"><summary>Fault 8 — where to look</summary><p>Switch the profile's <code>defaultAction</code> to <code>SCMP_ACT_KILL_PROCESS</code> and read <code>dmesg</code>: the audit record names the syscall number and the process — <code>type=1326</code>, <code>syscall=72</code>, <code>comm="runc:[2:INIT]"</code>. That pairing is the whole diagnostic technique (I11.8). Two traps: <code>architectures</code> <em>adds</em> architectures and does not select, so a profile listing only ARM still filters on x86-64; and one <code>args</code> block applies to every name in its <code>syscalls[]</code> entry, while argument positions differ per syscall, so grouped rules can silently never fire.</p></details>
+<details class="reveal"><summary>Fault 8 — solution</summary><p>Add the syscall the audit record named. Expect the allow-list to be larger than the workload needs, because the filter also covers <code>runc init</code>: I11.8 needed four rounds and 29 → 30 → 71 → 74 names just to run <code>echo</code>, failing first at <code>fcntl(F_DUPFD_CLOEXEC)</code> and then at a libpathrs Rust panic for missing <code>openat2</code>/<code>statfs</code>.</p></details>
+</div>
+
+<div class="k8s-link">
+<p>This is the intermediate track's version of <a href="w6.html#cp-6-19">6.19 — The gauntlet: six broken workloads, 30 minutes, notes closed</a>, one layer down. The faults there are Kubernetes objects; the faults here are what those objects are made of, and several of week 6's symptoms — <code>ImagePullBackOff</code>, <code>CreateContainerError</code>, a pod stuck <code>ContainerCreating</code> — are literally the eight below, seen from above.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> none. This one is closed-book on purpose — the point is the ladder you already have, not the page you can find.</p>
+</article>
+
+<article class="lesson project" id="cp-i13-8" data-id="i13-8">
+<div class="lesson-head"><span class="cp-id">I13.8</span><h4>Post-mortem your own triage</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Speed on a real incident comes from having an order, not from knowing more commands. Almost every minute lost in run 1 will turn out to be a rung skipped or a guess made before evidence — and you cannot fix a habit you have not named. This checkpoint's deliverable is one page, in your words, that you would actually reach for.</p>
+
+<h5>The concept</h5>
+<p>This stack has a natural order, because each rung depends on the one below it. Ask them in this sequence and you never investigate a layer whose foundation you have not confirmed:</p>
+<div class="flow"><span>runtime up?</span><em>→</em><span>right endpoint?</span><em>→</em><span>image local?</span><em>→</em><span>sandbox up?</span><em>→</em><span>network attached?</span><em>→</em><span>container started?</span><em>→</em><span>how did it exit?</span></div>
+<p>Two rungs deserve special attention because they are where people lose the most time.</p>
+<p><strong>"Is the runtime down, or is the client pointed at the wrong socket?"</strong> — I8.16 established that these are byte-identical: <code>dial unix &lt;path&gt;: connect: no such file or directory</code> appears for both, because systemd removes the socket along with the unit. The discriminator is <code>systemctl is-active containerd</code> and nothing else. A third case exists and looks different: a socket that <em>is</em> there but speaks something else fails at the gRPC handshake, after a pause, with <code>code = Unavailable</code>.</p>
+<p><strong>"Did it exit, or was it never started?"</strong> — answered by absence in the event stream. I12.7 measured a good container emitting the full eight-event sequence ending in <code>/tasks/exit</code> with its status, while a container with a bad binary emitted four events and not one <code>/tasks/*</code> at all. The event that is missing is the answer.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Learn the shape of "fine" first.</strong> Every rung answered on a healthy system, so you know what you are comparing against. Run this before you need it, not during.
+<pre class="cmd">systemctl is-active containerd
+ls -l /run/containerd/containerd.sock
+sudo minidock images | head -3
+ip netns list &amp;&amp; sudo ls -l /run/netns/</pre>
+<pre class="out">active
+srw-rw---- 1 root root 0 Aug  1 12:45 /run/containerd/containerd.sock
+REFERENCE                                   MANIFEST                  SIZE
+127.0.0.1:5000/i13/wh:v1                    7175f331a10b           3647259
+alpine:3.21                                 f27cad911749           3646875
+md-e902a6b51178 (id: 0)
+-r--r--r-- 1 root root 0 Aug  1 14:00 md-e902a6b51178</pre>
+<p>That last line is worth a second look: the pinned network namespace is a zero-byte, read-only file. There is no process holding it — the bind mount is the whole mechanism, which is why the sandbox can exist before anything runs in it and survive everything that does.</p></li>
+
+<li>The rest of the ladder, on the same healthy system.
+<pre class="cmd">sudo minidock exec L ip -4 -o addr show eth0
+sudo iptables -t nat -S POSTROUTING | grep -c minibridge
+sudo minidock ps
+sudo minidock run --rm --network none alpine:3.21 sh -c 'exit 3'; echo "rc=$?"</pre>
+<pre class="out">2: eth0    inet <b>10.66.0.2/24</b> scope global eth0
+1
+ID            NAME          IMAGE                 STATUS    IP                RESTARTS
+e902a6b51178  L             alpine:3.21           running   10.66.0.2/24             0
+rc=<b>3</b></pre></li>
+
+<li>Compress the whole ladder into one line you can paste at the start of any investigation. Five numbers, and every one of them wrong in a different way tells you which rung to start on.
+<pre class="cmd">printf 'containerd=%s  images=%s  running=%s  netns=%s  natrules=%s\n' \
+  "$(systemctl is-active containerd)" \
+  "$(sudo minidock images | grep -c '^[0-9a-z]')" \
+  "$(sudo minidock ps | tail -n +2 | wc -l)" \
+  "$(ip netns list | wc -l)" \
+  "$(sudo iptables -t nat -S POSTROUTING | grep -c minibridge)"</pre>
+<pre class="out">containerd=active  images=4  running=1  netns=1  natrules=1</pre>
+<p><code>netns</code> greater than <code>running</code> is a leak. <code>natrules</code> less than <code>running</code> is a container with no egress. <code>containerd</code> anything but <code>active</code> and the rest of the numbers are meaningless.</p></li>
+
+<li><strong>Now write your page.</strong> One side of A4, in your words, with three sections: the ordered ladder; the discriminating command for each ambiguous pair you actually hit; and the fault-to-signature table from your run-1 notes. Do not copy the ladder above — the value is in it being yours, phrased the way you will think of it at speed.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You have a one-page checklist you would genuinely use, and for every fault in run 1 you can state the single command that would have found it fastest. If any of those commands is "read the logs", it is not specific enough yet — name the log and the line you would grep for.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A ladder you have not rehearsed is a document, not a skill.</strong> Run the healthy sweep a few times so the normal output is familiar; recognising "wrong" is much faster than reasoning about it.</li>
+<li><strong>Beware the rung you always skip.</strong> Most people skip "right endpoint?" because it is boring, and it is the single most common wasted twenty minutes in this stack.</li>
+<li><strong>Record what you tried that did not work.</strong> That is the part with the learning in it, and it is the part memory deletes first.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The advanced track asks for exactly this deliverable, one layer up: <a href="w6.html#cp-6-4">6.4 — Start your one-page triage flowchart</a> and <a href="w6.html#cp-6-23">6.23 — Deliverable: your finished one-page triage sheet</a>. Bring this page with you — the Kubernetes ladder sits directly on top of it, and "is the runtime answering?" is the rung where the two meet.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> your own notes. That is the point of the checkpoint.</p>
+</article>
+
+<article class="lesson drill" id="cp-i13-9" data-id="i13-9">
+<div class="lesson-head"><span class="cp-id">I13.9</span><h4>Run 2 — the same gauntlet, against the clock</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The goal is not perfection and it is not memorising eight answers. It is watching a routine beat improvisation on problems you have already seen once — because that gap, measured on yourself, is the most convincing argument anyone has ever made for writing the checklist.</p>
+
+<h5>The concept</h5>
+<p>Re-run the same eight faults with your page beside you and time each one separately. What you are looking for is not a smaller total; it is a different <em>shape</em>. In run 1 the time is dominated by two or three faults where you searched the wrong layer for fifteen minutes. In run 2 those collapse and the total is dominated by the actual repairs. If your run-2 total is only slightly better but the variance across faults has collapsed, that is the result you wanted and it is worth more than the total.</p>
+<p>Two habits to watch for deliberately, since they are the ones the clock exposes:</p>
+<ul>
+<li><strong>Evidence before hypothesis.</strong> Count how many times you ran a command to <em>confirm</em> a guess versus to <em>narrow</em> the possibilities. The second kind is what the ladder is made of.</li>
+<li><strong>Stopping at the first plausible cause.</strong> Several of these faults have a nearby innocent explanation — a bridge that is <code>DOWN</code>, a container with an old PID, a snapshot directory that looks large. Fixing the innocent one costs a full cycle.</li>
+</ul>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Reset the machine so the faults land on a clean stack: remove every container, clear stale namespaces and IPAM reservations, and confirm the one-line health sweep from I13.8 reads normal before you start.</li>
+<li>Re-plant all eight and run them in a different order than last time — ideally worst-first, so the fault that cost you most in run 1 is attempted while you are freshest.</li>
+<li>Time each fault individually. A single total hides exactly the information you are after.</li>
+<li>Afterwards, compare fault by fault and write one sentence per fault about what changed. The sentences that say "I looked in the right place immediately" are the checklist working; the ones that say "I still went to the wrong layer" tell you which rung to move up your page.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Eight per-fault times from both runs, side by side, and a one-line explanation for each difference. Your checklist has been edited at least once as a result — an unedited checklist after a second run usually means it was not consulted.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Do not re-run immediately.</strong> A day's gap makes run 2 a test of the checklist rather than of short-term memory.</li>
+<li><strong>Reset properly.</strong> A leftover leaked reservation from run 1 turns fault 5 into a different, easier problem and quietly invalidates the comparison.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The same method carries into exam preparation directly — <a href="w7.html#cp-7-13">7.13 — Topic sprints: ten timed tasks across weeks 2–6</a> is this exercise applied to Kubernetes tasks, and the finding is identical: the second attempt improves because of the order you follow, not because you learned new commands.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> your page from I13.8, and nothing else.</p>
+</article>
+</div><!-- /g-the-debugging-gauntlet -->
+
+<!-- ---------------- Track assessment ---------------- --><div class="grp" id="g-track-assessment"><h3>Track assessment</h3>
+<article class="lesson" id="cp-i13-10" data-id="i13-10">
+<div class="lesson-head"><span class="cp-id">I13.10</span><h4>Written self-test — 30 questions across I0–I12</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Recognition is not recall. Everything in this track made sense while you were reading it, which is exactly the condition under which people overestimate what they have retained. The self-test exists to convert a comfortable feeling into a number, and the number's only job is to tell you which module to re-read.</p>
+
+<h5>The concept</h5>
+<p>Thirty questions, mapped back to the module that taught each one, in <code>mock/intermediate-final.html</code> with solutions and a rubric alongside. They are weighted toward the things this track claims are load-bearing: what a bundle contains, what a digest guarantees, which process survives which restart, what a contract's error codes mean, and which control stops which attack.</p>
+<p><strong>Score honestly and then do the unusual part:</strong> for every wrong answer, re-read the <em>module</em>, not the answer. A wrong answer is evidence about a model, not about a fact — and the fact is the cheapest thing to fix and the least useful. If you missed "what does DEL do when the namespace is already gone", the gap is not that sentence; it is the idea that idempotency is a requirement the caller relies on, which is three lessons of I9 and shows up again in the CRI and in every controller Kubernetes has.</p>
+<p>A rough reading of your score: <strong>above 25</strong> and the track has landed; <strong>20–25</strong> and you have two or three modules to revisit, which the mapping will name for you; <strong>below 20</strong> and the honest advice is to redo the mini projects rather than re-read the prose, because the gap is usually in the layers you read about but did not build.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Sit the 30 questions closed-book, in one sitting, with no terminal open. Ninety minutes is generous; if you are still going at two hours, stop and score what you have.</li>
+<li>Mark it against the solutions page without negotiating with yourself. "I knew that really" is not a mark.</li>
+<li>Group your wrong answers by module. The pattern matters more than the count — five scattered misses across five modules is a different problem from five misses all inside I7.</li>
+<li>Re-read the modules the pattern names, then re-sit only those questions a week later.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>A score, a per-module breakdown, and a specific list of what you are re-reading. "I'll review everything" is not a plan and will not happen.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Do not sit it the same day you finish I13.6.</strong> Everything is in short-term memory and the result will flatter you.</li>
+<li><strong>Closed-book means closed-terminal too.</strong> Half these questions can be answered by running a command, which is precisely what the test is trying to see past.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The advanced track opens with the same discipline — <a href="w0.html#cp-0-1">0.1</a> onward asks you to self-assess before studying rather than after, for the same reason: a measured gap gets closed and a felt one does not.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>mock/intermediate-final.html</code> for the questions, <code>mock/intermediate-final-solutions.html</code> for the answers and the mapping back to modules.</p>
+</article>
+
+<article class="lesson" id="cp-i13-11" data-id="i13-11">
+<div class="lesson-head"><span class="cp-id">I13.11</span><h4>Practical task set — 8 timed tasks, 66 to pass</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The written test measures what you can recall. This measures what you can do with a terminal and a clock, which is the only thing that has ever mattered on a bad afternoon or in an exam. It is also where the two halves are checked against each other: people who score well on one and badly on the other are common, and which way round it goes tells you exactly what to practise.</p>
+
+<h5>The concept</h5>
+<p>Eight hands-on tasks on the sandbox host, each with a verification command and a rubric. A hundred points, sixty-six to pass — the same line as both other tracks' assessments, and for the same reason: a score you can compare to something is worth far more than a score you cannot.</p>
+<p>The tasks span the stack rather than sampling it: unpack an image by hand and explain its layers; write a bundle and run it with <code>runc</code>; pull a manifest with <code>curl</code> and select a platform out of an index; drive a CNI plugin by hand and prove the teardown left nothing; produce and verify a signature; read a container's resource usage from the cgroup files and reconcile it with a tool. Every one of them is something a module made you do once. The rubric awards points for the verification, not the attempt — a task that "should work" scores zero, which is deliberate and matches how the CKA marks.</p>
+<p>Two pieces of advice that are worth more than any single task. <strong>Read all eight before starting</strong> and do them in your own order — the point weighting is not uniform and the cheapest points are rarely first. <strong>Verify as you go</strong>, because an unverified task is an unscored task, and the most common way to lose points here is finishing seven and proving five.</p>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Set up a clean sandbox host — no leftover containers, namespaces or reservations from the gauntlet — and confirm the health sweep from I13.8 reads normal.</li>
+<li>Set a timer for the stated limit and treat it as real. The exam does.</li>
+<li>Work the eight tasks, running each task's verification command before moving on and recording its output.</li>
+<li>Score against the rubric. For anything below full marks, note whether you lost the point on the <em>doing</em> or on the <em>proving</em> — those are different failures with different fixes.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>A score out of 100 with the verification output to back each task, and a note on any task where you knew what to do but could not show it worked.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An unverified task scores nothing.</strong> This is the single biggest cause of a disappointing number here, and it transfers directly to the CKA.</li>
+<li><strong>Do not fix the environment silently.</strong> If a task fails because of gauntlet leftovers, note it — that is a finding about your reset procedure, not a technicality.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The format is deliberately the CKA's, so this is a rehearsal for <a href="w8.html#cp-8-1">week 8's mock exam</a> as much as an assessment of this track: weighted tasks, a fixed clock, verification you perform yourself, and a pass line you can compare across attempts.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>mock/intermediate-final.html</code> §"Practical tasks" and the rubric in <code>mock/intermediate-final-solutions.html</code>.</p>
+</article>
+
+<article class="lesson" id="cp-i13-12" data-id="i13-12">
+<div class="lesson-head"><span class="cp-id">I13.12</span><h4>Readiness checklist — and where you go next</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the last checkpoint of the track, and its job is to answer one question honestly: are you ready for Kubernetes itself? Not "have you finished the pages" — finishing pages is easy. The list below is the actual standard, and it is written as things you can <em>do unaided</em>, because that is the only form of readiness that survives contact with an exam.</p>
+
+<h5>The concept</h5>
+<p>Work through these out loud, with no notes. Each one names the module that owns it, so a "no" is immediately actionable.</p>
+<ul>
+<li><strong>State what an OCI bundle contains and run one with <code>runc</code></strong> — a directory, a <code>config.json</code>, a <code>rootfs</code>, and nothing else. (I2, I3)</li>
+<li><strong>Explain an image as manifest, config and layers, and pull one with <code>curl</code></strong> — including why the manifest's digest changes when you convert its media types while no layer byte moves. (I4, I5)</li>
+<li><strong>Draw the process tree from kubelet to workload and say what survives a daemon restart</strong> — and why the shim's parent is PID 1 rather than containerd. (I7)</li>
+<li><strong>Name the calls that start a pod, in order</strong> — <code>RunPodSandbox</code>, <code>PullImage</code>, <code>CreateContainer</code>, <code>StartContainer</code> — and say which of them the network attachment happens inside. (I8)</li>
+<li><strong>Recite the CNI contract and write a plugin that honours DEL twice</strong> — configuration on stdin, parameters in the environment, result on stdout, idempotent teardown. (I9)</li>
+<li><strong>Say which control stops which attack</strong> — capabilities, seccomp, MAC, read-only rootfs, user namespaces — and which of them a misspelling silently disables. (I11)</li>
+<li><strong>Read a container's CPU and memory from the cgroup files</strong> and explain why <code>memory.current</code> can be three hundred times its RSS. (I12)</li>
+<li><strong>Fix a broken node without a hint</strong>, following an order you can state before you start. (I13)</li>
+</ul>
+<p>When those are true, the next track is where you belong.</p>
+
+<h5>The handoff</h5>
+<p>You have now implemented, at toy scale, every component that <a href="w1.html">week 1 of the advanced track</a> names in passing. That is the whole purpose of this track, and it is why its lessons should read as recognition rather than introduction: when week 1 says "the kubelet calls the CRI, which asks containerd, which starts a shim, which runs runc", you have written four of those five things.</p>
+<p>The framing worth carrying with you is this. Everything you built decides <em>how</em> a container runs on <em>this</em> machine. <strong>Kubernetes is the layer that decides <em>which</em> of these should run <em>where</em> — and keeps deciding.</strong> That is the entire difference, and it is why the advanced track spends its time on schedulers, controllers and the API rather than on runtimes: the runtime question is settled, and you settled it.</p>
+<p>Two of your own artefacts come with you. The triage page from I13.8 sits directly underneath the Kubernetes ladder in week 6. And the reconciler from I13.6 is the shape of every controller you are about to meet — compare desired to observed, act on the difference, back off when it fails, and never assume the world stayed still while you were thinking.</p>
+
+<h5>Steps</h5>
+<ol class="lab">
+<li>Work the checklist aloud, unaided, and mark each item yes or no.</li>
+<li>For every "no", redo that module's mini project — not its prose. The projects are where these capabilities actually come from.</li>
+<li>Tick the last checkpoint on <a href="../intermediate.html#i13">the intermediate tracker</a> and take a moment over the 195 that are now green.</li>
+<li>Start the advanced track. Go to <a href="../index.html">the CKA tracker</a>, or read <a href="w0.html">w0</a> first if you would rather have the cluster built before the theory.</li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Every item on the checklist is a yes, said out loud, with no page open. The intermediate tracker reads 195 / 195.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"I could look it up" is a no.</strong> The checklist measures what you can produce unaided, because that is what the next track assumes.</li>
+<li><strong>Do not skip w0 because you have a cluster.</strong> The advanced track's week 0 sets up a specific three-node lab that later weeks break on purpose; substituting your own costs you more time than it saves.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Start at <a href="../index.html">the CKA tracker</a>. The first lesson that will feel different is <a href="w1.html#cp-1-20">1.20 — Understand CRI: kubelet → containerd → shim → runc</a>, which you should now be able to read as a summary of things you have built rather than as new material — and <a href="w1.html#cp-1-21">1.21 — Meet the pause container</a>, which will finally make complete sense.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <a href="../index.html">the advanced tracker</a> and <a href="w0.html">w0 — the lab build</a>. Everything else you need, you have already written.</p>
+</article>
+</div><!-- /g-track-assessment -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
@@ -736,6 +1073,16 @@ started at 07:49:50
 <details class="reveal"><summary>Answer</summary><p>The workload keeps running, re-parented to PID 1. The metadata store says <code>running</code> forever, because the process responsible for updating it is gone and the exit status has nowhere to be recorded. Real containerd avoids this by monitoring the shim's ttrpc socket and reaping the orphan within a couple of seconds.</p></details></li>
 <li>Your store verified every blob on the way in. Why is a <code>verify</code> subcommand still worth having?
 <details class="reveal"><summary>Answer</summary><p>Because verification happens on write and then never again — the filename is trusted forever afterwards. That is a reasonable trade until bits rot, at which point the only symptom is an unreadable tar from inside the unpacker. <code>verify</code> re-hashes the store and turns that into a named blob and a one-line repair.</p></details></li>
+<li>Your <code>minidock</code> contains no networking code at all. What single change would prove that claim, and what would failing the test mean?
+<details class="reveal"><summary>Answer</summary><p>Change <code>"type": "minibridge"</code> to <code>"type": "bridge"</code> in the network configuration and run a container. If the reference plugin takes over with no change to your program, you implemented the contract. If it does not, you implemented a special case with a JSON accent — most commonly by depending on something only your own plugin returns.</p></details></li>
+<li>A container's log has been rotated. Where did the missing lines go, and what does that imply about incident response?
+<details class="reveal"><summary>Answer</summary><p>Nowhere — they are deleted. Rotation is a permanent loss of history and there is no third option: the alternative is a chatty container filling the disk, and a log the runtime still holds open cannot even be reclaimed by deleting it. In practice this means an incident older than roughly <code>containerLogMaxSize × containerLogMaxFiles</code> per container has no logs left locally, which is the argument for shipping them off the node.</p></details></li>
+<li>Why must a <code>restart=always</code> container keep its network namespace between attempts, and which Kubernetes behaviour does that explain?
+<details class="reveal"><summary>Answer</summary><p>Because tearing it down would return the address to IPAM and the restart would allocate a new one, churning the pool and changing the container's identity on the network every few seconds. Keeping it means the container comes back at the same address — which is exactly why a pod keeps its IP while its container restarts, and why the restart count climbs against one unchanged sandbox.</p></details></li>
+<li>You get <code>dial unix /run/containerd/containerd.sock: connect: no such file or directory</code>. Name the two causes and the one command that separates them.
+<details class="reveal"><summary>Answer</summary><p>Either the runtime is not running, or your client is pointed at the wrong endpoint — the message is byte-identical for both, because systemd removes the socket along with the unit. <code>systemctl is-active containerd</code> is the discriminator. A third case looks different: a socket that exists but speaks something else fails later, at the gRPC handshake, with <code>code = Unavailable</code>.</p></details></li>
+<li>A hardening change is applied and nothing errors, but no limit is enforced. Which fault class is this, and how do you confirm it?
+<details class="reveal"><summary>Answer</summary><p>A cgroup-driver mismatch: the runtime writes to one tree and the init system owns another, both trees exist and nothing complains. Confirm by reading the container's <code>cgroupsPath</code> out of its generated config and checking whether that path exists on disk with the expected <code>memory.max</code> — never by the absence of errors, because there were never any.</p></details></li>
 </ol>
 </div>
 
@@ -744,6 +1091,11 @@ started at 07:49:50
 <li>Built a content store that verifies on write, deduplicates as a side effect of its file naming, and repairs itself from the registry.</li>
 <li>Built a snapshotter keyed on chain ID, and translated the image format's whiteouts into the kernel's by hand.</li>
 <li>Wrote the image-config-to-runtime-config translation that is the entire meaning of "running an image", and proved its resource flags in <code>/sys/fs/cgroup</code>.</li>
+<li>Attached a container to a network by executing a plugin and parsing JSON — with no networking code of your own — and left nothing behind on teardown.</li>
+<li>Produced the CRI log format including the partial/full split, consumed it back correctly, and can state exactly what rotation costs.</li>
+<li>Built a metadata store, a CLI and a restart reconciler with exponential backoff, and discovered the pod model from below: the sandbox outlives the container.</li>
+<li>Fixed eight planted faults across every layer, twice, and turned the second run into a one-page triage ladder that is yours.</li>
+<li><strong>Can build, run, network, observe and repair a container stack without Kubernetes — which is the only honest prerequisite for learning Kubernetes.</strong></li>
 </ul>
 </div>
 
