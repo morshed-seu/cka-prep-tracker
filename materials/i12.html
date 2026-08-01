@@ -302,7 +302,230 @@ LLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
 
 <p class="docs-links"><b>Docs:</b> the format's definition lives in the <code>cri-client</code> parser rather than in any spec — search for <code>parseCRILog</code>. On the runtime side, search containerd's config for <code>max_container_log_line_size</code>. For the reassembly contract as Kubernetes states it, search the API reference for <code>LogTagPartial</code>.</p>
 </article>
+
+<article class="lesson" id="cp-i12-3" data-id="i12-3">
+<div class="lesson-head"><span class="cp-id">I12.3</span><h4>Rotation: nobody on this node owns it, and what that costs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A container that logs forever writes a file that grows forever. Something has to truncate it, and the surprising answer is that <em>the container runtime does not</em> — not containerd, not runc, not the shim. On the node you are looking at right now, unless a kubelet is running, the answer to "who rotates this?" is <strong>nobody</strong>. That single fact explains a large share of full-disk incidents, and it explains why <code>kubectl logs</code> sometimes cannot show you what happened an hour ago.</p>
+
+<h5>The concept</h5>
+<p>Rotation needs two parties to cooperate, and that is why it is not the runtime's job alone. One party renames or deletes the file. The other party is <em>holding it open</em> and must be told to let go and open a fresh one. If only the first half happens, you get the classic Unix failure that B5 taught: the writer keeps writing into a file that no longer has a name, and every observer looking at the path sees nothing.</p>
+<p>In Kubernetes the two halves are split like this. The <strong>kubelet</strong> owns rotation — it runs a <code>ContainerLogManager</code> that periodically checks each running container's log size, renames the current file to a timestamped one, compresses older ones to <code>.gz</code>, and deletes the excess. Then it does the second half: it calls the CRI method <code>ReopenContainerLog</code>, and <em>the runtime</em> closes its descriptor and opens the path again. Two defaults are worth memorising because they bound how much history exists at all: <code>containerLogMaxSize</code> is <strong>10Mi</strong> and <code>containerLogMaxFiles</code> is <strong>5</strong>.</p>
+<p>So on a real node roughly 50 MB of history exists per container, and anything older is gone — not archived, deleted. This is the real reason <code>kubectl logs</code> "loses" history: not a bug, a retention policy you did not know you had. It is also why every serious cluster ships logs off the node.</p>
+<p>Which leads to the design decision this checkpoint asks you to state plainly. <strong>A container that writes to a file inside itself has, from the platform's point of view, no logs at all.</strong> Nothing collects that file. It is not rotated, so it fills the container's writable layer (I10's copy-up) until the node's disk fills. It is invisible to <code>kubectl logs</code>, to every log shipper, and to the kubelet's own accounting. The contract is fd 1 and fd 2, and there is no second way in.</p>
+
+<div class="specref">
+<p>The CRI has exactly one method for this, and its comment is unusually explicit about who calls it and when:</p>
+<blockquote>// ReopenContainerLog asks runtime to reopen the stdout/stderr log file<br>
+// for the container. This is often called after the log file has been<br>
+// rotated. If the container is not running, container runtime can choose<br>
+// to either create a new log file and return nil, or return an error.<br>
+// Once it returns error, new container log file MUST NOT be created.<br>
+rpc ReopenContainerLog(ReopenContainerLogRequest) returns (ReopenContainerLogResponse) {}</blockquote>
+<cite>CRI <code>api.proto</code>, <code>ReopenContainerLog</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">kubernetes/cri-api</a></cite>
+<p>Read "<em>asks runtime to</em>" carefully: the runtime is passive here. It never decides to rotate; it waits to be told. The kubelet's own manager states the other half of the bargain in a comment — "<em>rotateLatestLog rotates latest log without compression, so that container can still write and fluentd can finish reading</em>" — which is a designed accommodation for exactly the stale-handle problem in the lab below.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>First establish the negative: nothing on this node is configured to rotate container logs.
+<pre class="cmd">containerd config default | grep -ci rotat
+sudo grep -rl "var/log/pods\|var/log/containers" /etc/logrotate.d/ /etc/logrotate.conf 2&gt;/dev/null || echo "(no logrotate rule)"
+command -v kubelet || echo "(no kubelet on this node — so nobody rotates)"
+sudo crictl --help 2&gt;&amp;1 | grep -ic reopen</pre>
+<pre class="out">0
+(no logrotate rule)
+(no kubelet on this node — so nobody rotates)
+<b>0</b></pre>
+<p>containerd has no rotation setting at all, and <code>crictl</code> exposes no <code>reopen</code> verb — so from this node we can perform the first half of a rotation but never the second. That limitation is exactly what makes the next step instructive.</p></li>
+
+<li>Start a container that logs steadily, then rotate its file the way <code>logrotate</code> would: rename it, and leave the writer alone.
+<pre class="cmd"># container runs: i=0; while :; do i=$((i+1)); echo "line $i"; sleep 0.05; done
+LOG=/var/log/pods/default_obs_obs-uid/chatty/0.log
+CTRD=$(systemctl show containerd -p MainPID --value)
+FD=$(sudo find /proc/$CTRD/fd -lname "$LOG*" | head -1)
+sudo mv "$LOG" "$LOG.20260801-120000"
+sleep 2
+echo "the fd containerd still holds now points at:"; sudo readlink "$FD"
+sudo ls -l "$LOG.20260801-120000"; sleep 2; sudo ls -l "$LOG.20260801-120000"</pre>
+<pre class="out">the fd containerd still holds now points at:
+<b>/var/log/pods/default_obs_obs-uid/chatty/0.log.20260801-120000</b>
+-rw-r----- 1 root root 5229 Aug  1 12:31 …/0.log.20260801-120000
+-rw-r----- 1 root root <b>7331</b> Aug  1 12:31 …/0.log.20260801-120000</pre>
+<p>The descriptor followed the <em>inode</em>, not the path — B5's central lesson. containerd is still writing happily, into a file with a new name that nothing will ever look at.</p></li>
+
+<li>Now ask the CRI for the logs, and then try the obvious repair of putting a fresh file back at the old path.
+<pre class="cmd">sudo crictl logs "$CID" 2&gt;&amp;1 | tail -1
+sudo touch "$LOG"; sudo chmod 640 "$LOG"
+sleep 2
+sudo ls -l "$LOG"</pre>
+<pre class="out">time="…" level=<b>fatal</b> msg="failed to try resolving symlinks in path \"…/chatty/0.log\": lstat …: no such file or directory"
+-rw-r----- 1 root root <b>0</b> Aug  1 12:31 /var/log/pods/default_obs_obs-uid/chatty/0.log</pre>
+<p>Two failures worth separating. <code>crictl logs</code> resolves the path and dies <em>fatally</em> — it does not return empty, it errors. And the fresh file stays <strong>0 bytes forever</strong> while the container writes twenty lines a second, because nobody sent <code>ReopenContainerLog</code>. This is the exact state a half-finished rotation leaves behind.</p></li>
+
+<li><strong>The sharper half.</strong> I12.1 showed a containerd restart loses no lines. That is true — and it hides something. Stop containerd entirely and watch what happens to a container that logs <em>faster than the pipe can buffer</em>. Each iteration writes 100 KB and then a countable <code>MARK</code>.
+<pre class="cmd">marks () { sudo grep -c MARK "$LOG"; }
+A=$(marks); sleep 5; B=$(marks); echo "up:   $(( (B-A) / 5 )) iterations/s"
+sudo systemctl stop containerd
+C=$(marks); sleep 12; D=$(marks)
+echo "down: $((D-C)) iterations in 12s"
+PID=$(sudo cat /sys/fs/cgroup/k8s.io/"$CID"/cgroup.procs | head -1)
+sudo ps -o pid,stat,wchan:16,comm --ppid "$PID"
+sudo systemctl start containerd; sleep 2
+E=$(marks); sleep 5; F=$(marks); echo "up:   $(( (F-E) / 5 )) iterations/s"</pre>
+<pre class="out">up:   <b>639 iterations/s</b>
+down: <b>0 iterations in 12s</b>
+    PID STAT WCHAN            COMMAND
+ 145261 S    <b>pipe_write</b>       head
+ 145262 S    <b>pipe_write</b>       tr
+up:   <b>684 iterations/s</b></pre>
+<p>The application did not slow down — it <strong>stopped</strong>, parked in <code>pipe_write</code>, for as long as containerd was away. The pipe's capacity is 65536 bytes by default; once the shim stops draining and that fills, the next <code>write(2)</code> blocks. Logging is not a side channel. It is backpressure straight into your application's control flow.</p></li>
+
+<li>Finally, confirm the blocked writes were delayed rather than discarded.
+<pre class="cmd">sudo grep -o "MARK [0-9]*" "$LOG" | awk '{print $2}' &gt; ~/marks.txt
+awk -v f="$(head -1 ~/marks.txt)" -v l="$(tail -1 ~/marks.txt)" \
+  'BEGIN{for(i=f;i&lt;=l;i++)w[i]=1}{delete w[$1]}
+   END{n=0;for(i in w)n++; print "missing marks: " n}' ~/marks.txt</pre>
+<pre class="out">first=1 last=11090 count=11090 expected=11090
+<b>missing marks: 0  -&gt; delayed, not lost</b></pre>
+<p>Zero of 11,090 lost. Blocking is how the guarantee is bought: the kernel would rather stall your process than drop a line.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can say who rotates container logs (the kubelet, not the runtime), name the CRI method that makes it safe, and quote the two defaults that decide how much history exists. You can explain, in inode terms, why a renamed log keeps growing while the path shows nothing.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>A logrotate rule pointed at <code>/var/log/pods</code> is actively harmful.</strong> It performs the first half of a rotation and cannot perform the second, leaving containerd writing to a nameless inode forever. If you must use logrotate here, it needs <code>copytruncate</code> — which has its own race — and even then you are fighting the kubelet.</li>
+<li><strong>Roughly 50 MB per container is all the history there is</strong> (10Mi × 5). A crash loop that logs heavily can push the interesting failure out of retention within minutes.</li>
+<li><strong>Logging can stall your application.</strong> Any consumer downstream of fd 1 — the shim, containerd, or a node agent tailing the file — becomes a dependency of your request path once the pipe fills. Rate-limit your own logging; do not assume the platform absorbs it.</li>
+<li><strong>Writing logs to a file inside the container is not "logging to disk", it is discarding them.</strong> Nothing rotates it, nothing collects it, and it consumes the writable layer until the node's disk fills.</li>
+<li><strong><code>crictl logs</code> fails fatally on a missing file</strong> rather than returning empty output. In a script, check the exit status — an empty result and an error are different diagnoses.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the mechanism under two everyday observations. "Why can't I see yesterday's logs?" is <code>containerLogMaxSize</code> × <code>containerLogMaxFiles</code>. And "the node's disk filled up" is very often this, which is why the advanced track's disk-pressure and log-location material — <a href="w6.html#cp-6-2">W6 · Where logs physically live</a> — is the fallback ladder to walk when <code>kubectl logs</code> has nothing to give you. Note also that <code>kubectl logs --previous</code> reads the <em>previous container instance's</em> file (attempt <code>0.log</code> vs <code>1.log</code> from I8), which is a different mechanism from rotation entirely.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the kubelet config reference for <code>containerLogMaxSize</code> and <code>containerLogMaxFiles</code> (and note the newer <code>containerLogMaxWorkers</code> / <code>containerLogMonitorInterval</code> knobs alongside them); search the CRI proto for <code>ReopenContainerLog</code>; and <code>man 7 pipe</code> for the 65536-byte capacity that produced the stall above.</p>
+</article>
 </div><!-- /g-logs -->
+
+<!-- ---------------- Metrics ---------------- --><div class="grp" id="g-metrics"><h3>Metrics</h3>
+<article class="lesson" id="cp-i12-4" data-id="i12-4">
+<div class="lesson-head"><span class="cp-id">I12.4</span><h4>Every container metric is a cgroup file. There is no other source.</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Container monitoring looks like a deep stack — Grafana on Prometheus on kube-state-metrics on metrics-server on cAdvisor on the kubelet — and it is easy to assume the numbers come from somewhere sophisticated. They do not. At the bottom of that entire tower are a handful of plain-text files in <code>/sys/fs/cgroup</code> that B7 taught you to <code>cat</code>. Knowing this converts "the dashboard says the pod is using 2 GB" from an assertion into a claim you can check in ten seconds on the node.</p>
+
+<h5>The concept</h5>
+<p>A cgroup is a directory (B7's first rule), and the kernel keeps that directory's accounting in files inside it. For a container the interesting ones are few enough to list:</p>
+<table class="langpair">
+<thead><tr><th>File</th><th>What it holds</th><th>Shape</th></tr></thead>
+<tbody>
+<tr><td><code>memory.current</code></td><td>bytes charged to this cgroup <em>including page cache</em></td><td>gauge</td></tr>
+<tr><td><code>memory.max</code></td><td>the hard limit, or the literal string <code>max</code></td><td>limit</td></tr>
+<tr><td><code>memory.stat</code></td><td>the breakdown: <code>anon</code>, <code>file</code>, <code>inactive_file</code>, kernel memory…</td><td>gauges</td></tr>
+<tr><td><code>cpu.stat</code></td><td><code>usage_usec</code>, plus throttling counters</td><td>counters</td></tr>
+<tr><td><code>cpu.max</code></td><td>quota and period, as two numbers</td><td>limit</td></tr>
+<tr><td><code>pids.current</code></td><td>processes in the cgroup and its descendants</td><td>gauge</td></tr>
+</tbody></table>
+<p>Everything above the kernel is transport and arithmetic. <code>crictl stats</code> reads these files and renames the fields; <code>ctr task metrics</code> reads the same files and keeps the kernel's names; cAdvisor reads them on a timer and adds labels; Prometheus stores what cAdvisor emitted. Nothing in that chain <em>measures</em> anything — the measuring happened in the kernel, at allocation time.</p>
+<p>Finding a container's directory takes one lookup, because the OCI config records it. <code>crictl inspect</code> exposes <code>.info.runtimeSpec.linux.cgroupsPath</code>, and with the cgroupfs driver that value is already a path under <code>/sys/fs/cgroup</code>. (Under the systemd driver it is the <code>slice:prefix:id</code> form from I8 and needs expanding — the mini project handles both.)</p>
+
+<div class="specref">
+<p>There is no OCI or CRI spec for metrics; the authority is the kernel's own cgroup v2 documentation, and its wording on <code>memory.current</code> is the sentence the rest of this group depends on:</p>
+<blockquote>memory.current<br>
+&nbsp;&nbsp;&nbsp;&nbsp;The total amount of memory currently being used by the cgroup and its descendants.</blockquote>
+<cite>Linux <code>Documentation/admin-guide/cgroup-v2.rst</code> — <a href="https://raw.githubusercontent.com/torvalds/linux/master/Documentation/admin-guide/cgroup-v2.rst">torvalds/linux</a></cite>
+<p>Note what it does <em>not</em> say: it does not say "memory your program allocated". It says memory <em>being used</em>, and the same document defines <code>file</code> as "<em>Amount of memory used to cache filesystem data, including tmpfs and shared memory</em>" — which is charged to the cgroup too. That inclusion is deliberate, correct, and the source of the most misdiagnosed number in container operations (I12.6).</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start a container with both a memory limit and a CPU quota, then find its cgroup directory.
+<pre class="cmd"># container: while :; do :; done   with memory_limit_in_bytes 134217728,
+#                                        cpu_quota 20000 / cpu_period 100000
+CG=$(sudo crictl inspect "$CID" | jq -r .info.runtimeSpec.linux.cgroupsPath)
+echo "cgroupsPath = $CG"
+D=/sys/fs/cgroup$CG</pre>
+<pre class="out">cgroupsPath = <b>/k8s.io/cee11e82b50d15cbda84b2d704877cf5fa32b6e23048370e6843f644f9bc76f4</b></pre></li>
+
+<li>Read the numbers straight from the kernel. No container tooling is involved in this step at all.
+<pre class="cmd">for f in memory.current memory.max cpu.max pids.current; do
+  printf '%-16s %s\n' "$f" "$(sudo cat "$D/$f")"
+done
+sudo cat "$D/cpu.stat"</pre>
+<pre class="out">memory.current   229376
+memory.max       134217728
+cpu.max          20000 100000
+pids.current     1
+usage_usec 854747
+user_usec 847810
+system_usec 6937
+nr_periods 42
+<b>nr_throttled 42</b>
+throttled_usec 3290317</pre>
+<p><code>nr_throttled</code> equals <code>nr_periods</code>: every single enforcement period hit the quota. A spin loop under a 20% cap is throttled 100% of the time, and this is the file that proves it — B7's "slow on an idle box" evidence, now for a real container.</p></li>
+
+<li>Ask the CRI for the same container's stats and line the two up.
+<pre class="cmd">sudo crictl stats --output json "$CID" | jq -r '.stats[0] |
+  "usageCoreNanoSeconds = \(.cpu.usageCoreNanoSeconds.value)
+memory.usageBytes    = \(.memory.usageBytes.value)
+memory.rssBytes      = \(.memory.rssBytes.value)"'
+echo "kernel usage_usec    = $(sudo awk '/^usage_usec/{print $2}' "$D/cpu.stat")"
+echo "kernel memory.current= $(sudo cat "$D/memory.current")"</pre>
+<pre class="out">usageCoreNanoSeconds = <b>1088660000</b>
+memory.usageBytes    = <b>229376</b>
+memory.rssBytes      = 65536
+kernel usage_usec    = <b>1088660</b>
+kernel memory.current= <b>229376</b></pre>
+<p>Not approximately equal — <em>identical</em>. <code>usageCoreNanoSeconds</code> is <code>usage_usec</code> × 1000, and <code>usageBytes</code> is <code>memory.current</code> byte for byte. The CRI is a unit conversion and a rename.</p></li>
+
+<li>The other interface, for contrast: <code>ctr task metrics</code> does the same read but keeps the kernel's field names.
+<pre class="cmd">sudo ctr -n k8s.io task metrics "$CID"</pre>
+<pre class="out">METRIC                VALUE
+pids.current          1
+pids.limit            18446744073709551615
+cpu.usage_usec        1069549
+cpu.nr_throttled      52
+cpu.throttled_usec    4089056
+memory.usage          229376
+memory.usage_limit    134217728
+memory.swap_limit     0</pre>
+<p><code>pids.limit</code> of 18446744073709551615 is <code>2^64 − 1</code> — how "no limit" looks once the string <code>max</code> has been forced into an unsigned integer. Dashboards that plot "percent of pid limit" against this produce a permanent zero.</p></li>
+
+<li>Finally, look at what <code>memory.current</code> is actually made of. For a container doing nothing, most of it is not the workload.
+<pre class="cmd">sudo awk '/^(anon|file|kernel_stack|pagetables|slab) /{print}' "$D/memory.stat"</pre>
+<pre class="out">anon 65536
+file 0
+kernel_stack 16384
+pagetables 45056
+slab 90688</pre>
+<p>65,536 bytes of the workload's own memory, and 163,840 bytes of kernel bookkeeping — page tables, kernel stacks, slab objects — charged to the container because the kernel allocated them on its behalf. A container's floor is not zero.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given any running container you can produce its memory and CPU numbers from <code>/sys/fs/cgroup</code> without using <code>crictl</code>, and then show that <code>crictl stats</code> reports the same values. You can point at the file that proves throttling.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>memory.current</code> includes page cache.</strong> It is not "how much memory my program is using". This is the whole of I12.6 and half of the debugging drill.</li>
+<li><strong><code>memory.max</code> reads as the literal string <code>max</code> when unlimited</strong>, and <code>pids.limit</code> comes back as 2<sup>64</sup>−1 through the API. Parse both defensively or your exporter will publish nonsense.</li>
+<li><strong>The cgroup path depends on the driver.</strong> With the systemd driver <code>cgroupsPath</code> is <code>slice:prefix:id</code>, not a filesystem path, and pasting it after <code>/sys/fs/cgroup</code> gives a directory that does not exist — I8's cgroup-driver mismatch showing up as a monitoring bug.</li>
+<li><strong>A container's cgroup disappears the instant it is deleted</strong>, taking its counters with it. There is no historical query here; if you did not sample it, it is gone.</li>
+</ul>
+
+<div class="k8s-link">
+<p>These files are where the number in <code>kubectl top pod</code> begins. The kubelet reads them, metrics-server scrapes the kubelet, and the HPA divides one of them by your <code>resources.requests</code> to decide whether to scale. Both of those are the advanced track's subject — <a href="w3.html#cp-3-19">W3 · metrics-server and the aggregated API</a> and <a href="w3.html#cp-3-20">W3 · HPA's control loop and formula</a>. The <code>nr_throttled</code> counter above is also the honest answer to "the pod is slow but CPU usage looks low": it is at its limit, not idle.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the kernel's <code>cgroup-v2.rst</code> is the reference for every field name here — search it for <code>memory.stat</code> to see the full breakdown. On the tooling side, <code>crictl stats --output json</code> shows the CRI's field names, and <code>ctr task metrics</code> shows the kernel's.</p>
+</article>
+</div><!-- /g-metrics -->
 
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
