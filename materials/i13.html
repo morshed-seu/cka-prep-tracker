@@ -391,6 +391,330 @@ sudo minidock ps | grep lim</pre>
 
 <p class="docs-links"><b>Docs:</b> runtime-spec <code>config.md</code> (<code>process</code>, <code>root</code>, <code>linux.resources</code>, <code>linux.namespaces</code>); image-spec <code>config.md</code> for the <code>.config</code> properties you are translating.</p>
 </article>
+
+<article class="lesson project" id="cp-i13-4" data-id="i13-4">
+<div class="lesson-head"><span class="cp-id">I13.4</span><h4>Layer 4 — network</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>This is the layer where you write the least code and learn the most. <code>minidock</code> contains <strong>no networking code at all</strong> — not one <code>ip link</code>, not one iptables rule. It creates an empty network namespace, executes a binary, writes JSON to that binary's stdin, and reads JSON back from its stdout. Everything else is somebody else's program. That is the entire CNI contract, and implementing it is the cleanest demonstration in this track of what "a contract rather than a special case" buys you.</p>
+
+<h5>The concept</h5>
+<p>B9 built a pod network by hand: a namespace, a veth pair, a bridge, an address, a route, a masquerade rule. I9 took that same script and rewrote it as <code>cni-minibridge</code> — identical mechanism, wrapped in a contract. Now you are on the other side of that contract, writing the runtime.</p>
+<p>The runtime's half is four things:</p>
+<ol>
+<li><strong>Create the namespace first, before anything runs in it.</strong> <code>ip netns add</code> makes a bind mount under <code>/run/netns/</code>, which keeps the namespace alive with no process inside it. I8.5 measured real containerd doing exactly this — the pod's network namespace is pinned by a bind mount <em>before</em> the pause container exists, and the sandbox's own config then joins it by path. The namespace is not made by the process; the process is put into the namespace.</li>
+<li><strong>Call <code>loopback</code> first.</strong> A fresh namespace answers <code>ping 127.0.0.1</code> with "Network is unreachable" (I9.10). Every real runtime attaches loopback, and the reference plugin for it exists precisely because everyone needs it.</li>
+<li><strong>Pass parameters in the environment and configuration on stdin</strong>, then parse the result. <code>CNI_COMMAND</code>, <code>CNI_CONTAINERID</code>, <code>CNI_NETNS</code>, <code>CNI_IFNAME</code>, <code>CNI_PATH</code> — and <code>CNI_ARGS</code> carrying <code>IgnoreUnknown=1</code>, without which the reference <code>bridge</code> plugin rejects unknown arguments outright with code 999 (I9.6).</li>
+<li><strong>Call DEL on teardown, and make teardown survive being run twice.</strong> This is not politeness; it is the contract, and it is where leaks come from.</li>
+</ol>
+<p>Because you have implemented the runtime side, you can now perform the test that proves the contract is real: change one string — <code>"type": "minibridge"</code> to <code>"type": "bridge"</code> — and the reference plugin takes over with no change to your program. If that works, you built an interface. If it does not, you built a special case with a JSON accent.</p>
+
+<div class="specref">
+<p>The whole of the runtime's obligation, in two sentences:</p>
+<blockquote>The runtime passes parameters to the plugin via environment variables and configuration. It supplies configuration via stdin. The plugin returns a result on stdout on success, or an error on stderr if the operation fails. Configuration and results are encoded in JSON.</blockquote>
+<cite>CNI spec v1.1.0, §2 "Executing plugins" — <a href="https://raw.githubusercontent.com/containernetworking/cni/v1.3.0/SPEC.md">SPEC.md</a> at library tag v1.3.0</cite>
+<p>Note where that text lives: the file describing spec <strong>1.1.0</strong> sits at library tag <strong>v1.3.0</strong>, because the CNI repository's tags are library releases and not spec versions (I9.1). Note also what the specification never says: it contains no mention of <code>/etc/cni/net.d</code>, <code>/opt/cni/bin</code>, or lexical file ordering. Those are your runtime's policy — and in <code>minidock</code> the "policy" is a Python dict, which is a perfectly conformant way to configure one network.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start from a clean host so the deltas mean something.
+<pre class="cmd">ip netns list; sudo iptables -t nat -S POSTROUTING</pre>
+<pre class="out">-P POSTROUTING ACCEPT</pre></li>
+
+<li>Run one container and look at it from the inside. Three files here were written by the runtime, not the image.
+<pre class="cmd">sudo minidock run -d --name n1 alpine:3.21 sleep 90
+sudo minidock exec n1 sh -c 'ip -4 -o addr show eth0; ip route; cat /etc/resolv.conf; cat /etc/hosts'</pre>
+<pre class="out">2: eth0    inet <b>10.66.0.2/24</b> scope global eth0
+default via <b>10.66.0.1</b> dev eth0
+10.66.0.0/24 dev eth0 scope link  src 10.66.0.2
+nameserver 8.8.8.8
+options ndots:1
+127.0.0.1 localhost
+10.66.0.2 cd66064ad2f5</pre>
+<p><code>/etc/resolv.conf</code>, <code>/etc/hostname</code> and <code>/etc/hosts</code> cannot come from the image — the image was built before this machine existed. I8.6 found the CRI writing exactly these three per sandbox and bind-mounting them over the image's copies; <code>minidock</code> writes them into the overlay's upper layer instead, which is simpler and has one visible consequence: they show up as container changes rather than as mounts.</p></li>
+
+<li>Read the plugin's result, verbatim. This JSON is the entire conversation.
+<pre class="cmd">sudo cat /var/lib/minidock/containers/*/cni-result.json</pre>
+<pre class="out">{
+ "interfaces": [
+  { "name": "mbda7a3c0e1bb", "mac": "c6:5f:f9:47:2b:9e" },
+  { "name": "eth0", "mac": "c6:d1:ff:e9:44:36",
+    "sandbox": "/run/netns/md-cd66064ad2f5" }
+ ],
+ "ips": [ { "address": "10.66.0.2/24", "gateway": "10.66.0.1", "interface": 1 } ],
+ "routes": [ { "dst": "0.0.0.0/0", "gw": "10.66.0.1" } ],
+ "dns": {}
+}</pre>
+<p>Two interfaces, and only the second has a <code>sandbox</code> key — that is how a result distinguishes the host end of the veth from the container end. The <code>interface</code> index on the address points into that array. Store this file: at teardown time it is the only record of what was allocated.</p></li>
+
+<li>Now the host side, which your program never touched directly.
+<pre class="cmd">ip netns list; sudo iptables -t nat -S POSTROUTING; ip -br link show master mdbr0</pre>
+<pre class="out">md-cd66064ad2f5 (id: 0)
+-P POSTROUTING ACCEPT
+-A POSTROUTING -s 10.66.0.2/32 ! -d 10.66.0.0/24 -m comment --comment "minibridge:minidock" -j MASQUERADE
+mbda7a3c0e1bb@if2 UP c6:5f:f9:47:2b:9e &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt;</pre>
+<p><strong>That masquerade rule cost a debugging session.</strong> The first networked container came up with an address, a gateway, a route — and no internet at all. The cause was one missing key: <code>cni-minibridge</code> defaults <code>ipMasq</code> to <code>false</code>, exactly as the reference <code>bridge</code> plugin does. It is worth reproducing deliberately, because the signature — everything configured, nothing reachable, no error anywhere — is precisely what a real cluster looks like when a CNI config is subtly wrong.</p></li>
+
+<li>Prove egress.
+<pre class="cmd">sudo minidock exec n1 wget -qO- -T6 http://neverssl.com | head -3</pre>
+<pre class="out">&lt;html&gt;
+	&lt;head&gt;
+		&lt;title&gt;NeverSSL - Connecting ... &lt;/title&gt;</pre></li>
+
+<li><strong>Tear it down and audit for leaks</strong> — the three places I9.9 found the reference plugins leaking.
+<pre class="cmd">sudo minidock rm -f n1
+echo "  netns:  $(ip netns list | wc -l)"
+echo "  nat:    $(sudo iptables -t nat -S POSTROUTING | grep -c minibridge)"
+echo "  ipam:   $(sudo ls /var/lib/cni/minibridge/minidock | grep -vc lock) reservations"</pre>
+<pre class="out">  netns:  <b>0</b>
+  nat:    <b>0</b>
+  ipam:   <b>0</b> reservations</pre>
+<p>Zero on all three, and that is not luck: <code>cni-minibridge</code> deliberately reads the container's address out of its own IPAM store rather than out of the namespace, which is the fix for the leak the reference <code>bridge</code> plugin has when the namespace is already gone. I9.9 measured two of three realistic teardown orders leaking a masquerade rule with the reference plugin.</p></li>
+
+<li>Finally, DEL something that does not exist, because the contract says this must work.
+<pre class="cmd">CNI_COMMAND=DEL CNI_CONTAINERID=doesnotexist CNI_NETNS=/run/netns/gone \
+  CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin sudo -E /opt/cni/bin/minibridge &lt;&lt;'JSON'
+{"cniVersion":"1.1.0","name":"minidock","type":"minibridge","ipMasq":true,"ipam":{"subnet":"10.66.0.0/24"}}
+JSON
+echo "rc=$?"</pre>
+<pre class="out">rc=<b>0</b></pre>
+<p>Success on an empty world. Your teardown path can therefore be unconditional — no "does it still exist?" check, no error handling for the second call — which is exactly why the specification made idempotency a MUST.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>A container gets an address, a default route and working egress. The result JSON is stored and your DEL path uses it rather than the namespace. After <code>rm</code>, the namespace, the NAT rule and the IPAM reservation are all gone, and running DEL a second time exits 0. Bonus, and the real test: swap <code>"type": "minibridge"</code> for <code>"type": "bridge"</code> and confirm your program does not notice.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>ipMasq</code> defaults to false.</strong> Address, gateway, route, no internet, no error. Both <code>minibridge</code> and the reference <code>bridge</code> behave this way.</li>
+<li><strong>Delete the namespace after DEL, never before.</strong> A plugin that reads the container's address out of the namespace returns success on a namespace that is already gone — correctly, per the idempotency MUST — and silently leaks whatever it could not find.</li>
+<li><strong>Capability arguments must be replayed on DEL.</strong> Port mappings passed as <code>CAP_ARGS</code> on ADD have to be passed again on DEL or the DNAT rules survive. <code>cnitool</code> does not do this; containerd does (I9.11).</li>
+<li><strong>The bridge outlives every container</strong>, sitting there <code>NO-CARRIER,DOWN</code> with nothing attached. That is normal and the reference plugin does the same; do not "fix" it.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now written both halves of <a href="w4.html#cp-4-5">4.5 — The CNI contract: exec a binary, JSON in, JSON out</a>, and the namespace-before-process ordering is why <a href="w1.html#cp-1-21">1.21 — Meet the pause container</a> is subtler than it looks: the pause container holds the pod's IPC and UTS namespaces, but the network namespace was pinned by a bind mount before pause ever ran.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> CNI SPEC.md §2 "Executing plugins" and §5 "Result types"; the <code>bridge</code> and <code>host-local</code> plugin READMEs for the configuration keys, <code>ipMasq</code> first among them.</p>
+</article>
+
+<article class="lesson project" id="cp-i13-5" data-id="i13-5">
+<div class="lesson-head"><span class="cp-id">I13.5</span><h4>Layer 5 — volumes and logs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two features that look unrelated and are the same feature: both are about data that has to outlive the process producing it. A volume outlives the container; a log outlives the moment the line was printed. And both force the same unpleasant question, which is what to do when there is more of it than you have room for.</p>
+
+<h5>The concept</h5>
+<p><strong>Volumes</strong> are the easy half. A named volume is a directory on the host and a bind mount in <code>config.json</code> — that is all. <code>volman.py</code> from I10 added a real size limit by putting an ext4 filesystem on a loop device, which is the only way to get quota semantics for a directory and the reason ordinary bind mounts cannot be size-limited. <code>minidock</code> deliberately keeps the simpler version, and you should know exactly what that costs: nothing enforces the size, so one container can fill the host's disk through a volume. That is the same trade Kubernetes makes with <code>emptyDir</code> without <code>sizeLimit</code>.</p>
+<p><strong>Logs</strong> are the interesting half, because you are now the producer of a format you have only ever consumed. The CRI log format is one line per record:</p>
+<div class="flow"><span>timestamp</span><em>→</em><span>stdout|stderr</span><em>→</em><span>P|F</span><em>→</em><span>the text</span></div>
+<p>The <code>P</code> tag means <em>partial</em>: the line was longer than the maximum and continues in the next record. Producing that tag is easy. The half that most log shippers get wrong is <em>consuming</em> it — reassembling partial records back into one line, per stream, without interleaving the two streams — and implementing <code>minidock logs</code> forces you onto that side of the problem.</p>
+<p>Then rotation, which is where the real decision lives. Rotate and you lose history, permanently. Do not rotate and a chatty container fills the disk — I12.10 measured a 300 MB log file that <code>rm</code> could not reclaim a single byte of, because the runtime still held the descriptor. <strong>There is no third option.</strong> That is precisely why the kubelet has <code>containerLogMaxSize</code> and <code>containerLogMaxFiles</code>, and why <code>kubectl logs</code> cannot show you last Tuesday.</p>
+
+<div class="specref">
+<p>The CRI does not define the log format in the proto — it defines <em>where</em> the file goes and leaves the rest to convention:</p>
+<blockquote>// Path relative to PodSandboxConfig.LogDirectory for container to store<br>
+// the log (STDOUT and STDERR) on the host.<br>
+// E.g.,<br>
+//     PodSandboxConfig.LogDirectory = `/var/log/pods/&lt;NAMESPACE&gt;_&lt;NAME&gt;_&lt;UID&gt;/`<br>
+//     ContainerConfig.LogPath = `containerName/Instance#.log`</blockquote>
+<cite>CRI <code>api.proto</code>, <code>ContainerConfig.log_path</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">kubernetes/cri-api</a></cite>
+<p>Two things worth reading out of that. <code>Instance#.log</code> is the restart attempt — the same number as <code>kubectl</code>'s RESTARTS column, which is why a restarted container gets <code>1.log</code> and its previous life stays readable at <code>0.log</code>. And the whole path is the <em>kubelet's</em> convention: I12.2 found no <code>/var/log/containers/</code> on a node with no kubelet, because that symlink farm is not the runtime's.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>A named volume, and the point of it: the data survives the container that made it.
+<pre class="cmd">sudo minidock run --rm -v data:/data --network none alpine:3.21 \
+  sh -c 'echo written-by-the-first-container &gt; /data/note; ls -l /data'
+sudo minidock run --rm -v data:/data --network none alpine:3.21 cat /data/note</pre>
+<pre class="out">-rw-r--r--    1 root     root            31 Aug  1 07:49 note
+<b>written-by-the-first-container</b></pre></li>
+
+<li>Write the format, then look at it. Both streams, one file, in the order they happened.
+<pre class="cmd">sudo minidock run --name v1 --network none alpine:3.21 \
+  sh -c 'echo to-stdout; echo to-stderr &gt;&amp;2'
+sudo cat /var/lib/minidock/containers/*/log/0.log</pre>
+<pre class="out">2026-08-01T07:49:02.397996857Z <b>stdout F</b> to-stdout
+2026-08-01T07:49:02.398125647Z <b>stderr F</b> to-stderr</pre>
+<p>Note whose clock that is. The timestamp is stamped by whichever process reads the pipe — here, your shim — not by the application. I12.1 established the same thing for containerd, and it is why a log line's time can differ from a timestamp the application printed inside the line itself.</p></li>
+
+<li><strong>Force a partial record.</strong> Print a line longer than the maximum and count the bytes.
+<pre class="cmd">sudo minidock run --name big --network none alpine:3.21 \
+  sh -c 'printf %20000s x | tr " " z; echo'
+sudo awk '{print "record " NR ": stream=" $2 " tag=" $3 " bytes=" length($4)}' \
+  /var/lib/minidock/containers/*/log/0.log
+sudo minidock logs big | awk '{print "one line of " length($0) " characters"}'</pre>
+<pre class="out">record 1: stream=stdout tag=<b>P</b> bytes=<b>16384</b>
+record 2: stream=stdout tag=<b>F</b> bytes=<b>3616</b>
+one line of <b>20000</b> characters</pre>
+<p>16384 + 3616 = 20000. That split is byte-for-byte what I8.14 measured coming out of real containerd, because 16384 is <code>maxContainerLogLineSize</code> and your implementation used the same constant. Then <code>minidock logs</code> put it back together — which is the half a naive log shipper skips, producing one truncated line and one mysterious fragment.</p></li>
+
+<li>Check that your reader keeps the streams apart. This is a design choice with a sharp edge.
+<pre class="cmd">sudo minidock run --name v2 --network none alpine:3.21 sh -c 'echo out; echo err &gt;&amp;2; echo out2'
+sudo minidock logs v2 2&gt;/dev/null | wc -l
+sudo minidock logs v2 2&gt;&amp;1 | wc -l</pre>
+<pre class="out"><b>2</b>
+<b>3</b></pre>
+<p>The reader replays each record onto the matching stream of its own process, so a reflexive <code>2&gt;/dev/null</code> silently discards every line the application wrote to stderr. I12.3 caught <code>crictl logs</code> doing exactly this and nearly recorded it as "crictl drops stderr". It is the honest behaviour — but it is a trap, and now it is your trap too.</p></li>
+
+<li><strong>Rotate, and count the cost.</strong> 400 lines into a 4 KB budget with three files.
+<pre class="cmd">sudo minidock run --name chatty --network none --log-max-size 4k --log-max-files 3 \
+  alpine:3.21 sh -c 'i=0; while [ $i -lt 400 ]; do echo "line $i padding-padding-padding"; i=$((i+1)); done'
+sudo ls -l /var/lib/minidock/containers/*/log/
+sudo minidock logs chatty | head -1
+sudo minidock logs chatty | wc -l</pre>
+<pre class="out">-rw-r--r-- 1 root root    0 0.log
+-rw-r--r-- 1 root root 4161 0.log.1
+-rw-r--r-- 1 root root 4161 0.log.2
+<b>line 286 padding-padding-padding</b>
+<b>114</b></pre>
+<p>Four hundred lines written, 114 readable, and the first 286 are gone for good. Multiply by the kubelet's defaults — 10 MiB × 5 files, about 50 MB of history per container — and you have the exact reason a production incident that started an hour ago may have no logs left by the time you look.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Data written to a named volume is readable from a second container after the first is gone. Your log file's records carry a timestamp, a stream and a <code>P</code>/<code>F</code> tag, a 20,000-byte line becomes exactly two records, and <code>minidock logs</code> reassembles it into one line of 20,000 characters. Rotation drops the oldest history and you can say how much.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Buffer per stream, not globally.</strong> One shared partial-line buffer will interleave stdout and stderr mid-line under load, and the corruption only appears when both are busy.</li>
+<li><strong>Split at the byte limit, not at the character.</strong> The limit is bytes; splitting a multi-byte UTF-8 sequence across two records is legal and every consumer has to cope, which is a reason to reassemble before decoding.</li>
+<li><strong>A directory-backed volume has no size limit.</strong> Say so in your own tool's help, or somebody will assume otherwise and fill the node.</li>
+<li><strong>Deleting a log file the runtime still has open frees nothing.</strong> I12.10 measured exactly 0 KB reclaimed from a 300 MB deletion, with the inode still growing. Rotation has to happen through the writer, which is why the CRI has <code>ReopenContainerLog</code> at all.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The file you just wrote is the one <a href="w6.html#cp-6-2">6.2 — Where logs physically live: the fallback ladder for when kubectl logs fails</a> teaches you to find by hand when the API path is broken. Knowing its five fields, and that a container's previous life is a different file rather than a different section, is what makes that ladder fast.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> CRI <code>api.proto</code> (<code>LogDirectory</code>, <code>log_path</code>, <code>ReopenContainerLog</code>); kubelet configuration reference for <code>containerLogMaxSize</code> and <code>containerLogMaxFiles</code>.</p>
+</article>
+
+<article class="lesson project" id="cp-i13-6" data-id="i13-6">
+<div class="lesson-head"><span class="cp-id">I13.6</span><h4>Layer 6 — the platform layer</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Five layers make a container run once. This one makes it a system: state that survives the process that created it, a CLI somebody else could use, several containers coexisting without stepping on each other, and something that notices when one dies and starts it again. That last item is a <strong>reconciliation loop</strong>, and writing it is the moment B13 stops being theory.</p>
+
+<h5>The concept</h5>
+<p><strong>The metadata store</strong> is a JSON file and a lock, and the lock is not decoration — two <code>minidock run</code> processes really do race on it, and behind them their CNI plugins race on the IPAM store. What goes in it is the set of facts that cannot be recomputed: the name a human chose, the image reference, the address that was allocated, the restart policy, the exit code. Everything else — is it running, what is its PID — you could rediscover, and the interesting failure of your own tool is what happens when the store and reality disagree.</p>
+<p><strong>The reconciler</strong> is four lines of logic and a great deal of consequence. Desired state: every container with <code>restart=always</code> is running. Observed state: the metadata store. The loop compares them and acts on the difference. The instant you write it, you inherit every problem the real ones have:</p>
+<ul>
+<li><strong>Crash loops need backoff</strong>, or the loop is a fork bomb. Exponential, capped — 1s, 2s, 4s, 8s.</li>
+<li><strong>"Exited cleanly" and "was killed" are different facts</strong>, and <code>restart=always</code> is the policy that deliberately ignores the difference. Kubernetes offers <code>OnFailure</code> for the other choice, and now you know why it is a separate policy rather than a smarter default.</li>
+<li><strong>What should happen to a container whose node rebooted?</strong> Your store still says <code>running</code>. Nothing is. Deciding whether the reconciler trusts the store or the machine is the same question a kubelet answers on every startup.</li>
+</ul>
+<p>And one design decision falls out that the tracker's own text does not mention, because you only meet it by building it: <strong>a container being restarted must not be torn down</strong>. If the exit path deletes the network namespace, every restart gets a new address and the reconciler churns the IPAM pool. Keep the namespace and the container comes back at the same address — which is the pod model, arrived at from below. The sandbox outlives the container.</p>
+
+<div class="specref">
+<p>The CRI is explicit that teardown is idempotent and eager, which is the same discipline your <code>rm</code> path needs:</p>
+<blockquote>// This call is idempotent, and must not return an error if all relevant<br>
+// resources have already been reclaimed. kubelet will call StopPodSandbox<br>
+// at least once before calling RemovePodSandbox. It will also attempt to<br>
+// reclaim resources eagerly, as soon as a sandbox is not needed. Hence,<br>
+// multiple StopPodSandbox calls are expected.</blockquote>
+<cite>CRI <code>api.proto</code>, <code>StopPodSandbox</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">kubernetes/cri-api</a></cite>
+<p>"Multiple calls are expected" is a design statement, not a warning: the caller is a control loop that may act on stale information at any time, so every operation it can issue has to be safe to issue twice. Your reconciler is that caller. Build the teardown path accordingly and the awkward cases stop being awkward.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Three containers at once. The addresses are the thing to watch.
+<pre class="cmd">for n in a b c; do sudo minidock run -d --name $n alpine:3.21 sleep 120; done
+sudo minidock ps</pre>
+<pre class="out">ID            NAME          IMAGE                 STATUS    IP                RESTARTS
+dc9af1067220  a             alpine:3.21           running   <b>10.66.0.2/24</b>            0
+8800667f2588  b             alpine:3.21           running   <b>10.66.0.3/24</b>            0
+ebb2d2b33380  c             alpine:3.21           running   <b>10.66.0.4/24</b>            0</pre>
+<p>Sequential, with no allocator in your code — <code>host-local</code>-style IPAM inside the plugin does it, walking forward and never backfilling (I9.12). Three separate processes, one shared reservation directory, no collisions.</p></li>
+
+<li>The whole metadata store for one container.
+<pre class="cmd">sudo python3 -c 'import json
+d = json.load(open("/var/lib/minidock/state.json")); cid, c = list(d.items())[0]
+print(json.dumps({k: c[k] for k in ("name","image","status","ip","restart","restarts","args")}, indent=1))'</pre>
+<pre class="out">{
+ "name": "a",
+ "image": "alpine:3.21",
+ "status": "running",
+ "ip": "10.66.0.2/24",
+ "restart": "no",
+ "restarts": 0,
+ "args": [ "sleep", "120" ]
+}</pre></li>
+
+<li>Refusing to do something is a feature. Try removing a running container.
+<pre class="cmd">sudo minidock rm a; echo "rc=$?"</pre>
+<pre class="out">minidock: a is running (use -f), and refusing is the point: a removed record
+with a live container is I7.14's fault
+rc=1</pre>
+<p>I7.14 measured that fault against containerd: a record removed while its container lives leaves something running that no tool lists. The cheapest possible defence is a refusal.</p></li>
+
+<li><strong>Now the reconciler.</strong> Start a container that always fails.
+<pre class="cmd">sudo minidock run -d --name crasher --restart always alpine:3.21 \
+  sh -c 'echo "started at $(date +%T)"; exit 7'
+sudo minidock ps -a | grep crasher</pre>
+<pre class="out">f8b837e2e6af  crasher   alpine:3.21   <b>exited(7)</b>   10.66.0.2/24   0</pre></li>
+
+<li>Supervise it the way a real node would — under systemd, not in your terminal.
+<pre class="cmd">sudo tee /etc/systemd/system/minidock-supervise.service &lt;&lt;'UNIT'
+[Unit]
+Description=minidock restart reconciler
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/minidock supervise --interval 1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl start minidock-supervise
+sleep 22 &amp;&amp; sudo systemctl stop minidock-supervise
+sudo journalctl -u minidock-supervise --no-pager -o cat | grep restarting</pre>
+<pre class="out">2026-08-01T07:49:33.231891360Z restarting crasher (exit 7, attempt 1, backoff was <b>1s</b>)
+2026-08-01T07:49:36.236678797Z restarting crasher (exit 7, attempt 2, backoff was <b>2s</b>)
+2026-08-01T07:49:41.243331911Z restarting crasher (exit 7, attempt 3, backoff was <b>4s</b>)
+2026-08-01T07:49:50.252998741Z restarting crasher (exit 7, attempt 4, backoff was <b>8s</b>)</pre>
+<p>Read the wall-clock gaps rather than the labels: 33 → 36 → 41 → 50, so three, five and nine seconds — each backoff plus one poll interval. That is <code>CrashLoopBackOff</code>, and you have just written it. Note also the <code>Restart=always</code> on the unit itself: the supervisor needs a supervisor, which is why <code>systemd</code> is underneath the kubelet and nothing is underneath <code>systemd</code>.</p></li>
+
+<li>Check what the reconciler produced, and look hard at the address.
+<pre class="cmd">sudo minidock logs crasher
+sudo minidock inspect crasher | grep -E '"ip"|"restarts"|"netns"'</pre>
+<pre class="out">started at 07:49:31
+started at 07:49:33
+started at 07:49:36
+started at 07:49:41
+started at 07:49:50
+  "netns": "/run/netns/md-f8b837e2e6af",
+  "ip": <b>"10.66.0.2/24"</b>,
+  "restarts": 4,</pre>
+<p>Five starts, one log file — because the log belongs to the container record, not to the process. And one address across all five, because a <code>restart=always</code> container keeps its network namespace between attempts. Compare that to a pod whose container restarts: same pod IP, restart count climbing, one sandbox throughout. You did not copy that design; it fell out of not tearing down something you were about to need again.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Several containers run concurrently with distinct addresses and no collisions. <code>ps</code>, <code>logs</code>, <code>exec</code> and <code>rm</code> all work against either a name or an ID prefix. A <code>restart=always</code> container that fails is restarted with growing backoff by a supervisor running under systemd, keeps its address across restarts, and its restart count is visible in <code>ps</code>.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Lock the metadata store.</strong> Read-modify-write on a JSON file from three processes loses updates, and the symptom is a container that vanishes from <code>ps</code> while still running.</li>
+<li><strong>Do not hold the lock while a container runs.</strong> The shim must take it, update, and release — a lock held for the container's lifetime serialises your whole platform.</li>
+<li><strong>Backoff must be capped.</strong> Uncapped doubling reaches hours quickly, and then a container that recovers stays down.</li>
+<li><strong>Decide what a reboot means.</strong> Your store will say <code>running</code> for containers that no longer exist. Trusting it silently is the bug; the fix is a reconcile-on-startup pass that checks the machine, which is exactly what the kubelet does with its three pod sources.</li>
+</ul>
+
+<div class="k8s-link">
+<p>You have now written a small, honest version of <a href="w1.html#cp-1-19">1.19 — Learn the kubelet's syncLoop and its three pod sources</a> — the same compare-desired-to-observed shape described in <a href="w1.html#cp-1-16">1.16 — Understand the controller pattern: informer → queue → reconcile</a>. And the backoff you just measured is the subject of <a href="w6.html#cp-6-16">6.16 — CrashLoopBackOff mastery: --previous, lastState, and the exit-code table</a>: the state is not an error, it is a timer, and you have now built the timer.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> CRI <code>api.proto</code> for the container lifecycle calls your CLI mirrors; <code>man 5 systemd.service</code> for <code>Restart=</code> and <code>RestartSec=</code>; the kubelet's <code>syncLoop</code> in the Kubernetes source if you want to read the grown-up version of what you just wrote.</p>
+</article>
 </div><!-- /g-capstone-minidock-one-la -->
 
 <div class="quiz" id="quiz">
