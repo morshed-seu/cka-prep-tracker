@@ -1,0 +1,42 @@
+# captured 2026-08-01T06:32:36Z on sandbox
+# --- snippet ---
+# bash ~/i12-6.sh
+# --- output ---
+== 1. read cpu.stat three times, five seconds apart ==
+sample1  t=1785565956.820119817  usage_usec=9749021
+sample2  t=1785565961.832004311  usage_usec=10760328
+sample3  t=1785565966.852138071  usage_usec=11768717
+
+== 2. the number only ever goes up — that is what makes it a counter ==
+  usage_usec now: 11768717
+
+== 3. compute the rate ourselves ==
+  interval 1: dt=5.01s  d(usage_usec)=1011307  -> 20.2% of one CPU
+  interval 2: dt=5.02s  d(usage_usec)=1008389  -> 20.1% of one CPU
+
+== 4. and what crictl stats says for the same container ==
+cee11e82b50d1       worker              20.01               229.4kB             8.192kB             3                   0B
+(cpu.max says 20000 100000 -> a 20% quota, and the loop is trying to use 100%)
+throttling proves the cap is biting:
+  nr_periods 597
+  nr_throttled 597
+  throttled_usec 47653859
+
+== 5. the gauge, by contrast: memory.current can go DOWN ==
+before: memory.current=229376
+after writing a 64MB file inside the container:
+  memory.current      = 69345280
+  memory.stat anon 65536
+  memory.stat file 67108864
+  memory.stat inactive_file 67108864
+  memory.stat active_file 0
+  CRI usageBytes      = 69345280
+  CRI workingSetBytes = 2236416
+  CRI rssBytes        = 65536
+
+== 6. delete the file: the gauge falls ==
+  memory.current      = 249856
+  memory.stat anon 65536
+  memory.stat file 0
+  CRI usageBytes      = 249856
+  CRI workingSetBytes = 249856

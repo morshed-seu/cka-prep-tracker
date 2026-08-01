@@ -1,0 +1,71 @@
+# captured 2026-08-01T06:34:53Z on sandbox
+# --- snippet ---
+# set -u
+# A=0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0fff24673a9ff9c   # exits-cleanly
+# B=e3b4814a12406325658d32836515b276f70565a8eee6fd6616e6248c1308931f   # never-starts
+# echo "== 1. topic sequence, one line each (field 6 is the topic) =="
+# sudo awk "{printf \"%2d  %-22s %s\n\", NR, \$6, substr(\$7,1,60)}" ~/events.txt
+# 
+# echo
+# echo "== 2. the two containers side by side =="
+# echo "--- exits-cleanly (ran, then exited 3):"
+# sudo grep "$A" ~/events.txt | awk "{print \"    \"\$6}"
+# echo "--- never-starts (bad binary):"
+# sudo grep "$B" ~/events.txt | awk "{print \"    \"\$6}"
+# 
+# echo
+# echo "== 3. the exit event payload in full =="
+# sudo grep "/tasks/exit" ~/events.txt | grep "$A" | cut -d" " -f7-
+# 
+# echo
+# echo "== 4. so: exited, or never started? =="
+# echo -n "  exits-cleanly got a /tasks/start? "; sudo grep "$A" ~/events.txt | grep -c "/tasks/start"
+# echo -n "  never-starts  got a /tasks/start? "; sudo grep "$B" ~/events.txt | grep -c "/tasks/start"
+# echo -n "  never-starts  got a /tasks/exit?  "; sudo grep "$B" ~/events.txt | grep -c "/tasks/exit"
+# 
+# --- output ---
+== 1. topic sequence, one line each (field 6 is the topic) ==
+ 1  /snapshot/prepare      {"key":"c55f14946052a8b570d264f6a93c09654616cde99ecc8b16180a
+ 2  /containers/create     {"id":"c55f14946052a8b570d264f6a93c09654616cde99ecc8b16180a7
+ 3  /tasks/create          {"container_id":"c55f14946052a8b570d264f6a93c09654616cde99ec
+ 4  /tasks/start           {"container_id":"c55f14946052a8b570d264f6a93c09654616cde99ec
+ 5  /snapshot/prepare      {"key":"0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0ff
+ 6  /containers/create     {"id":"0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0fff
+ 7  /tasks/create          {"container_id":"0c00e2fae47405652690320867aacb202cf114ad6b9
+ 8  /tasks/start           {"container_id":"0c00e2fae47405652690320867aacb202cf114ad6b9
+ 9  /tasks/exit            {"container_id":"0c00e2fae47405652690320867aacb202cf114ad6b9
+10  /tasks/delete          {"container_id":"0c00e2fae47405652690320867aacb202cf114ad6b9
+11  /snapshot/prepare      {"key":"e3b4814a12406325658d32836515b276f70565a8eee6fd6616e6
+12  /containers/create     {"id":"e3b4814a12406325658d32836515b276f70565a8eee6fd6616e62
+13  /tasks/exit            {"container_id":"c55f14946052a8b570d264f6a93c09654616cde99ec
+14  /tasks/delete          {"container_id":"c55f14946052a8b570d264f6a93c09654616cde99ec
+15  /snapshot/remove       {"key":"0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0ff
+16  /containers/delete     {"id":"0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0fff
+17  /snapshot/remove       {"key":"e3b4814a12406325658d32836515b276f70565a8eee6fd6616e6
+18  /containers/delete     {"id":"e3b4814a12406325658d32836515b276f70565a8eee6fd6616e62
+19  /snapshot/remove       {"key":"c55f14946052a8b570d264f6a93c09654616cde99ecc8b16180a
+20  /containers/delete     {"id":"c55f14946052a8b570d264f6a93c09654616cde99ecc8b16180a7
+
+== 2. the two containers side by side ==
+--- exits-cleanly (ran, then exited 3):
+    /snapshot/prepare
+    /containers/create
+    /tasks/create
+    /tasks/start
+    /tasks/exit
+    /tasks/delete
+    /snapshot/remove
+    /containers/delete
+--- never-starts (bad binary):
+    /snapshot/prepare
+    /containers/create
+    /snapshot/remove
+    /containers/delete
+
+== 3. the exit event payload in full ==
+{"container_id":"0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0fff24673a9ff9c","id":"0c00e2fae47405652690320867aacb202cf114ad6b9cee41c0fff24673a9ff9c","pid":7015,"exit_status":3,"exited_at":{"seconds":1785566068,"nanos":830404732}}
+
+== 4. so: exited, or never started? ==
+  exits-cleanly got a /tasks/start? 1
+  never-starts  got a /tasks/start? 0
+  never-starts  got a /tasks/exit?  0

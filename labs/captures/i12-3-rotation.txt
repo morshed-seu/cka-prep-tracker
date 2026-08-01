@@ -1,0 +1,40 @@
+# captured 2026-08-01T06:30:56Z on sandbox
+# --- snippet ---
+# bash ~/i12-3.sh
+# --- output ---
+== 1. it is growing, and containerd holds the fd ==
+-rw-r----- 1 root root 3114 Aug  1 12:31 /var/log/pods/default_obs_obs-uid/chatty/0.log
+containerd fd = /proc/756/fd/27 -> /var/log/pods/default_obs_obs-uid/chatty/0.log
+first and last record:
+2026-08-01T12:30:57.960421827+06:00 stdout F line 1
+2026-08-01T12:31:01.031578446+06:00 stdout F line 60
+
+== 2. rotate it the way logrotate would: rename, and leave the writer alone ==
+the fd containerd still holds now points at:
+/var/log/pods/default_obs_obs-uid/chatty/0.log.20260801-120000
+does the old path exist again?
+ls: cannot access '/var/log/pods/default_obs_obs-uid/chatty/0.log': No such file or directory
+the renamed file is still growing:
+-rw-r----- 1 root root 5229 Aug  1 12:31 /var/log/pods/default_obs_obs-uid/chatty/0.log.20260801-120000
+-rw-r----- 1 root root 7331 Aug  1 12:31 /var/log/pods/default_obs_obs-uid/chatty/0.log.20260801-120000
+
+== 3. what does crictl logs say now? ==
+time="2026-08-01T12:31:05+06:00" level=fatal msg="failed to try resolving symlinks in path \"/var/log/pods/default_obs_obs-uid/chatty/0.log\": lstat /var/log/pods/default_obs_obs-uid/chatty/0.log: no such file or directory"
+exit=0
+
+== 4. and if we hand it a fresh empty file at the old path? ==
+size of the new file after 2s of a container writing 20 lines/s:
+-rw-r----- 1 root root 0 Aug  1 12:31 /var/log/pods/default_obs_obs-uid/chatty/0.log
+crictl logs output:
+0
+
+== 5. the rotated-away history is unreachable through the CRI ==
+/home/ubuntu/i12-3.sh: line 60: /var/log/pods/default_obs_obs-uid/chatty/0.log.20260801-120000: Permission denied
+lines in the rotated file: 
+lines crictl will show you: 0
+
+== 6. is there anything on this node that would have rotated it? ==
+--- logrotate config mentioning pods/containers:
+(none)
+--- kubelet present?
+(no kubelet on this node — so nobody rotates)

@@ -1,0 +1,77 @@
+# captured 2026-08-01T06:31:47Z on sandbox
+# --- snippet ---
+# bash ~/i12-4.sh
+# --- output ---
+== 1. where is this container's cgroup? ==
+cgroupsPath = /k8s.io/cee11e82b50d15cbda84b2d704877cf5fa32b6e23048370e6843f644f9bc76f4
+on disk      = /sys/fs/cgroup/k8s.io/cee11e82b50d15cbda84b2d704877cf5fa32b6e23048370e6843f644f9bc76f4
+cgroup.controllers
+cgroup.events
+cgroup.freeze
+cgroup.kill
+cgroup.max.depth
+
+== 2. read the four numbers straight from the kernel ==
+memory.current   229376
+memory.max       134217728
+cpu.max          20000 100000
+pids.current     1
+pids.max         max
+cpu.stat:
+  usage_usec 854747
+  user_usec 847810
+  system_usec 6937
+  core_sched.force_idle_usec 0
+  nr_periods 42
+  nr_throttled 42
+  throttled_usec 3290317
+  nr_bursts 0
+  burst_usec 0
+
+== 3. what crictl stats reports ==
+cpu.usageCoreNanoSeconds = 869749000
+memory.workingSetBytes   = 229376
+memory.usageBytes        = 229376
+memory.rssBytes          = 65536
+--- the table form:
+[2J[HCONTAINER           NAME                CPU %               MEM                 DISK                INODES              SWAP
+cee11e82b50d1       worker              19.93               229.4kB             0B                  0                   0B
+
+== 4. what ctr task metrics reports (same container, other interface) ==
+ID                                                                  TIMESTAMP                              
+cee11e82b50d15cbda84b2d704877cf5fa32b6e23048370e6843f644f9bc76f4    seconds:1785565913  nanos:433210343    
+
+METRIC                VALUE                   
+pids.current          1                       
+pids.limit            18446744073709551615    
+cpu.usage_usec        1069549                 
+cpu.user_usec         1062612                 
+cpu.system_usec       6937                    
+cpu.nr_periods        52                      
+cpu.nr_throttled      52                      
+cpu.throttled_usec    4089056                 
+memory.usage          229376                  
+memory.usage_limit    134217728               
+memory.swap_usage     0                       
+memory.swap_limit     0                       
+
+== 5. line them up: kernel vs CRI ==
+kernel memory.current      = 229376
+CRI    memory.usageBytes   = 229376
+kernel cpu.stat usage_usec = 1088660
+CRI    usageCoreNanoSeconds= 1088660000
+(usec * 1000 should be ~= nanoseconds)
+
+== 6. what memory.current is actually made of ==
+anon 65536
+file 0
+kernel 163840
+kernel_stack 16384
+pagetables 45056
+sec_pagetables 0
+...
+  anon 65536
+  file 0
+  kernel_stack 16384
+  sock 0
+  slab 90688

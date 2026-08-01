@@ -1,0 +1,82 @@
+# captured 2026-08-01T06:35:11Z on sandbox
+# --- snippet ---
+# bash ~/i12-8.sh
+# --- output ---
+container PID as the HOST sees it = 7926
+and as the container sees itself:  5171
+
+== 1. /proc/PID/status — no container tooling involved at all ==
+  Name:	sh
+  Pid:	7926
+  PPid:	7858
+  NSpid:	7926	7
+  VmRSS:	     944 kB
+  Threads:	1
+  CapEff:	00000000a80425fb
+  voluntary_ctxt_switches:	5206
+  nonvoluntary_ctxt_switches:	93
+
+== 2. what namespaces is it in? (the host is not in these) ==
+    
+  cgroup -> cgroup:[4026532342]
+  ipc -> ipc:[4026532339]
+  mnt -> mnt:[4026532341]
+  net -> net:[4026532213]
+  pid -> pid:[4026532340]
+  pid_for_children -> pid:[4026532340]
+  time -> time:[4026531834]
+  time_for_children -> time:[4026531834]
+  user -> user:[4026531837]
+  uts -> uts:[4026532338]
+  host net ns: net:[4026531840]
+
+== 3. what is it doing right now? ==
+  wchan: do_wait
+  3.02    0.033473           3      8826           dup2
+  2.74    0.030361           3      8826           fcntl
+  1.78    0.019756           2      8824           read
+  1.57    0.017395           3      4413           rt_sigreturn
+  1.33    0.014704           1      8824           mmap
+  1.25    0.013848           1      8824           mprotect
+  0.72    0.007973           0      8824           brk
+  0.55    0.006147           1      4412           writev
+  0.51    0.005705           1      4412      4412 ioctl
+  0.38    0.004251           0      4412           getuid
+  0.33    0.003609           0      8825           set_tid_address
+  0.31    0.003461           0      4412           arch_prctl
+  0.11    0.001170           0      4412           rt_sigaction
+------ ----------- ----------- --------- --------- ----------------
+100.00    1.108500           7    154433      8825 total
+
+== 4. perf: sample it for 3 seconds ==
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 71K of event 'cycles:P'
+# Event count (approx.): 9696614815
+#
+# Children      Self  Command  Shared Object      
+# ........  ........  .......  ...................
+#
+    46.90%    46.90%  sh       [kernel.kallsyms]  
+            |          
+            |--21.29%--0xffffffff
+
+== 5. eBPF, and the privilege it needs ==
+--- as an ordinary user:
+ERROR: bpftrace currently only supports running as the root user.
+--- as root, counting this container syscalls for 3 seconds:
+@[57]: 6802
+@[15]: 6803
+@[2]: 6803
+@[72]: 13604
+@[61]: 13605
+@[3]: 13605
+@[33]: 13605
+@[14]: 27208
+
+== 6. does the host need to enter the container to do any of this? ==
+  every command above ran in the host namespaces:
+  our mount ns = mnt:[4026531841] ; container mount ns = mnt:[4026532341]

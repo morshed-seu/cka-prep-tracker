@@ -1,0 +1,43 @@
+# captured 2026-08-01T06:38:12Z on sandbox
+# --- snippet ---
+# bash ~/i12-10.sh
+# --- output ---
+== 1. baseline: a healthy, growing log ==
+-rw-r----- 1 root root 10028438 Aug  1 12:38 /var/log/pods/default_obs_obs-uid/noisy/0.log
+  /var used: 14749744K
+  containerd holds /proc/756/fd/27
+
+== 2. an observer attaches — this is the tail that will go stale ==
+  the tail has collected 434 lines so far
+
+== 3. the fault: somebody cleans up the log file ==
+== 4. the symptoms, in the order an operator meets them ==
+--- the file is gone:
+ls: cannot access '/var/log/pods/default_obs_obs-uid/noisy/0.log': No such file or directory
+--- crictl logs:
+time="2026-08-01T12:38:25+06:00" level=fatal msg="failed to try resolving symlinks in path \"/var/log/pods/default_obs_obs-uid/noisy/0.log\": lstat /var/log/pods/default_obs_obs-uid/noisy/0.log: no such file or directory"
+--- the container is fine:
+a1121e9f05fcf       docker.io/library/alpine:3.21   12 seconds ago      Running             noisy               0                   fb657dce6fd5b       unknown             unknown
+--- the directory looks empty:
+4.0K	/var/log/pods/default_obs_obs-uid/noisy/
+
+== 5. but the writer never noticed ==
+  containerd's fd still points at:
+/var/log/pods/default_obs_obs-uid/noisy/0.log (deleted)
+  and the deleted inode is still growing:
+  size=64 links=1
+  size=39110936 (4s later)
+
+== 6. the space is really gone: df disagrees with du ==
+  /var used was 14749744K, now 14806552K  (delta 56808K)
+  du of the log directory says: 8K
+
+== 7. and the stale observer? ==
+  the tail is STILL receiving data: 1798 lines
+  it holds the same deleted inode, so it sees what crictl cannot:
+    lr-x------ 1 root root 64 Aug  1 12:38 /proc/36974/fd/3 -> pipe:[32232]
+
+== 8. who can free it? ==
+  nothing on disk can: the name is gone, only the open fd holds the inode.
+  restart the writer and the space comes back:
+  /var used after restarting containerd: 14819816K (delta from peak: 13264K)

@@ -1,0 +1,73 @@
+# captured 2026-08-01T06:33:28Z on sandbox
+# --- snippet ---
+# set -u
+# CID=$(sudo crictl ps -q --name worker | head -1)
+# CG=$(sudo crictl inspect "$CID" | jq -r .info.runtimeSpec.linux.cgroupsPath); D=/sys/fs/cgroup$CG
+# 
+# echo "== 0. which number does the crictl stats MEM column print? =="
+# sudo crictl exec "$CID" /bin/sh -c "dd if=/dev/zero of=/big bs=1M count=64 2>/dev/null; sync" 2>/dev/null
+# sleep 1
+# echo "kernel memory.current = $(sudo cat $D/memory.current)"
+# sudo crictl stats --output json "$CID" 2>/dev/null | jq -r ".stats[0].memory | \"usageBytes=\(.usageBytes.value)  workingSetBytes=\(.workingSetBytes.value)\""
+# echo "table MEM column:"
+# sudo crictl stats "$CID" 2>/dev/null | tail -1
+# sudo crictl exec "$CID" /bin/sh -c "rm -f /big" 2>/dev/null
+# 
+# echo
+# echo "== 1. ten valid lines of Prometheus exposition, written by hand =="
+# cat > ~/metrics.prom <<EOF
+# # HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# # TYPE container_cpu_usage_seconds_total counter
+# container_cpu_usage_seconds_total{container="worker",pod="obs"} $(sudo awk "/^usage_usec/{printf \"%.6f\", \$2/1e6}" $D/cpu.stat)
+# # HELP container_memory_working_set_bytes Current working set.
+# # TYPE container_memory_working_set_bytes gauge
+# container_memory_working_set_bytes{container="worker",pod="obs"} $(sudo cat $D/memory.current)
+# # HELP container_processes Number of processes running inside the container.
+# # TYPE container_processes gauge
+# container_processes{container="worker",pod="obs"} $(sudo cat $D/pids.current)
+# EOF
+# cat ~/metrics.prom
+# echo "lines: $(wc -l < ~/metrics.prom)"
+# 
+# echo
+# echo "== 2. serve it and scrape it =="
+# cd ~ && setsid python3 -m http.server 9101 >/dev/null 2>&1 &
+# sleep 2
+# curl -s http://127.0.0.1:9101/metrics.prom | head -3
+# echo "--- HTTP status and content type:"
+# curl -s -o /dev/null -w "status=%{http_code} type=%{content_type}\n" http://127.0.0.1:9101/metrics.prom
+# pkill -f "[h]ttp.server" || true
+# 
+# echo
+# echo "== 3. is cAdvisor a separate process here? =="
+# pgrep -a cadvisor || echo "(no cadvisor process — on a real node it is a LIBRARY inside the kubelet)"
+# 
+# --- output ---
+== 0. which number does the crictl stats MEM column print? ==
+kernel memory.current = 69349376
+usageBytes=69349376  workingSetBytes=2240512
+table MEM column:
+cee11e82b50d1       worker              19.90               2.241MB             8.192kB             3                   0B
+
+== 1. ten valid lines of Prometheus exposition, written by hand ==
+# HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="worker",pod="obs"} 20.807009
+# HELP container_memory_working_set_bytes Current working set.
+# TYPE container_memory_working_set_bytes gauge
+container_memory_working_set_bytes{container="worker",pod="obs"} 249856
+# HELP container_processes Number of processes running inside the container.
+# TYPE container_processes gauge
+container_processes{container="worker",pod="obs"} 1
+lines: 9
+
+== 2. serve it and scrape it ==
+# HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="worker",pod="obs"} 20.807009
+--- HTTP status and content type:
+status=200 type=application/octet-stream
+
+== 3. is cAdvisor a separate process here? ==
+Terminated
+(no cadvisor process — on a real node it is a LIBRARY inside the kubelet)

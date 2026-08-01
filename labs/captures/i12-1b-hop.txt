@@ -1,0 +1,31 @@
+# captured 2026-08-01T06:29:05Z on sandbox
+# --- snippet ---
+# bash ~/i12-1b.sh
+# --- output ---
+workload=2256  shim=  containerd=756
+
+== the shim's fds (pipes to the workload, fifos to containerd) ==
+ls: cannot access '/proc//fd': No such file or directory
+
+== the CRI stdio fifos on disk ==
+/run/containerd/io.containerd.grpc.v1.cri/containers/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c/io/3004481266/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c-stderr
+/run/containerd/io.containerd.grpc.v1.cri/containers/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c/io/3004481266/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c-stdout
+prwx------ 1 root root 0 Aug  1 12:28 /run/containerd/io.containerd.grpc.v1.cri/containers/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c/io/3004481266/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c-stdout
+
+== who has that fifo open, and in which direction? ==
+FIFO=/run/containerd/io.containerd.grpc.v1.cri/containers/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c/io/3004481266/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c-stdout
+/proc/2187/fd/15         pid=2187    comm=containerd-shim    mode=l---------
+/proc/2187/fd/16         pid=2187    comm=containerd-shim    mode=l-wx------
+/proc/2187/fd/18         pid=2187    comm=containerd-shim    mode=l---------
+/proc/2187/fd/19         pid=2187    comm=containerd-shim    mode=lr-x------
+/proc/756/fd/23          pid=756     comm=containerd         mode=l---------
+/proc/756/fd/25          pid=756     comm=containerd         mode=lr-x------
+
+== so the chain is, end to end ==
+  workload 2256  fd1 -> pipe:[10973]
+  shim       reads that pipe, writes -> /run/containerd/io.containerd.grpc.v1.cri/containers/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c/io/3004481266/ed6efa44e8e98c9b8a17a403d849b4add9ae2eba103a965b6cc1045bfc9a362c-stdout
+  containerd 756 reads that fifo, writes -> /var/log/pods/default_obs_obs-uid/talker/0.log
+
+== proof containerd (not the shim) owns the log file ==
+  /proc/756/fd/27  pid=756 comm=containerd
+  shim has it open? -> 0 fd(s)

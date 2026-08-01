@@ -1,0 +1,101 @@
+# captured 2026-08-01T06:36:50Z on sandbox
+# --- snippet ---
+# set -u
+# sudo crictl rmp -fa >/dev/null 2>&1
+# sudo mkdir -p /var/log/pods/default_obs_obs-uid
+# cat > ~/ctA.json <<EOF
+# { "metadata": { "name": "spinner", "attempt": 0 },
+#   "image": { "image": "docker.io/library/alpine:3.21" },
+#   "command": [ "/bin/sh", "-c", "while :; do :; done" ],
+#   "log_path": "spinner/0.log",
+#   "linux": { "resources": { "memory_limit_in_bytes": 134217728, "cpu_quota": 30000, "cpu_period": 100000 } } }
+# EOF
+# cat > ~/ctB.json <<EOF
+# { "metadata": { "name": "sleeper", "attempt": 0 },
+#   "image": { "image": "docker.io/library/alpine:3.21" },
+#   "command": [ "/bin/sh", "-c", "sleep 600" ],
+#   "log_path": "sleeper/0.log" }
+# EOF
+# POD=$(sudo crictl runp ~/sb.json 2>/dev/null)
+# A=$(sudo crictl create "$POD" ~/ctA.json ~/sb.json 2>/dev/null); sudo crictl start "$A" >/dev/null
+# B=$(sudo crictl create "$POD" ~/ctB.json ~/sb.json 2>/dev/null); sudo crictl start "$B" >/dev/null
+# sleep 3
+# echo "== 1. one scrape, rendered =="
+# sudo python3 ~/cgexport.py --once | head -24
+# echo "..."
+# echo "total lines: $(sudo python3 ~/cgexport.py --once | wc -l)"
+# 
+# echo
+# echo "== 2. serve it and scrape over HTTP =="
+# sudo setsid python3 ~/cgexport.py >/dev/null 2>&1 &
+# sleep 3
+# curl -s -o /dev/null -w "  status=%{http_code}\n  content-type=%{content_type}\n  bytes=%{size_download}\n" http://127.0.0.1:9101/metrics
+# 
+# echo
+# echo "== 3. two samples 20s apart -> the rate, computed by hand =="
+# S1=$(curl -s http://127.0.0.1:9101/metrics | awk "/^container_cpu_usage_seconds_total.*spinner/{print \$2}")
+# sleep 20
+# S2=$(curl -s http://127.0.0.1:9101/metrics | awk "/^container_cpu_usage_seconds_total.*spinner/{print \$2}")
+# echo "  sample 1: $S1"
+# echo "  sample 2: $S2"
+# awk -v a="$S1" -v b="$S2" "BEGIN{printf \"  rate = (%.3f - %.3f) / 20s = %.3f cores = %.1f%% of one CPU\n\", b, a, (b-a)/20, (b-a)/20*100}"
+# echo "  quota was 30000/100000 = 30%"
+# 
+# echo
+# echo "== 4. and the same for the idle container =="
+# curl -s http://127.0.0.1:9101/metrics | grep -E "^container_(cpu_usage_seconds_total|memory_working_set_bytes|processes)" | grep sleeper
+# 
+# echo
+# echo "== 5. compare against crictl stats =="
+# sudo crictl stats 2>/dev/null
+# sudo pkill -f "[c]gexport.py" || true
+# 
+# --- output ---
+== 1. one scrape, rendered ==
+# HELP container_cpu_usage_seconds_total Cumulative CPU time consumed by the container.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0.013036
+container_cpu_usage_seconds_total{container="spinner",pod="-",namespace="-",id="4830d159132b"} 1.030326
+# HELP container_cpu_throttled_seconds_total Cumulative time the container was throttled by its CPU quota.
+# TYPE container_cpu_throttled_seconds_total counter
+container_cpu_throttled_seconds_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0.000000
+container_cpu_throttled_seconds_total{container="spinner",pod="-",namespace="-",id="4830d159132b"} 2.261186
+# HELP container_cpu_throttled_periods_total Number of enforcement periods in which the container was throttled.
+# TYPE container_cpu_throttled_periods_total counter
+container_cpu_throttled_periods_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0
+container_cpu_throttled_periods_total{container="spinner",pod="-",namespace="-",id="4830d159132b"} 33
+# HELP container_cpu_periods_total Number of CPU enforcement periods elapsed.
+# TYPE container_cpu_periods_total counter
+container_cpu_periods_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0
+container_cpu_periods_total{container="spinner",pod="-",namespace="-",id="4830d159132b"} 33
+# HELP container_memory_usage_bytes Current memory usage including page cache.
+# TYPE container_memory_usage_bytes gauge
+container_memory_usage_bytes{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 208896
+container_memory_usage_bytes{container="spinner",pod="-",namespace="-",id="4830d159132b"} 229376
+# HELP container_memory_working_set_bytes Current memory usage excluding reclaimable page cache.
+# TYPE container_memory_working_set_bytes gauge
+container_memory_working_set_bytes{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 208896
+container_memory_working_set_bytes{container="spinner",pod="-",namespace="-",id="4830d159132b"} 229376
+...
+total lines: 40
+
+== 2. serve it and scrape over HTTP ==
+  status=200
+  content-type=text/plain; version=0.0.4; charset=utf-8
+  bytes=3270
+
+== 3. two samples 20s apart -> the rate, computed by hand ==
+  sample 1: 1.990521
+  sample 2: 7.998074
+  rate = (7.998 - 1.991) / 20s = 0.300 cores = 30.0% of one CPU
+  quota was 30000/100000 = 30%
+
+== 4. and the same for the idle container ==
+container_cpu_usage_seconds_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0.013036
+container_memory_working_set_bytes{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 208896
+container_processes{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 1
+
+== 5. compare against crictl stats ==
+[2J[HCONTAINER           NAME                CPU %               MEM                 DISK                INODES              SWAP
+4830d159132b2       spinner             29.96               229.4kB             8.192kB             3                   0B
+4c192e17f4297       sleeper             0.00                208.9kB             8.192kB             3                   0B
