@@ -97,6 +97,15 @@ Two more, learned the hard way and worth never repeating:
 - **A rootfs unpacked with `sudo tar` cannot be removed without `sudo`.**
   A scratch-directory reset written as plain `rm -rf` produces sixty lines of
   *Permission denied* before the interesting part of the script runs.
+- **`vm.sh put` single-quotes its destination, so `~` does not expand.**
+  `tools/vm.sh put x.sh '~/x.sh'` creates a file literally named `~/x.sh` in
+  the home directory and the next `bash ~/x.sh` fails with *No such file or
+  directory*. Always pass an absolute path: `/home/ubuntu/x.sh`.
+- **`sandbox` runs two containerds since I-S16** — the system daemon and the
+  rootless stack — so `pgrep -x containerd | head -1` silently picks whichever
+  started first and every fd lookup against it comes back empty. Use
+  `systemctl show containerd -p MainPID --value`. In I-S17 this produced a
+  capture claiming containerd held no descriptor on its own log file.
 - **Never run two `tools/vm.sh` calls concurrently.** They share
   `~/.vmrun/run.sh` and `~/.vmrun/out`, so a backgrounded capture and a
   foreground one interleave and each reads the other's output. Serialise them.
