@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Assemble every project from I0–I12 into minidock — one program that pulls, unpacks, runs, networks, mounts, logs and supervises containers — then prove it against eight planted faults and a track assessment.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I13 — Capstone: build minidock, then the gauntlet — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I13 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4 · The OCI image</a></li>
+    <li><a href="i5.html">I5 · Registries &amp; distribution</a></li>
+    <li><a href="i6.html">I6 · Building images</a></li>
+    <li><a href="i7.html">I7 · containerd</a></li>
+    <li><a href="i8.html">I8 · CRI</a></li>
+    <li><a href="i9.html">I9 · CNI</a></li>
+    <li><a href="i10.html">I10 · Storage &amp; CSI</a></li>
+    <li><a href="i11.html">I11 · Security &amp; supply chain</a></li>
+    <li><a href="i12.html">I12 · Observability</a></li>
+    <li><a href="i13.html">I13 · Capstone: minidock</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i13">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I13 — Capstone: build minidock, then the gauntlet</h1>
+  <p>No new concepts — assembly and proof. Every module's mini project becomes one layer of a single tool that pulls, unpacks, runs, networks, mounts, logs and supervises containers. Then eight planted faults, against a clock.</p>
+  <p>This is the module where the track stops explaining and starts asking. Thirteen modules have each handed you one working piece; nothing so far has made you hold all of them at once. The value is not the program — the program is about eleven hundred lines and you could read someone else's in an afternoon. The value is that every design decision you have been <em>told</em> about arrives at your desk as a decision you have to make, in the order the machine forces, and you discover that you already know the answer. That is a different kind of knowing than passing a quiz about it.</p>
+  <div class="weights">
+    <span>Checkpoints<b>12</b></span>
+    <span>Hours<b>~8</b></span>
+    <span>Prerequisites<b>I0–I12</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>Capstone</strong> — build <code>minidock</code> in six layers: a content store, a snapshotter, a runtime bundle plus shim, a CNI attachment, volumes and CRI-format logs, and a platform layer with a metadata store, a CLI and a restart reconciler.</li>
+<li><strong>Gauntlet</strong> — eight planted faults, one per layer, against a clock; then a written post-mortem of your own triage order; then the same run again to watch a routine beat improvisation.</li>
+<li><strong>Assessment</strong> — a written self-test across I0–I12, a practical task set with a rubric, and an explicit readiness checklist for the advanced track.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>All of I0–I12</strong>, and the artefacts they produced: <code>pull.py</code>, <code>oci-inspect.py</code>, <code>microshim.py</code>, <code>tinybuild.py</code>, <code>cni-minibridge</code> and <code>volman.py</code>. If a module still has unticked checkpoints, finish it first — debugging two unfamiliar layers at once is how people conclude they are bad at this.</p>
+<p><strong>Which machine.</strong> The same <code>sandbox</code> VM every intermediate module has used: Ubuntu 24.04, kernel 6.8.0, cgroup v2, with containerd 2.3.3, runc 1.5.1, CNI plugins v1.9.1 plus your <code>cni-minibridge</code> installed as <code>/opt/cni/bin/minibridge</code>, BuildKit v0.32.0, a local <code>registry:2</code> on <code>127.0.0.1:5000</code>, and Python 3.12.3. Everything below runs as root, and honestly so — every layer needs a capability an ordinary user does not have: <code>mknod</code> for whiteouts, <code>mount</code> for overlayfs, <code>clone</code> for the namespaces, netlink for the bridge. I11's rootless stack is the alternative and it needs a helper for every one of them.</p>
+<p><strong>The finished program</strong> ships with this track as <a href="../labs/intermediate/minidock.py"><code>labs/intermediate/minidock.py</code></a>. Write your own first and read that afterwards — every checkpoint below is worth more attempted than copied. Where the two differ, yours is not wrong; there are several defensible answers to most of these and the lessons say which decision is which.</p>
+</div>
+
+<!-- ---------------- Capstone — minidock, one layer at a time ---------------- --><div class="grp" id="g-capstone-minidock-one-la"><h3>Capstone — minidock, one layer at a time</h3>
+<article class="lesson project" id="cp-i13-1" data-id="i13-1">
+<div class="lesson-head"><span class="cp-id">I13.1</span><h4>Layer 1 — pull and store</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A container starts as bytes you do not have. Before anything can run, something has to fetch those bytes over HTTP, decide whether to believe them, and file them somewhere it can find them again. That "file them somewhere" is a <strong>content store</strong>, and it is the first thing every runtime in this ecosystem builds — because once you have one, half the hard problems in image distribution turn into lookups.</p>
+
+<h5>The concept</h5>
+<p>You already wrote the network half of this in I5: <code>pull.py</code> does the token dance, resolves a tag to an index, picks a platform out of the index, and fetches a manifest, a config and some layers. What it did <em>not</em> do is decide where those bytes live afterwards. That decision is the layer.</p>
+<p>Two stores, and the argument for splitting them writes itself the moment you try. <strong>Blobs</strong> are content-addressed: the file's name is the SHA-256 of its own contents, so the name is a checksum and any blob can always be fetched again from a registry. <strong>Names</strong> — the mapping from <code>alpine:3.21</code> to a manifest digest — cannot be recomputed from anything. They are the only fact in the store with no upstream. I7.11 found containerd making exactly this split, with the content store holding 472 files and <code>meta.db</code> being the one store with nothing to rebuild it from; here you arrive at the same shape from first principles, and you should keep the two in separate directories for the same reason. When the gauntlet plants a corrupted blob, being able to delete one store and keep the other is the difference between a one-line fix and re-pulling everything.</p>
+<p><strong>Verify on write.</strong> As each blob streams in, hash it; compare against the digest the manifest claimed; and only then rename it into place. The rename is the whole atomicity story — a partial download is called <code>.partial</code> until its bytes have been proved, so an interrupted pull can never leave a file a later run will trust. This is the one class of error content addressing hands you for free, and it costs a hash of bytes you are already reading.</p>
+<p><strong>Deduplication is a side effect, not a feature.</strong> If the blob's path is its digest, then "have I got this already?" is <code>os.path.exists</code>, and two images sharing a base layer share it automatically because they name it identically. You do not write a deduplication algorithm; you write a file path.</p>
+
+<div class="specref">
+<p>The registry protocol has an opinion on verification, and it is weaker than you might expect:</p>
+<blockquote>Clients SHOULD verify that the response body matches the requested digest.</blockquote>
+<cite>OCI distribution-spec v1.1.1, §"Pulling blobs" — <a href="https://raw.githubusercontent.com/opencontainers/distribution-spec/v1.1.1/spec.md">spec.md</a></cite>
+<p><strong>SHOULD</strong>, not MUST — and the same section says of the <code>Docker-Content-Digest</code> header that "<em>Most clients MAY ignore the value</em>". So a conformant client is allowed to trust whatever the registry sends. That is worth knowing before you decide your own tool's behaviour: verifying is a choice the format makes cheap and the specification does not force.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Pull once, cold. This is <code>pull.py</code>'s job with the store bolted on, so nothing here should surprise you — except how much of the elapsed time is not layer bytes.
+<pre class="cmd">sudo rm -rf /var/lib/minidock
+time sudo minidock pull docker.io/library/alpine:3.21</pre>
+<pre class="out">  index     <b>16 entries</b> -> linux/amd64
+  verified  config     sha256:2607caa9805847fa...       611 B
+  verified  layer 0    sha256:897d797d2723cf0e...   3646875 B
+docker.io/library/alpine:3.21
+sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339
+
+real	0m14.680s</pre>
+<p>Sixteen entries for eight architectures — the extra eight are attestation manifests with <code>platform: unknown/unknown</code>, exactly as I4.9 found. Your platform selector has to skip them, and it has to treat <code>architecture</code> and <code>variant</code> as separate fields.</p></li>
+
+<li>Pull again. The requirement is that this fetches nothing.
+<pre class="cmd">time sudo minidock pull alpine:3.21</pre>
+<pre class="out">  index     16 entries -> linux/amd64
+  <b>cached</b>    config     sha256:2607caa9805847fa...
+  <b>cached</b>    layer 0    sha256:897d797d2723cf0e...
+
+real	0m4.190s</pre>
+<p>Four seconds for zero bytes of payload. All of it is re-resolving the tag: <code>/v2/</code>, a token, the index, the manifest. That is what <code>imagePullPolicy: Always</code> costs on a node that already has the image — and I5.6 measured that those manifest requests do not even move Docker Hub's rate-limit counter, which is why the policy is affordable at all.</p></li>
+
+<li>Look at what the store actually is. Two directories and a JSON file.
+<pre class="cmd">sudo find /var/lib/minidock -maxdepth 3 | sort | sed 's|/var/lib/minidock|.|'</pre>
+<pre class="out">.
+./content
+./content/blobs
+./content/blobs/sha256
+./images.json</pre>
+<p><code>content/blobs/sha256/&lt;hex&gt;</code> is not a coincidence — it is the same path an OCI image layout uses (I4.5), which is why <code>oci-inspect.py</code> can read this directory unchanged.</p></li>
+
+<li>Now pull a second image whose base is the first, and watch deduplication happen without any code that does deduplication. (This one was built with BuildKit in I6 and pushed to the local registry; any image <code>FROM alpine:3.21</code> will do.)
+<pre class="cmd">sudo minidock pull 127.0.0.1:5000/i13/wh:v1
+sudo minidock images</pre>
+<pre class="out">  verified  config     sha256:245ea420ec7eddda...      1235 B
+  <b>cached    layer 0    sha256:897d797d2723cf0e...</b>
+  verified  layer 1    sha256:c383e1feac606fd4...       166 B
+  verified  layer 2    sha256:6de9a78f50fb7e83...       218 B
+
+REFERENCE                                   MANIFEST                  SIZE
+127.0.0.1:5000/i13/wh:v1                    7175f331a10b           3647259
+alpine:3.21                                 f27cad911749           3646875
+docker.io/library/alpine:3.21               f27cad911749           3646875
+
+3 names -&gt; 2 manifests; <b>7294134 B of layers declared, 3650984 B in 7 blobs on disk</b></pre>
+<p>Seven and a quarter megabytes claimed, three and a half stored. Note also that three names resolve to two manifests: <code>alpine:3.21</code> and <code>docker.io/library/alpine:3.21</code> are the same image, and the name index is where that fact lives.</p></li>
+
+<li><strong>Now break it on purpose</strong>, because the interesting property of this store is not that it verifies — it is <em>when</em>. Flip nine bytes inside a stored layer and run the image.
+<pre class="cmd">B=$(sudo find /var/lib/minidock/content -name '897d797d*')
+printf 'corrupted' | sudo dd of="$B" bs=1 seek=200 conv=notrunc status=none
+sudo rm -rf /var/lib/minidock/snapshots
+sudo minidock run --rm --network none alpine:3.21 true</pre>
+<pre class="out">minidock: cannot unpack sha256:897d797d2723cf0e318...: invalid compressed data
+  the bytes on disk no longer match the name they are filed under.
+  run: minidock verify   (then delete the blob and pull again - the content
+  store is the one store here with an upstream to rebuild from)</pre>
+<p>That message is the second draft. The <em>first</em> draft of this program had no <code>except</code> clause there, and the same corruption surfaced as a raw <code>tarfile.ReadError: invalid compressed data</code> traceback out of the unpacker — naming neither the blob, nor the image, nor the word "digest". Content addressing gives you the check for free, but only if you actually run it.</p></li>
+
+<li>Run it, then repair.
+<pre class="cmd">sudo minidock verify
+sudo rm -f "$B" &amp;&amp; sudo minidock pull alpine:3.21 &amp;&amp; sudo minidock verify</pre>
+<pre class="out">CORRUPT sha256:897d797d2723cf0e318402f4d6f37d51b011517e5cf09246b22155f0fa90dc81
+        content hashes to sha256:27f8bc659a82330b3884ba19e0c7089c04a0e0d9868f36d550356e83e8d534bc
+7 blobs checked, <b>1 corrupt</b>
+
+  verified  layer 0    sha256:897d797d2723cf0e...   3646875 B
+7 blobs checked, <b>0 corrupt</b></pre></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p><code>minidock pull</code> of an image you already have fetches zero payload bytes and prints <code>cached</code> for every blob. Two images sharing a base store that base once. A blob whose bytes you corrupt produces an error naming the digest, and <code>minidock verify</code> finds it without being told where to look.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Verify-on-write is not verify-on-read.</strong> Every registry client in this ecosystem, yours included, hashes a blob once — as it arrives — and then trusts the filename forever. That is a defensible trade (a full re-hash costs a read of the whole store) right up until a bit rots, which is why a <code>verify</code> subcommand belongs in the tool even though nothing calls it automatically.</li>
+<li><strong>Do not put the name index inside the blob directory.</strong> It is tempting — one directory, fewer paths — and it destroys the property that makes the blob store safe to delete wholesale.</li>
+<li><strong>The digest in the manifest and the digest of the manifest are different things.</strong> The manifest's own digest is computed over its exact bytes, so re-serialising the JSON before storing it changes the digest and breaks every reference to it. Store the bytes you received, never the object you parsed.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This layer is what fails when a pod reports <code>ErrImagePull</code> or <code>ImagePullBackOff</code>, and knowing it is two stores explains why the two states differ from "the image is corrupt on one node and fine on the others" — see <a href="w6.html#cp-6-17">6.17 — Image failures: ErrImagePull, ImagePullBackOff, and the three real causes</a>. The kubelet never talks to a registry itself; it asks the CRI's image service, which owns exactly the store you just built.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> distribution-spec §"Pulling blobs" and §"Content Digests"; image-spec §"Image Layout" for why <code>blobs/sha256/</code> is the path it is.</p>
+</article>
+
+<article class="lesson project" id="cp-i13-2" data-id="i13-2">
+<div class="lesson-head"><span class="cp-id">I13.2</span><h4>Layer 2 — unpack and snapshot</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>A layer in the store is a gzipped tar file. A container needs a directory tree it can be <code>chroot</code>ed into. Turning the first into the second is the job of a <strong>snapshotter</strong>, and it is where "images are layers" stops being a diagram and becomes a mount command with a very particular argument order.</p>
+
+<h5>The concept</h5>
+<p>Three decisions, in increasing order of how easy they are to get wrong.</p>
+<p><strong>What to key the cache on.</strong> Not the layer digest — the <strong>chain ID</strong>. I4.12 argued this and the reason only lands once you build it: two images sharing a base must share unpacked directories up to the exact point their chains diverge, and not one layer further. A layer's digest identifies the layer; the chain ID identifies "this layer applied on top of exactly those layers", which is what a directory on disk actually represents. The recursion is containerd's, not the spec's — <code>sha256("&lt;parent&gt; &lt;diff_id&gt;")</code>, one space, both operands keeping their <code>sha256:</code> prefixes — and the base case is that a one-layer image's chain ID <em>is</em> its <code>diff_id</code>.</p>
+<p><strong>How to represent a deletion.</strong> This is the fiddly part and the one worth writing by hand. The image format marks a deleted file with a zero-length file named <code>.wh.&lt;name&gt;</code>. The kernel's overlayfs marks one with a <strong>character device numbered 0:0</strong>. No kernel has ever heard of the first convention, so somebody has to translate — and in your program, that somebody is about eight lines in the middle of the extract loop. Getting it wrong produces containers with ghost files that no amount of image inspection will explain, because the image is fine.</p>
+<p><strong>How to stack them.</strong> One <code>mount -t overlay</code> with <code>lowerdir=</code> listing every snapshot directory <em>topmost first</em> — the reverse of the order the layers are applied in. B5 built this by hand; the only new thing here is that the list is computed from a manifest.</p>
+
+<div class="specref">
+<p>The whiteout rules are spelled out precisely, and two of them are easy to miss:</p>
+<blockquote>A whiteout file is an empty file with a special filename that signifies a path should be deleted.<br>
+A whiteout filename consists of the prefix <code>.wh.</code> plus the basename of the path to be deleted.<br>
+Once a whiteout is applied, the whiteout itself MUST also be hidden.<br>
+Whiteout files MUST only apply to resources in lower/parent layers.</blockquote>
+<cite>OCI image-spec v1.1.1, §"Whiteouts" — <a href="https://raw.githubusercontent.com/opencontainers/image-spec/v1.1.1/layer.md">layer.md</a></cite>
+<p>"The whiteout itself MUST also be hidden" is the rule your extractor obeys by never creating the <code>.wh.</code> file at all. And the spec defines a second form — <code>.wh..wh..opq</code>, "<em>indicating that all siblings are hidden in the lower layer</em>" — which maps to the <code>trusted.overlay.opaque=y</code> xattr rather than to a device node. Both encodings are legal, so handle both and never infer which producer made an image from which one it used.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Prove the cache exists by removing it. Run the same image twice with the unpack timer on.
+<pre class="cmd">sudo rm -rf /var/lib/minidock/snapshots
+MINIDOCK_DEBUG=1 sudo -E minidock run --rm --network none alpine:3.21 true
+MINIDOCK_DEBUG=1 sudo -E minidock run --rm --network none alpine:3.21 true</pre>
+<pre class="out">  unpack: <b>0.050s</b> for 1 layers
+  unpack: <b>0.000s</b> for 1 layers</pre>
+<p>Fifty milliseconds for three and a half megabytes, then nothing. On a 300 MB image the first number is seconds and the second is still nothing, which is the entire reason a node that has run a pod once starts the next one so much faster.</p></li>
+
+<li>Check the base case of the chain-ID recursion against the image's own config.
+<pre class="cmd">sudo ls /var/lib/minidock/snapshots
+sudo python3 -c 'import json, glob
+m = json.load(open(glob.glob("/var/lib/minidock/content/blobs/sha256/f27cad*")[0]))
+c = json.load(open("/var/lib/minidock/content/blobs/sha256/" + m["config"]["digest"].split(":")[1]))
+print("config rootfs.diff_ids[0] =", c["rootfs"]["diff_ids"][0])'</pre>
+<pre class="out">7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb
+config rootfs.diff_ids[0] = sha256:<b>7211d01aba8fa2e9eb71ad34395cd313df5fc51a6b69b92d2dfad32cc37759cb</b></pre>
+<p>Identical. For a single-layer image there is no parent to hash in, so the chain ID is the <code>diff_id</code> — and I7.12 found containerd's snapshot key doing exactly the same thing for the same reason.</p></li>
+
+<li>Now use an image that <em>deletes</em> something from its base. The one built in I6 does <code>rm /etc/motd</code> and <code>rm -rf /opt/app</code> before recreating it.
+<pre class="cmd">sudo minidock run --rm --network none 127.0.0.1:5000/i13/wh:v1 \
+  sh -c 'ls /opt/app; ls /etc/motd; echo "exit=$?"'</pre>
+<pre class="out">new
+ls: /etc/motd: No such file or directory
+exit=1</pre></li>
+
+<li>Look at what each snapshot recorded, and where the deletions landed.
+<pre class="cmd">for d in /var/lib/minidock/snapshots/*/; do sudo cat "$d/.committed"; echo; done</pre>
+<pre class="out">{"chainID": "sha256:438ca0cd...", "layer": "sha256:c383e1fe...", "whiteouts": 0, "opaques": 0}
+{"chainID": "sha256:7211d01a...", "layer": "sha256:897d797d...", "whiteouts": 0, "opaques": 0}
+{"chainID": "sha256:78c42788...", "layer": "sha256:6de9a78f...", <b>"whiteouts": 3, "opaques": 0</b>}</pre>
+<p>Three whiteouts, zero opaques — for a step that deleted an entire directory. BuildKit emitted one <code>.wh.</code> entry per former child (<code>one</code>, <code>two</code>) plus one for <code>/etc/motd</code>, rather than a single <code>.wh..wh..opq</code>. I4.7 found containerd's walking differ making the same choice. Both are conformant; your unpacker must handle either and must not assume which it will get.</p></li>
+
+<li><strong>The translation, on disk.</strong> Look at the same four paths across the three snapshot directories.
+<pre class="cmd">sudo find /var/lib/minidock/snapshots -name motd -o -name one -o -name two -o -name new \
+  | sort | xargs -r sudo ls -l</pre>
+<pre class="out">-rw-r--r-- 1 root root    4 .../438ca0cd.../fs/opt/app/one
+-rw-r--r-- 1 root root    4 .../438ca0cd.../fs/opt/app/two
+-rw-r--r-- 1 root root  284 .../7211d01a.../fs/etc/motd
+<b>crw------- 1 root root 0, 0 .../78c42788.../fs/etc/motd</b>
+-rw-r--r-- 1 root root    6 .../78c42788.../fs/opt/app/new
+<b>crw------- 1 root root 0, 0 .../78c42788.../fs/opt/app/one</b>
+<b>crw------- 1 root root 0, 0 .../78c42788.../fs/opt/app/two</b></pre>
+<p>That listing is the whole idea in seven lines. <code>/etc/motd</code> still exists, 284 bytes of it, in the base snapshot — nothing was deleted. What the top layer holds instead is <code>crw------- 0, 0</code>, a character device with major 0 and minor 0, which is overlayfs's way of saying "whatever is underneath this name, pretend it is not there". The <code>.wh.</code> files never reached the disk.</p></li>
+
+<li>Finally, the mount that makes it one tree. Start something and read the mount options back.
+<pre class="cmd">sudo minidock run -d --network none --name stack 127.0.0.1:5000/i13/wh:v1 sleep 30
+findmnt -no SOURCE,TARGET,OPTIONS -T /var/lib/minidock/containers/*/rootfs | tr ',' '\n'</pre>
+<pre class="out">overlay /var/lib/minidock/containers/7ed117ef.../rootfs rw
+lowerdir=.../<b>78c42788</b>.../fs:.../<b>438ca0cd</b>.../fs:.../<b>7211d01a</b>.../fs
+upperdir=/var/lib/minidock/containers/7ed117ef.../upper
+workdir=/var/lib/minidock/containers/7ed117ef.../work</pre>
+<p>Read the <code>lowerdir</code> list against the <code>.committed</code> files above: <code>78c42788</code> is the <em>top</em> layer and it is listed <em>first</em>. Get that order backwards and the container boots into its own base image with every later change invisible — which looks exactly like having pulled the wrong tag.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>The second container from an image starts with a zero-second unpack. Your snapshot directories are named by chain ID, and for a single-layer image that name equals the config's <code>diff_id</code>. An image that deletes a file produces a <code>0, 0</code> character device in the upper snapshot and the original file, untouched, in the lower one — and the container sees neither.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>lowerdir</code> is topmost-first.</strong> Every other list in this pipeline — manifest layers, <code>diff_ids</code>, history — is base-first. This one is reversed, and the failure is silent.</li>
+<li><strong>Handle both whiteout encodings.</strong> A producer may emit per-child <code>.wh.</code> entries or one <code>.wh..wh..opq</code>; the same <code>rm -rf</code> can legally produce either.</li>
+<li><strong>Extract each layer into its own directory.</strong> The tempting alternative — extract every layer into one tree and hand that to <code>chroot</code> — works, and throws away the entire cache: nothing is shared between two images, and every container costs a full unpack.</li>
+<li><strong>Unpacked size is not image size.</strong> I7.11 measured a 691 MB content store against a 2.2 GB snapshotter. It is the second number that fills a node.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the layer behind <code>DiskPressure</code> and the evictions that follow it — see <a href="w6.html#cp-6-12">6.12 — Read node Conditions fluently: MemoryPressure, DiskPressure, PIDPressure</a>. When a node runs out of disk it is almost never the image list that did it; it is this directory, at roughly three times the compressed size, times every image ever run there.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> image-spec §"Whiteouts" and §"Applying Changesets"; <code>man 5 overlayfs</code> (kernel docs <code>filesystems/overlayfs.rst</code>) for <code>lowerdir</code> ordering and the 0:0 whiteout convention.</p>
+</article>
+
+<article class="lesson project" id="cp-i13-3" data-id="i13-3">
+<div class="lesson-head"><span class="cp-id">I13.3</span><h4>Layer 3 — run</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Here is where the track's thesis becomes forty lines of your own code. "Running an image" turns out to mean one thing: <strong>translating an image config into a runtime config</strong>. Everything else — the namespaces, the cgroup, the mounts — is boilerplate you copy once. The translation is the whole job, and it is why the two specifications are separate documents.</p>
+
+<h5>The concept</h5>
+<p>The image config says what the author wanted: an entrypoint, some default arguments, environment variables, a working directory, a user. The runtime config says what the kernel is told: an <code>args</code> array, a namespace list, a cgroup path, resource limits. Your function reads the first and writes the second, and every interesting behaviour of every container tool lives in the small decisions it makes on the way.</p>
+<p>Three of those decisions are worth naming, because you have already met all three as bugs.</p>
+<ul>
+<li><strong>Overriding the entrypoint discards the image's <code>Cmd</code></strong> unless arguments are also given (I4.14). This is exactly a pod spec with <code>command:</code> and no <code>args:</code>, and the run then prints an empty line and exits 0. The spec is silent on it; the behaviour is convention.</li>
+<li><strong>A numeric user always works; a named user has to be looked up inside the image.</strong> I2.11 found a uid absent from the rootfs starting fine and failing later with a permission error, while <code>ctr run --user appuser</code> answers <code>no users found</code> — because resolving a name means reading <code>/etc/passwd</code> from a filesystem the tool has not mounted. Your version has mounted it, so you can do better.</li>
+<li><strong>Resource flags are a unit conversion.</strong> <code>--cpus 0.2</code> becomes <code>quota 20000 / period 100000</code>; <code>--memory 64m</code> becomes a byte count. No cleverness — but note that OCI <code>memory.swap</code> is memory <em>plus</em> swap (I2.9), so equal values mean no swap at all rather than "the same amount of swap".</li>
+</ul>
+<p><strong>Then something has to stay alive.</strong> runc will not: it sets up the container, <code>exec</code>s away and leaves (I3.2). If nothing holds the container's stdout, the output goes nowhere; if nothing waits on it, the exit status is lost to the kernel. That is what a <strong>shim</strong> is for, and I3.13's <code>microshim.py</code> is already the answer — a process that owns the pipes and collects the status. Detaching is then just <code>fork()</code>: the parent deliberately does <em>not</em> wait, so the shim re-parents to PID 1 and the CLI's exit means nothing to the container.</p>
+
+<div class="specref">
+<p>The image specification says outright that its config is a starting point, not an instruction:</p>
+<blockquote>The execution parameters which SHOULD be used as a base when running a container using the image. This field can be <code>null</code>, in which case any execution parameters should be specified at creation of the container.</blockquote>
+<cite>OCI image-spec v1.1.1, <code>.config</code> property — <a href="https://raw.githubusercontent.com/opencontainers/image-spec/v1.1.1/config.md">config.md</a></cite>
+<p>"As a base" is the licence for every override flag your tool has, and "can be <code>null</code>" is why an image with no config at all is legal — the caller is then required to supply everything. Read that sentence as the formal statement of what this layer does.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start from what the image declares. For alpine it is three fields.
+<pre class="cmd">sudo python3 -c 'import json, glob
+m = json.load(open(glob.glob("/var/lib/minidock/content/blobs/sha256/f27cad*")[0]))
+c = json.load(open("/var/lib/minidock/content/blobs/sha256/" + m["config"]["digest"].split(":")[1]))
+print(json.dumps(c["config"], indent=1))'</pre>
+<pre class="out">{
+ "Env": [
+  "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ ],
+ "Cmd": [
+  "/bin/sh"
+ ],
+ "WorkingDir": "/"
+}</pre></li>
+
+<li>Now run one with overrides and read back what the kernel was told.
+<pre class="cmd">sudo minidock run -d --name lim --memory 64m --cpus 0.2 -e GREETING=hello \
+  --workdir /tmp alpine:3.21 sleep 90
+sudo minidock inspect lim --spec</pre>
+<pre class="out">{
+ "process": {
+  "args": [ "sleep", "90" ],
+  "env": [ "PATH=/usr/local/sbin:...:/bin", <b>"GREETING=hello"</b> ],
+  "cwd": <b>"/tmp"</b>,
+  "user": { "uid": 0, "gid": 0 }
+ },
+ "hostname": "888f176d7e14",
+ "linux": {
+  "cgroupsPath": "/minidock/888f176d7e14",
+  "resources": {
+   "memory": { "limit": <b>67108864</b> },
+   "cpu": { "quota": <b>20000</b>, "period": <b>100000</b> }
+  }
+ }
+}</pre>
+<p>Read the two JSON documents side by side. <code>Env</code> was inherited and appended to; <code>Cmd</code> was replaced entirely by the command line; <code>WorkingDir</code> was overridden. That is the whole translation, and it is the same translation the kubelet performs when it turns a container spec into a CRI <code>ContainerConfig</code>.</p></li>
+
+<li>Confirm the limits are not decoration.
+<pre class="cmd">CG=/sys/fs/cgroup/minidock/$(sudo minidock ps | awk '/lim/{print $1}')
+for f in memory.max cpu.max pids.current; do printf '%-14s %s\n' "$f" "$(sudo cat $CG/$f)"; done</pre>
+<pre class="out">memory.max     <b>67108864</b>
+cpu.max        <b>20000 100000</b>
+pids.current   1</pre>
+<p>B7 wrote those files by hand. The only difference now is that a JSON document decided their contents.</p></li>
+
+<li><strong>Check what <code>exec</code> inherits</strong> — and be careful here, because it is easy to make your own tool lie to you.
+<pre class="cmd">sudo minidock exec lim sh -c 'echo cwd=$PWD; echo env=${GREETING:-UNSET}; echo uid=$(id -u)'</pre>
+<pre class="out">cwd=<b>/tmp</b>
+env=<b>hello</b>
+uid=0</pre>
+<p>All three came through. <code>runc exec</code> re-enters the container's namespaces and cgroup <em>and</em> seeds the new process from the container's own <code>config.json</code>, so cwd, environment and user are inherited unless you override them. An earlier draft of <code>minidock</code> passed <code>--cwd /</code> on every exec, which hid this completely and made the runtime look forgetful. If your <code>exec</code> reports <code>/</code> here, suspect your own flags before you suspect runc.</p></li>
+
+<li>Look at the process tree. This is I7.3's diagram, drawn by your own program.
+<pre class="cmd">sudo ps -eo pid,ppid,comm | awk 'NR==1 || /python3|runc|sleep/'</pre>
+<pre class="out">    PID    PPID COMMAND
+ 166233       <b>1</b> python3      <- the shim, already re-parented to init
+ 166234  166233 runc
+ 166252  166234 sleep         <- the workload</pre></li>
+
+<li><strong>Now kill the shim</strong> and find out what your program does not do.
+<pre class="cmd">SHIM=$(sudo ps -eo pid,args | awk '/[m]inidock run -d --name lim/{print $1}' | head -1)
+sudo kill -9 "$SHIM"; sleep 1
+sudo ps -eo pid,ppid,comm | awk '/sleep|runc/'
+sudo minidock ps | grep lim</pre>
+<pre class="out"> 166234       <b>1</b> runc
+ 166252  166234 sleep
+888f176d7e14  lim   alpine:3.21   <b>running</b>   10.66.0.2/24   0</pre>
+<p>The workload is still running. Its supervisor re-parented to PID 1 and nothing collected anything. <code>minidock ps</code> will say <code>running</code> forever, because the only process that was ever going to update that record is the one you just killed — and the exit code, whenever it comes, has nowhere to go.</p>
+<p>This is the honest answer to "what does containerd actually add?". I7.14 measured the same experiment against the real thing: containerd monitors the shim's ttrpc socket, logs <code>shim disconnected</code> and <code>cleaning up dead shim</code>, and reaps the orphan within about two seconds. Your version has no monitor, so the orphan is permanent. Writing that gap yourself is a better explanation of containerd's value than any diagram.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can point at the specific lines that turn an image config into a runtime config, and say what each override flag does to the result. <code>--memory</code> and <code>--cpus</code> appear in <code>/sys/fs/cgroup</code> with the values you expect. A detached container survives its CLI, and you can state precisely what happens when its shim dies and why the real runtime behaves differently.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>runc will not stay.</strong> If you skip the shim and let the CLI run <code>runc run</code> directly, your tool works perfectly until the first time somebody closes the terminal.</li>
+<li><strong>An empty <code>args</code> array is a runtime error, not a default.</strong> If the image declares neither <code>Entrypoint</code> nor <code>Cmd</code> and the user gave no command, fail loudly at translation time — the alternative is a confusing failure from runc about an executable it cannot find.</li>
+<li><strong>runc warns and continues on unknown capability names.</strong> I2.14 found this: the spec says it MUST error, runc says <code>ignoring unknown or unavailable capabilities</code>, and a typo in a hardening config silently produces an empty capability set.</li>
+<li><strong>Do not hardcode overrides on <code>exec</code>.</strong> As above — it makes a correct runtime look broken, and you will chase it in the wrong layer.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The chain you have just built by hand is drawn end to end in <a href="w1.html#cp-1-20">1.20 — Understand CRI: kubelet → containerd → shim → runc</a>, and the flags you translated are the subject of <a href="w3.html#cp-3-16">3.16 — Requests vs limits: scheduler bookkeeping vs cgroup enforcement</a>. That lesson's central point — that a <em>request</em> never reaches the kernel while a <em>limit</em> becomes exactly the two files you just read — is much harder to forget once you have written the function that does or does not write them.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> runtime-spec <code>config.md</code> (<code>process</code>, <code>root</code>, <code>linux.resources</code>, <code>linux.namespaces</code>); image-spec <code>config.md</code> for the <code>.config</code> properties you are translating.</p>
+</article>
+</div><!-- /g-capstone-minidock-one-la -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>Your content store keys blobs by digest. Why does the name index have to live somewhere else, and what property is lost if it does not?
+<details class="reveal"><summary>Answer</summary><p>Blobs are recomputable — any blob can be fetched again from a registry, so the blob store is safe to delete wholesale. Names cannot be recomputed from anything; the mapping from <code>alpine:3.21</code> to a manifest digest is the only fact in the store with no upstream. Putting them together means you can no longer throw away the recoverable half without also losing the irrecoverable one.</p></details></li>
+<li>Why is the snapshot cache keyed on chain ID rather than layer digest?
+<details class="reveal"><summary>Answer</summary><p>A directory on disk represents "this layer applied on top of exactly those layers", which is what a chain ID names. A layer digest names only the layer, so two images that share a base but diverge earlier would wrongly share a directory. For a single-layer image the chain ID equals the <code>diff_id</code>, because there is no parent to hash in.</p></details></li>
+<li>An image layer contains <code>./etc/.wh.motd</code>. What does your unpacker write to disk, and what does it deliberately not write?
+<details class="reveal"><summary>Answer</summary><p>It writes a character device numbered 0:0 at <code>etc/motd</code> — overlayfs's whiteout convention. It does not write the <code>.wh.motd</code> file itself; the spec requires that once applied, the whiteout is hidden. The original <code>/etc/motd</code> in the lower layer is untouched and simply becomes invisible.</p></details></li>
+<li>Give the <code>lowerdir</code> ordering rule, and describe the symptom of getting it backwards.
+<details class="reveal"><summary>Answer</summary><p>Topmost layer first — the reverse of the order layers are applied in. Reversed, the container sees its base image with every subsequent change invisible, which presents as though the wrong tag was pulled.</p></details></li>
+<li>What single sentence describes what "running an image" means, and which two specifications does it sit between?
+<details class="reveal"><summary>Answer</summary><p>Translating an image config into a runtime config. It sits between image-spec (which says its <code>.config</code> is a base "which SHOULD be used ... when running a container") and runtime-spec (which defines the <code>config.json</code> the runtime is actually handed).</p></details></li>
+<li>You override a container's entrypoint and pass no arguments. What happens to the image's <code>Cmd</code>?
+<details class="reveal"><summary>Answer</summary><p>It is discarded. The container runs the new entrypoint with no arguments — exactly a pod spec with <code>command:</code> and no <code>args:</code>. The specification does not cover this; it is convention, and it usually presents as a container that exits 0 immediately having printed nothing.</p></details></li>
+<li>A detached container's shim is SIGKILLed. What is the state of the workload, and what does your metadata store say?
+<details class="reveal"><summary>Answer</summary><p>The workload keeps running, re-parented to PID 1. The metadata store says <code>running</code> forever, because the process responsible for updating it is gone and the exit status has nowhere to be recorded. Real containerd avoids this by monitoring the shim's ttrpc socket and reaping the orphan within a couple of seconds.</p></details></li>
+<li>Your store verified every blob on the way in. Why is a <code>verify</code> subcommand still worth having?
+<details class="reveal"><summary>Answer</summary><p>Because verification happens on write and then never again — the filename is trusted forever afterwards. That is a reasonable trade until bits rot, at which point the only symptom is an unreadable tar from inside the unpacker. <code>verify</code> re-hashes the store and turns that into a named blob and a one-line repair.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Built a content store that verifies on write, deduplicates as a side effect of its file naming, and repairs itself from the registry.</li>
+<li>Built a snapshotter keyed on chain ID, and translated the image format's whiteouts into the kernel's by hand.</li>
+<li>Wrote the image-config-to-runtime-config translation that is the entire meaning of "running an image", and proved its resource flags in <code>/sys/fs/cgroup</code>.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html#b5">B5 built the overlayfs stack this module drives from a manifest →</a></div>
+
+<nav class="pager"><a href="i12.html">← I12</a><a href="../intermediate.html#i13">Tracker →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04 (kernel 6.8.0, cgroup v2) with containerd 2.3.3,
+runc 1.5.1, CNI plugins v1.9.1, BuildKit v0.32.0, Python 3.12.3, alpine 3.21,
+OCI image-spec v1.1.1, distribution-spec v1.1.1, runtime-spec v1.3.0 and CNI
+spec v1.1.0 (from library tag v1.3.0). Verified 2026-08-01. Every command and
+every line of output on this page came from a live run on the
+<code>sandbox</code> VM.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
