@@ -525,6 +525,200 @@ slab 90688</pre>
 
 <p class="docs-links"><b>Docs:</b> the kernel's <code>cgroup-v2.rst</code> is the reference for every field name here — search it for <code>memory.stat</code> to see the full breakdown. On the tooling side, <code>crictl stats --output json</code> shows the CRI's field names, and <code>ctr task metrics</code> shows the kernel's.</p>
 </article>
+
+<article class="lesson" id="cp-i12-5" data-id="i12-5">
+<div class="lesson-head"><span class="cp-id">I12.5</span><h4>cAdvisor is a loop over those files, and exposition is ten lines of text</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two names dominate container monitoring and both sound like infrastructure you could not build: cAdvisor, and "the Prometheus format". One is a program that reads the files you just read; the other is a text format simple enough to write by hand in a shell heredoc. Demystifying them is not trivia — it is what lets you write a five-minute exporter for the one number nobody exposes, instead of filing a ticket.</p>
+
+<h5>The concept</h5>
+<p><strong>cAdvisor</strong> (Container Advisor) is a Google project that does exactly one useful thing for us: it walks the cgroup tree on a schedule, reads the files from I12.4, attaches labels identifying the container and pod, and exposes the result over HTTP. Its own README describes it as "<em>a running daemon that collects, aggregates, processes, and exports information about running containers</em>". The important structural fact is that on a Kubernetes node it is <strong>not a separate process</strong> — it is compiled into the kubelet as a library, which is why <code>pgrep cadvisor</code> on a node finds nothing and why its metrics appear on a kubelet endpoint.</p>
+<p>The <strong>Prometheus exposition format</strong> is the other half. It is line-oriented plain text with three kinds of line: a <code># HELP</code> comment, a <code># TYPE</code> comment, and samples. A sample is a metric name, an optional set of key=value labels in braces, and a number. That is the entire format for our purposes.</p>
+<pre class="cmd"># HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="worker",pod="obs"} 20.807009</pre>
+<p>The design is deliberately dumb in a way worth appreciating: there is no session, no registration, no push. A scraper does a plain HTTP <code>GET</code> and parses text. Anything that can serve a string over HTTP can be a monitoring target, which is why the ecosystem has thousands of exporters.</p>
+<p>One convention that is not optional in practice: <strong>base units</strong>. Seconds, not milliseconds; bytes, not megabytes. And counters end in <code>_total</code>. Following it means every existing dashboard and alerting rule works against your metric.</p>
+
+<div class="specref">
+<p>The format is small enough that most of its rules fit in a paragraph, but two of them are hard requirements that a hand-rolled exporter routinely violates:</p>
+<blockquote>Only one TYPE line may exist for a given metric name. The TYPE line for a metric name must appear before the first sample.<br><br>
+All lines for a given metric must be provided as one single group, with the optional HELP and TYPE lines first (in no particular order)</blockquote>
+<cite>Prometheus exposition formats, text format version 0.0.4 — <a href="https://prometheus.io/docs/instrumenting/exposition_formats/">prometheus.io</a></cite>
+<p>"One single group" is the rule people break: if you loop over containers on the outside and metrics on the inside, you emit each metric name several times in separate groups and a strict parser rejects it. The fix is to invert the loops — metric outermost, containers innermost — which is exactly how the mini project is written. The spec also pins the content type to <code>text/plain</code> with <code>version=0.0.4</code>.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write ten valid lines by hand, filling the values from the cgroup files of a running container.
+<pre class="cmd">cat &gt; ~/metrics.prom &lt;&lt;EOF
+# HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="worker",pod="obs"} $(sudo awk '/^usage_usec/{printf "%.6f", $2/1e6}' $D/cpu.stat)
+# HELP container_memory_working_set_bytes Current working set.
+# TYPE container_memory_working_set_bytes gauge
+container_memory_working_set_bytes{container="worker",pod="obs"} $(sudo cat $D/memory.current)
+# HELP container_processes Number of processes running inside the container.
+# TYPE container_processes gauge
+container_processes{container="worker",pod="obs"} $(sudo cat $D/pids.current)
+EOF
+cat ~/metrics.prom</pre>
+<pre class="out"># HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="worker",pod="obs"} <b>20.807009</b>
+# HELP container_memory_working_set_bytes Current working set.
+# TYPE container_memory_working_set_bytes gauge
+container_memory_working_set_bytes{container="worker",pod="obs"} <b>249856</b>
+# HELP container_processes Number of processes running inside the container.
+# TYPE container_processes gauge
+container_processes{container="worker",pod="obs"} <b>1</b></pre>
+<p>Nine lines, three metrics, no library. Note the CPU value was converted from microseconds to seconds to honour the base-unit convention.</p></li>
+
+<li>Serve it over HTTP and scrape it, which is all a Prometheus target ever does.
+<pre class="cmd">cd ~ &amp;&amp; setsid python3 -m http.server 9101 &gt;/dev/null 2&gt;&amp;1 &amp;
+sleep 2
+curl -s http://127.0.0.1:9101/metrics.prom | head -3
+curl -s -o /dev/null -w "status=%{http_code} type=%{content_type}\n" \
+  http://127.0.0.1:9101/metrics.prom</pre>
+<pre class="out"># HELP container_cpu_usage_seconds_total Cumulative CPU time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="worker",pod="obs"} 20.807009
+status=200 type=<b>application/octet-stream</b></pre>
+<p>It serves — but look at the content type. <code>python3 -m http.server</code> guesses from the file extension and gets <code>application/octet-stream</code>, where the spec requires <code>text/plain</code> with <code>version=0.0.4</code>. A real scraper is entitled to refuse this. Fixing that header is one of the few things the mini project's exporter must do that a static file server cannot.</p></li>
+
+<li>Confirm the structural claim about cAdvisor on this node.
+<pre class="cmd">pgrep -a cadvisor || echo "(no cadvisor process)"</pre>
+<pre class="out">(no cadvisor process)</pre>
+<p>There is no kubelet here either, so nothing is reading the cgroup tree on a schedule — the numbers exist in the kernel and nobody is collecting them. That is the normal state of a machine, and it is what a monitoring stack changes.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can write valid exposition from scratch without looking anything up, name the required content type, and state where cAdvisor runs on a Kubernetes node. You can explain why serving a metrics file with <code>python3 -m http.server</code> is not quite a valid target.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Emitting the same metric name in more than one group is invalid</strong>, even though it looks fine. Loop metric-outermost, not container-outermost.</li>
+<li><strong>The content type matters.</strong> <code>text/plain; version=0.0.4</code> — a static file server will not produce it.</li>
+<li><strong>Labels are not free.</strong> Every distinct label-value combination is a separate time series, so putting a container ID in a label means every restart creates a new series forever. This is how monitoring systems get killed by the thing monitoring them.</li>
+<li><strong>cAdvisor's metrics are not the kubelet's own metrics.</strong> They live on different endpoints with different lifecycles — the kubelet's docs note explicitly that <code>/metrics/cadvisor</code>, <code>/metrics/resource</code> and <code>/metrics/probes</code> "<em>do not have the same lifecycle</em>" as <code>/metrics</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>On a real node this is served at <code>/metrics/cadvisor</code> on the kubelet, and the Kubernetes docs describe cAdvisor as a "<em>Daemon for collecting, aggregating and exposing container metrics included in Kubelet</em>" — "included in" being the operative phrase. A separate, much smaller pipeline (<code>/metrics/resource</code>) feeds metrics-server for <code>kubectl top</code> and the HPA: <a href="w3.html#cp-3-19">W3 · metrics-server and the aggregated API</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the exposition format page on prometheus.io is short enough to read in full — search it for <code>version=0.0.4</code>. For the Kubernetes side, search the docs for "System metrics" to find the four kubelet endpoints, and note that <code>kubectl get --raw /metrics/cadvisor</code> will show you the real thing on any cluster you have node access to.</p>
+</article>
+
+<article class="lesson" id="cp-i12-6" data-id="i12-6">
+<div class="lesson-head"><span class="cp-id">I12.6</span><h4>CPU is a counter, memory is a gauge — and page cache is charged to you</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two data types, two expensive mistakes. Graph a counter as if it were a gauge and you get a line that rises forever and means nothing. Read the memory gauge without knowing what is inside it and you will spend a day hunting a leak that does not exist. Both mistakes are extremely common, both are made by competent people, and both are avoidable in about five minutes of looking at the files.</p>
+
+<h5>The concept</h5>
+<p>A <strong>counter</strong> only ever increases. <code>cpu.stat</code>'s <code>usage_usec</code> is cumulative CPU time since the cgroup was created, so its instantaneous value tells you almost nothing — a container showing 3,600,000,000 µs might have been busy for an hour or idle for a week. The information is in the <em>slope</em>. You take two samples, subtract, divide by elapsed wall-clock time, and get CPU cores consumed:</p>
+<div class="flow"><span>Δusage_usec ÷ 10⁶</span><em>÷</em><span>Δseconds</span><em>=</em><span>cores</span></div>
+<p>Multiply by 100 for "percent of one CPU". This is the arithmetic behind every CPU number you have ever seen on a container dashboard, and <code>crictl stats</code> is doing it internally between two of its own samples.</p>
+<p>A <strong>gauge</strong> is an instantaneous value that can go up or down. <code>memory.current</code> is a gauge, and here is the part that costs people days: it includes <strong>page cache</strong>. When your container reads or writes a file, the kernel keeps those pages in memory to make the next access fast, and charges them to the cgroup that caused them. So a program that streams a large file — a backup, a log processor, a database doing a table scan — makes <code>memory.current</code> climb steadily while its own allocation never changes.</p>
+<p>That memory is not lost. It is <em>reclaimable</em>: under pressure the kernel drops those pages instead of OOM-killing anything. Which is why the metric you should actually publish is the <abbr title="memory usage minus the file cache the kernel could reclaim for free">working set</abbr> — usage minus the cache that could be dropped for free:</p>
+<div class="flow"><span>memory.current</span><em>−</em><span>inactive_file</span><em>=</em><span>working set</span></div>
+<p>The CRI already computes this for you and reports both numbers. Knowing which one you are looking at is the whole skill.</p>
+
+<div class="specref">
+<p>The kernel documentation states the inclusion plainly, and the two definitions sit a few lines apart in the same file:</p>
+<blockquote>file<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Amount of memory used to cache filesystem data, including tmpfs and shared memory.<br><br>
+inactive_file<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Amount of cached filesystem data […] on the internal memory management lists used by the page reclaim algorithm.</blockquote>
+<cite>Linux <code>Documentation/admin-guide/cgroup-v2.rst</code>, <code>memory.stat</code> — <a href="https://raw.githubusercontent.com/torvalds/linux/master/Documentation/admin-guide/cgroup-v2.rst">torvalds/linux</a></cite>
+<p>"On the internal memory management lists used by the page reclaim algorithm" is the technical way of saying <em>the kernel can take these back whenever it wants</em>. Subtracting exactly that quantity is what turns a misleading number into a useful one.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Sample the CPU counter three times, five seconds apart, and watch it do the only thing a counter does.
+<pre class="cmd">for i in 1 2 3; do
+  echo "$(date +%s.%N) $(sudo awk '/^usage_usec/{print $2}' "$D/cpu.stat")" &gt;&gt; ~/cpu.samples
+  [ $i -lt 3 ] &amp;&amp; sleep 5
+done
+cat ~/cpu.samples</pre>
+<pre class="out">1785565956.820119817 9749021
+1785565961.832004311 10760328
+1785565966.852138071 11768717</pre></li>
+
+<li>Compute the rate yourself, then check it against the tool.
+<pre class="cmd">awk 'NR&gt;1{ dt=$1-pt; du=$2-pu;
+  printf "  interval %d: dt=%.2fs  d(usage_usec)=%d  -&gt; %.1f%% of one CPU\n",
+    NR-1, dt, du, (du/1e6)/dt*100 } {pt=$1; pu=$2}' ~/cpu.samples
+sudo crictl stats "$CID" | tail -1
+sudo cat "$D/cpu.max"</pre>
+<pre class="out">  interval 1: dt=5.01s  d(usage_usec)=1011307  -&gt; <b>20.2% of one CPU</b>
+  interval 2: dt=5.02s  d(usage_usec)=1008389  -&gt; <b>20.1% of one CPU</b>
+cee11e82b50d1  worker  <b>20.01</b>  229.4kB  8.192kB  3  0B
+20000 100000</pre>
+<p>Our hand arithmetic and <code>crictl stats</code> agree to within rounding, and both land on the 20% quota that <code>cpu.max</code> declares. There is no magic in the CPU column.</p></li>
+
+<li><strong>Now the gauge, and the trap.</strong> Write a 64 MB file <em>inside</em> the container and watch what happens to its memory numbers.
+<pre class="cmd">echo "before: memory.current=$(sudo cat "$D/memory.current")"
+sudo crictl exec "$CID" /bin/sh -c 'dd if=/dev/zero of=/big bs=1M count=64; sync'
+sleep 1
+echo "after:  memory.current=$(sudo cat "$D/memory.current")"
+sudo awk '/^(anon|file|inactive_file) /{print "  memory.stat "$0}' "$D/memory.stat"
+sudo crictl stats --output json "$CID" | jq -r '.stats[0].memory |
+  "  CRI usageBytes      = \(.usageBytes.value)
+  CRI workingSetBytes = \(.workingSetBytes.value)
+  CRI rssBytes        = \(.rssBytes.value)"'</pre>
+<pre class="out">before: memory.current=229376
+after:  memory.current=<b>69345280</b>
+  memory.stat anon 65536
+  memory.stat file 67108864
+  memory.stat inactive_file 67108864
+  CRI usageBytes      = <b>69345280</b>
+  CRI workingSetBytes = <b>2236416</b>
+  CRI rssBytes        = 65536</pre>
+<p>Read those numbers carefully, because this is the whole lesson. <code>memory.current</code> went up <strong>300×</strong>. The workload's own memory — <code>anon</code>, and the CRI's <code>rssBytes</code> — did <strong>not move at all</strong>: 65,536 bytes before and after. Every added byte is page cache. And <code>workingSetBytes</code> is 2,236,416, which is exactly 69,345,280 − 67,108,864: usage minus <code>inactive_file</code>, computed for you.</p></li>
+
+<li>Confirm it is a gauge, not a leak, by deleting the file.
+<pre class="cmd">sudo crictl exec "$CID" /bin/sh -c 'rm -f /big'
+sleep 1
+echo "  memory.current = $(sudo cat "$D/memory.current")"
+sudo awk '/^(anon|file) /{print "  memory.stat "$0}' "$D/memory.stat"</pre>
+<pre class="out">  memory.current = <b>249856</b>
+  memory.stat anon 65536
+  memory.stat file <b>0</b></pre>
+<p>Straight back down. A counter could never do this — which is the practical test for telling the two apart when you are unsure.</p></li>
+
+<li>One more thing worth knowing about the tooling: check which of those two numbers <code>crictl stats</code> puts in its MEM column.
+<pre class="cmd">sudo crictl exec "$CID" /bin/sh -c 'dd if=/dev/zero of=/big bs=1M count=64; sync'
+sleep 1
+echo "kernel memory.current = $(sudo cat "$D/memory.current")"
+sudo crictl stats "$CID" | tail -1</pre>
+<pre class="out">kernel memory.current = 69349376
+cee11e82b50d1  worker  19.90  <b>2.241MB</b>  8.192kB  3  0B</pre>
+<p><code>crictl stats</code> shows <strong>2.241 MB</strong>, not 69 MB — it prints the working set. The tool is honest by default. The trap is reserved for whoever reads <code>memory.current</code> themselves, or graphs <code>usageBytes</code> because it sounded like the obvious field.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can convert a CPU counter into cores with two samples and a subtraction, and you can predict which of <code>memory.current</code>, <code>workingSetBytes</code> and <code>rssBytes</code> will move when a container reads a large file. You can state the working-set formula from memory.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>An alert on <code>container_memory_usage_bytes</code> is an alert on how much file I/O the container has done.</strong> Alert on <code>container_memory_working_set_bytes</code> instead — that is the number the OOM killer's decision actually tracks.</li>
+<li><strong>A counter resets to zero when the container is recreated</strong>, because the cgroup is new. Rate functions handle this; hand-rolled subtraction across a restart produces a large negative number.</li>
+<li><strong>Sampling interval changes the answer for CPU.</strong> A container that burns 100% of a core for one second in every ten reads as 10% at a 60-second interval and 100% at a one-second one. Neither is wrong; they answer different questions.</li>
+<li><strong>Page cache being reclaimable does not make it free.</strong> It still counts against <code>memory.max</code>, so a container doing heavy I/O against a tight limit will stall in reclaim — slow, but not OOM-killed. That combination (slow, high memory, no kill) is the signature.</li>
+</ul>
+
+<div class="k8s-link">
+<p><code>kubectl top pod</code> reports the working set, not usage — so a pod's <code>kubectl top</code> figure legitimately differs from what a dashboard graphing <code>container_memory_usage_bytes</code> shows for the same pod at the same instant, and neither is broken. The HPA scales on the same working-set number (<a href="w3.html#cp-3-20">W3 · HPA's control loop and formula</a>), which is why an HPA does not scale up just because a pod read a large file. The OOM-kill side of this — exit 137, and the evidence in <code>memory.events</code> — is B7's <a href="b7.html#cp-b7-9">B7.9</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search <code>cgroup-v2.rst</code> for <code>inactive_file</code> to see the reclaim wording; search the Prometheus docs for <code>rate()</code> to see how counters are meant to be consumed; and compare <code>crictl stats</code> with <code>crictl stats --output json</code>, which is the fastest way to see that the table hides a field.</p>
+</article>
 </div><!-- /g-metrics -->
 
 <div class="quiz" id="quiz">
