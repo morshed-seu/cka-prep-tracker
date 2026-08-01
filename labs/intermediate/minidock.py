@@ -723,3 +723,436 @@ def read_cri_log(path, tail=None, streams=("stdout", "stderr")):
     return out[-tail:] if tail else out
 
 
+# =========================================================================
+# layer 6 - the platform layer
+#
+# A metadata store, a CLI, and a reconciler. The lock is not decoration: two
+# `minidock run` processes race on this file, and the CNI plugin's IPAM store
+# behind them.
+# =========================================================================
+
+
+@contextlib.contextmanager
+def state(write=False):
+    os.makedirs(ROOT, exist_ok=True)
+    lock = open(DB + ".lock", "a+")
+    fcntl.flock(lock, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+    try:
+        data = {}
+        if os.path.exists(DB):
+            with open(DB) as f:
+                data = json.load(f)
+        yield data
+        if write:
+            tmp = DB + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, DB)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def find(name_or_id):
+    with state() as db:
+        if name_or_id in db:
+            return name_or_id, db[name_or_id]
+        for cid, c in db.items():
+            if c.get("name") == name_or_id or cid.startswith(name_or_id):
+                return cid, c
+    die(f"no such container: {name_or_id}")
+
+
+def update(cid, **fields):
+    with state(write=True) as db:
+        db.setdefault(cid, {}).update(fields)
+
+
+def teardown(cid, c, remove_dirs):
+    """Undo layers 4 and 2, in reverse order. Every step must be idempotent."""
+    if c.get("netns"):
+        net_down(cid, c["netns"])
+    bundle = f"{CONTAINERS}/{cid}"
+    if os.path.ismount(f"{bundle}/rootfs"):
+        umount_rootfs(bundle)
+    subprocess.run(["runc", "--root", RUNC_ROOT, "delete", "--force", cid],
+                   capture_output=True)
+    if remove_dirs:
+        shutil.rmtree(bundle, ignore_errors=True)
+
+
+def shim(cid, attach):
+    """Be the parent runc refuses to be.
+
+    This function is I3.13's microshim.py with a log writer bolted on, and it
+    is doing containerd's single most important job: staying alive to own the
+    container's stdio and to collect its exit status. runc will not - it execs
+    away and leaves, which is why something has to stay (I3.2). Kill minidock's
+    own CLI while a detached container runs and nothing happens to it, because
+    the process holding the pipes is this one, already re-parented to PID 1.
+    """
+    with state() as db:
+        c = db[cid]
+    log = CriLog(f"{CONTAINERS}/{cid}/log/0.log",
+                 max_bytes=c.get("logMaxBytes", 1 << 20),
+                 max_files=c.get("logMaxFiles", 3))
+    r_out, w_out = os.pipe()
+    r_err, w_err = os.pipe()
+    p = subprocess.Popen(
+        ["runc", "--root", RUNC_ROOT, "run", "--bundle", f"{CONTAINERS}/{cid}", cid],
+        stdin=subprocess.DEVNULL, stdout=w_out, stderr=w_err)
+    os.close(w_out)
+    os.close(w_err)
+    update(cid, status="running", pid=p.pid, startedAt=stamp())
+    sel = selectors.DefaultSelector()
+    sel.register(r_out, selectors.EVENT_READ, "stdout")
+    sel.register(r_err, selectors.EVENT_READ, "stderr")
+    live = 2
+    while live:
+        for key, _ in sel.select():
+            data = os.read(key.fileobj, 65536)
+            if not data:
+                sel.unregister(key.fileobj)
+                os.close(key.fileobj)
+                live -= 1
+                continue
+            log.feed(key.data, data)
+            if attach:
+                out = sys.stdout if key.data == "stdout" else sys.stderr
+                out.buffer.write(data)
+                out.flush()
+    rc = p.wait()
+    log.close()
+    update(cid, status="exited", exitCode=rc, finishedAt=stamp(), pid=None,
+           exitedEpoch=time.time())
+    with state() as db:
+        keep = db[cid].get("restart") == "always"
+    if not keep:
+        teardown(cid, c, remove_dirs=c.get("autoremove", False))
+        if c.get("autoremove"):
+            with state(write=True) as db:
+                db.pop(cid, None)
+    return rc
+
+
+def start_container(cid, detach):
+    """Run the shim, in this process or a detached one. `-d` is a fork()."""
+    if not detach:
+        return shim(cid, attach=True)
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()                       # leave the session: no controlling tty
+        fd = os.open("/dev/null", os.O_RDWR)
+        for target in (0, 1, 2):
+            os.dup2(fd, target)
+        try:
+            rc = shim(cid, attach=False)
+        except Exception as e:            # a dead shim must still record why
+            update(cid, status="error", error=str(e))
+            rc = 125
+        os._exit(rc if 0 <= rc < 256 else 1)
+    # The parent does NOT wait. That is the whole of `-d`: this process is
+    # about to exit and the container will not notice, because the process
+    # holding its pipes is the child, now re-parented to PID 1 (I7.3).
+    return 0
+
+
+def cmd_run(args):
+    need_root()
+    manifest, _ = resolve(args.image)
+    cid = os.urandom(32).hex()
+    bundle = f"{CONTAINERS}/{cid}"
+    os.makedirs(bundle, exist_ok=True)
+    volumes = []
+    for v in args.volume:
+        name, _, dest = v.partition(":")
+        if not dest.startswith("/"):
+            die(f"-v {v}: expected name:/absolute/path")
+        volumes.append((name, dest))
+    if args.name:
+        with state() as db:
+            if any(c.get("name") == args.name for c in db.values()):
+                die(f"the name {args.name!r} is already in use")
+    t0 = time.time()
+    lowers, image_cfg = unpack(manifest)
+    if os.environ.get("MINIDOCK_DEBUG"):
+        print(f"  unpack: {time.time() - t0:.3f}s for {len(lowers)} layers",
+              file=sys.stderr)
+    rootfs = mount_rootfs(lowers, bundle)
+    netns = ip = None
+    try:
+        if args.network != "none":
+            netns, ip, result = net_up(cid)
+            with open(f"{bundle}/cni-result.json", "w") as f:
+                json.dump(result, f, indent=1)
+        # Three files the runtime writes into every container, all of them
+        # because the image cannot know them (I8.6 - CRI writes the same three).
+        os.makedirs(f"{rootfs}/etc", exist_ok=True)
+        with open(f"{rootfs}/etc/resolv.conf", "w") as f:
+            f.write(RESOLV)
+        with open(f"{rootfs}/etc/hostname", "w") as f:
+            f.write((args.hostname or cid[:12]) + "\n")
+        with open(f"{rootfs}/etc/hosts", "w") as f:
+            f.write(f"127.0.0.1 localhost\n{(ip or '').split('/')[0]} "
+                    f"{args.hostname or cid[:12]}\n")
+        opts = {"args": args.cmd, "entrypoint": args.entrypoint.split() if
+                args.entrypoint else None, "env": args.env, "user": args.user,
+                "workdir": args.workdir, "volumes": volumes,
+                "memory": parse_size(args.memory) if args.memory else None,
+                "cpus": args.cpus, "read_only": args.read_only,
+                "hostname": args.hostname}
+        spec = make_spec(image_cfg, opts, rootfs, netns, cid)
+        with open(f"{bundle}/config.json", "w") as f:
+            json.dump(spec, f, indent=2)
+    except Exception:
+        if netns:
+            net_down(cid, netns)
+        umount_rootfs(bundle)
+        shutil.rmtree(bundle, ignore_errors=True)
+        raise
+    update(cid, name=args.name or cid[:12], image=args.image, status="created",
+           createdAt=stamp(), netns=netns, ip=ip, args=spec["process"]["args"],
+           restart=args.restart, autoremove=args.rm, exitCode=None,
+           restarts=0, logMaxBytes=parse_size(args.log_max_size),
+           logMaxFiles=args.log_max_files)
+    if args.detach:
+        print(cid)
+    rc = start_container(cid, args.detach)
+    if not args.detach:
+        # Propagate the container's exit code as our own. Reading it back out
+        # of the metadata store instead looks equivalent and is not: --rm has
+        # already deleted the record by the time we would look.
+        sys.exit(rc)
+    return 0
+
+
+def parse_size(s):
+    if s is None:
+        return None
+    m = re.fullmatch(r"(\d+)([kKmMgG]?)", str(s))
+    if not m:
+        die(f"cannot parse size: {s}")
+    return int(m.group(1)) * {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[
+        m.group(2).lower()]
+
+
+def cmd_ps(args):
+    with state() as db:
+        rows = [(cid, c) for cid, c in db.items()
+                if args.all or c.get("status") == "running"]
+    print(f"{'ID':<14}{'NAME':<14}{'IMAGE':<22}{'STATUS':<10}"
+          f"{'IP':<18}{'RESTARTS':>8}")
+    for cid, c in sorted(rows, key=lambda r: r[1].get("createdAt", "")):
+        st = c.get("status", "?")
+        if st == "exited":
+            st = f"exited({c.get('exitCode')})"
+        print(f"{cid[:12]:<14}{(c.get('name') or '')[:12]:<14}"
+              f"{(c.get('image') or '')[:20]:<22}{st:<10}"
+              f"{(c.get('ip') or '-'):<18}{c.get('restarts', 0):>8}")
+
+
+def cmd_logs(args):
+    cid, c = find(args.container)
+    path = f"{CONTAINERS}/{cid}/log/0.log"
+    if not os.path.exists(path):
+        die(f"no log file for {args.container} - it may have been removed")
+    streams = ("stdout",) if args.stdout_only else ("stdout", "stderr")
+    for ts, stream, text in read_cri_log(path, args.tail, streams):
+        prefix = f"{ts} " if args.timestamps else ""
+        # I12.3: crictl replays the stream field onto ITS OWN stdout/stderr,
+        # which is why `crictl logs x 2>/dev/null` silently drops half the
+        # output. Same here, and for the same reason: it is the honest choice.
+        out = sys.stdout if stream == "stdout" else sys.stderr
+        print(prefix + text, file=out)
+
+
+def cmd_exec(args):
+    need_root()
+    cid, c = find(args.container)
+    if c.get("status") != "running":
+        die(f"container is {c.get('status')}, not running")
+    # I3.11: exec re-enters every namespace and the cgroup. It ALSO inherits
+    # the container's process block - runc 1.5.1 seeds the exec process from
+    # config.json, so cwd, env and user all come through unless you override
+    # them. Passing --cwd / here unconditionally, as an earlier draft of this
+    # file did, hides that and makes the runtime look like it forgets.
+    argv = ["runc", "--root", RUNC_ROOT, "exec"]
+    for e in args.env:
+        argv += ["--env", e]
+    if args.workdir:
+        argv += ["--cwd", args.workdir]
+    if args.user:
+        argv += ["--user", args.user]
+    p = subprocess.run(argv + [cid] + args.cmd)
+    sys.exit(p.returncode)
+
+
+def cmd_stop(args):
+    need_root()
+    cid, c = find(args.container)
+    if c.get("status") != "running":
+        return
+    subprocess.run(["runc", "--root", RUNC_ROOT, "kill", cid, "TERM"],
+                   capture_output=True)
+    for _ in range(args.time * 10):
+        with state() as db:
+            if db.get(cid, {}).get("status") != "running":
+                return
+        time.sleep(0.1)
+    subprocess.run(["runc", "--root", RUNC_ROOT, "kill", cid, "KILL"],
+                   capture_output=True)
+
+
+def cmd_rm(args):
+    need_root()
+    for target in args.container:
+        cid, c = find(target)
+        if c.get("status") == "running":
+            if not args.force:
+                die(f"{target} is running (use -f), and refusing is the point: "
+                    f"a removed record with a live container is I7.14's fault")
+            subprocess.run(["runc", "--root", RUNC_ROOT, "kill", cid, "KILL"],
+                           capture_output=True)
+            for _ in range(50):
+                with state() as db:
+                    if db.get(cid, {}).get("status") != "running":
+                        break
+                time.sleep(0.1)
+        with state() as db:
+            c = db.get(cid, c)
+        teardown(cid, c, remove_dirs=True)
+        with state(write=True) as db:
+            db.pop(cid, None)
+        print(cid[:12])
+
+
+def cmd_supervise(args):
+    """The reconciliation loop, and B13.12 was not exaggerating.
+
+    Desired state: every container with restart=always is running. Observed
+    state: the metadata store. The loop compares them and acts on the
+    difference - and inherits, immediately and unavoidably, every problem the
+    real ones have: a crash loop needs backoff or it becomes a fork bomb, and
+    "exited cleanly" and "was killed" are different facts that this policy
+    deliberately does not distinguish (restart=always means always).
+    """
+    need_root()
+    while True:
+        with state() as db:
+            snapshot = {cid: dict(c) for cid, c in db.items()}
+        for cid, c in snapshot.items():
+            if c.get("restart") != "always" or c.get("status") != "exited":
+                continue
+            n = c.get("restarts", 0)
+            backoff = min(2 ** n, 300)              # 1s, 2s, 4s ... capped at 5m
+            since = time.time() - c.get("exitedEpoch", 0)
+            if since < backoff:
+                continue
+            print(f"{stamp()} restarting {c.get('name')} "
+                  f"(exit {c.get('exitCode')}, attempt {n + 1}, "
+                  f"backoff was {backoff}s)", flush=True)
+            update(cid, restarts=n + 1, status="created")
+            start_container(cid, detach=True)
+        if args.once:
+            return
+        time.sleep(args.interval)
+
+
+def cmd_inspect(args):
+    cid, c = find(args.container)
+    out = dict(c, id=cid, bundle=f"{CONTAINERS}/{cid}")
+    cfg = f"{CONTAINERS}/{cid}/config.json"
+    if os.path.exists(cfg) and args.spec:
+        with open(cfg) as f:
+            out["spec"] = json.load(f)
+    print(json.dumps(out, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="minidock", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("pull", help="fetch an image into the content store")
+    p.add_argument("ref")
+    p.set_defaults(fn=cmd_pull)
+
+    p = sub.add_parser("images", help="what is in the store")
+    p.set_defaults(fn=cmd_images)
+
+    p = sub.add_parser("verify", help="re-hash every blob in the content store")
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("run", help="run a container")
+    p.add_argument("-d", "--detach", action="store_true")
+    p.add_argument("--name")
+    p.add_argument("--rm", action="store_true", help="delete it when it exits")
+    p.add_argument("-e", "--env", action="append", default=[])
+    p.add_argument("-v", "--volume", action="append", default=[],
+                   help="name:/path - a named volume, surviving the container")
+    p.add_argument("--memory", help="e.g. 64m")
+    p.add_argument("--cpus", type=float, help="e.g. 0.2")
+    p.add_argument("--user")
+    p.add_argument("--workdir")
+    p.add_argument("--hostname")
+    p.add_argument("--entrypoint")
+    p.add_argument("--read-only", action="store_true")
+    p.add_argument("--network", default="minidock", choices=["minidock", "none"])
+    p.add_argument("--restart", default="no", choices=["no", "always"])
+    p.add_argument("--log-max-size", default="1m")
+    p.add_argument("--log-max-files", type=int, default=3)
+    p.add_argument("image")
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("ps", help="what is running")
+    p.add_argument("-a", "--all", action="store_true")
+    p.set_defaults(fn=cmd_ps)
+
+    p = sub.add_parser("logs", help="read the CRI-format log back")
+    p.add_argument("container")
+    p.add_argument("--tail", type=int)
+    p.add_argument("-t", "--timestamps", action="store_true")
+    p.add_argument("--stdout-only", action="store_true")
+    p.set_defaults(fn=cmd_logs)
+
+    p = sub.add_parser("exec", help="run a command in a running container")
+    p.add_argument("container")
+    p.add_argument("-e", "--env", action="append", default=[])
+    p.add_argument("--workdir")
+    p.add_argument("--user")
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_exec)
+
+    p = sub.add_parser("stop", help="SIGTERM, then SIGKILL")
+    p.add_argument("container")
+    p.add_argument("-t", "--time", type=int, default=10)
+    p.set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("rm", help="remove a container and its bundle")
+    p.add_argument("container", nargs="+")
+    p.add_argument("-f", "--force", action="store_true")
+    p.set_defaults(fn=cmd_rm)
+
+    p = sub.add_parser("supervise", help="the restart reconciler (run under systemd)")
+    p.add_argument("--interval", type=float, default=2.0)
+    p.add_argument("--once", action="store_true")
+    p.set_defaults(fn=cmd_supervise)
+
+    p = sub.add_parser("inspect", help="the metadata store's view of a container")
+    p.add_argument("container")
+    p.add_argument("--spec", action="store_true", help="include config.json")
+    p.set_defaults(fn=cmd_inspect)
+
+    args = ap.parse_args()
+    try:
+        sys.exit(args.fn(args) or 0)
+    except RuntimeError as e:
+        die(str(e))
+    except urllib.error.HTTPError as e:
+        die(f"{e.code} {e.reason} on {e.url}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
