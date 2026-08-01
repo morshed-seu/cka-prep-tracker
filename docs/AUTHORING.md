@@ -121,6 +121,23 @@ Two more, learned the hard way and worth never repeating:
   `vm.sh cap NAME 'bash ~/x.sh'`. In I-S14 an escaped `\"` inside a snippet made
   `grep` search for literal quote characters and produced a plausible-looking
   wrong answer — the worst possible failure mode for a captured lab.
+- **A registry started with `nerdctl run -d` is not ready the instant the
+  command returns.** A fixed `sleep 2` after starting it was intermittently
+  too short under load in I-S19 — poll `curl .../v2/` for the expected status
+  code instead, and do this unconditionally (not only on first start), since a
+  `--restart=always` container can also be mid-restart when a script runs.
+  The symptom was exactly two of eight gauntlet fault scripts failing, but
+  only when they ran first in a longer sequence — never standalone.
+- **`crictl rmp` takes a pod ID, not a name.** A cleanup line like
+  `crictl rmp -f mypod || true` silently does nothing (wrong argument,
+  swallowed by `|| true`), leaving a stale sandbox reservation that fatals
+  the *next* run with `"name ... is reserved for ..."`. Look pods up by
+  `--name` first: `crictl pods --name mypod -q | xargs -r crictl rmp -f`.
+- **`ctr images ls -q <ref>` is not "resolve this ref" — it treats the
+  argument as a filter expression**, and a bare `host:port/repo:tag` ref's
+  colons parse as filter operators and error. Use `ctr images ls "name==<ref>"`
+  and read the `DIGEST` column; `-q` alone just prints matching refs, not
+  digests.
 
 ## Commit discipline
 
