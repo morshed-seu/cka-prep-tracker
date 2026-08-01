@@ -50,8 +50,14 @@ if ! nerdctl ps -a --format '{{.Names}}' | grep -qx "$REG"; then
     -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=gauntlet \
     -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
     docker.io/library/registry:2 >/dev/null
-  sleep 2
 fi
+# Wait for the registry to actually answer, rather than a fixed sleep — a
+# freshly (re)started container is not instantly ready to accept connections.
+for _ in $(seq 1 30); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v2/" 2>/dev/null || true)
+  if [ "$code" = "401" ]; then break; fi
+  sleep 1
+done
 
 mkdir -p "$CERTSD"
 GOODAUTH=$(printf 'gauntlet:secretpw' | base64 -w0)
