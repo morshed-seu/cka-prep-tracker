@@ -1,0 +1,49 @@
+# captured 2026-08-01T07:49:27Z on sandbox
+# --- snippet ---
+# bash /home/ubuntu/i13-platform.sh
+# --- output ---
+### 1. three containers, concurrently
+ID            NAME          IMAGE                 STATUS    IP                RESTARTS
+dc9af1067220  a             alpine:3.21           running   10.66.0.2/24             0
+8800667f2588  b             alpine:3.21           running   10.66.0.3/24             0
+ebb2d2b33380  c             alpine:3.21           running   10.66.0.4/24             0
+
+### 2. the metadata store is one file, and this is all of it
+{
+ "name": "a",
+ "image": "alpine:3.21",
+ "status": "running",
+ "ip": "10.66.0.2/24",
+ "restart": "no",
+ "restarts": 0,
+ "args": [
+  "sleep",
+  "120"
+ ]
+}
+
+### 3. rm refuses a running container without -f
+minidock: a is running (use -f), and refusing is the point: a removed record with a live container is I7.14's fault
+rc=1
+
+### 4. the reconciler: a container that always fails
+f8b837e2e6af  crasher       alpine:3.21           exited(7) 10.66.0.2/24             0
+
+### 5. supervise it under systemd
+2026-08-01T07:49:33.231891360Z restarting crasher (exit 7, attempt 1, backoff was 1s)
+2026-08-01T07:49:36.236678797Z restarting crasher (exit 7, attempt 2, backoff was 2s)
+2026-08-01T07:49:41.243331911Z restarting crasher (exit 7, attempt 3, backoff was 4s)
+2026-08-01T07:49:50.252998741Z restarting crasher (exit 7, attempt 4, backoff was 8s)
+
+### 6. what the reconciler produced
+f8b837e2e6af  crasher       alpine:3.21           exited(7) 10.66.0.2/24             4
+--- every attempt, from the container's own log:
+started at 07:49:31
+started at 07:49:33
+started at 07:49:36
+started at 07:49:41
+started at 07:49:50
+--- and note the address across all of them:
+  "netns": "/run/netns/md-f8b837e2e6af",
+  "ip": "10.66.0.2/24",
+  "restarts": 4,

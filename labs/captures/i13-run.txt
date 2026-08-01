@@ -1,0 +1,75 @@
+# captured 2026-08-01T07:48:08Z on sandbox
+# --- snippet ---
+# bash /home/ubuntu/i13-run.sh
+# --- output ---
+### 1. what the IMAGE declares (image-spec)
+{
+ "Env": [
+  "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ ],
+ "Cmd": [
+  "/bin/sh"
+ ],
+ "WorkingDir": "/"
+}
+
+### 2. what minidock tells the KERNEL (runtime-spec)
+{
+ "process": {
+  "args": [
+   "sleep",
+   "90"
+  ],
+  "env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "GREETING=hello"
+  ],
+  "cwd": "/tmp",
+  "user": {
+   "uid": 0,
+   "gid": 0
+  }
+ },
+ "hostname": "888f176d7e14",
+ "linux": {
+  "cgroupsPath": "/minidock/888f176d7e14",
+  "resources": {
+   "memory": {
+    "limit": 67108864
+   },
+   "cpu": {
+    "quota": 20000,
+    "period": 100000
+   }
+  }
+ }
+}
+
+### 3. and what the kernel actually has
+memory.max     67108864
+cpu.max        20000 100000
+pids.current   1
+
+### 4. exec inherits the process block - all of it
+cwd=/tmp
+env=hello
+uid=0
+
+### 5. the process tree: who is whose parent
+    PID    PPID COMMAND
+ 166233       1 python3
+ 166234  166233 runc
+ 166252  166234 sleep
+ 166258  166128 sleep
+
+### 6. kill the shim. Does the container notice?
+shim pid: 166233
+--- 1 s later, the workload:
+ 166234       1 runc
+ 166252  166234 sleep
+ 166304  166128 sleep
+--- what minidock believes:
+888f176d7e14  lim           alpine:3.21           running   10.66.0.2/24             0
+--- what runc believes:
+ID PID STATUS
+888f176d7e148887b954c573dda624e9ce8f630fafd9ac
