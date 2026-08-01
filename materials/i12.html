@@ -927,6 +927,195 @@ sudo timeout 6 bpftrace -e \
 </article>
 </div><!-- /g-events-and-deeper -->
 
+<!-- ---------------- Project &amp; drill ---------------- --><div class="grp" id="g-project-drill"><h3>Project &amp; drill</h3>
+<article class="lesson project" id="cp-i12-9" data-id="i12-9">
+<div class="lesson-head"><span class="cp-id">I12.9</span><h4>Mini project — cAdvisor, minus twenty thousand lines</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Everything this group taught is now enough to build the real thing. Not a toy that prints one number — a working Prometheus exporter that discovers every running container, reads its cgroup files, resolves a human name, and serves valid exposition on a port. It is about a hundred lines with comments, and when you are done you will know exactly which twenty thousand lines of cAdvisor you did <em>not</em> write, which is a more useful thing to know than the hundred you did.</p>
+
+<h5>The concept</h5>
+<p>The whole program is four steps, and you have already done all four by hand:</p>
+<ol>
+<li><strong>Discover</strong> — <code>crictl ps -o json</code> lists running containers.</li>
+<li><strong>Locate</strong> — <code>crictl inspect</code> gives <code>.info.runtimeSpec.linux.cgroupsPath</code> (I12.4).</li>
+<li><strong>Read</strong> — <code>cpu.stat</code>, <code>memory.current</code>, <code>memory.stat</code>, <code>pids.current</code> from that directory.</li>
+<li><strong>Render</strong> — exposition format, metric-outermost, with the right content type (I12.5).</li>
+</ol>
+<p>Three decisions in that list are where the judgement lives, and they are the same three cAdvisor had to make. <strong>Which memory number to publish:</strong> we publish both <code>usage</code> and <code>working_set</code>, because I12.6 showed they answer different questions and hiding either one is how people get misled. <strong>What to put in labels:</strong> container name, pod, namespace, and a <em>truncated</em> ID — full IDs would create a new time series on every restart. <strong>How to handle both cgroup drivers:</strong> the systemd form has to be expanded from <code>slice:prefix:id</code> into a nested path, or the exporter silently reports zeros on half the world's clusters.</p>
+<p>What we are <em>not</em> writing is the honest part of the exercise. cAdvisor also handles: several container runtimes, cgroup v1 as well as v2, network and disk I/O statistics, filesystem usage per container, machine-level topology, historical in-memory storage, an event subsystem, and a per-container collection scheduler that avoids stampeding the node. Our version re-reads the files on demand, at scrape time, which is fine for one node and wrong for a thousand.</p>
+
+<div class="specref">
+<p>Worth noticing before you build it: the CRI already has a stats API. Our exporter deliberately goes around it to the kernel, but the interface it duplicates is right there —</p>
+<blockquote>// ListContainerStats returns stats of all running containers.<br>
+rpc ListContainerStats(ListContainerStatsRequest) returns (ListContainerStatsResponse) {}</blockquote>
+<cite>CRI <code>api.proto</code>, <code>ListContainerStats</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">kubernetes/cri-api</a></cite>
+<p>and its <code>MemoryUsage</code> message carries a <code>working_set_bytes</code> field defined simply as "<em>The amount of working set memory in bytes</em>". So the runtime will do the subtraction for you if you ask it. Going to the files instead is a learning choice here — but it is also what cAdvisor genuinely does, because the CRI's stats set is narrower than what a monitoring system wants.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>The exporter ships with this track as <a href="../labs/intermediate/cgexport.py"><code>labs/intermediate/cgexport.py</code></a>. Read it first — it is short — then run one scrape against whatever is running.
+<pre class="cmd">sudo python3 cgexport.py --once | head -12</pre>
+<pre class="out"># HELP container_cpu_usage_seconds_total Cumulative CPU time consumed by the container.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0.013036
+container_cpu_usage_seconds_total{container="spinner",pod="-",namespace="-",id="4830d159132b"} 1.030326
+# HELP container_cpu_throttled_seconds_total Cumulative time the container was throttled by its CPU quota.
+# TYPE container_cpu_throttled_seconds_total counter
+container_cpu_throttled_seconds_total{container="sleeper",pod="-",namespace="-",id="4c192e17f429"} 0.000000
+container_cpu_throttled_seconds_total{container="spinner",pod="-",namespace="-",id="4830d159132b"} 2.261186</pre>
+<p>Note the grouping: both containers appear under one <code>HELP</code>/<code>TYPE</code> pair, which is the "one single group" rule from I12.5. Note also <code>pod="-"</code> and <code>namespace="-"</code> — these containers were created by hand, so they carry none of the <code>io.kubernetes.pod.*</code> labels the kubelet sets, and the exporter has nothing to resolve. On a real node those fill in.</p></li>
+
+<li>Serve it and check the two things a static file server got wrong.
+<pre class="cmd">sudo setsid python3 cgexport.py &amp; sleep 3
+curl -s -o /dev/null -w "  status=%{http_code}\n  content-type=%{content_type}\n  bytes=%{size_download}\n" \
+  http://127.0.0.1:9101/metrics</pre>
+<pre class="out">  status=200
+  content-type=<b>text/plain; version=0.0.4; charset=utf-8</b>
+  bytes=3270</pre></li>
+
+<li><strong>Now do the thing the project is actually for:</strong> take two samples a minute apart and turn the counter into a rate by hand. This is the arithmetic every dashboard hides.
+<pre class="cmd">S1=$(curl -s localhost:9101/metrics | awk '/^container_cpu_usage_seconds_total.*spinner/{print $2}')
+sleep 20
+S2=$(curl -s localhost:9101/metrics | awk '/^container_cpu_usage_seconds_total.*spinner/{print $2}')
+awk -v a="$S1" -v b="$S2" 'BEGIN{printf "  rate = (%.3f - %.3f) / 20s = %.3f cores = %.1f%%\n",
+  b, a, (b-a)/20, (b-a)/20*100}'</pre>
+<pre class="out">  sample 1: 1.990521
+  sample 2: 7.998074
+  rate = (7.998 - 1.991) / 20s = <b>0.300 cores = 30.0%</b></pre></li>
+
+<li>Check your arithmetic against two independent sources: the quota the container was given, and the tool.
+<pre class="cmd">sudo crictl stats</pre>
+<pre class="out">CONTAINER      NAME      CPU %     MEM       DISK      INODES   SWAP
+4830d159132b2  spinner   <b>29.96</b>     229.4kB   8.192kB   3        0B
+4c192e17f4297  sleeper   0.00      208.9kB   8.192kB   3        0B</pre>
+<p>The container was created with <code>cpu_quota 30000 / cpu_period 100000</code> — a 30% cap. Our hand-computed rate says 30.0%, <code>crictl stats</code> says 29.96%, and the kernel's <code>cpu.max</code> says 30%. Three independent paths to the same number, and you built one of them.</p>
+<p>Graph it on paper: two points, twenty seconds apart, slope 0.3. That is the entire content of a CPU dashboard panel.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Your exporter serves a 200 with <code>text/plain; version=0.0.4</code>, lists every running container, and its CPU rate agrees with <code>crictl stats</code> and with the configured quota. You can point at the three judgement calls in the code and say why each went the way it did.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Scrape-time collection does not scale.</strong> Reading every container's cgroup files inside the HTTP handler means a slow scraper stalls the exporter, and two scrapers double the work. Real exporters collect on their own timer and serve the last result.</li>
+<li><strong>Never label with the full container ID.</strong> Each restart mints a new one and therefore a new time series, forever. Truncate, or leave it out.</li>
+<li><strong>An exception inside the handler must not kill the process.</strong> A container deleted between the <code>ps</code> and the <code>inspect</code> is normal, not exceptional — the exporter catches it and returns a 500 for that scrape instead of dying.</li>
+<li><strong>Needs root</strong>, because the CRI socket and the containers' cgroup files are root-owned. An exporter is therefore a privileged component — which, as I11 would put it, is a decision and not a detail.</li>
+</ul>
+
+<div class="k8s-link">
+<p>What you have built is structurally the node-exporter/cAdvisor pattern: a privileged DaemonSet pod, host namespaces, reading <code>/sys/fs/cgroup</code> and serving text on a port that Prometheus scrapes. The path from your port to a <code>kubectl top</code> number runs through metrics-server and the aggregated API instead (<a href="w3.html#cp-3-19">W3 · metrics-server</a>) — a deliberately separate, much smaller pipeline, because scaling decisions should not depend on your monitoring stack being healthy.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the Prometheus "writing exporters" guide is the reference for the conventions used here (naming, base units, <code>_total</code>). For the interface we bypassed, search the CRI proto for <code>ListContainerStats</code> and <code>working_set_bytes</code>.</p>
+</article>
+
+<article class="lesson drill" id="cp-i12-10" data-id="i12-10">
+<div class="lesson-head"><span class="cp-id">I12.10</span><h4>Debugging drill — logs that stopped, and memory that grew on its own</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Two faults, chosen because they are the ones people actually meet and because both are <em>misdiagnosed in the same direction</em> — as an application bug, when neither is. In both, the container is healthy and behaving correctly, and the misleading signal is coming from the observability layer itself. Fixing them requires knowing exactly which file the number came from, which is what this module has been for.</p>
+
+<h5>The concept</h5>
+<p><strong>Fault 1 — the logs stopped, and the disk is full of a file that does not exist.</strong> Somebody deletes or renames a container's log file. The runtime does not notice, because it holds a file descriptor and descriptors refer to inodes, not names (B5). So containerd keeps writing into a nameless inode: <code>crictl logs</code> fails, the directory looks empty, <code>du</code> reports nothing — and the disk fills anyway. The disagreement between <code>df</code> and <code>du</code> is the signature, and it is B5's "impossible full disk" showing up at the observability layer.</p>
+<p><strong>Fault 2 — memory climbs and the workload did not change.</strong> A container's memory graph rises steadily over hours. Nothing was deployed. The application's own heap metrics are flat. What is growing is page cache, charged to the cgroup because the container read or wrote files (I12.6) — and the graph is plotting <code>memory.current</code> or <code>usageBytes</code> rather than the working set. There is no leak. The proof takes one command, and the fix is to change the query.</p>
+
+<div class="specref">
+<p>Fault 1 is not a bug in containerd, in the filesystem, or in <code>rm</code>. It is the documented behaviour of <code>unlink</code>, and every piece of the symptom follows from this one sentence:</p>
+<blockquote>If the name was the last link to a file but any processes still have the file open, the file will remain in existence until the last file descriptor referring to it is closed.</blockquote>
+<cite><code>unlink(2)</code>, DESCRIPTION — <a href="https://man7.org/linux/man-pages/man2/unlink.2.html">man7.org</a></cite>
+<p>"Remain in existence" includes its blocks. That is why the space is not freed, and why no amount of deleting things in that directory will bring it back — the file you would need to delete has no name to delete it by.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li><strong>Fault 1, planted.</strong> A container is logging steadily; delete its log file while it runs.
+<pre class="cmd">LOG=/var/log/pods/default_obs_obs-uid/noisy/0.log
+sudo ls -l "$LOG"
+sudo rm -f "$LOG"
+sleep 5</pre>
+<pre class="out">-rw-r----- 1 root root <b>10028438</b> Aug  1 12:38 …/noisy/0.log</pre></li>
+
+<li><strong>The symptoms, in the order an operator meets them.</strong> Work through them before reading the diagnosis.
+<pre class="cmd">sudo crictl logs "$CID" 2&gt;&amp;1 | tail -1
+sudo crictl ps | tail -1
+sudo du -sh /var/log/pods/default_obs_obs-uid/noisy/</pre>
+<pre class="out">level=<b>fatal</b> msg="failed to try resolving symlinks in path \"…/noisy/0.log\": lstat …: no such file or directory"
+a1121e9f05fcf  alpine:3.21  12 seconds ago  <b>Running</b>  noisy  0  …
+<b>4.0K</b>	/var/log/pods/default_obs_obs-uid/noisy/</pre>
+<p>The container is <em>Running</em> and producing output at full speed. The log directory is empty. Something is consuming disk that nothing can see.</p></li>
+
+<li><strong>The diagnosis.</strong> Ask who still has the file open — and remember from I12.1 that it is containerd, not the shim.
+<pre class="cmd">CTRD=$(systemctl show containerd -p MainPID --value)
+sudo ls -l /proc/$CTRD/fd | grep "0.log"
+sleep 4
+sudo ls -lL /proc/$CTRD/fd/27 | awk '{print "  size now: "$5}'</pre>
+<pre class="out">lrwx------ 1 root root 64 … 27 -&gt; /var/log/pods/…/noisy/0.log <b>(deleted)</b>
+  size now: <b>39110936</b></pre>
+<p><code>(deleted)</code> is the kernel telling you the inode has no name left. And it is still growing — 39 MB and climbing, in a file that <code>ls</code> cannot show you.</p></li>
+
+<li>Confirm the disk cost with the <code>df</code>/<code>du</code> disagreement, using a container that wrote a large log and then went idle.
+<pre class="cmd">sudo ls -l "$LOG" | awk '{print "  log size: "$5}'
+D0=$(df --output=used -k /var | tail -1)
+sudo rm -f "$LOG"; sleep 3
+D1=$(df --output=used -k /var | tail -1)
+echo "  df: ${D0}K -&gt; ${D1}K  (freed $((D0-D1))K)"
+echo "  du of the log dir: $(sudo du -sk /var/log/pods/default_obs_obs-uid | cut -f1)K"</pre>
+<pre class="out">  log size: <b>300853511</b>
+  df: 15033832K -&gt; 15033832K  (freed <b>0K</b>)
+  du of the log dir: <b>8K</b></pre>
+<p>A 300 MB file was deleted and <strong>zero bytes were freed</strong>. <code>du</code> now says 8K; <code>df</code> still says the space is gone. They are both correct — they measure different things, and only one of them can see nameless inodes.</p></li>
+
+<li><strong>The repair.</strong> The space returns when the last descriptor closes — and nothing you do in the filesystem can cause that.
+<pre class="cmd">sudo crictl rmp -fa          # deleting the container closes containerd's fd
+sleep 4
+D2=$(df --output=used -k /var | tail -1)
+echo "  df: ${D1}K -&gt; ${D2}K  (freed $((D1-D2))K)"</pre>
+<pre class="out">  df: 15033832K -&gt; 14739940K  (freed <b>293892K</b>)</pre>
+<p>All 287 MB back at once. On a real node the same repair is <code>kubectl delete pod</code>, or restarting the runtime — both of which work by closing the descriptor, not by touching the disk. Note the operational trap: a <code>tail -f</code> that a colleague left running on the old path is <em>also</em> a holder, and will quietly keep the inode alive after the container is gone.</p></li>
+
+<li><strong>Fault 2, planted.</strong> A container's memory metric rises with no change in the workload. Reproduce it in one command.
+<pre class="cmd">echo "before: memory.current=$(sudo cat "$D/memory.current")"
+sudo crictl exec "$CID" /bin/sh -c 'dd if=/dev/zero of=/big bs=1M count=64; sync'
+echo "after:  memory.current=$(sudo cat "$D/memory.current")"</pre>
+<pre class="out">before: memory.current=229376
+after:  memory.current=<b>69345280</b></pre></li>
+
+<li><strong>The diagnosis, in one command.</strong> Split the number into what the workload allocated and what the kernel cached on its behalf.
+<pre class="cmd">sudo awk '/^(anon|file|inactive_file) /{print "  "$0}' "$D/memory.stat"
+sudo crictl stats --output json "$CID" | jq -r '.stats[0].memory |
+  "  workingSetBytes = \(.workingSetBytes.value)\n  rssBytes        = \(.rssBytes.value)"'</pre>
+<pre class="out">  anon 65536
+  file 67108864
+  inactive_file 67108864
+  workingSetBytes = <b>2236416</b>
+  rssBytes        = <b>65536</b></pre>
+<p><code>anon</code> and <code>rssBytes</code> are unchanged at 65,536 — the workload allocated nothing. All 67 MB is reclaimable page cache, and <code>workingSetBytes</code> (usage minus <code>inactive_file</code>) already excludes it. <strong>There is no leak.</strong> The fix is to graph and alert on <code>container_memory_working_set_bytes</code>, not <code>container_memory_usage_bytes</code>.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can recognise fault 1 from the <code>df</code>/<code>du</code> disagreement alone, name the process holding the descriptor, and explain why no filesystem operation can free the space. You can settle a suspected memory leak in a container with one <code>memory.stat</code> read, and say which metric the dashboard should have been using.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>Restarting containerd is not a reliable way to measure the fix.</strong> The container immediately starts filling a fresh log file, so <code>df</code> can go <em>up</em> while the old inode is freed. Stop the writes, or close the descriptor by deleting the container, before you measure.</li>
+<li><strong>The stale holder is not always the runtime.</strong> Any <code>tail -f</code>, log shipper or editor with the file open keeps the inode alive. <code>find /proc/[0-9]*/fd -lname '&lt;path&gt;'</code> finds all of them.</li>
+<li><strong>Page cache is still charged against the limit.</strong> "It is only cache" does not mean the container cannot be affected — it will stall in reclaim near <code>memory.max</code>. Slow, high memory, no OOM kill is the recognisable combination.</li>
+<li><strong>Do not "fix" fault 2 by dropping caches or lowering the limit.</strong> Both make real performance worse to improve a number that was never measuring what you thought.</li>
+</ul>
+
+<div class="k8s-link">
+<p>Fault 1 is a common cause of node <code>DiskPressure</code> and of the eviction that follows: the kubelet sees the filesystem filling, cannot find what is using it, and starts evicting pods that are not responsible. Fault 2 is the reason a pod's <code>kubectl top</code> number and a Grafana panel can disagree by an order of magnitude for the same pod at the same moment — <code>kubectl top</code> reports the working set (<a href="w3.html#cp-3-19">W3 · metrics-server</a>). Both belong in the triage sequence at <a href="w6.html#cp-6-1">W6 · events, describe, logs, wide</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 2 unlink</code> for the sentence that explains fault 1 completely; <code>man 1 du</code> and <code>man 1 df</code> for why they disagree; and <code>cgroup-v2.rst</code>'s <code>memory.stat</code> section for the field that settles fault 2.</p>
+</article>
+</div><!-- /g-project-drill -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
@@ -936,13 +1125,40 @@ sudo timeout 6 bpftrace -e \
 <details class="reveal"><summary>Answer</summary><p>One logical line exceeded <code>max_container_log_line_size</code> (default 16384) and was written as a <code>P</code> (partial) record followed by an <code>F</code> (full) record. A correct reader joins a run of <code>P</code> records terminated by one <code>F</code> back into a single line.</p></details></li>
 <li>Why does <code>sudo crictl logs "$CID" 2&gt;/dev/null</code> hide half your application's output?
 <details class="reveal"><summary>Answer</summary><p>Because <code>crictl logs</code> replays the <code>stdout</code>/<code>stderr</code> field onto its own stdout and stderr. Redirecting its stderr to <code>/dev/null</code> discards every line the application wrote to stderr.</p></details></li>
+<li>Who rotates container logs, and what stops the runtime from doing it alone?
+<details class="reveal"><summary>Answer</summary><p>The <strong>kubelet</strong>, via its <code>ContainerLogManager</code>. Rotation needs two halves: rename/compress/delete the files, then tell the holder of the open descriptor to reopen. The second half is the CRI call <code>ReopenContainerLog</code> — the runtime never initiates it, it only responds. Defaults: <code>containerLogMaxSize</code> 10Mi, <code>containerLogMaxFiles</code> 5.</p></details></li>
+<li>You stop containerd for fifteen seconds. A container logging 40 bytes/second is unaffected; a container logging 1 MB/second stops running entirely. Why the difference?
+<details class="reveal"><summary>Answer</summary><p>The pipe between the workload and the shim has a fixed capacity — 65536 bytes by default. While containerd is down nobody drains it. The quiet writer's output fits in the buffer; the chatty writer fills it and its next <code>write(2)</code> blocks, parking the process in <code>pipe_write</code>. Nothing is lost (0 of 11,090 lines missing in the measured run) — logging applies backpressure rather than dropping.</p></details></li>
+<li>A container's <code>memory.current</code> is 69,345,280 while its <code>rssBytes</code> is 65,536. Is it leaking?
+<details class="reveal"><summary>Answer</summary><p>No. The difference is page cache, charged to the cgroup because the container read or wrote files. <code>anon</code> is unchanged, so the workload allocated nothing. The number to use is the working set: <code>memory.current − inactive_file</code>, which the CRI reports as <code>workingSetBytes</code> (2,236,416 here).</p></details></li>
+<li><code>cpu.stat</code> says <code>usage_usec 11768717</code>. What is this container's CPU usage?
+<details class="reveal"><summary>Answer</summary><p>Unanswerable from one sample — it is a counter, not a gauge. You need two samples: <code>Δusage_usec ÷ 10⁶ ÷ Δseconds</code> gives cores. In the lab, 1,008,389 µs over 5.02 s came to 0.201 cores, i.e. 20.1% of one CPU, matching <code>crictl stats</code>' 20.01% and the 20% <code>cpu.max</code> quota.</p></details></li>
+<li>A container shows <code>nr_periods 597</code> and <code>nr_throttled 597</code>. What does that mean, and what will the CPU graph look like?
+<details class="reveal"><summary>Answer</summary><p>It was throttled in <em>every single</em> enforcement period — it is pinned at its quota. The CPU graph will look flat and unremarkable (exactly the quota, e.g. 20%), which is why "the pod is slow but CPU looks fine" is so common. <code>nr_throttled</code> is the file that tells the truth.</p></details></li>
+<li>A container is failing. The event stream shows <code>/snapshot/prepare</code> and <code>/containers/create</code> and then, later, <code>/snapshot/remove</code> and <code>/containers/delete</code>. What happened, and where should you <em>not</em> look?
+<details class="reveal"><summary>Answer</summary><p>No <code>/tasks/*</code> event was emitted, so no process was ever created — the container never started (bad binary, missing entrypoint, unusable rootfs). Do not go looking in the logs or the metrics: there is nothing to have logged and nothing to have consumed CPU.</p></details></li>
+<li>An event stream shows <code>/tasks/exit</code> with no <code>exit_status</code> field. What was the exit code?
+<details class="reveal"><summary>Answer</summary><p>Zero. Protobuf omits zero-valued fields, so a successful exit carries no <code>exit_status</code> at all. Absent and zero are indistinguishable on the wire, and a parser must treat the missing field as 0 rather than as unknown.</p></details></li>
+<li>You need the PID a container's main process sees for itself, but the image has no shell. How?
+<details class="reveal"><summary>Answer</summary><p>Read <code>NSpid</code> from <code>/proc/&lt;host-pid&gt;/status</code> — it lists the process's ID in each PID namespace, outermost first (e.g. <code>NSpid: 7926 7</code>). Do not use <code>crictl exec … echo $$</code>: that reports the PID of the new process the exec just created.</p></details></li>
+<li><code>crictl logs</code> fails with "no such file or directory", the container is <code>Running</code>, <code>du</code> on the log directory says 4K, and <code>df</code> says <code>/var</code> is filling. Diagnose it.
+<details class="reveal"><summary>Answer</summary><p>The log file was deleted or renamed while containerd held it open. The descriptor refers to the inode, not the name, so containerd keeps writing into a file with no name: invisible to <code>ls</code> and <code>du</code>, still charged by <code>df</code>. Confirm with <code>ls -l /proc/&lt;containerd-pid&gt;/fd</code> and look for <code>(deleted)</code>. Only closing the last descriptor frees the space — deleting the container or restarting the runtime, never a filesystem operation.</p></details></li>
+<li>Your hand-written exporter emits <code># TYPE container_cpu_usage_seconds_total counter</code> once per container, each followed by that container's sample. Why is this invalid?
+<details class="reveal"><summary>Answer</summary><p>The exposition format allows only one <code>TYPE</code> line per metric name, and requires all samples for a metric to appear as one single group. Loop metric-outermost and containers-innermost. Also serve <code>text/plain; version=0.0.4</code> — <code>python3 -m http.server</code> sends <code>application/octet-stream</code>.</p></details></li>
+<li>Which process holds the CRI log file open, and which holds the container's stdout pipe?
+<details class="reveal"><summary>Answer</summary><p><strong>containerd</strong> holds the log file (and reads a FIFO the shim writes into). The <strong>shim</strong> holds the read end of the workload's stdout pipe and has zero descriptors on the log file. That division is why the log survives a containerd restart but a chatty container stalls during one.</p></details></li>
 </ol>
 </div>
 
 <div class="outcome">
 <ul>
-<li>Traced one line of application output through all four hops and proved each one from <code>/proc</code>.</li>
-<li>Decoded the CRI log format's five fields and reproduced the partial/full split deliberately.</li>
+<li>Traced one line of application output through all four hops and proved each one from <code>/proc</code> — and can name which process writes the log file.</li>
+<li>Decoded the CRI log format's five fields, reproduced the partial/full split deliberately, and know who owns rotation and what it costs when nobody does.</li>
+<li>Read every container metric from its source in <code>/sys/fs/cgroup</code>, and showed that <code>crictl stats</code> is a unit conversion over the same files.</li>
+<li>Can convert a CPU counter to cores by hand and settle a suspected memory leak with one <code>memory.stat</code> read.</li>
+<li>Answered "did it exit, or was it never started?" from the event stream alone, and profiled a running container from the host without entering it.</li>
+<li>Built a working Prometheus exporter in about a hundred lines, and can say precisely which parts of cAdvisor it does not implement.</li>
+<li><strong>Can answer "what is this container doing?" from the node, without Kubernetes.</strong></li>
 </ul>
 </div>
 
