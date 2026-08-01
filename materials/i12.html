@@ -721,6 +721,212 @@ cee11e82b50d1  worker  19.90  <b>2.241MB</b>  8.192kB  3  0B</pre>
 </article>
 </div><!-- /g-metrics -->
 
+<!-- ---------------- Events and deeper ---------------- --><div class="grp" id="g-events-and-deeper"><h3>Events and deeper</h3>
+<article class="lesson" id="cp-i12-7" data-id="i12-7">
+<div class="lesson-head"><span class="cp-id">I12.7</span><h4>The third signal: did it exit, or was it never started?</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>Logs tell you what a container said. Metrics tell you what it consumed. Neither can tell you about a container that never got far enough to say or consume anything — and that is a large fraction of real failures. "It's not starting" and "it starts and dies immediately" look identical from the outside and need completely different repairs. The event stream separates them in one glance.</p>
+
+<h5>The concept</h5>
+<p>containerd publishes an event for every state change it makes, on a bus you can subscribe to with <code>ctr events</code>. Unlike logs and metrics, this is a record of the <em>runtime's own actions</em>, so it is authoritative about causation in a way the other two signals are not. I7 established the full sequence for a healthy container; the diagnostic value comes from knowing which events are <em>missing</em>.</p>
+<p>The shape is <code>/&lt;subsystem&gt;/&lt;verb&gt;</code>, and a normal container's life produces eight of them in a fixed order:</p>
+<div class="flow"><span>/snapshot/prepare</span><em>→</em><span>/containers/create</span><em>→</em><span>/tasks/create</span><em>→</em><span>/tasks/start</span><em>→</em><span>/tasks/exit</span><em>→</em><span>/tasks/delete</span><em>→</em><span>/containers/delete</span><em>→</em><span>/snapshot/remove</span></div>
+<p>Read that as two halves, because the split is the whole diagnostic. <code>/snapshot/*</code> and <code>/containers/*</code> are about the <strong>record and its filesystem</strong> — metadata that exists whether or not anything ever runs. <code>/tasks/*</code> are about a <strong>process actually existing</strong>. A container that fails before <code>execve</code> — bad binary, missing entrypoint, unreadable rootfs — produces the first kind and none of the second.</p>
+<p>One crucial subtlety carried forward from I7: the exit event's <code>exit_status</code> field is a protobuf integer, and protobuf omits zero values. <strong>A successful exit shows no <code>exit_status</code> field at all.</strong> Absent and zero are the same bytes on the wire, so you cannot distinguish "exited 0" from "field missing" — you infer success from the absence.</p>
+
+<div class="specref">
+<p>The CRI gained its own event stream for exactly this reason: polling every container's status on a timer is expensive, and an event says precisely when something changed.</p>
+<blockquote>// GetContainerEvents gets container events from the CRI runtime<br>
+rpc GetContainerEvents(GetEventsRequest) returns (stream ContainerEventResponse) {}</blockquote>
+<cite>CRI <code>api.proto</code>, <code>GetContainerEvents</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">kubernetes/cri-api</a></cite>
+<p>Note <code>stream</code> in the return type: this is a long-lived subscription, not a query. That distinction has a practical consequence in the lab — <strong>you must start listening before the thing you want to observe happens.</strong> There is no history to fetch afterwards, on either containerd's bus or the CRI's.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Start the listener <em>first</em>, then run two containers through one sandbox: one that works and exits 3, and one whose binary does not exist.
+<pre class="cmd">sudo setsid sh -c 'ctr -n k8s.io events &gt; /home/ubuntu/events.txt 2&gt;&amp;1' &amp;
+sleep 2
+# ct-ok.json  : command ["/bin/sh","-c","echo working; exit 3"]
+# ct-bad.json : command ["/no/such/binary"]
+POD=$(sudo crictl runp ~/sb.json)
+A=$(sudo crictl create "$POD" ~/ct-ok.json ~/sb.json);  sudo crictl start "$A"
+B=$(sudo crictl create "$POD" ~/ct-bad.json ~/sb.json); sudo crictl start "$B"
+sleep 2; sudo crictl rmp -fa
+sudo pkill -f '[c]tr -n k8s.io events'</pre></li>
+
+<li>Print the topic of every event in order. Field 6 is the topic (the timestamp occupies the first five).
+<pre class="cmd">sudo awk '{printf "%2d  %-22s %s\n", NR, $6, substr($7,1,50)}' ~/events.txt</pre>
+<pre class="out"> 1  /snapshot/prepare      {"key":"c55f1494…   ← the sandbox
+ 2  /containers/create     {"id":"c55f1494…
+ 3  /tasks/create          {"container_id":"c55f1494…
+ 4  /tasks/start           {"container_id":"c55f1494…
+ 5  /snapshot/prepare      {"key":"0c00e2fa…   ← exits-cleanly
+ 6  /containers/create     {"id":"0c00e2fa…
+ 7  /tasks/create          {"container_id":"0c00e2fa…
+ 8  /tasks/start           {"container_id":"0c00e2fa…
+ 9  /tasks/exit            {"container_id":"0c00e2fa…
+10  /tasks/delete          {"container_id":"0c00e2fa…
+11  /snapshot/prepare      {"key":"e3b4814a…   ← never-starts
+12  /containers/create     {"id":"e3b4814a…
+13  /tasks/exit            {"container_id":"c55f1494…
+14  /tasks/delete          {"container_id":"c55f1494…</pre>
+<p>The pause container gets the same lifecycle as any other container — I8's point, visible here as events 1–4.</p></li>
+
+<li><strong>The diagnosis.</strong> Filter the stream by each container ID and compare the two sequences side by side.
+<pre class="cmd">echo "--- exits-cleanly:"; sudo grep "$A" ~/events.txt | awk '{print "    "$6}'
+echo "--- never-starts:";  sudo grep "$B" ~/events.txt | awk '{print "    "$6}'</pre>
+<pre class="out">--- exits-cleanly:
+    /snapshot/prepare
+    /containers/create
+    <b>/tasks/create</b>
+    <b>/tasks/start</b>
+    <b>/tasks/exit</b>
+    <b>/tasks/delete</b>
+    /snapshot/remove
+    /containers/delete
+--- never-starts:
+    /snapshot/prepare
+    /containers/create
+    /snapshot/remove
+    /containers/delete</pre>
+<p>Eight events versus four. The broken container got a filesystem and a record and then went straight to cleanup — <strong>not a single <code>/tasks/</code> event</strong>. No process was ever created, so there is nothing to have logged and nothing to have consumed CPU. That is the answer, and neither of the other two signals could have given it to you.</p></li>
+
+<li>Read the exit event's payload for the container that <em>did</em> run.
+<pre class="cmd">sudo grep "/tasks/exit" ~/events.txt | grep "$A" | cut -d' ' -f7-</pre>
+<pre class="out">{"container_id":"0c00e2fa…","id":"0c00e2fa…","pid":7015,<b>"exit_status":3</b>,
+ "exited_at":{"seconds":1785566068,"nanos":830404732}}</pre>
+<p><code>exit_status: 3</code> is present because it is non-zero. Run the same container with <code>exit 0</code> and the field vanishes entirely — the protobuf zero-omission from I7.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Shown an event stream for a failed container, you can say whether a process was ever created, and you can name the specific event whose absence proves it. You know why you cannot query the stream retroactively.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>There is no history.</strong> <code>ctr events</code> subscribes from now. If the failure already happened, this signal has nothing for you — which is why the durable version of it is Kubernetes Event objects, stored in etcd with a TTL.</li>
+<li><strong>Absent <code>exit_status</code> means zero.</strong> Do not write a parser that treats the missing field as an error or as unknown.</li>
+<li><strong>Events are namespaced.</strong> <code>ctr events</code> without <code>-n k8s.io</code> subscribes to the <code>default</code> namespace and shows you nothing while pods are churning — I7's namespace trap, in a form that looks like a broken bus.</li>
+<li><strong>The stream is the runtime's actions, not the kubelet's decisions.</strong> It will not tell you <em>why</em> the kubelet asked for something, only that it did.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the node-level ancestor of <code>kubectl get events</code>, and the distinction between the two is worth holding: containerd's bus records what the runtime did, while Kubernetes Events record what a controller decided — including the ones the runtime never heard about, like a failed scheduling attempt. The advanced track's first move is to read those (<a href="w6.html#cp-6-1">W6 · events, describe, logs, wide</a>). The CRI's <code>GetContainerEvents</code> stream above is what "evented PLEG" uses to stop polling every container's status on a timer.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>ctr events --help</code> for the subscription, and search the CRI proto for <code>GetContainerEvents</code> and <code>ContainerEventResponse</code>. On the Kubernetes side, search for "PLEG" to find why an event stream was worth adding to the CRI at all.</p>
+</article>
+
+<article class="lesson" id="cp-i12-8" data-id="i12-8">
+<div class="lesson-head"><span class="cp-id">I12.8</span><h4>Profiling a container from the host, and what eBPF costs</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The moment you most need to inspect a container is the moment it is least able to help you: a distroless image with no shell, a process pegged at 100% CPU, an <code>exec</code> that hangs. All the usual advice — install a debugger, exec in, add a sidecar — assumes cooperation from a container that is not cooperating. But a container is just a process on your machine, and <em>you are root on that machine</em>. Everything you need is in <code>/proc</code> and in tools that never enter the container at all.</p>
+
+<h5>The concept</h5>
+<p>This is the module's payoff for everything the beginner track built. A container's isolation is namespaces (B6) and cgroups (B7), and neither of those hides the process from the host. From outside you can read its memory maps, its open files, its stack, its syscalls and its CPU samples, with no agent inside and no cooperation required.</p>
+<p>The one thing you need first is the <strong>host PID</strong>, because that is the identity the host's tools speak. <code>crictl inspect</code> gives it to you. The mapping between that and the PID the container sees is written down in one place — <code>/proc/&lt;pid&gt;/status</code>'s <code>NSpid</code> line, which lists the process's ID in each nested PID namespace, outermost first.</p>
+<p>From there, three tools in increasing order of power and intrusiveness:</p>
+<ul>
+<li><strong><code>/proc/&lt;pid&gt;/*</code></strong> — free, instantaneous, zero impact. <code>status</code>, <code>wchan</code>, <code>stack</code>, <code>fd/</code>, <code>maps</code>. Answers "what is it blocked on?" without touching it.</li>
+<li><strong><code>strace -p</code></strong> — shows every syscall. It works by stopping the process at each one, so it can slow a busy program by an order of magnitude. Use <code>-c</code> for a summary rather than a firehose.</li>
+<li><strong><code>perf</code></strong> — samples the instruction pointer on a timer interrupt. Overhead is small and bounded, and it tells you where CPU time actually goes.</li>
+</ul>
+<p>And then <strong>eBPF</strong>, which deserves the honest paragraph the checkpoint asks for. eBPF lets you attach small verified programs to kernel hook points and aggregate in kernel space, so you can answer questions like "which syscalls is PID 7926 making, counted by number" with almost no overhead and no process stopping. It is genuinely the best observability mechanism Linux has. Its cost is privilege: the program runs in the kernel, so it needs a <strong>privileged, host-namespace agent</strong> and a reasonably modern kernel. That is not a small ask — it means an eBPF observability tool has, by construction, the access I11 spent a whole module teaching you to withhold. Both facts are true at once, and choosing is a real trade, not an oversight.</p>
+
+<div class="specref">
+<p>The kernel documents the field that makes the whole host-side approach navigable, in one line of a table:</p>
+<blockquote>NSpid&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;descendant namespace process ID hierarchy</blockquote>
+<cite>Linux <code>Documentation/filesystems/proc.rst</code>, Table 1-2 — <a href="https://raw.githubusercontent.com/torvalds/linux/master/Documentation/filesystems/proc.rst">torvalds/linux</a></cite>
+<p>"Hierarchy" is exact: it is a list, one entry per PID namespace the process is in, and reading it from the host gives you both identities at once. The same document describes <code>wchan</code> as showing "<em>the kernel function symbol the task is blocked in — or "0" if not blocked</em>", which is the cheapest possible answer to "is it stuck, and on what?"</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Get the host PID of a busy container and read its identity from <code>/proc</code>.
+<pre class="cmd"># container: while :; do md5sum /etc/services &gt;/dev/null; done
+PID=$(sudo crictl inspect "$CID" | jq -r .info.pid)
+sudo awk '/^(Name|Pid|PPid|NSpid|Threads|VmRSS|CapEff|voluntary)/{print "  "$0}' \
+  /proc/"$PID"/status</pre>
+<pre class="out">  Name:	sh
+  Pid:	7926
+  PPid:	7858
+  <b>NSpid:	7926	7</b>
+  VmRSS:	     944 kB
+  Threads:	1
+  CapEff:	00000000a80425fb
+  voluntary_ctxt_switches:	5206</pre>
+<p>One line, both identities: PID <strong>7926</strong> on the host, PID <strong>7</strong> inside the container. Nothing was executed inside the container to learn this.</p>
+<p class="note">Do not try to get the in-container PID with <code>crictl exec … echo $$</code> — that starts a <em>new</em> process and reports its PID, not the workload's. <code>NSpid</code> is the authority.</p></li>
+
+<li>Confirm the process is in its own namespaces while you are not, which is what makes this "from outside".
+<pre class="cmd">sudo ls -l /proc/"$PID"/ns | awk '{print "  "$9" "$10" "$11}'
+echo "  host net ns: $(readlink /proc/self/ns/net)"</pre>
+<pre class="out">  cgroup -&gt; cgroup:[4026532342]
+  ipc -&gt; ipc:[4026532339]
+  mnt -&gt; mnt:[4026532341]
+  net -&gt; net:[<b>4026532213</b>]
+  pid -&gt; pid:[4026532340]
+  user -&gt; user:[4026531837]
+  host net ns: net:[<b>4026531840</b>]</pre>
+<p>Different network namespace, different mount namespace — but the same <code>user</code> namespace, because this container does not use one (I11). Isolation is per-namespace, not a wall.</p></li>
+
+<li>Ask what it is doing, cheaply first and then expensively.
+<pre class="cmd">echo "wchan: $(sudo cat /proc/"$PID"/wchan)"
+sudo timeout 5 strace -c -f -p "$PID" 2&gt;&amp;1 | tail -6</pre>
+<pre class="out">wchan: <b>do_wait</b>
+  1.33    0.014704           1      8824           mmap
+  0.72    0.007973           0      8824           brk
+  0.55    0.006147           1      4412           writev
+------ ----------- ----------- --------- --------- ----------------
+100.00    1.108500           7    <b>154433</b>      8825 total</pre>
+<p><code>do_wait</code> says the shell is blocked waiting for a child — so the CPU is being burnt by <code>md5sum</code>, not by the shell. 154,433 syscalls in five seconds, and the counts come in multiples of 4,412: one iteration of the loop.</p></li>
+
+<li>Sample it with <code>perf</code>, which costs far less than <code>strace</code>.
+<pre class="cmd">sudo perf record -q -g -p "$PID" -o ~/perf.data -- sleep 3
+sudo perf report -i ~/perf.data --stdio --sort=comm,dso | head -12</pre>
+<pre class="out"># Samples: 71K of event 'cycles:P'
+# Event count (approx.): 9696614815
+# Children      Self  Command  Shared Object
+    <b>46.90%    46.90%  sh       [kernel.kallsyms]</b></pre>
+<p>Nearly half the cycles are in the kernel, under the shell — which is what a fork-per-iteration loop looks like from the outside. <code>perf</code> resolved the command name without any help from the container.</p></li>
+
+<li>Finally, eBPF and the privilege it demands. Try it unprivileged first.
+<pre class="cmd">bpftrace -e 'BEGIN { printf("hello\n"); exit(); }'
+sudo timeout 6 bpftrace -e \
+  "tracepoint:raw_syscalls:sys_enter /pid == $PID/ { @[args.id] = count(); }
+   interval:s:3 { exit(); }"</pre>
+<pre class="out"><b>ERROR: bpftrace currently only supports running as the root user.</b>
+@[57]: 6802     ← clone
+@[15]: 6803     ← rt_sigreturn
+@[61]: 13605    ← wait4
+@[3]: 13605     ← close
+@[14]: 27208    ← rt_sigprocmask</pre>
+<p>Refused outright without root; as root, it filtered by host PID and counted syscalls in the kernel with no process stopping at all. Note the shape of the answer — aggregated counts by syscall number, not a log of events. That aggregation is why it is cheap.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given only a container ID you can produce its host PID, its in-container PID, what it is blocked on, and where its CPU time goes — without executing anything inside it. You can state in one sentence what eBPF requires and why that is a real trade-off.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>crictl exec … echo $$</code> does not give you the workload's PID.</strong> It creates a new process. Use <code>NSpid</code>.</li>
+<li><strong><code>strace</code> is not free.</strong> It stops the target at every syscall; on a syscall-heavy process it can be a several-fold slowdown, which is enough to change the behaviour you are investigating or trip a liveness probe.</li>
+<li><strong>Symbol resolution can fail across the namespace boundary.</strong> <code>perf</code> resolves symbols by reading the binary, and the binary lives in the container's mount namespace — so a stripped or unusual image yields addresses instead of names. Getting to the file usually means <code>/proc/&lt;pid&gt;/root/&lt;path&gt;</code>.</li>
+<li><strong>An eBPF observability agent is a privileged host-namespace pod.</strong> Deploying one is a security decision, not a monitoring decision, and it belongs in the same conversation as I11's hardening.</li>
+</ul>
+
+<div class="k8s-link">
+<p>This is the ladder to climb when <code>kubectl exec</code> is not available — a distroless image with no shell, or a container too wedged to accept a new process. Kubernetes' own supported answer to the same problem is <em>ephemeral containers</em> (<code>kubectl debug</code>), which attaches a debug container to the pod's namespaces; the host-side approach here needs no API access at all, only node access. The advanced track's triage sequence is <a href="w6.html#cp-6-1">W6 · events, describe, logs, wide</a>, and the namespaces you inspected are B6's, seen from the far side.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> <code>man 5 proc</code> for <code>NSpid</code>, <code>wchan</code> and <code>status</code>; <code>man 1 strace</code> for <code>-c</code> and <code>-f</code>; <code>perf record --help</code> for <code>-p</code> and <code>-g</code>. For eBPF, the bpftrace reference guide's one-liner section is the fastest possible introduction.</p>
+</article>
+</div><!-- /g-events-and-deeper -->
+
 <div class="quiz" id="quiz">
 <h3>Quiz</h3>
 <ol>
