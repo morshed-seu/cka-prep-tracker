@@ -109,6 +109,13 @@ Two more, learned the hard way and worth never repeating:
 - **Never run two `tools/vm.sh` calls concurrently.** They share
   `~/.vmrun/run.sh` and `~/.vmrun/out`, so a backgrounded capture and a
   foreground one interleave and each reads the other's output. Serialise them.
+- **A lab's own flags can make the runtime look broken.** In I-S18 the capstone
+  tool passed `--cwd /` on every `runc exec`, and the resulting capture appeared
+  to confirm this repo's I-S8 note that exec does not inherit the container's
+  process block. A bare `runc exec` with nothing overridden proved the opposite.
+  When a capture confirms an existing claim, check that the *harness* is not the
+  thing producing the result — a confirming measurement gets far less scrutiny
+  than a surprising one, which is exactly backwards.
 - **Anything non-trivial belongs in a file, not a snippet.** Once a lab needs
   quoting inside quoting, write it locally, `vm.sh put` it, and
   `vm.sh cap NAME 'bash ~/x.sh'`. In I-S14 an escaped `\"` inside a snippet made
