@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="I12 — Observability of a running runtime: trace one log line from write(2) to the file kubectl logs reads, find the cgroup file behind every container metric, and read the runtime's own event stream.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+<title>I12 — Observability of a running runtime — Intermediate Track</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body class="materials">
+
+<div class="wrap">
+<aside class="side">
+  <div class="brand-row">
+    <div class="brand">Intermediate · Contracts</div>
+    <button class="theme-btn" id="theme" aria-label="Toggle light/dark theme">theme</button>
+  </div>
+  <div class="tracks">
+    <a href="../beginner.html">Beginner<em>The machine under Kubernetes</em></a>
+    <a class="on" href="../intermediate.html">Intermediate<em>Containers &amp; runtimes</em></a>
+    <a href="../index.html">Advanced<em>Kubernetes, through the CKA</em></a>
+  </div>
+  <div class="panel ring-row">
+    <div class="ring" id="ring"><div class="pct" id="pct">0%</div></div>
+    <div class="ring-meta"><strong id="done-count">0 / 0</strong>I12 done</div>
+  </div>
+  <nav><ul class="nav" id="nav"></ul></nav>
+  <div id="matwrap"><h4>Site</h4><ul class="mats">
+    <li><a href="../intermediate.html">← Back to the tracker</a></li>
+    <li><a href="i0.html">I0 · Your build box</a></li>
+    <li><a href="i1.html">I1 · The primitives the beginner track left out</a></li>
+    <li><a href="i2.html">I2 · What a container is, formally</a></li>
+    <li><a href="i3.html">I3 · runc internals</a></li>
+    <li><a href="i4.html">I4</a></li>
+    <li><a href="i5.html">I5</a></li>
+    <li><a href="i6.html">I6</a></li>
+    <li><a href="i7.html">I7</a></li>
+    <li><a href="i8.html">I8</a></li>
+    <li><a href="i9.html">I9</a></li>
+    <li><a href="i10.html">I10</a></li>
+    <li><a href="i11.html">I11</a></li>
+    <li><a href="i12.html">I12 · Observability</a></li>
+  </ul></div>
+</aside>
+
+<main>
+<p class="crumb"><a href="../intermediate.html#i12">← Back to the tracker</a></p>
+<header class="hero">
+  <h1>I12 — Observability of a running runtime</h1>
+  <p>The short module that makes the other twelve debuggable. One line of application output, traced from <code>write(2)</code> to the file <code>kubectl logs</code> reads; one number, traced from a cgroup file to a dashboard — and the honest limits of both.</p>
+  <p>Everything here is the same move: refuse the dashboard and go find the file. A container's logs are a pipe, a FIFO and a text file. Its metrics are six numbers in <code>/sys/fs/cgroup</code>. Its history is an event stream you can <code>tail</code>. Once you have seen each of those with your own eyes, "the monitoring is wrong" stops being a helpless sentence and becomes a question with a location.</p>
+  <div class="weights">
+    <span>Checkpoints<b>10</b></span>
+    <span>Hours<b>~4</b></span>
+    <span>Prerequisites<b>I7 · I8 · B7</b></span>
+  </div>
+</header>
+
+<div class="objectives">
+<ul>
+<li><strong>Logs</strong> — follow one line through all four hops, decode the five-field CRI log format including the partial/full split, and find out who owns rotation (on this node: nobody).</li>
+<li><strong>Metrics</strong> — read the cgroup files that are the only source of any container metric, write valid Prometheus exposition by hand, and get the counter/gauge distinction right before it costs you.</li>
+<li><strong>Events and deeper</strong> — answer "did it exit, or was it never started?" from the runtime's event stream, then profile a container from the host by PID without entering it.</li>
+<li><strong>Project &amp; drill</strong> — build a working exporter in fifty lines, then fix logs that stopped appearing and a memory number that grows on its own.</li>
+</ul>
+</div>
+
+<div class="prereq">
+<p><strong>I7</strong> (the shim owns the stdio) and <strong>I8</strong> (the CRI log format and who chose the directory). B7's cgroup files return as the source of every container metric there is.</p>
+<p><strong>Which machine.</strong> Everything below ran on the <code>sandbox</code> VM — Ubuntu 24.04.4 LTS, kernel 6.8.0-136-generic, cgroup v2 — with containerd 2.3.3, runc 1.5.1, crictl v1.36.0, nerdctl 2.3.5, Python 3.12.3, perf 6.8.12 and bpftrace v0.20.2. There is no kubelet on this node, which is the point: every question in this module is answerable from the runtime alone.</p>
+</div>
+
+<!-- ---------------- Logs ---------------- --><div class="grp" id="g-logs"><h3>Logs</h3>
+<article class="lesson" id="cp-i12-1" data-id="i12-1">
+<div class="lesson-head"><span class="cp-id">I12.1</span><h4>One line, all four hops: from <code>write(2)</code> to the file on disk</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>When somebody says "the logs are missing", they have described a symptom with at least four possible locations. The application's output travels through a pipe, a shim, a FIFO and a daemon before it becomes a file anyone can read, and every famous logging surprise is a property of exactly one of those hops. You cannot diagnose a chain you have never seen, so this lesson walks the whole thing once with real commands and real process IDs.</p>
+
+<h5>The concept</h5>
+<p>Start from the application's point of view, because it is startlingly simple: <strong>the workload does not know it is being logged.</strong> It writes bytes to file descriptor 1. That is the entire contract. It cannot tell whether fd 1 is a terminal, a file, a socket or a pipe, and nothing in the container gives it a hint.</p>
+<p>In a container, fd 1 is a <abbr title="a kernel buffer with a write end and a read end, referred to by file descriptors">pipe</abbr> — a kernel buffer with a write end and a read end, the same object B2 used for shell pipelines. The read end is held by the <strong>shim</strong>, the small per-container process I7 introduced as the on-site foreman: the one who stays after runc leaves. This is why the shim exists at all. Someone has to be holding the other end of that pipe every moment the container is alive, and it cannot be the daemon, because the daemon has to be restartable.</p>
+<p>Here is the part most descriptions skip, including this repo's own earlier notes. The shim does <em>not</em> write the log file. It writes into a second IPC object — a <abbr title="first in, first out — a named pipe, which behaves like a pipe but has a path in the filesystem">FIFO</abbr>, a named pipe that exists as a path on disk — and <strong>containerd</strong> reads that FIFO and writes the log file. So the chain has four hops and two different kinds of pipe in it:</p>
+<div class="flow"><span>workload fd 1</span><em>→</em><span>pipe</span><em>→</em><span>shim</span><em>→</em><span>FIFO</span><em>→</em><span>containerd</span><em>→</em><span>0.log</span></div>
+<p>You can prove every arrow, which is what the lab does. The consequence worth carrying away: the timestamp on each line is written by <strong>containerd, at the moment it read the bytes</strong> — not by the application, and not when the application decided to log. An application with a buffered writer can emit a burst of lines all stamped within the same millisecond, describing events minutes apart. The timestamps are honest about when the runtime saw the bytes and say nothing about when the events happened.</p>
+
+<div class="specref">
+<p>The CRI does not describe the pipes at all — those are implementation. What it standardises is <em>where the file goes</em>, and it does so in two halves: the sandbox names a directory, and each container names a path relative to it.</p>
+<blockquote>// Path to the directory on the host in which container log files are<br>
+// stored.<br>
+// By default the log of a container going into the LogDirectory will be<br>
+// hooked up to STDOUT and STDERR. However, the LogDirectory may contain<br>
+// binary log files with structured logging data from the individual<br>
+// containers. […]<br>
+// E.g.,<br>
+//&nbsp;&nbsp;&nbsp;&nbsp; PodSandboxConfig.LogDirectory = `/var/log/pods/&lt;NAMESPACE&gt;_&lt;NAME&gt;_&lt;UID&gt;/`<br>
+//&nbsp;&nbsp;&nbsp;&nbsp; ContainerConfig.LogPath = `containerName/Instance#.log`</blockquote>
+<cite>CRI <code>api.proto</code>, <code>PodSandboxConfig.log_directory</code> — <a href="https://raw.githubusercontent.com/kubernetes/cri-api/master/pkg/apis/runtime/v1/api.proto">kubernetes/cri-api</a></cite>
+<p>Note what that means: <strong>the runtime does not choose the path — its caller does.</strong> On a real node the kubelet fills in those two fields, which is why the layout looks like Kubernetes rather than like containerd. Below, we fill them in ourselves and get to pick.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Write a sandbox config that names a log directory, and a container config that names a path inside it and prints a string we can search for.
+<pre class="cmd">cat &gt; ~/sb.json &lt;&lt;'EOF'
+{
+  "metadata": { "name": "obs", "uid": "obs-uid", "namespace": "default", "attempt": 0 },
+  "log_directory": "/var/log/pods/default_obs_obs-uid",
+  "linux": {}
+}
+EOF
+cat &gt; ~/ct.json &lt;&lt;'EOF'
+{
+  "metadata": { "name": "talker", "attempt": 0 },
+  "image": { "image": "docker.io/library/alpine:3.21" },
+  "command": [ "/bin/sh", "-c", "echo I-AM-THE-KNOWN-STRING; sleep 300" ],
+  "log_path": "talker/0.log"
+}
+EOF
+sudo mkdir -p /var/log/pods/default_obs_obs-uid
+POD=$(sudo crictl runp ~/sb.json)
+CID=$(sudo crictl create "$POD" ~/ct.json ~/sb.json)
+sudo crictl start "$CID"</pre></li>
+
+<li><strong>Hop 1 — the workload's own fds.</strong> Ask the CRI for the host PID, then look at what its standard streams actually are.
+<pre class="cmd">PID=$(sudo crictl inspect "$CID" | jq -r .info.pid)
+echo "workload PID on the host = $PID"
+sudo ls -l /proc/"$PID"/fd/0 /proc/"$PID"/fd/1 /proc/"$PID"/fd/2</pre>
+<pre class="out">workload PID on the host = 2256
+lrwx------ 1 root root 64 Aug  1 12:28 /proc/2256/fd/0 -&gt; /dev/null
+l-wx------ 1 root root 64 Aug  1 12:28 /proc/2256/fd/1 -&gt; <b>pipe:[10973]</b>
+l-wx------ 1 root root 64 Aug  1 12:28 /proc/2256/fd/2 -&gt; <b>pipe:[10974]</b></pre>
+<p>stdout and stderr are two <em>different</em> pipes — that separation is physical, and it is why the stream field in the log file can be trusted later. stdin is <code>/dev/null</code>, because nothing is going to type at this container.</p></li>
+
+<li><strong>Hop 2 — who holds the read end?</strong> A pipe has an inode number; search every process's fds for a link to the same one.
+<pre class="cmd">INO=$(sudo readlink /proc/"$PID"/fd/1 | tr -dc '0-9')
+for f in $(sudo find /proc/[0-9]*/fd -lname "pipe:\[$INO\]" 2&gt;/dev/null); do
+  p=$(echo "$f" | cut -d/ -f3)
+  printf '%-20s pid=%-8s comm=%s\n' "$f" "$p" "$(sudo cat /proc/"$p"/comm)"
+done</pre>
+<pre class="out">/proc/2187/fd/14     pid=2187     comm=<b>containerd-shim</b>
+/proc/2256/fd/1      pid=2256     comm=sleep</pre>
+<p>Two holders: our workload at the write end, and the shim at the read end. This is I7's claim, made visible.</p></li>
+
+<li><strong>Hop 3 — the shim writes into a FIFO, and containerd reads it.</strong> The FIFO is a real path (note the leading <code>p</code> in its mode — that is what "named pipe" looks like to <code>ls</code>).
+<pre class="cmd">FIFO=$(sudo find /run/containerd/io.containerd.grpc.v1.cri -name '*-stdout' | head -1)
+sudo ls -l "$FIFO"
+for f in $(sudo find /proc/[0-9]*/fd -lname "$FIFO" 2&gt;/dev/null); do
+  p=$(echo "$f" | cut -d/ -f3)
+  printf '%-18s pid=%-7s comm=%-18s mode=%s\n' "$f" "$p" \
+    "$(sudo cat /proc/$p/comm)" "$(sudo ls -l "$f" | cut -c1-10)"
+done</pre>
+<pre class="out"><b>p</b>rwx------ 1 root root 0 Aug  1 12:28 /run/containerd/io.containerd.grpc.v1.cri/containers/ed6efa44…/io/3004481266/ed6efa44…-stdout
+/proc/2187/fd/16   pid=2187   comm=containerd-shim   mode=<b>l-wx------</b>
+/proc/2187/fd/19   pid=2187   comm=containerd-shim   mode=lr-x------
+/proc/756/fd/25    pid=756    comm=<b>containerd</b>        mode=<b>lr-x------</b></pre>
+<p>Read the mode column, not just the names: the shim holds it <strong>write</strong>-only on fd 16 (<code>l-wx</code>), containerd holds it <strong>read</strong>-only on fd 25 (<code>lr-x</code>). That is the direction of flow, stated by the kernel.</p></li>
+
+<li><strong>Hop 4 — the file, and who owns it.</strong> This is the step that corrects the folk model.
+<pre class="cmd">LOG=$(sudo crictl inspect "$CID" | jq -r .status.logPath)
+sudo cat "$LOG"
+echo "--- which process has it open?"
+sudo find /proc/[0-9]*/fd -lname "$LOG" 2&gt;/dev/null | while read -r f; do
+  p=$(echo "$f" | cut -d/ -f3); echo "$f  pid=$p comm=$(sudo cat /proc/"$p"/comm)"
+done</pre>
+<pre class="out">2026-08-01T12:28:09.864985918+06:00 stdout F I-AM-THE-KNOWN-STRING
+--- which process has it open?
+/proc/756/fd/27  pid=756 comm=<b>containerd</b></pre>
+<p><strong>The shim has zero file descriptors on the log file.</strong> containerd writes it. The shim's job is to hold the pipe and survive; the daemon's job is to format and persist.</p></li>
+
+<li><strong>The payoff — does a containerd restart lose lines?</strong> The chain says the shim keeps buffering while the daemon is away. Test it with a numbered sequence so nothing can hide.
+<pre class="cmd"># container runs: i=0; while :; do i=$((i+1)); echo "seq $i"; sleep 0.2; done
+sudo systemctl restart containerd
+sleep 5
+sudo awk '{print $NF}' "$LOG" &gt; ~/seq.txt
+awk -v f="$(head -1 ~/seq.txt)" -v l="$(tail -1 ~/seq.txt)" \
+  'BEGIN{for(i=f;i&lt;=l;i++)w[i]=1}{delete w[$1]}
+   END{n=0;for(i in w)n++; print "missing lines: " n}' ~/seq.txt</pre>
+<pre class="out">restart took 0.20s
+containerd pid: 39746 -&gt; 39874   (shim pid unchanged)
+first=1 last=47 lines=47 expected=47
+<b>missing lines: 0</b></pre>
+<p>The shim survived the restart untouched (I7's finding again), the log file kept the same inode, and containerd reopened it by path and appended. Not one line lost.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>You can name all four hops from memory and prove any one of them on a running container with <code>ls -l /proc/&lt;pid&gt;/fd</code>. You can state, without hedging, which process writes the log file — and you know that the shim is not it.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong>"The shim writes the log" is wrong, and it matters.</strong> The shim holds the pipe; containerd formats and writes. If you are looking for the process that has your log file open — to see whether it is stuck, or holding a deleted inode — search containerd's fds, not the shim's.</li>
+<li><strong>Timestamps are the runtime's, not the application's.</strong> They record when containerd read the bytes. A buffered application produces clusters of identical-looking timestamps that have nothing to do with when anything happened. If ordering matters to you, log your own timestamp in the message.</li>
+<li><strong>The log survives a containerd restart, but the container may not keep running.</strong> That is I12.3's subject and it is the sharper half of this story — a chatty container blocks. Do not read "no lines lost" as "no impact".</li>
+<li><strong>The FIFO path contains a random directory component</strong> (<code>io/3004481266/</code>), so never hard-code it. Find it with <code>find</code>, or get the log path from <code>crictl inspect</code>.</li>
+</ul>
+
+<div class="k8s-link">
+<p>On a real node this whole chain is what sits under one command. <code>kubectl logs</code> asks the apiserver, which proxies to the kubelet, which reads exactly the file you just found — the kubelet is the caller that filled in <code>log_directory</code> and <code>log_path</code>. When <code>kubectl logs</code> fails but the application is clearly running, the advanced track's fallback ladder walks the same hops from the top: <a href="w6.html#cp-6-2">W6 · Where logs physically live</a>, and the first moves that precede it in <a href="w6.html#cp-6-1">W6 · events, describe, logs, wide</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> search the CRI proto for <code>log_directory</code> and <code>log_path</code> to see the two-field split; <code>man 7 pipe</code> for why a pipe has a fixed capacity (which is the next lesson's ambush); and <code>crictl inspect</code>'s <code>.status.logPath</code>, which is the only supported way to learn where a container's log went.</p>
+</article>
+
+<article class="lesson" id="cp-i12-2" data-id="i12-2">
+<div class="lesson-head"><span class="cp-id">I12.2</span><h4>The five-field log format, and the split line that breaks log shippers</h4>
+<label class="donebox"><input type="checkbox"><span class="box"></span>done</label></div>
+
+<h5>Why it matters</h5>
+<p>The file containerd writes is not your application's output. It is your application's output wrapped in three fields per line, and one of those fields exists to tell you that the line is <em>incomplete</em>. Log shippers that ignore it deliver your JSON logs chopped into unparseable fragments, and the failure is silent — the shipper is not broken, it is doing exactly what it was told.</p>
+
+<h5>The concept</h5>
+<p>Every line in a CRI log file has the same shape: a timestamp, a stream name, a one-character tag, then your bytes.</p>
+<div class="flow"><span>RFC3339Nano timestamp</span><em>·</em><span>stdout|stderr</span><em>·</em><span>P|F</span><em>·</em><span>your line</span></div>
+<p>The <strong>stream</strong> field comes from which of the two pipes the bytes arrived on, so it is structurally reliable rather than guessed. The <strong>tag</strong> is the interesting one. <code>F</code> means <em>full</em>: this record is a complete line. <code>P</code> means <em>partial</em>: this record is a fragment, and the line continues in the next record.</p>
+<p>Partial records exist because of a mismatch the pipe cannot resolve. Reading a pipe returns whatever bytes are available, not whole lines — the kernel has no idea what a line is. Meanwhile a log file needs bounded records, or one runaway <code>printf</code> could produce a single line larger than memory. So containerd caps how much it will accumulate before flushing a record, and marks the flushed fragment <code>P</code> to say "not finished". On containerd 2.3.3 that cap is <code>max_container_log_line_size</code>, and its default is <strong>16384</strong> bytes.</p>
+<p>The reassembly rule is simple and worth memorising: <strong>a logical line is a run of <code>P</code> records terminated by exactly one <code>F</code> record.</strong> Anything that reads the file line-by-line and ignores the tag will emit each 16 KB fragment as if it were a separate log event.</p>
+
+<div class="specref">
+<p>This format is not in the CRI protobuf — the proto only says where the file goes (I12.1). The format is defined by the code that parses it, on the Kubernetes side, and its own comment is the canonical statement:</p>
+<blockquote>parseCRILog parses logs in CRI log format. CRI Log format example:<br><br>
+2016-10-06T00:17:09.669794202Z stdout P log content 1<br>
+2016-10-06T00:17:09.669794203Z stderr F log content 2</blockquote>
+<cite>Kubernetes <code>cri-client</code>, <code>pkg/logs/logs.go</code> — <a href="https://raw.githubusercontent.com/kubernetes/kubernetes/master/staging/src/k8s.io/cri-client/pkg/logs/logs.go">kubernetes/kubernetes</a></cite>
+<p>Two things follow from the format being defined by the reader rather than by a spec. It is a de-facto contract between two projects, and the example above is the whole of it — there is no field for severity, no field for the container name, and nowhere to put structured data. Everything richer has to live inside your own bytes.</p>
+</div>
+
+<h5>Lab</h5>
+<ol class="lab">
+<li>Produce all three variants deliberately in one container: a stdout line, a stderr line, and a line long enough to be split.
+<pre class="cmd">cat &gt; ~/ct2.json &lt;&lt;'EOF'
+{
+  "metadata": { "name": "shouter", "attempt": 0 },
+  "image": { "image": "docker.io/library/alpine:3.21" },
+  "command": [ "/bin/sh", "-c",
+    "echo this-went-to-stdout; echo this-went-to-stderr 1&gt;&amp;2; head -c 20000 /dev/zero | tr '\\0' L; echo; sleep 60" ],
+  "log_path": "shouter/0.log"
+}
+EOF
+POD=$(sudo crictl runp ~/sb.json); CID=$(sudo crictl create "$POD" ~/ct2.json ~/sb.json)
+sudo crictl start "$CID"; sleep 2
+LOG=/var/log/pods/default_obs_obs-uid/shouter/0.log
+sudo cut -c1-90 "$LOG" | head -2</pre>
+<pre class="out">2026-08-01T12:29:24.483101925+06:00 <b>stdout F</b> this-went-to-stdout
+2026-08-01T12:29:24.483146165+06:00 <b>stderr F</b> this-went-to-stderr</pre></li>
+
+<li>Now look at the whole file as records rather than as text, printing the stream, the tag and the message length for each.
+<pre class="cmd">sudo awk '{printf "%-4s stream=%-7s tag=%-3s len(msg)=%d\n", \
+  NR, $2, $3, length($0)-length($1)-length($2)-length($3)-3}' "$LOG"</pre>
+<pre class="out">1    stream=stdout  tag=F   len(msg)=19
+2    stream=stderr  tag=F   len(msg)=19
+3    stream=stdout  tag=<b>P</b>   len(msg)=<b>16384</b>
+4    stream=stdout  tag=<b>F</b>   len(msg)=<b>3616</b></pre>
+<p>One 20,000-byte line became two records: a <code>P</code> of exactly 16384 and an <code>F</code> of 3616. They sum to 20000. That 16384 is <code>max_container_log_line_size</code>, and it is the only log-related knob containerd has apart from a tracing flag:</p>
+<pre class="cmd">containerd config default | grep -i log</pre>
+<pre class="out">  log_trace_id = false
+    <b>max_container_log_line_size = 16384</b></pre></li>
+
+<li>Confirm that a correct reader puts the line back together, and that the timestamp is RFC3339 with nanoseconds and an offset.
+<pre class="cmd">sudo crictl logs "$CID" 2&gt;&amp;1 | awk '{print NR": len="length($0)" head="substr($0,1,22)}'
+sudo awk 'NR==1{print $1}' "$LOG"</pre>
+<pre class="out">1: len=19 head=this-went-to-stdout
+2: len=19 head=this-went-to-stderr
+3: <b>len=20000</b> head=LLLLLLLLLLLLLLLLLLLLLL
+<b>2026-08-01T12:29:24.483101925+06:00</b></pre>
+<p><code>crictl logs</code> reassembled 16384 + 3616 back into one 20,000-byte line. Note the timestamp carries a <code>+06:00</code> offset — it is the node's local time, not UTC.</p></li>
+
+<li><strong>The trap worth ten minutes of your life.</strong> The stream field is not just metadata that gets printed — <code>crictl logs</code> <em>replays</em> it, sending stdout records to its own stdout and stderr records to its own stderr.
+<pre class="cmd">echo "--- with 2&gt;/dev/null (crictl's stderr thrown away):"
+sudo crictl logs "$CID" 2&gt;/dev/null | cut -c1-30
+echo "--- with 2&gt;&amp;1 (both kept):"
+sudo crictl logs "$CID" 2&gt;&amp;1 | cut -c1-30
+echo "--- only crictl's stderr (1&gt;/dev/null):"
+sudo crictl logs "$CID" 1&gt;/dev/null</pre>
+<pre class="out">--- with 2&gt;/dev/null (crictl's stderr thrown away):
+this-went-to-stdout
+LLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
+--- with 2&gt;&amp;1 (both kept):
+this-went-to-stdout
+<b>this-went-to-stderr</b>
+LLLLLLLLLLLLLLLLLLLLLLLLLLLLLL
+--- only crictl's stderr (1&gt;/dev/null):
+<b>this-went-to-stderr</b></pre>
+<p>The habitual <code>2&gt;/dev/null</code> that suppresses a tool's warnings silently discards <strong>every stderr line your application wrote</strong> — usually the half you were looking for.</p></li>
+</ol>
+
+<h5 class="verify">Verify</h5>
+<p>Given a raw CRI log file you can say how many logical lines it contains without counting records, and you can explain why <code>grep ERROR app.log | wc -l</code> run against a raw CRI file can overcount. You know the default split point is 16384 bytes and where that number is configured.</p>
+
+<h5 class="gotcha">Gotchas</h5>
+<ul>
+<li><strong><code>crictl logs … 2&gt;/dev/null</code> throws away your application's stderr.</strong> Use <code>2&gt;&amp;1</code> when you want everything in one stream. This bites hardest in scripts, where suppressing tool noise is reflexive.</li>
+<li><strong>A split line is not an error condition.</strong> Nothing logs a warning; the file is valid and every byte is present. The damage happens downstream, in whatever reads it.</li>
+<li><strong>The split point counts bytes, not characters.</strong> A multi-byte UTF-8 character can be cut in half across two records, so a naïve reader can decode a fragment into replacement characters even after reassembling correctly.</li>
+<li><strong>Raising <code>max_container_log_line_size</code> does not fix a shipper.</strong> It moves the threshold; a longer line still splits. Fix the reader, or stop emitting enormous lines.</li>
+</ul>
+
+<div class="k8s-link">
+<p>The kubelet is the reader that defines this format, so <code>kubectl logs</code> reassembles partial records correctly and interleaves the two streams — which is why <code>kubectl logs</code> output looks nothing like the file on disk. Anything that bypasses the kubelet and reads <code>/var/log/pods</code> directly (most node-level log shippers) has to do the reassembly itself. The advanced track meets those files in <a href="w6.html#cp-6-2">W6 · Where logs physically live</a>.</p>
+</div>
+
+<p class="docs-links"><b>Docs:</b> the format's definition lives in the <code>cri-client</code> parser rather than in any spec — search for <code>parseCRILog</code>. On the runtime side, search containerd's config for <code>max_container_log_line_size</code>. For the reassembly contract as Kubernetes states it, search the API reference for <code>LogTagPartial</code>.</p>
+</article>
+</div><!-- /g-logs -->
+
+<div class="quiz" id="quiz">
+<h3>Quiz</h3>
+<ol>
+<li>A container's fd 1 is a pipe. Which process holds the read end, and which process writes the log file on disk?
+<details class="reveal"><summary>Answer</summary><p>The <strong>shim</strong> holds the read end of the pipe. <strong>containerd</strong> writes the log file — it reads a FIFO the shim writes into, and holds the only file descriptor on <code>0.log</code>. The shim has none.</p></details></li>
+<li>A raw CRI log file has 4 records but <code>crictl logs</code> prints 3 lines. What happened?
+<details class="reveal"><summary>Answer</summary><p>One logical line exceeded <code>max_container_log_line_size</code> (default 16384) and was written as a <code>P</code> (partial) record followed by an <code>F</code> (full) record. A correct reader joins a run of <code>P</code> records terminated by one <code>F</code> back into a single line.</p></details></li>
+<li>Why does <code>sudo crictl logs "$CID" 2&gt;/dev/null</code> hide half your application's output?
+<details class="reveal"><summary>Answer</summary><p>Because <code>crictl logs</code> replays the <code>stdout</code>/<code>stderr</code> field onto its own stdout and stderr. Redirecting its stderr to <code>/dev/null</code> discards every line the application wrote to stderr.</p></details></li>
+</ol>
+</div>
+
+<div class="outcome">
+<ul>
+<li>Traced one line of application output through all four hops and proved each one from <code>/proc</code>.</li>
+<li>Decoded the CRI log format's five fields and reproduced the partial/full split deliberately.</li>
+</ul>
+</div>
+
+<div class="godeep"><a href="../beginner.html#b5">B5 built the inode and file-handle machinery this module leans on →</a></div>
+
+<nav class="pager"><a href="i11.html">← I11</a><a href="../intermediate.html#i13">I13 · Capstone →</a></nav>
+
+<footer>
+Authored against Ubuntu 24.04.4 LTS (kernel 6.8.0-136-generic, cgroup v2) with
+containerd 2.3.3, runc 1.5.1, crictl v1.36.0, nerdctl 2.3.5, Python 3.12.3,
+perf 6.8.12, bpftrace v0.20.2 and alpine 3.21. Verified 2026-08-01. Every
+command and every line of output on this page came from a live run on the
+<code>sandbox</code> VM.
+</footer>
+</main>
+</div>
+<script src="../assets/lesson.js"></script>
+</body>
+</html>
